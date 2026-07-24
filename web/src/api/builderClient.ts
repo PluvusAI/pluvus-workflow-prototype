@@ -196,6 +196,27 @@ export function publishWorkflow(workflowId: string, notes?: string) {
   });
 }
 
+// PLU-117 §4.2: AI-assisted authoring of the reusable outreach template. This is
+// a SETUP-TIME helper — brand/campaign/deal context is assembled server-side, the
+// client only passes an optional instruction + the current copy it's revising.
+// The result populates the editable fields; it is never auto-sent.
+export interface OutreachTemplateResult {
+  subject: string;
+  body: string;
+  alternateSubjects: string[];
+  flaggedPlaceholders: string[];
+}
+
+export function generateOutreachTemplate(
+  workflowId: string,
+  input: { instruction?: string; currentSubject?: string; currentBody?: string } = {},
+): Promise<OutreachTemplateResult> {
+  return postJson<OutreachTemplateResult>(
+    `/api/workflows/${workflowId}/outreach/template`,
+    input,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Creators
 // ---------------------------------------------------------------------------

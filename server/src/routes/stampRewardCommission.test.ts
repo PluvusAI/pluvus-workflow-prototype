@@ -6,7 +6,7 @@
  */
 
 import assert from "node:assert/strict";
-import { stampRewardFromNegotiation } from "./workflows.js";
+import { stampRewardFromNegotiation, stampOutreachDerivedFields } from "./workflows.js";
 
 let n = 0;
 function test(name: string, fn: () => void): void {
@@ -93,6 +93,54 @@ test("clears a stale commission on CONTENT_BRIEF for a fixed-fee deal", () => {
   const brief = out.find((x) => x.type === "CONTENT_BRIEF")!;
   assert.equal("commissionRate" in brief.config, false);
   assert.equal(brief.config["briefFileRef"], "ref-2");
+});
+
+// ── PLU-117: stampOutreachDerivedFields — campaignName + deal shape onto outreach
+function outreachConfig(nodes: unknown): Record<string, unknown> {
+  return (nodes as Node[]).find((x) => x.type === "INITIAL_OUTREACH")!.config;
+}
+
+test("stamps campaignName + collaborationType + offerSummary onto the outreach node", () => {
+  const nodes: Node[] = [
+    { id: "neg", type: "NEGOTIATION", order: 0, config: { maxBudget: 500, commissionRate: 15 } },
+    { id: "out", type: "INITIAL_OUTREACH", order: 1, config: { brandName: "Acme" } },
+  ];
+  const cfg = outreachConfig(stampOutreachDerivedFields(nodes, "Spring Launch"));
+  assert.equal(cfg["campaignName"], "Spring Launch");
+  assert.equal(cfg["collaborationType"], "hybrid partnership");
+  assert.match(cfg["offerSummary"] as string, /hybrid partnership/);
+  assert.equal(cfg["brandName"], "Acme", "unrelated config preserved");
+});
+
+test("removes derived keys when the source is absent (so availability hides them)", () => {
+  const nodes: Node[] = [
+    { id: "neg", type: "NEGOTIATION", order: 0, config: {} }, // no deal shape
+    // stale derived values from a previous save
+    { id: "out", type: "INITIAL_OUTREACH", order: 1, config: { campaignName: "Old", collaborationType: "x", offerSummary: "y" } },
+  ];
+  const cfg = outreachConfig(stampOutreachDerivedFields(nodes, null));
+  assert.equal("campaignName" in cfg, false);
+  assert.equal("collaborationType" in cfg, false);
+  assert.equal("offerSummary" in cfg, false);
+});
+
+test("overwrites a stale campaignName with the current one", () => {
+  const nodes: Node[] = [
+    { id: "neg", type: "NEGOTIATION", order: 0, config: {} },
+    { id: "out", type: "INITIAL_OUTREACH", order: 1, config: { campaignName: "Old Name" } },
+  ];
+  const cfg = outreachConfig(stampOutreachDerivedFields(nodes, "New Name"));
+  assert.equal(cfg["campaignName"], "New Name");
+});
+
+test("leaves non-outreach nodes untouched", () => {
+  const nodes: Node[] = [
+    { id: "neg", type: "NEGOTIATION", order: 0, config: { maxBudget: 500 } },
+    { id: "out", type: "INITIAL_OUTREACH", order: 1, config: {} },
+  ];
+  const out = stampOutreachDerivedFields(nodes, "Camp") as Node[];
+  const neg = out.find((x) => x.type === "NEGOTIATION")!;
+  assert.equal("campaignName" in neg.config, false);
 });
 
 console.log(`\n${n} passed\n`);

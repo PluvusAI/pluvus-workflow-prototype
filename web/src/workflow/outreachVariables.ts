@@ -17,23 +17,93 @@ export interface OutreachVariable {
   group: "Creator" | "Brand" | "Campaign";
   label: string;
   fallbackNote: string;
+  /**
+   * PLU-117 §3 / AC10: a REQUIRED variable has NO silent fallback. When a
+   * template uses it and a creator's value is empty, that send is blocked. The
+   * builder surfaces a warning when a required variable is referenced.
+   */
+  required?: boolean;
+  /**
+   * PLU-117: when is this variable AVAILABLE (offered in the palette / given to
+   * the AI / valid in the template)? "always" = resolves for every creator
+   * regardless of config; "config" = comes from a brand-supplied field and is
+   * offered only when the config carries a non-empty value for `sourceKey`. Keep
+   * in sync with the server module.
+   */
+  availability: "always" | "config";
+  sourceKey?: string;
 }
 
 export const OUTREACH_VARIABLES: readonly OutreachVariable[] = [
-  { name: "creatorName", group: "Creator", label: "The creator's name", fallbackNote: "always present" },
-  { name: "platform", group: "Creator", label: "The creator's platform (e.g. Instagram)", fallbackNote: '"social media" when unknown' },
-  { name: "niche", group: "Creator", label: "The creator's niche (e.g. fitness)", fallbackNote: '"your niche" when unknown' },
-  { name: "brandName", group: "Brand", label: "The brand's name", fallbackNote: "falls back to the sender name" },
-  { name: "senderName", group: "Brand", label: "The sender / partnerships identity", fallbackNote: '"Pluvus Partnerships" when unset' },
-  { name: "brandDescription", group: "Brand", label: "What the brand does", fallbackNote: "blank when unset" },
-  { name: "rewardDescription", group: "Campaign", label: "The product / sample reward blurb", fallbackNote: "blank when cash-only" },
-  { name: "deliverables", group: "Campaign", label: "What the creator would produce", fallbackNote: "blank when unset" },
-  { name: "timeline", group: "Campaign", label: "The campaign timeline", fallbackNote: "blank when unset" },
+  { name: "creatorFirstName", group: "Creator", label: "The creator's first name", fallbackNote: "first word of the creator's name", availability: "always" },
+  { name: "creatorName", group: "Creator", label: "The creator's name", fallbackNote: "always present", required: true, availability: "always" },
+  { name: "platform", group: "Creator", label: "The creator's platform (e.g. Instagram)", fallbackNote: '"social media" when unknown', availability: "always" },
+  { name: "niche", group: "Creator", label: "The creator's niche (e.g. fitness)", fallbackNote: '"your niche" when unknown', availability: "always" },
+  { name: "brandName", group: "Brand", label: "The brand's name", fallbackNote: "the campaign's brand", required: true, availability: "config", sourceKey: "brandName" },
+  { name: "senderName", group: "Brand", label: "The sender / partnerships identity", fallbackNote: "the campaign's brand", availability: "config", sourceKey: "senderName" },
+  { name: "brandDescription", group: "Brand", label: "What the brand does", fallbackNote: "blank when unset", availability: "config", sourceKey: "brandDescription" },
+  { name: "campaignName", group: "Campaign", label: "The campaign's name", fallbackNote: "blank when unset", availability: "config", sourceKey: "campaignName" },
+  { name: "collaborationType", group: "Campaign", label: "The deal shape (fixed-fee / affiliate / hybrid)", fallbackNote: '"partnership" when the deal shape is unknown', availability: "always" },
+  { name: "offerSummary", group: "Campaign", label: "A price-free summary of the offer", fallbackNote: "blank when the deal shape is unknown", availability: "config", sourceKey: "offerSummary" },
+  { name: "rewardDescription", group: "Campaign", label: "The product / sample reward blurb", fallbackNote: "blank when cash-only", availability: "config", sourceKey: "rewardDescription" },
+  { name: "deliverables", group: "Campaign", label: "What the creator would produce", fallbackNote: "blank when unset", availability: "config", sourceKey: "deliverables" },
+  { name: "timeline", group: "Campaign", label: "The campaign timeline", fallbackNote: "blank when unset", availability: "config", sourceKey: "timeline" },
 ] as const;
 
 export const OUTREACH_VARIABLE_NAMES: ReadonlySet<string> = new Set(
   OUTREACH_VARIABLES.map((v) => v.name),
 );
+
+/** REQUIRED variable names (PLU-117 §3) — mirrors the server set. */
+export const REQUIRED_OUTREACH_VARIABLE_NAMES: ReadonlySet<string> = new Set(
+  OUTREACH_VARIABLES.filter((v) => v.required).map((v) => v.name),
+);
+
+/**
+ * Variables AVAILABLE for a config — "always" vars plus "config" vars whose
+ * source key carries a non-empty value. Mirrors the server. Single source of
+ * truth for what the palette offers and what the AI is allowed to use.
+ */
+export function availableOutreachVariables(
+  config: Record<string, unknown>,
+): OutreachVariable[] {
+  return OUTREACH_VARIABLES.filter((v) => {
+    if (v.availability === "always") return true;
+    const key = v.sourceKey ?? v.name;
+    const val = config[key];
+    return typeof val === "string" && val.trim().length > 0;
+  });
+}
+
+export function availableOutreachVariableNames(
+  config: Record<string, unknown>,
+): Set<string> {
+  return new Set(availableOutreachVariables(config).map((v) => v.name));
+}
+
+/**
+ * KNOWN placeholders a template uses that are NOT available for this config (they
+ * would render blank because the brand didn't supply the value). Mirrors the
+ * server unavailableUsedTokens. Unknown-token typos are handled separately.
+ */
+export function unavailableUsedTokens(
+  subject: string,
+  body: string,
+  config: Record<string, unknown>,
+): string[] {
+  const available = availableOutreachVariableNames(config);
+  const flagged = new Set<string>();
+  for (const text of [subject, body]) {
+    if (!text) continue;
+    for (const m of text.matchAll(TOKEN_RE)) {
+      const name = m[1];
+      if (name && OUTREACH_VARIABLE_NAMES.has(name) && !available.has(name)) {
+        flagged.add(name);
+      }
+    }
+  }
+  return [...flagged];
+}
 
 const TOKEN_RE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 
@@ -94,10 +164,16 @@ export function didYouMeanClause(unknown: string): string {
  * onto it), falling back to these placeholders when the campaign hasn't set one.
  */
 export const PREVIEW_SAMPLE = {
-  creatorName: "Maya",
+  creatorName: "Maya Chen",
   platform: "Instagram",
   niche: "fitness",
 } as const;
+
+/** First whitespace-delimited word of a name; "" when blank. Mirrors server. */
+export function firstNameOf(name: string): string {
+  const first = name.trim().split(/\s+/)[0];
+  return first ?? "";
+}
 
 /**
  * Render `template` for the live preview using the node config's real brand /
@@ -112,16 +188,23 @@ export function renderOutreachPreview(
   const str = (key: string): string =>
     typeof config[key] === "string" ? (config[key] as string) : "";
 
-  const senderName = str("senderName") || "Pluvus Partnerships";
-  const brandName = str("brandName") || senderName;
+  // Mirror the server: brandName is the campaign brand, senderName mirrors it, and
+  // there is NO "Pluvus Partnerships" fallback — it must never appear in the copy.
+  const brandName = str("brandName") || str("senderName");
+  const senderName = str("senderName") || brandName;
+  const collaborationType = str("collaborationType") || "partnership";
 
   const values: Record<string, string> = {
+    creatorFirstName: firstNameOf(PREVIEW_SAMPLE.creatorName),
     creatorName: PREVIEW_SAMPLE.creatorName,
     platform: PREVIEW_SAMPLE.platform,
     niche: PREVIEW_SAMPLE.niche,
     brandName,
     senderName,
     brandDescription: str("brandDescription"),
+    campaignName: str("campaignName"),
+    collaborationType,
+    offerSummary: str("offerSummary"),
     rewardDescription: str("rewardDescription"),
     deliverables: str("deliverables"),
     timeline: str("timeline"),

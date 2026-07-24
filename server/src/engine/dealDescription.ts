@@ -13,7 +13,26 @@
 // No dollar figures are included — the band/rate is negotiated later, and the
 // output guard must never see floor/ceiling here.
 
-export function describeDeal(negotiationConfig: Record<string, unknown> | undefined): string | undefined {
+/**
+ * The deal shape inferred from the NEGOTIATION node config, split into:
+ *   - `type`    — a short human label ("hybrid partnership" / "affiliate
+ *                 partnership" / "fixed-fee collaboration") for {{collaborationType}}
+ *   - `summary` — the full price-free sentence (same wording describeDeal
+ *                 returns) for {{offerSummary}} and outreach copy.
+ * Both are undefined when the config carries no discernible deal shape.
+ */
+export interface DealShape {
+  type: string;
+  summary: string;
+}
+
+/**
+ * Structured version of describeDeal: derive the deal type label AND the
+ * price-free summary sentence from the NEGOTIATION node config. Returns
+ * undefined when no deal shape is discernible (same condition describeDeal
+ * returns undefined). No dollar figures — the band/rate is negotiated later.
+ */
+export function dealShape(negotiationConfig: Record<string, unknown> | undefined): DealShape | undefined {
   if (!negotiationConfig) return undefined;
 
   const commission =
@@ -30,26 +49,40 @@ export function describeDeal(negotiationConfig: Record<string, unknown> | undefi
     isPositive(rateOf(negotiationConfig["termFloor"]));
 
   if (commission !== undefined && hasFixedFee) {
-    return (
-      `a hybrid partnership — you receive a fixed fee for your content, ` +
-      `PLUS a ${commission}% commission on the sales you drive. ` +
-      `(The exact fee is discussed once you reply.)`
-    );
+    return {
+      type: "hybrid partnership",
+      summary:
+        `a hybrid partnership — you receive a fixed fee for your content, ` +
+        `PLUS a ${commission}% commission on the sales you drive. ` +
+        `(The exact fee is discussed once you reply.)`,
+    };
   }
   if (commission !== undefined && !hasFixedFee) {
-    return (
-      `a performance-based affiliate partnership — you earn a ${commission}% ` +
-      `commission on every sale you drive through your unique link. ` +
-      `(No upfront fee.)`
-    );
+    return {
+      type: "affiliate partnership",
+      summary:
+        `a performance-based affiliate partnership — you earn a ${commission}% ` +
+        `commission on every sale you drive through your unique link. ` +
+        `(No upfront fee.)`,
+    };
   }
   if (hasFixedFee) {
-    return (
-      `a fixed-fee collaboration — a flat fee for an agreed piece of content. ` +
-      `(The exact fee is discussed once you reply.)`
-    );
+    return {
+      type: "fixed-fee collaboration",
+      summary:
+        `a fixed-fee collaboration — a flat fee for an agreed piece of content. ` +
+        `(The exact fee is discussed once you reply.)`,
+    };
   }
   return undefined;
+}
+
+/**
+ * Back-compat sentence form used by the outreach/negotiation draft prompts.
+ * Returns just the `summary` from dealShape (or undefined).
+ */
+export function describeDeal(negotiationConfig: Record<string, unknown> | undefined): string | undefined {
+  return dealShape(negotiationConfig)?.summary;
 }
 
 function isPositive(v: unknown): boolean {

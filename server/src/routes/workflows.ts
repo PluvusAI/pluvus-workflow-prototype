@@ -29,6 +29,9 @@ import {
 import { enqueueNodeExecution } from "../workers/queues.js";
 import { validateNodeGraph } from "../templates/index.js";
 import { validateWorkflowGraph } from "../validation/graphValidation.js";
+import { agentBaseUrl, agentPostJson } from "../adapters/agentServiceClient.js";
+import { dealShape } from "../engine/dealDescription.js";
+import { availableOutreachVariables } from "../engine/outreachVariables.js";
 
 const router = Router();
 
@@ -166,6 +169,56 @@ export function stampRewardFromNegotiation(nodes: unknown): unknown {
 }
 
 // ---------------------------------------------------------------------------
+// Stamp the outreach template's DERIVED placeholder sources onto the node.
+// ---------------------------------------------------------------------------
+// PLU-117: {{campaignName}}, {{collaborationType}}, {{offerSummary}} are not
+// plain brand fields — campaignName comes off the campaign row, and the other
+// two are derived from the NEGOTIATION deal shape. So the builder (palette /
+// preview / AI availability) never saw their real values and they rendered
+// blank. Stamp them onto the INITIAL_OUTREACH node config here on every save /
+// publish so the builder resolves them exactly as the send path will.
+//
+// Unlike brand fields these are AUTHORITATIVE from the campaign/negotiation (an
+// operator can't meaningfully override "what is this campaign's name"), so they
+// OVERWRITE — and when a source is ABSENT the key is REMOVED, so an availability
+// check based on "config has a non-empty value" correctly hides the placeholder.
+export function stampOutreachDerivedFields(
+  nodes: unknown,
+  campaignName: string | null | undefined,
+): unknown {
+  if (!Array.isArray(nodes)) return nodes;
+
+  const negotiation = nodes.find(
+    (n): n is { type: string; config?: Record<string, unknown> } =>
+      !!n && typeof n === "object" && (n as { type?: unknown }).type === "NEGOTIATION",
+  );
+  const shape = dealShape((negotiation?.config ?? {}) as Record<string, unknown>);
+
+  const derived: Record<string, string> = {};
+  if (typeof campaignName === "string" && campaignName.trim().length > 0) {
+    derived["campaignName"] = campaignName;
+  }
+  if (shape) {
+    derived["collaborationType"] = shape.type;
+    derived["offerSummary"] = shape.summary;
+  }
+
+  return nodes.map((node) => {
+    if (!node || typeof node !== "object") return node;
+    const n = node as { type?: unknown; config?: unknown; [k: string]: unknown };
+    if (n.type !== "INITIAL_OUTREACH") return node;
+    const config = (n.config && typeof n.config === "object" ? n.config : {}) as Record<
+      string,
+      unknown
+    >;
+    // Drop any stale derived keys, then set the ones we have a source for. A
+    // dropped key (no source) means the placeholder is unavailable → not offered.
+    const { campaignName: _c, collaborationType: _t, offerSummary: _o, ...rest } = config;
+    return { ...n, config: { ...rest, ...derived } };
+  });
+}
+
+// ---------------------------------------------------------------------------
 // GET /workflows/:id — workflow detail with draftNodes + latest version
 // ---------------------------------------------------------------------------
 
@@ -216,6 +269,144 @@ router.get("/:id", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[workflows] get error:", err);
     res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /workflows/:id/outreach/template — AI-assisted TEMPLATE authoring (PLU-117)
+// ---------------------------------------------------------------------------
+// Setup-time ONLY. Helps the operator author/revise the ONE reusable outreach
+// template that is later sent deterministically (placeholders only) to every
+// creator. This is NEVER on the send path — executeInitialOutreach in manual mode
+// still calls no AI. Brand/campaign/deal context is assembled SERVER-SIDE from the
+// campaign row + the workflow's NEGOTIATION node, never trusted from the client
+// (the client can only pass an instruction + the current subject/body it's
+// revising). The supported placeholder list is the server's own allow-list so the
+// model can only emit tokens we can actually resolve.
+
+// Find a node of a given type in the draft node array (setup-time source).
+function findDraftNode(
+  nodes: unknown,
+  type: string,
+): { config?: Record<string, unknown> } | undefined {
+  if (!Array.isArray(nodes)) return undefined;
+  return nodes.find(
+    (n): n is { type: string; config?: Record<string, unknown> } =>
+      !!n && typeof n === "object" && (n as { type?: unknown }).type === type,
+  );
+}
+
+/** The minimal campaign shape the outreach-template context reads. */
+export interface OutreachTemplateCampaignFacts {
+  brand?: string | null;
+  brandDescription?: string | null;
+  name?: string | null;
+  deliverables?: string | null;
+  timeline?: string | null;
+  rewardDescription?: string | null;
+}
+
+/**
+ * Assemble the brand/campaign/deal context sent to the agent's template route,
+ * SERVER-SIDE from the campaign row + the workflow's NEGOTIATION node. This is the
+ * trust boundary: the client never supplies brand facts — only reliably-available
+ * fields are included (PLU-117), and empty/absent fields are omitted so the model
+ * never treats a blank as a fact. Pure + exported so it's unit-testable without a
+ * DB or a live agent.
+ */
+export function buildOutreachTemplateContext(
+  campaign: OutreachTemplateCampaignFacts | null | undefined,
+  draftNodes: unknown,
+): { brandContext: Record<string, unknown>; allowedPlaceholders: string[] } {
+  const negConfig = findDraftNode(draftNodes, "NEGOTIATION")?.config ?? {};
+  const shape = dealShape(negConfig);
+
+  const brandContext: Record<string, unknown> = {};
+  const put = (k: string, v: unknown): void => {
+    if (typeof v === "string" && v.trim().length > 0) brandContext[k] = v;
+  };
+  put("brandName", campaign?.brand);
+  put("senderName", campaign?.brand);
+  put("brandDescription", campaign?.brandDescription);
+  put("campaignName", campaign?.name);
+  put("deliverables", campaign?.deliverables);
+  put("timeline", campaign?.timeline);
+  put("rewardDescription", campaign?.rewardDescription);
+  if (shape) {
+    brandContext["collaborationType"] = shape.type;
+    brandContext["offerSummary"] = shape.summary;
+  }
+
+  // PLU-117: give the AI ONLY the placeholders that are AVAILABLE for this
+  // campaign — always-available ones plus the config-sourced ones the brand
+  // actually supplied (which are exactly the keys we just put on brandContext).
+  // So the AI can never emit {{campaignName}} when there's no campaign name, etc.
+  const allowedPlaceholders = availableOutreachVariables(brandContext).map(
+    (v) => `{{${v.name}}}`,
+  );
+  return { brandContext, allowedPlaceholders };
+}
+
+router.post("/:id/outreach/template", async (req: Request, res: Response) => {
+  try {
+    const wfRows = await db
+      .select({ workflow: workflowsTable, campaign: campaignsTable })
+      .from(workflowsTable)
+      .leftJoin(campaignsTable, eq(workflowsTable.campaignId, campaignsTable.id))
+      .where(eq(workflowsTable.id, req.params["id"]!))
+      .limit(1);
+    const found = wfRows[0];
+    if (!found) {
+      res.status(404).json({ error: "workflow not found" });
+      return;
+    }
+    const { workflow: wf, campaign } = found;
+
+    // The client may pass ONLY an instruction and the current copy it is revising.
+    // Everything factual (brand/campaign/deal) is assembled here so a client can't
+    // inject brand facts the operator never approved.
+    const body = (req.body ?? {}) as {
+      instruction?: unknown;
+      currentSubject?: unknown;
+      currentBody?: unknown;
+    };
+    const instruction = typeof body.instruction === "string" ? body.instruction : undefined;
+    const currentSubject = typeof body.currentSubject === "string" ? body.currentSubject : undefined;
+    const currentBody = typeof body.currentBody === "string" ? body.currentBody : undefined;
+
+    // Assemble brand/campaign/deal context server-side (trust boundary).
+    const { brandContext, allowedPlaceholders } = buildOutreachTemplateContext(
+      campaign,
+      wf.draftNodes,
+    );
+
+    const result = await agentPostJson(agentBaseUrl(), "/outreach/template", {
+      brandContext,
+      allowedPlaceholders,
+      ...(instruction ? { instruction } : {}),
+      ...(currentSubject ? { currentSubject } : {}),
+      ...(currentBody ? { currentBody } : {}),
+    });
+
+    res.json({
+      subject: typeof result["subject"] === "string" ? result["subject"] : "",
+      body: typeof result["body"] === "string" ? result["body"] : "",
+      alternateSubjects: Array.isArray(result["alternateSubjects"]) ? result["alternateSubjects"] : [],
+      flaggedPlaceholders: Array.isArray(result["flaggedPlaceholders"])
+        ? result["flaggedPlaceholders"]
+        : [],
+    });
+  } catch (err) {
+    // The agent maps an injection-flagged instruction to a 400; surface that as a
+    // 400 so the builder can show "rephrase the instruction" rather than a generic
+    // failure. Everything else is a 502 (agent unavailable / generation failed).
+    const status = (err as { status?: number }).status;
+    if (status === 400) {
+      res.status(400).json({ error: "instruction looks like a prompt-injection attempt" });
+      return;
+    }
+    console.error("[workflows] outreach template error:", err);
+    res.status(502).json({ error: "outreach template generation failed" });
   }
 });
 
@@ -275,7 +466,7 @@ router.put("/:id/draft", async (req: Request, res: Response) => {
     let nodesToSave: unknown = nodes;
     if (wf.campaignId) {
       const campaign = await findCampaignById(wf.campaignId);
-      if (campaign)
+      if (campaign) {
         nodesToSave = restampBrand(
           nodes,
           campaign.brand,
@@ -285,6 +476,11 @@ router.put("/:id/draft", async (req: Request, res: Response) => {
           campaign.rewardDescription,
           campaign.shipsPhysicalProduct,
         );
+        // PLU-117: stamp campaignName + deal-shape sources onto the outreach node
+        // so the builder palette/preview/AI see their real values (or hide them
+        // when absent). Depends on the NEGOTIATION node, so run after restamp.
+        nodesToSave = stampOutreachDerivedFields(nodesToSave, campaign.name);
+      }
     }
     // Mirror the brand's negotiation commission onto the Reward Setup node so the
     // builder + runtime always show the current value (independent of campaign).
@@ -367,6 +563,12 @@ router.post("/:id/publish", async (req: Request, res: Response) => {
           campaign.timeline,
           campaign.rewardDescription,
           campaign.shipsPhysicalProduct,
+        ) as InputJsonValue;
+        // PLU-117: freeze the derived outreach placeholder sources (campaignName +
+        // deal shape) onto the immutable version, matching what the builder showed.
+        nodeGraphToPublish = stampOutreachDerivedFields(
+          nodeGraphToPublish,
+          campaign.name,
         ) as InputJsonValue;
       }
     }

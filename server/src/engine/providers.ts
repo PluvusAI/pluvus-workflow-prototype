@@ -154,9 +154,13 @@ export class MockEmailProvider implements IEmailProvider {
   ): Promise<EmailDraft> {
     // senderName / platform are used by the generic fallback body below when no
     // template is supplied. All {{variable}} substitution in a supplied template
-    // is done by resolveOutreachTemplate (the shared allow-list), not here.
+    // is done by resolveOutreachTemplate (the shared allow-list), not here. The
+    // sender is the campaign brand (brandName or senderName) — NEVER the internal
+    // "Pluvus Partnerships" name, which must not appear in a brand's outreach.
     const senderName =
-      typeof config["senderName"] === "string" ? config["senderName"] : "Pluvus Partnerships";
+      (typeof config["senderName"] === "string" && config["senderName"]) ||
+      (typeof config["brandName"] === "string" && config["brandName"]) ||
+      "our team";
     const platform =
       typeof creator.platform === "string" ? creator.platform : "social media";
 

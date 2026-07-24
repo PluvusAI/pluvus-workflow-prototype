@@ -693,6 +693,9 @@ export function WorkflowBuilder({ workflowId, onBack }: Props) {
                 <NodeConfigPanel
                   key={selectedNode.id}
                   node={selectedNode}
+                  workflowId={workflowId}
+                  campaignBrand={wf?.campaign?.brand ?? null}
+                  campaignName={wf?.campaign?.name ?? null}
                   onUpdate={handleNodeUpdate}
                   onDelete={handleDeleteNode}
                   onMoveUp={handleMoveUp}

@@ -13,7 +13,12 @@ import {
   extractUnknownTokens,
   suggestVariable,
   validateOutreachConfig,
+  missingRequiredValues,
+  unavailableUsedTokens,
+  availableOutreachVariableNames,
+  firstNameOf,
   OUTREACH_VARIABLE_NAMES,
+  REQUIRED_OUTREACH_VARIABLE_NAMES,
 } from "./outreachVariables.js";
 
 let n = 0;
@@ -35,12 +40,16 @@ console.log("\noutreach variables\n");
 // (web/src/workflow/outreachVariables.ts) asserts the SAME list. If you
 // add/rename a variable, update both modules AND both expected sets.
 const EXPECTED_VARIABLE_NAMES = [
+  "creatorFirstName",
   "creatorName",
   "platform",
   "niche",
   "brandName",
   "senderName",
   "brandDescription",
+  "campaignName",
+  "collaborationType",
+  "offerSummary",
   "rewardDescription",
   "deliverables",
   "timeline",
@@ -48,6 +57,10 @@ const EXPECTED_VARIABLE_NAMES = [
 
 test("allow-list matches the canonical variable set (web mirror contract)", () => {
   assert.deepEqual([...OUTREACH_VARIABLE_NAMES].sort(), EXPECTED_VARIABLE_NAMES);
+});
+
+test("required set is exactly creatorName + brandName (PLU-117 §3)", () => {
+  assert.deepEqual([...REQUIRED_OUTREACH_VARIABLE_NAMES].sort(), ["brandName", "creatorName"]);
 });
 
 test("resolves creator + brand + campaign variables", () => {
@@ -68,14 +81,15 @@ test("resolves creator + brand + campaign variables", () => {
   );
 });
 
-test("brandName falls back to senderName when unset", () => {
-  const out = resolveOutreachTemplate("{{brandName}}", creator, { senderName: "Solo Co" });
-  assert.equal(out, "Solo Co");
+test("brandName and senderName cross-fill each other (same campaign brand)", () => {
+  assert.equal(resolveOutreachTemplate("{{brandName}}", creator, { senderName: "Solo Co" }), "Solo Co");
+  assert.equal(resolveOutreachTemplate("{{senderName}}", creator, { brandName: "Acme" }), "Acme");
 });
 
-test("senderName falls back to the default when unset", () => {
-  const out = resolveOutreachTemplate("{{senderName}}", creator, {});
-  assert.equal(out, "Pluvus Partnerships");
+test("brandName/senderName resolve EMPTY when unset — never the internal name", () => {
+  // PLU-117: "Pluvus Partnerships" must NEVER leak into a brand's outreach.
+  assert.equal(resolveOutreachTemplate("[{{senderName}}]", creator, {}), "[]");
+  assert.equal(resolveOutreachTemplate("[{{brandName}}]", creator, {}), "[]");
 });
 
 test("empty campaign fields resolve to empty string", () => {
@@ -122,6 +136,137 @@ test("every allow-listed name resolves to a non-token output", () => {
     const out = resolveOutreachTemplate(`{{${name}}}`, creator, { brandName: "B", senderName: "S" });
     assert.ok(!out.includes("{{"), `${name} left an unresolved token`);
   }
+});
+
+// --- new PLU-117 placeholders (§2) ---
+
+test("creatorFirstName resolves to the first word of the name", () => {
+  const out = resolveOutreachTemplate("Hi {{creatorFirstName}}", creator, {});
+  assert.equal(out, "Hi Casey");
+  const multi = { name: "Maya Chen Rivera" } as unknown as Creator;
+  assert.equal(resolveOutreachTemplate("{{creatorFirstName}}", multi, {}), "Maya");
+});
+
+test("firstNameOf handles blank / whitespace names", () => {
+  assert.equal(firstNameOf("  "), "");
+  assert.equal(firstNameOf(null), "");
+  assert.equal(firstNameOf(undefined), "");
+  assert.equal(firstNameOf("Solo"), "Solo");
+});
+
+test("campaignName / offerSummary resolve from config", () => {
+  const out = resolveOutreachTemplate(
+    "{{campaignName}} — {{offerSummary}}",
+    creator,
+    { campaignName: "Spring Launch", offerSummary: "a fixed-fee collaboration" },
+  );
+  assert.equal(out, "Spring Launch — a fixed-fee collaboration");
+});
+
+test("collaborationType falls back to 'partnership' when unset", () => {
+  assert.equal(resolveOutreachTemplate("{{collaborationType}}", creator, {}), "partnership");
+  assert.equal(
+    resolveOutreachTemplate("{{collaborationType}}", creator, { collaborationType: "hybrid partnership" }),
+    "hybrid partnership",
+  );
+});
+
+test("campaignName / offerSummary resolve to empty when unset (no invented value)", () => {
+  assert.equal(resolveOutreachTemplate("[{{campaignName}}][{{offerSummary}}]", creator, {}), "[][]");
+});
+
+// --- required-value handling (§3 / AC10) ---
+
+test("missingRequiredValues: clean when required vars have values", () => {
+  const missing = missingRequiredValues(
+    "Hi from {{brandName}}",
+    "Hi {{creatorName}}",
+    creator,
+    { brandName: "Acme", senderName: "Acme Partnerships" },
+  );
+  assert.deepEqual(missing, []);
+});
+
+test("missingRequiredValues: flags a required var with no value", () => {
+  const blank = { name: "", platform: "TikTok", niche: "beauty" } as unknown as Creator;
+  const missing = missingRequiredValues("Hi {{creatorName}}", "body", blank, {});
+  assert.deepEqual(missing, ["creatorName"]);
+});
+
+test("missingRequiredValues: required brandName flags when the campaign brand is missing", () => {
+  // PLU-117: brandName no longer falls back to an internal name — an empty brand
+  // now correctly BLOCKS the send (rather than mailing "Pluvus Partnerships").
+  // campaign.brand is NOT NULL in practice, so this only fires for a mis-stamped
+  // instance, which is exactly what should route to MANUAL_REVIEW.
+  assert.deepEqual(missingRequiredValues("s", "from {{brandName}}", creator, {}), ["brandName"]);
+  // With a real brand (or a senderName it cross-fills from) it's satisfied.
+  assert.deepEqual(missingRequiredValues("s", "from {{brandName}}", creator, { brandName: "Acme" }), []);
+  assert.deepEqual(missingRequiredValues("s", "from {{brandName}}", creator, { senderName: "Acme" }), []);
+});
+
+test("missingRequiredValues: optional vars never block (empty is fine)", () => {
+  const missing = missingRequiredValues(
+    "s",
+    "{{platform}} {{campaignName}} {{offerSummary}}",
+    creator,
+    {},
+  );
+  assert.deepEqual(missing, []);
+});
+
+// --- availability (PLU-117: only offer placeholders with a real value) ---
+
+test("availableOutreachVariableNames: always-vars present with empty config", () => {
+  const names = availableOutreachVariableNames({});
+  // Creator vars + collaborationType always resolve (they carry fallbacks).
+  for (const n of ["creatorFirstName", "creatorName", "platform", "niche", "collaborationType"]) {
+    assert.ok(names.has(n), `${n} should always be available`);
+  }
+  // Config-sourced vars with no value are NOT available — INCLUDING brandName /
+  // senderName now (they come from the campaign brand, never an internal name).
+  for (const n of ["brandName", "senderName", "brandDescription", "campaignName", "offerSummary", "rewardDescription", "deliverables", "timeline"]) {
+    assert.ok(!names.has(n), `${n} should be unavailable with empty config`);
+  }
+});
+
+test("availableOutreachVariableNames: brandName/senderName appear once the brand is set", () => {
+  const names = availableOutreachVariableNames({ brandName: "Acme", senderName: "Acme" });
+  assert.ok(names.has("brandName") && names.has("senderName"));
+});
+
+test("availableOutreachVariableNames: config vars appear only when set", () => {
+  const names = availableOutreachVariableNames({
+    campaignName: "Spring Launch",
+    deliverables: "2 Reels",
+    // offerSummary intentionally blank/whitespace → still unavailable
+    offerSummary: "   ",
+  });
+  assert.ok(names.has("campaignName"));
+  assert.ok(names.has("deliverables"));
+  assert.ok(!names.has("offerSummary"), "whitespace-only value is not available");
+  assert.ok(!names.has("timeline"));
+});
+
+test("unavailableUsedTokens: flags a used placeholder with no campaign value", () => {
+  // Template uses {{campaignName}} + {{offerSummary}} but config has neither
+  // (brandName IS present here so it is not flagged).
+  const flagged = unavailableUsedTokens(
+    "About {{campaignName}}",
+    "The offer is {{offerSummary}}. From {{brandName}}.",
+    { brandName: "Acme" },
+  );
+  assert.deepEqual(flagged.sort(), ["campaignName", "offerSummary"]);
+});
+
+test("unavailableUsedTokens: does not flag available or unknown tokens", () => {
+  // {{brandName}} present; {{deliverables}} present; {{bogus}} is unknown
+  // (handled by extractUnknownTokens, not here).
+  const flagged = unavailableUsedTokens(
+    "{{brandName}} {{bogus}}",
+    "{{deliverables}}",
+    { brandName: "Acme", deliverables: "2 Reels" },
+  );
+  assert.deepEqual(flagged, []);
 });
 
 // --- validation ---

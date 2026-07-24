@@ -198,6 +198,85 @@ async function main() {
     assert.equal(agent.drafted, 1);
   });
 
+  await test("manual mode stamps campaignName + deal shape from campaign/negotiation", async () => {
+    // PLU-117 §2: campaignName off ctx.campaign, collaborationType/offerSummary
+    // off the NEGOTIATION deal shape (here fixed-fee: minBudget/maxBudget, no
+    // commission). None are in the node config, so the executor must stamp them.
+    const email = makeEmail(true);
+    const agent = makeAgent();
+    const ctx = ctxWith({
+      outreachMode: "manual",
+      subjectTemplate: "s",
+      bodyTemplate: "{{campaignName}} — {{collaborationType}} — {{offerSummary}}",
+      brandName: "Acme",
+    });
+    (ctx as { campaign?: unknown }).campaign = { name: "Spring Launch" };
+    await run(ctx, email, agent);
+    assert.equal(
+      email.lastDraftBody,
+      "Spring Launch — fixed-fee collaboration — a fixed-fee collaboration — a flat fee for an agreed piece of content. (The exact fee is discussed once you reply.)",
+    );
+  });
+
+  await test("required placeholder empty for this creator → MANUAL_REVIEW, not sent", async () => {
+    // PLU-117 §3 / AC10: the template uses {{creatorName}} (required) but this
+    // creator has a blank name → block this send, surface the missing var, no AI.
+    const email = makeEmail(false);
+    const agent = makeAgent();
+    const blankNameCreator = { id: "c2", name: "", platform: "instagram", niche: "fitness" } as unknown as Creator;
+    const outreachNode = {
+      id: "out1",
+      type: "INITIAL_OUTREACH",
+      order: 0,
+      config: {
+        outreachMode: "manual",
+        subjectTemplate: "Hi {{creatorName}}",
+        bodyTemplate: "Hi {{creatorName}}, from {{brandName}}.",
+        brandName: "Acme",
+      },
+    };
+    const ctx = {
+      instance: { id: "i2", currentState: "ENROLLED" } as unknown as ExecutionContext["instance"],
+      node: outreachNode,
+      nodeGraph: [outreachNode, negotiationNode],
+      creator: blankNameCreator,
+    } as ExecutionContext;
+    const { result } = await run(ctx, email, agent);
+    assert.equal(result?.nextState, "MANUAL_REVIEW");
+    assert.equal(result?.eventPayload?.["reason"], "outreach_missing_required_value");
+    assert.deepEqual(result?.eventPayload?.["missingVariables"], ["creatorName"]);
+    assert.equal(email.lastDraftBody, null, "must NOT render/draft when a required value is missing");
+    assert.equal(agent.drafted, 0, "must NOT call the AI on a required-value block");
+  });
+
+  await test("required check ignores a required var the template does not use", async () => {
+    // Blank-name creator, but the template never references {{creatorName}} → the
+    // send proceeds (creatorFirstName is optional, resolves to "").
+    const email = makeEmail(true);
+    const agent = makeAgent();
+    const blankNameCreator = { id: "c3", name: "", platform: "instagram", niche: "fitness" } as unknown as Creator;
+    const outreachNode = {
+      id: "out1",
+      type: "INITIAL_OUTREACH",
+      order: 0,
+      config: {
+        outreachMode: "manual",
+        subjectTemplate: "A collab opportunity",
+        bodyTemplate: "Hey there, from {{brandName}}.",
+        brandName: "Acme",
+      },
+    };
+    const ctx = {
+      instance: { id: "i3", currentState: "ENROLLED" } as unknown as ExecutionContext["instance"],
+      node: outreachNode,
+      nodeGraph: [outreachNode, negotiationNode],
+      creator: blankNameCreator,
+    } as ExecutionContext;
+    const { reachedGuard } = await run(ctx, email, agent);
+    assert.equal(reachedGuard, true, "send proceeds when no required var is referenced");
+    assert.equal(email.lastDraftBody, "Hey there, from Acme.");
+  });
+
   await test("manual body leaking the ceiling is blocked → MANUAL_REVIEW, not sent", async () => {
     // draft returns normally so the output guard can scan the rendered body.
     const email = makeEmail(false);

@@ -11,8 +11,12 @@ import {
   renderOutreachPreview,
   extractUnknownTokens,
   validateOutreachConfig,
+  firstNameOf,
+  availableOutreachVariableNames,
+  unavailableUsedTokens,
   PREVIEW_SAMPLE,
   OUTREACH_VARIABLE_NAMES,
+  REQUIRED_OUTREACH_VARIABLE_NAMES,
 } from "./outreachVariables";
 
 let passed = 0;
@@ -30,12 +34,16 @@ console.log("\noutreach variables (web mirror)\n");
 // modules AND this expected set — otherwise the palette resolves a variable the
 // server would strip, or vice versa.
 const EXPECTED_VARIABLE_NAMES = [
+  "creatorFirstName",
   "creatorName",
   "platform",
   "niche",
   "brandName",
   "senderName",
   "brandDescription",
+  "campaignName",
+  "collaborationType",
+  "offerSummary",
   "rewardDescription",
   "deliverables",
   "timeline",
@@ -43,6 +51,45 @@ const EXPECTED_VARIABLE_NAMES = [
 
 test("web allow-list matches the canonical variable set (server mirror contract)", () => {
   assert.deepEqual([...OUTREACH_VARIABLE_NAMES].sort(), EXPECTED_VARIABLE_NAMES);
+});
+
+test("web required set matches server (creatorName + brandName)", () => {
+  assert.deepEqual([...REQUIRED_OUTREACH_VARIABLE_NAMES].sort(), ["brandName", "creatorName"]);
+});
+
+test("preview resolves the new placeholders (first name, campaign, deal shape)", () => {
+  const out = renderOutreachPreview(
+    "{{creatorFirstName}} / {{campaignName}} / {{collaborationType}} / {{offerSummary}}",
+    { campaignName: "Spring Launch", collaborationType: "hybrid partnership", offerSummary: "a hybrid partnership" },
+  );
+  assert.equal(
+    out,
+    `${firstNameOf(PREVIEW_SAMPLE.creatorName)} / Spring Launch / hybrid partnership / a hybrid partnership`,
+  );
+});
+
+test("preview collaborationType falls back to 'partnership'", () => {
+  assert.equal(renderOutreachPreview("{{collaborationType}}", {}), "partnership");
+});
+
+test("availability: always-vars in, config-vars out with empty config (web mirror)", () => {
+  const names = availableOutreachVariableNames({});
+  assert.ok(names.has("creatorFirstName") && names.has("collaborationType"));
+  // brandName/senderName are now config-sourced (campaign brand) — not offered blank.
+  assert.ok(!names.has("brandName") && !names.has("senderName"));
+  assert.ok(!names.has("campaignName") && !names.has("offerSummary") && !names.has("deliverables"));
+});
+
+test("availability: config var appears once its value is set (web mirror)", () => {
+  const names = availableOutreachVariableNames({ campaignName: "Spring Launch" });
+  assert.ok(names.has("campaignName"));
+  assert.ok(!names.has("timeline"));
+});
+
+test("unavailableUsedTokens flags a blank-rendering placeholder (web mirror)", () => {
+  // With a brand present, only the truly-absent {{campaignName}} is flagged.
+  assert.deepEqual(unavailableUsedTokens("{{campaignName}}", "from {{brandName}}", { brandName: "Acme" }), ["campaignName"]);
+  assert.deepEqual(unavailableUsedTokens("{{campaignName}}", "", { campaignName: "X" }), []);
 });
 
 test("preview resolves sample creator + config brand/campaign values", () => {
@@ -58,9 +105,11 @@ test("preview strips unknown tokens", () => {
   assert.equal(out, `Hi ${PREVIEW_SAMPLE.creatorName}`);
 });
 
-test("preview falls back senderName/brandName when unset", () => {
-  assert.equal(renderOutreachPreview("{{senderName}}", {}), "Pluvus Partnerships");
+test("preview: brandName/senderName cross-fill; NEVER the internal name", () => {
+  // PLU-117: "Pluvus Partnerships" must never appear — unset resolves to "".
+  assert.equal(renderOutreachPreview("[{{senderName}}]", {}), "[]");
   assert.equal(renderOutreachPreview("{{brandName}}", { senderName: "Solo" }), "Solo");
+  assert.equal(renderOutreachPreview("{{senderName}}", { brandName: "Acme" }), "Acme");
 });
 
 test("extractUnknownTokens flags typos", () => {

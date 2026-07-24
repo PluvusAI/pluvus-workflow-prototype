@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.classify import router as classify_router
 from app.routes.negotiate import router as negotiate_router
+from app.routes.outreach_template import router as outreach_template_router
 from app.security import require_api_key
 
 app = FastAPI(title="Pluvus Agent Service", version="0.3.0")
@@ -41,3 +42,4 @@ def metrics() -> dict:
 
 app.include_router(classify_router)
 app.include_router(negotiate_router)
+app.include_router(outreach_template_router)
