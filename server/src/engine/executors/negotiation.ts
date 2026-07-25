@@ -30,6 +30,17 @@ import { resolveBand } from "../band.js";
 // each carried a byte-identical copy — a drift hazard on a safety path.
 import { blockedByGuard } from "./guardEscalation.js";
 
+// PLU-107 §4.9/§6: the /negotiate wiring carries its OWN sub-flag (separate from
+// the agent-side STRUCTURED_BRIEF_PARSING_ENABLED) so structured parsing can ship
+// and be validated before the decision-prompt change flips on. Default OFF → the
+// brief is threaded into /draft exactly as today but NOT into /negotiate, so the
+// negotiate prompt is byte-identical to today. When on, the brief flat text is made
+// available to /negotiate via campaignContext; the AGENT still applies the §4.10
+// knowledge-turn cost gate (it renders the block only on knowledge questions).
+function briefIntoNegotiateEnabled(): boolean {
+  return process.env["BRIEF_INTO_NEGOTIATE"] === "true";
+}
+
 // FIX-11 + Randomized Send Delay (§4.1, §4.3a): outbound AI replies use the
 // reserve-before-send helper, keyed on negotiation:<purpose>:<instance>:<round>,
 // so a crash between email.send() and the row write cannot double-send a turn on
@@ -541,11 +552,43 @@ export async function executeNegotiation(
   // only when present so the prompt renders exactly as before otherwise.
   const classifiedIntent =
     typeof latestInbound?.replyIntent === "string" ? latestInbound.replyIntent : undefined;
+
+  // HARD-K1 / PLU-107: parse the campaign brief PDF (once per run, cached by
+  // ref::parserVersion) into text the models can consult to answer a creator's
+  // question from real campaign data instead of inventing it.
+  //
+  // ORDERING FIX (§3): resolve the brief BEFORE agent.negotiate so its text can be
+  // threaded into the DECISION model too (not only the copywriter). The resolver
+  // never throws; a no-brief/unreadable brief degrades to flatText "" + a status.
+  //
+  // Conflict detection (§4.5): the four authoritative Campaign knowledge columns
+  // are already merged onto `config` (mergeCampaignFallback / BRAND_KEYS), so we
+  // hand them to the resolver to surface any material brief-vs-Campaign conflict.
+  const resolvedBrief = await resolveBriefKnowledge(nodeGraph, {
+    usageRights: typeof config["usageRights"] === "string" ? config["usageRights"] : undefined,
+    exclusivity: typeof config["exclusivity"] === "string" ? config["exclusivity"] : undefined,
+    paymentTerms: typeof config["paymentTerms"] === "string" ? config["paymentTerms"] : undefined,
+    attributionWindow:
+      typeof config["attributionWindow"] === "string" ? config["attributionWindow"] : undefined,
+  });
+  const briefKnowledge = resolvedBrief.flatText;
+
+  // §4.9 / §4.10: thread the brief into the DECISION model as source-of-truth for
+  // knowledge answers — but ONLY when BRIEF_INTO_NEGOTIATE is on (de-risks the
+  // two-step rollout independently, §6). The agent applies the §4.10 knowledge-turn
+  // cost gate itself (it renders the block only on knowledge questions), so here we
+  // just make the brief text AVAILABLE to it via campaignContext. Off/absent →
+  // /negotiate prompt byte-identical to today (invariant #9). The brief is
+  // reference DATA on this endpoint too — NEVER a money input (the guards are
+  // unchanged; a brief number can't move the fee).
+  const negotiateBrief = briefIntoNegotiateEnabled() && briefKnowledge ? briefKnowledge : undefined;
+
   const negotiationContext: PriorNegotiationContext = {
     ...priorContext,
     ...(draftHistory.length ? { conversationHistory: draftHistory } : {}),
     ...(openCommitments.length ? { openCommitments } : {}),
     ...(classifiedIntent ? { intent: classifiedIntent } : {}),
+    ...(negotiateBrief ? { campaignContext: { briefKnowledge: negotiateBrief } } : {}),
   };
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
@@ -567,12 +610,23 @@ export async function executeNegotiation(
   // prefer the agent's validated comprehension, fall back to the regex read.
   const ackRequestedRate = creatorRequestedRate ?? extractRequestedRate(creatorReply);
 
-  // HARD-K1: parse the campaign brief PDF (once per run, cached by ref) into text
-  // the copy can consult to answer a creator's question from real campaign data
-  // instead of inventing it. Threaded into the draft's campaignContext as
-  // `briefKnowledge`; "" when there's no brief or it can't be read (soft-degrade).
-  const briefKnowledge = await resolveBriefKnowledge(nodeGraph);
+  // HARD-K1: the SAME brief flat text is threaded into the draft's campaignContext
+  // as `briefKnowledge` (the /draft FALLBACK role, §4.9) — kept exactly as today so
+  // rules-mode / guard-nulled turns still answer from the brief. "" when there's no
+  // brief or it can't be read (soft-degrade).
   const draftConfig = briefKnowledge ? { ...config, briefKnowledge } : config;
+
+  // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
+  // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the
+  // section VALUES are not logged (keys/pages/reason only).
+  if (resolvedBrief.conflicts && resolvedBrief.conflicts.length) {
+    console.warn(
+      `[briefKnowledge] material brief-vs-Campaign conflict(s) on instance ${instance.id}: ` +
+        resolvedBrief.conflicts
+          .map((c) => `${c.section}(${c.reason}${c.pageStart ? `, p${c.pageStart}` : ""})`)
+          .join("; "),
+    );
+  }
 
   // PLU-111: the durable obligation ledger (loaded above) supersedes the event-
   // diff as the source of "what creator questions are still open". FALLBACK

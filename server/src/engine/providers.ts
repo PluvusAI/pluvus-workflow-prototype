@@ -472,6 +472,13 @@ export function buildNegotiationRequest(
   // Attached only when present so a mid-negotiation / un-classified turn is unchanged.
   const intent = priorContext?.intent;
 
+  // PLU-107 §4.9: campaign context (its only key is `briefKnowledge`) forwarded to
+  // the DECISION model so it can answer a knowledge question from the brief. The
+  // executor attaches it only when BRIEF_INTO_NEGOTIATE is on; the agent applies the
+  // §4.10 knowledge-turn gate. Attached only when non-empty → prompt byte-identical
+  // to today otherwise. NEVER a money input.
+  const campaignContext = priorContext?.campaignContext;
+
   return {
     creatorReply,
     currentOffer,
@@ -481,6 +488,7 @@ export function buildNegotiationRequest(
     ...(conversationHistory && conversationHistory.length ? { conversationHistory } : {}),
     ...(openCommitments && openCommitments.length ? { openCommitments } : {}),
     ...(intent ? { intent } : {}),
+    ...(campaignContext && Object.keys(campaignContext).length ? { campaignContext } : {}),
     campaignConstraints: {
       termFloor,
       termCeiling,

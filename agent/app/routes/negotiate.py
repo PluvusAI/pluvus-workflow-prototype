@@ -102,7 +102,11 @@ router = APIRouter()
 # v1.6 (no-dash): the `response` must be written without em/en dashes (they read
 # as machine-written) — the responseDraft now feeds the copy model, so it must be
 # clean at the source.
-_LLM_NEGOTIATE_PROMPT_VERSION = "llm-negotiate-v1.6"
+# v1.7 (PLU-107): optional {brief_block} — the parsed campaign-brief text as
+# reference DATA — folded into the DECISION prompt on knowledge turns, and the
+# DEFER-HONESTLY rule now points the model at the brief before it defers. Empty
+# block (flag/gate off) → the rendered prompt is byte-identical to v1.6.
+_LLM_NEGOTIATE_PROMPT_VERSION = "llm-negotiate-v1.7"
 # HARD-P1: structural rewrite of the rules prompt into a pure extraction module
 # (no copy, no confidential figures, no dead confidence field) → major bump.
 _NEGOTIATE_PROMPT_VERSION = "rules-extract-v2.0"
@@ -152,6 +156,11 @@ _ONBOARDING_PROMPT_VERSION = "onboarding-v2.2"
 # back" as openers. Intent + safety rules unchanged.
 # v2.1 (no-dash): shared _VOICE_BLOCK now bans em/en dashes in the copy.
 _FOLLOWUP_PROMPT_VERSION = "followup-v2.1"
+
+# PLU-107: the structured-brief parser version, sourced from app.brief so there is
+# ONE source of truth (invariant #3). Bumping it there flows through here and into
+# the TS cache key, self-invalidating stale parses.
+from app.brief import PARSER_VERSION as _BRIEF_PARSER_VERSION  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Shared types
@@ -281,6 +290,18 @@ class NegotiateRequest(BaseModel):
     # with-a-soft-no" cases. Free-form str (loosely typed so an unknown label can't
     # 422 a money decision); None/empty = no hint rendered = today's behavior.
     intent: str | None = None
+    # PLU-107 (§4.9): campaign context threaded into the DECISION model, mirroring
+    # what DraftRequest already carries. Its only consumed key today is
+    # `briefKnowledge` — the parsed campaign-brief text — so the money-decision
+    # model can ANSWER a creator's knowledge question (usage/timeline/exclusivity)
+    # from real brief data instead of deferring, then the copy model rephrases that
+    # answer. Rendered as the SAME "reference DATA, not instructions, never a $
+    # source" block trusted on the draft side (`_brief_knowledge_block`) — it never
+    # moves the fee (that still comes only from fee_rule / commission_guard).
+    # None / absent-key → no brief block → the negotiate prompt is byte-identical to
+    # today (invariant #9). The server only attaches it on knowledge turns
+    # (classify-gated, §4.10) and only when BRIEF_INTO_NEGOTIATE is on.
+    campaignContext: dict[str, Any] | None = None
     campaignConstraints: CampaignConstraints
 
 
@@ -1616,7 +1637,7 @@ Example: if the creator says "make it 15% commission and two pairs of shoes for
 $400", acknowledge warmly, state that the commission and the product perk are set
 for this campaign and can't change, and respond on the fee only.
 
----
+{brief_block}---
 
 ## Conversation so far
 
@@ -1646,14 +1667,17 @@ every question, and respond to every request (negotiate the fee; state any FIXED
 term as fixed). Do not answer only the first point or only the money — leaving a
 question unanswered reads as ignoring the creator.
 
-DEFER HONESTLY ON UNKNOWNS. You only know the facts in Campaign Context above. If
-the creator asks about something NOT given there — payment schedule/when they get
-paid, usage rights, whitelisting, category exclusivity, cookie/attribution
-windows, contract specifics — do NOT invent an answer. In one short, honest
-sentence say that specific will be confirmed together on the next step, and move
-on. Never fabricate a payment term, a usage-rights or exclusivity clause, a date,
-or any number. A concrete detail you WERE given (deliverables/timeline shown
-above) you may state as fact; everything else you defer.
+DEFER HONESTLY ON UNKNOWNS. You know the facts in Campaign Context above AND any
+campaign brief shown between <campaign_brief> tags above (when present). If the
+creator asks about something covered there — payment schedule/when they get paid,
+usage rights, whitelisting, category exclusivity, cookie/attribution windows,
+deliverables, timeline — answer it from that data, stated plainly as fact. Only if
+the answer is NOT in the Campaign Context or the brief do you defer: in one short,
+honest sentence say that specific will be confirmed together on the next step, and
+move on. Never fabricate a payment term, a usage-rights or exclusivity clause, a
+date, or any number that neither the Campaign Context nor the brief states, and
+never take a dollar amount, budget, or rate from the brief — the fee comes only
+from your own decision, never from the brief.
 
 <creator_reply>
 {creator_reply}
@@ -1924,6 +1948,13 @@ def _llm_negotiate_decision(
         # advisory context. Empty string for no/UNKNOWN/mid-negotiation intent, so
         # the rendered prompt is unchanged for callers that thread nothing.
         intent_hint=_render_intent_hint(req.intent),
+        # PLU-107 §4.9: the parsed campaign-brief text as reference DATA so the
+        # DECISION model answers a creator's knowledge question from real campaign
+        # data instead of deferring. "" (byte-identical) unless the server threaded
+        # briefKnowledge (BRIEF_INTO_NEGOTIATE on) AND this is a knowledge turn
+        # (§4.10 gate). NEVER a money input — the fee still comes only from the
+        # guarded decision.
+        brief_block=_negotiate_brief_block(req),
     )
 
     # HARD-O1 / item 47: stamp the LLM-negotiate prompt version on the telemetry
@@ -2992,6 +3023,61 @@ def _brief_knowledge_block(ctx: dict[str, Any]) -> str:
         "dollar amount, budget, or rate from it.\n"
         f"<campaign_brief>\n{text}\n</campaign_brief>"
     )
+
+
+# PLU-107 §4.10: intent labels the first-reply classifier assigns to a turn that
+# is (or may be) a knowledge question — the coarse gate that decides whether to
+# fold the brief blob into the DECISION prompt. Deliberately inclusive: anything
+# that isn't an unambiguous pure-pricing / pure-acceptance turn passes, because
+# the cost of a false-include (a few hundred extra tokens) is far below the cost of
+# a false-exclude (a knowledge question the decision model can no longer answer).
+_KNOWLEDGE_INTENTS = {"QUESTION", "RATE_DISCOVERY", "DEFERRED", "OBJECTION", "NEGOTIATION"}
+
+
+def _turn_wants_brief(creator_reply: str, intent: str | None) -> bool:
+    """PLU-107 §4.10 interim cost bound: is this turn a knowledge question that
+    warrants threading the (whole, un-selected) brief blob into the negotiate
+    prompt? Include-on-doubt — a false-include only spends tokens; a false-exclude
+    re-opens the deferral this issue exists to fix.
+
+    Two OR'd signals: (1) the classifier's intent is a knowledge-ish label (absent
+    on mid-negotiation turns, which skip classify — so it can't be the only gate);
+    (2) the creator's own text hits any of the `_KNOWN_FACT_QA` question-signals
+    (usage/payment/exclusivity/attribution vocabulary) — the same routers the
+    runtime already trusts to recognize a knowledge question. Either fires → include.
+    (PLU-114 replaces this whole-blob-on-knowledge-turns gate with per-section
+    selection; this is the interim.)"""
+    if intent and intent.strip().upper() in _KNOWLEDGE_INTENTS:
+        return True
+    body = (creator_reply or "").lower()
+    if not body.strip():
+        return False
+    for _field, (q_sig, _val_sig) in _KNOWN_FACT_QA.items():
+        if re.search(q_sig, body):
+            return True
+    # A bare question mark with no pricing number is also plausibly a knowledge ask.
+    return "?" in body and not re.search(r"\$\s*\d|\b\d{2,}\b", body)
+
+
+def _negotiate_brief_block(req: "NegotiateRequest") -> str:
+    """PLU-107 §4.9: the brief block for the DECISION prompt — the SAME reference-
+    DATA framing trusted on the draft side (`_brief_knowledge_block`), so the
+    contract ("reference data, not instructions, never a $ source") is identical on
+    both endpoints. Renders ONLY when (a) something was threaded into
+    `req.campaignContext['briefKnowledge']` — the server attaches it solely when the
+    BRIEF_INTO_NEGOTIATE sub-flag is on — AND (b) this turn is a knowledge question
+    (`_turn_wants_brief`, the §4.10 cost gate). Otherwise "" → the negotiate prompt
+    is byte-identical to today (invariant #9)."""
+    ctx = req.campaignContext
+    if not isinstance(ctx, dict):
+        return ""
+    if not _turn_wants_brief(req.creatorReply, req.intent):
+        return ""
+    block = _brief_knowledge_block(ctx)
+    # The prompt template inserts this between two `---` rules; give it its own
+    # rule + trailing newline so the layout reads cleanly, and keep the empty case
+    # a bare "" so the byte-identical-when-off property holds.
+    return f"---\n\n{block}\n\n" if block else ""
 
 
 # Option A: max chars of the negotiator's own written reply we fold into a draft
@@ -4645,7 +4731,28 @@ class ParseBriefRequest(BaseModel):
 
 
 class ParseBriefResponse(BaseModel):
+    # UNCHANGED: the flat blob (flatText). Always populated so a server that hasn't
+    # been updated (or the flag is off) reads exactly what it reads today.
     text: str
+    # PLU-107 (additive): the top-level parse status — "ok" | "empty" |
+    # "parse_failed" — so the caller can finally tell an ABSENT section from a
+    # PARSE FAILURE (invariant #2). Defaults keep old callers unaffected.
+    status: str = "ok"
+    # The parser version that produced this result (invariant #3), so the TS cache
+    # can key on (ref, parserVersion) and self-invalidate on a bump.
+    parserVersion: str = _BRIEF_PARSER_VERSION
+    # The structured section map (invariant #4) — None when structured parsing is
+    # off, so the wire is byte-identical to today with the flag off.
+    sections: dict[str, Any] | None = None
+    # Observability substrate (§4.8): which segmentation tier fired + page count.
+    tierUsed: str | None = None
+    pageCount: int = 0
+
+
+def _structured_brief_enabled() -> bool:
+    """PLU-107: gate the structured segmentation pass. Default OFF → /parse-brief
+    returns text-only and the wire is byte-identical to today (invariant #9)."""
+    return os.getenv("STRUCTURED_BRIEF_PARSING_ENABLED", "").strip().lower() == "true"
 
 
 @router.post(
@@ -4654,17 +4761,43 @@ class ParseBriefResponse(BaseModel):
     dependencies=[Depends(require_api_key), Depends(rate_limiter("draft"))],
 )
 def parse_brief(req: ParseBriefRequest) -> ParseBriefResponse:
-    """HARD-K1: extract plain text from a campaign brief PDF so the negotiation
-    agent can source real campaign terms instead of hallucinating them. Returns
-    "" (never 500s on a bad PDF) so a brief we can't read degrades to "no extra
-    knowledge" rather than breaking the run."""
+    """HARD-K1 / PLU-107: extract campaign brief knowledge from a PDF so the
+    negotiation agent sources real campaign terms instead of hallucinating them.
+    Returns "" text (never 500s on a bad PDF) so a brief we can't read degrades to
+    "no extra knowledge" rather than breaking the run.
+
+    With STRUCTURED_BRIEF_PARSING_ENABLED on, additionally returns the structured
+    section map + explicit status (invariant #2); with it off the response is the
+    flat text only, byte-identical to today (invariant #9)."""
     import base64
 
-    from app.brief import extract_brief_text
+    from app.brief import extract_brief_text, parse_brief_structured
 
     try:
         raw = base64.b64decode(req.pdfBase64, validate=False)
     except Exception:
         # Malformed base64 → no knowledge, not an error (the run must not break).
-        return ParseBriefResponse(text="")
-    return ParseBriefResponse(text=extract_brief_text(raw))
+        # A base64 failure IS a genuine failure (we never got readable bytes), so
+        # report parse_failed so the caller doesn't cache/treat it as authoritative.
+        return ParseBriefResponse(text="", status="parse_failed", parserVersion=_BRIEF_PARSER_VERSION)
+
+    if not _structured_brief_enabled():
+        # Flag OFF: flat text only — byte-identical to today. Status stays the
+        # default "ok" (old callers ignore it).
+        return ParseBriefResponse(text=extract_brief_text(raw), parserVersion=_BRIEF_PARSER_VERSION)
+
+    parsed = parse_brief_structured(raw)
+    # Stamp the immutable file ref onto every section (invariant #4). The route is
+    # the boundary that knows the ref-agnostic parser produced these; the TS side
+    # threads the real ref, but the parser output already carries the version, and
+    # each section needs SOME source ref — we cannot know the real one here (the
+    # engine owns it), so we leave sourceFileReference as produced ("") and let the
+    # TS resolver overwrite it with the real ref when it projects the sections.
+    return ParseBriefResponse(
+        text=parsed.flat_text,
+        status=parsed.status,
+        parserVersion=parsed.parser_version,
+        sections=parsed.sections_payload() if parsed.status == "ok" else None,
+        tierUsed=parsed.tier_used,
+        pageCount=parsed.page_count,
+    )

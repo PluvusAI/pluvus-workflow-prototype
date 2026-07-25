@@ -44,6 +44,17 @@ export interface NegotiationRequest {
    * (round >= 1 skips classify) or an un-classified row → agent renders no hint.
    */
   intent?: string;
+  /**
+   * PLU-107 §4.9: campaign context threaded into the DECISION model (mirrors what
+   * DraftRequest carries). Its only consumed key is `briefKnowledge` — the parsed
+   * campaign-brief flat text — so the money-decision model can ANSWER a creator's
+   * knowledge question from real brief data instead of deferring. Rendered agent-
+   * side as the SAME reference-DATA block trusted on /draft — NEVER a money input
+   * (a brief number can't move the fee). Attached only when the BRIEF_INTO_NEGOTIATE
+   * sub-flag is on; the agent applies the §4.10 knowledge-turn gate. Absent →
+   * /negotiate prompt byte-identical to today.
+   */
+  campaignContext?: Record<string, unknown>;
   campaignConstraints: {
     /**
      * The floor of the fee band — "Preferred Budget" in the product (V1 #1):
