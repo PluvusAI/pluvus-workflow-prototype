@@ -1,0 +1,226 @@
+"""PLU-114 — prompt-level tests for the selected-knowledge swap on BOTH endpoints.
+
+Two acceptance properties (§8 "prompt-level"):
+  1. Flag ON + a single-topic question → the assembled block contains ONLY the
+     selected section, not the other flat facts and not the 4000-char brief blob.
+  2. Flag OFF → the block is BYTE-IDENTICAL to today (the flat _knowledge_block /
+     _brief_knowledge_block / _negotiate_brief_block path is used verbatim).
+
+These drive the real prompt-assembly helpers (`_selected_knowledge_block`,
+`_negotiate_knowledge_block`) — no model call. The flag is toggled via monkeypatch
+so OFF/ON both run in one suite.
+"""
+
+from __future__ import annotations
+
+import app.routes.negotiate as neg
+
+
+# ---------------------------------------------------------------------------
+# Fixtures — request factories mirroring the existing test_brief_structured ones.
+# ---------------------------------------------------------------------------
+def _neg_req(**kw):
+    ctx = kw.pop("campaignContext", None)
+    constraints = neg.CampaignConstraints(
+        termFloor=neg.NegotiationTerm(rate=200),
+        termCeiling=neg.NegotiationTerm(rate=500),
+        deliverables=kw.pop("deliverables", None),
+        timeline=kw.pop("timeline", None),
+    )
+    base = dict(
+        creatorReply=kw.pop("creatorReply", ""),
+        currentOffer=neg.NegotiationTerm(rate=300),
+        round=1,
+        maxRounds=3,
+        campaignConstraints=constraints,
+    )
+    if ctx is not None:
+        base["campaignContext"] = ctx
+    base.update(kw)
+    return neg.NegotiateRequest(**base)
+
+
+def _draft_req(**kw):
+    base = dict(
+        purpose="counter_offer",
+        creatorName="Maya",
+        creatorReply=kw.pop("creatorReply", ""),
+    )
+    base.update(kw)
+    return neg.DraftRequest(**base)
+
+
+# The four flat knowledge facts, so a match resolves to `available` and the
+# no-swap (OFF) path renders all four.
+FLAT_CTX = {
+    "usageRights": "30-day reshare on paid + organic.",
+    "exclusivity": "No category exclusivity.",
+    "paymentTerms": "Net-30 after content goes live.",
+    "attributionWindow": "30-day attribution window.",
+}
+
+
+# ---------------------------------------------------------------------------
+# Flag OFF → byte-identical to today (both endpoints).
+# ---------------------------------------------------------------------------
+
+
+def test_draft_block_off_is_identical_to_flat_blocks(monkeypatch):
+    monkeypatch.delenv("KNOWLEDGE_RETRIEVAL_ENABLED", raising=False)
+    req = _draft_req(creatorReply="How long can the brand use my video?")
+    ctx = dict(FLAT_CTX)
+    # With the flag OFF, _selected_knowledge_block returns None → caller uses the
+    # flat blocks. Assert the helper itself signals "fall back".
+    result = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert result is None
+
+
+def test_negotiate_block_off_equals_negotiate_brief_block(monkeypatch):
+    monkeypatch.delenv("KNOWLEDGE_RETRIEVAL_ENABLED", raising=False)
+    req = _neg_req(
+        creatorReply="How long can the brand use my video?",
+        campaignContext={"briefKnowledge": "Usage Rights: reshare for 90 days."},
+    )
+    # OFF → the wrapper defers to _negotiate_brief_block verbatim (byte-identical).
+    assert neg._negotiate_knowledge_block(req) == neg._negotiate_brief_block(req)
+    assert "<campaign_brief>" in neg._negotiate_knowledge_block(req)
+
+
+def test_negotiate_block_off_non_knowledge_turn_empty(monkeypatch):
+    monkeypatch.delenv("KNOWLEDGE_RETRIEVAL_ENABLED", raising=False)
+    req = _neg_req(
+        creatorReply="$450 works, let's go.",
+        campaignContext={"briefKnowledge": "Usage Rights: reshare for 90 days."},
+    )
+    assert neg._negotiate_knowledge_block(req) == ""
+
+
+# ---------------------------------------------------------------------------
+# Flag ON → only the selected section, not the whole brief / other facts.
+# ---------------------------------------------------------------------------
+
+
+def test_draft_block_on_single_topic_selects_only_that_section(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _draft_req(creatorReply="How long can the brand use my content?")
+    ctx = dict(FLAT_CTX)
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    # ONLY the usage-rights value is present …
+    assert "30-day reshare on paid + organic." in block
+    # … and none of the OTHER three flat facts leaked in.
+    assert "Net-30" not in block
+    assert "attribution window" not in block
+    assert "category exclusivity" not in block.lower()
+
+
+def test_draft_block_on_drops_the_whole_brief_blob(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    # A big brief blob is threaded AND a specific usage question is asked. The ON
+    # path must NOT fold the whole blob in — only the selected section.
+    big_blob = "SHIPPING: mail within 5 days. " * 200  # ~5.6k chars, the baseline
+    ctx = dict(FLAT_CTX)
+    ctx["briefKnowledge"] = big_blob
+    req = _draft_req(creatorReply="How long can you use my content?")
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    assert "<campaign_brief>" not in block  # the blob framing is gone
+    assert "mail within 5 days" not in block  # the blob content is gone
+    assert len(block) < 500  # tiny, single-section block — not the 5.6k blob
+
+
+def test_negotiate_block_on_single_topic(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _neg_req(
+        creatorReply="When do I get paid?",
+        campaignContext=dict(FLAT_CTX),
+    )
+    block = neg._negotiate_knowledge_block(req)
+    assert "Net-30 after content goes live." in block
+    assert "reshare" not in block  # usage-rights fact not volunteered
+    assert block.startswith("---")  # same ---wrapped slot the brief block used
+
+
+def test_negotiate_block_on_no_match_is_empty(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _neg_req(
+        creatorReply="Sounds great, looking forward to it!",
+        campaignContext=dict(FLAT_CTX),
+    )
+    # no_match → no knowledge block on the decision prompt this turn.
+    assert neg._negotiate_knowledge_block(req) == ""
+
+
+def test_draft_block_on_no_match_falls_back(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _draft_req(creatorReply="Thanks, talk soon!")
+    ctx = dict(FLAT_CTX)
+    # no_match → None → caller renders the flat blocks (no regression).
+    result = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Honest defer: selected-but-unavailable renders a defer instruction, no value.
+# ---------------------------------------------------------------------------
+
+
+def test_on_selected_but_unavailable_defers_no_invented_value(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    # Ask about usage rights, but NO usageRights configured and no brief section.
+    req = _draft_req(creatorReply="How long can you use my content?")
+    ctx = {}  # nothing configured
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    low = block.lower()
+    assert "do not" in low and ("confirm" in low or "follow up" in low)
+    # No fabricated day-count / value.
+    assert "30-day" not in block
+
+
+# ---------------------------------------------------------------------------
+# Brief-section source: value resolves from a threaded brief section.
+# ---------------------------------------------------------------------------
+
+
+def test_on_resolves_from_brief_section(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _draft_req(creatorReply="What's the go-live timeline?")
+    ctx = {"briefSections": {"timeline": "Content must go live by March 15."}}
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    assert "March 15" in block
+
+
+# ---------------------------------------------------------------------------
+# Obligation widening reaches the prompt (invariant #5 end-to-end).
+# ---------------------------------------------------------------------------
+
+
+def test_on_open_obligation_widens_the_block(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    # Message is silent on shipping; an open shipping obligation must still pull it.
+    req = _draft_req(creatorReply="Any update?")
+    ctx = {
+        "briefSections": {"shipping": "We ship within 5 business days."},
+        "structuredObligations": [
+            {"id": "ob1", "originalText": "when does it ship?", "category": "shipping"}
+        ],
+    }
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    assert "5 business days" in block

@@ -11,12 +11,13 @@ import {
   buildDraftHistory,
   computeOpenQuestions,
   buildOpenObligations,
+  buildStructuredObligations,
   buildQuestionObligationPlan,
   type QuestionObligationPlanItem,
   computeChangedFields,
   computeRelationshipWarmth,
 } from "./negotiationHistory.js";
-import { resolveBriefKnowledge } from "./briefKnowledge.js";
+import { resolveBriefKnowledge, type ResolvedBrief } from "./briefKnowledge.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { randomSendDelayMs } from "../sendDelay.js";
@@ -39,6 +40,27 @@ import { blockedByGuard } from "./guardEscalation.js";
 // knowledge-turn cost gate (it renders the block only on knowledge questions).
 function briefIntoNegotiateEnabled(): boolean {
   return process.env["BRIEF_INTO_NEGOTIATE"] === "true";
+}
+
+// PLU-114 (§4.9): project ResolvedBrief.sections ({key: CampaignBriefSection}) to
+// the {key: text} map the agent's AvailableSections.brief consumes. Returns
+// undefined when there are no sections (no brief / structured parse off / parse
+// failed) so the caller omits the wire key entirely (the router then resolves
+// from the flat fields, or defers). Only the text crosses the wire — page/source
+// provenance stays server-side (the observability record is built agent-side from
+// keys/rules, not values).
+function projectBriefSections(
+  sections: ResolvedBrief["sections"],
+): Record<string, string> | undefined {
+  if (!sections) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, section] of Object.entries(sections)) {
+    const text = section?.text;
+    if (typeof text === "string" && text.trim()) {
+      out[key] = text;
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 // FIX-11 + Randomized Send Delay (§4.1, §4.3a): outbound AI replies use the
@@ -583,12 +605,37 @@ export async function executeNegotiation(
   // unchanged; a brief number can't move the fee).
   const negotiateBrief = briefIntoNegotiateEnabled() && briefKnowledge ? briefKnowledge : undefined;
 
+  // PLU-114 (§4.9 / §5, REVIEW #1+#2): the two structured INPUTS the agent-side
+  // knowledge router needs but which do NOT reach it today — the parsed brief
+  // SECTIONS (not just the flat blob) and the open obligations WITH their category.
+  // Both are threaded as ADDITIVE campaignContext keys (old callers ignore them),
+  // and the agent applies KNOWLEDGE_RETRIEVAL_ENABLED itself — so with the agent
+  // flag OFF these keys are inert (the new selected-knowledge block never renders)
+  // and both prompts are byte-identical to today. Threaded independently of
+  // BRIEF_INTO_NEGOTIATE: the router resolves values from the flat FIELDS too, so
+  // it must see sections/obligations regardless of that separate sub-flag.
+  //
+  //   briefSections — resolvedBrief.sections projected to {sectionKey: text}. The
+  //     router resolves a brief-sourced value from this; only present when the
+  //     structured parse produced sections (STRUCTURED_BRIEF_PARSING_ENABLED on +
+  //     an ok parse), else omitted → the router falls back to flat fields.
+  //   structuredObligations — {id, originalText, category} per non-terminal row,
+  //     so an open obligation pulls in the section it's on the hook to answer even
+  //     when this turn's message is silent on it (invariant #5).
+  const briefSections = projectBriefSections(resolvedBrief.sections);
+  const structuredObligations = buildStructuredObligations(openObligationRows);
+  const knowledgeContext: Record<string, unknown> = {
+    ...(negotiateBrief ? { briefKnowledge: negotiateBrief } : {}),
+    ...(briefSections ? { briefSections } : {}),
+    ...(structuredObligations.length ? { structuredObligations } : {}),
+  };
+
   const negotiationContext: PriorNegotiationContext = {
     ...priorContext,
     ...(draftHistory.length ? { conversationHistory: draftHistory } : {}),
     ...(openCommitments.length ? { openCommitments } : {}),
     ...(classifiedIntent ? { intent: classifiedIntent } : {}),
-    ...(negotiateBrief ? { campaignContext: { briefKnowledge: negotiateBrief } } : {}),
+    ...(Object.keys(knowledgeContext).length ? { campaignContext: knowledgeContext } : {}),
   };
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
@@ -614,7 +661,20 @@ export async function executeNegotiation(
   // as `briefKnowledge` (the /draft FALLBACK role, §4.9) — kept exactly as today so
   // rules-mode / guard-nulled turns still answer from the brief. "" when there's no
   // brief or it can't be read (soft-degrade).
-  const draftConfig = briefKnowledge ? { ...config, briefKnowledge } : config;
+  //
+  // PLU-114 (§5): the SAME two structured inputs threaded into /negotiate above are
+  // added to draftConfig so the agent's knowledge router runs identically on the
+  // /draft endpoint (the whole draftConfig becomes DraftRequest.campaignContext via
+  // stripBandFromContext). Added as keys (not a nested object) so they survive the
+  // band strip untouched. Inert with the agent flag OFF — the DraftRequest ignores
+  // unknown campaignContext keys and the selected-knowledge block never renders, so
+  // /draft is byte-identical to today.
+  const draftConfig: Record<string, unknown> = {
+    ...config,
+    ...(briefKnowledge ? { briefKnowledge } : {}),
+    ...(briefSections ? { briefSections } : {}),
+    ...(structuredObligations.length ? { structuredObligations } : {}),
+  };
 
   // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
   // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the

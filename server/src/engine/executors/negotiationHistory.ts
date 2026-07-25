@@ -467,6 +467,52 @@ export function buildOpenObligations(
 }
 
 // ---------------------------------------------------------------------------
+// PLU-114: structured obligations for campaign-knowledge retrieval (§4.4)
+// ---------------------------------------------------------------------------
+// The knowledge router (agent-side `select_knowledge_sections`) needs each open
+// obligation's `category` + `originalText` to widen retrieval to the section it's
+// on the hook to answer (invariant #5) — the flattened `openCommitments: string[]`
+// drops the category, so this is a SEPARATE structured projection threaded
+// alongside it. Both CREATOR_QUESTION and PLUVUS_COMMITMENT rows are relevant
+// inputs (a still-open creator question about shipping AND an unfulfilled Pluvus
+// shipping commitment both pull the shipping section). Read-only, category is
+// best-effort (may be null → the router routes off originalText instead).
+
+/** One obligation projected for the knowledge router: {category, originalText, id}. */
+export interface StructuredObligation {
+  id: string;
+  originalText: string;
+  category?: string;
+}
+
+/**
+ * Project non-terminal obligation rows into the {category, originalText, id} shape
+ * the PLU-114 knowledge router consumes. Pure; dedup by originalText (case-
+ * insensitive) preserving chronological order — same dedup discipline as
+ * buildOpenObligations. Empty in → empty out (no wire field attached, byte-
+ * identical). NEVER a money input; retrieval only narrows what the model reads.
+ */
+export function buildStructuredObligations(
+  rows: ConversationObligation[],
+): StructuredObligation[] {
+  const out: StructuredObligation[] = [];
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const text = row.originalText.trim();
+    if (!text) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      id: row.id,
+      originalText: text,
+      ...(row.category ? { category: row.category } : {}),
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // drafting-humanization (§Conversation State): the two STYLE hints for /draft
 // ---------------------------------------------------------------------------
 // Both are purely stylistic — the money decision never reads them — and both
