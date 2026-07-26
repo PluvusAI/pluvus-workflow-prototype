@@ -18,6 +18,9 @@ import type {
   LlmUsageSummary,
   ConversationObligationDTO,
   ManualResolveStatus,
+  CampaignCreatorMemoryDTO,
+  CorrectMemoryAction,
+  MemoryFactKey,
 } from "./types";
 
 const BASE = "/api/observability";
@@ -166,6 +169,56 @@ export function useResolveObligation(instanceId: string) {
         {
           status: vars.status,
           ...(vars.resolution ? { resolution: vars.resolution } : {}),
+        },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["instance", instanceId] });
+    },
+  });
+}
+
+/** PLU-113: correct one memory fact (EDIT / RESOLVE_CONFLICT / REMOVE). Invalidates
+ *  the instance detail so the Memory tab reflects the change immediately. */
+export function useCorrectMemory(instanceId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: {
+      factId: string;
+      action: CorrectMemoryAction;
+      value?: string;
+      note?: string;
+    }) =>
+      postJson<{ memory: CampaignCreatorMemoryDTO }>(
+        `${BASE}/instances/${instanceId}/memory/${vars.factId}/correct`,
+        {
+          action: vars.action,
+          ...(vars.value !== undefined ? { value: vars.value } : {}),
+          ...(vars.note ? { note: vars.note } : {}),
+        },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["instance", instanceId] });
+    },
+  });
+}
+
+/** PLU-113 (O7): create a purely operator-authored memory fact. */
+export function useCreateMemory(instanceId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: {
+      key: MemoryFactKey;
+      value: string;
+      category?: string;
+      note?: string;
+    }) =>
+      postJson<{ memory: CampaignCreatorMemoryDTO }>(
+        `${BASE}/instances/${instanceId}/memory`,
+        {
+          key: vars.key,
+          value: vars.value,
+          ...(vars.category ? { category: vars.category } : {}),
+          ...(vars.note ? { note: vars.note } : {}),
         },
       ),
     onSuccess: () => {

@@ -5,9 +5,53 @@ import type {
   NegotiationAction,
   DraftRequest,
   DraftResponse,
+  ExtractedFact,
+  MemoryFactKey,
 } from "./types.js";
 import { agentBaseUrl, agentPostJson } from "../agentServiceClient.js";
 import { recordAgentLlmUsage } from "../../observability/llmUsage.js";
+
+// PLU-113: the closed key vocabulary for validating extracted facts off the wire.
+const MEMORY_FACT_KEYS = new Set<MemoryFactKey>([
+  "REQUESTED_RATE",
+  "MINIMUM_RATE",
+  "AVAILABILITY",
+  "LOGISTICS_CONSTRAINT",
+  "OBJECTION",
+  "DELIVERABLE_PREFERENCE",
+  "COMPENSATION_PREFERENCE",
+  "MANAGER_INVOLVED",
+  "MANAGER_CONTACT",
+]);
+
+/**
+ * PLU-113: coerce the raw `creatorFacts` JSON to well-formed ExtractedFacts.
+ * Keeps only items with a known key + a non-empty string value; a bad key, a
+ * missing/non-string value, or a non-object entry is dropped (never throws — a
+ * malformed extraction degrades to "no fact", never a failed turn, invariant #9).
+ * Returns undefined when there's nothing usable so the response field stays absent.
+ */
+function asFactArray(v: unknown): ExtractedFact[] | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const out: ExtractedFact[] = [];
+  for (const raw of v) {
+    if (!raw || typeof raw !== "object") continue;
+    const rec = raw as Record<string, unknown>;
+    const key = rec["key"];
+    const value = rec["value"];
+    if (typeof key !== "string" || !MEMORY_FACT_KEYS.has(key as MemoryFactKey)) continue;
+    if (typeof value !== "string" || !value.trim()) continue;
+    const fact: ExtractedFact = { key: key as MemoryFactKey, value: value.trim() };
+    if (typeof rec["confidence"] === "number" && Number.isFinite(rec["confidence"])) {
+      fact.confidence = rec["confidence"];
+    }
+    if (typeof rec["category"] === "string" && rec["category"]) {
+      fact.category = rec["category"];
+    }
+    out.push(fact);
+  }
+  return out.length ? out : undefined;
+}
 
 // ---------------------------------------------------------------------------
 // LangGraph negotiation provider
@@ -99,6 +143,14 @@ export class LangGraphNegotiationProvider implements NegotiationProvider {
     // is the last round and can't state finality to the creator.
     if (data["isFinalRound"] === true) {
       response.isFinalRound = true;
+    }
+    // PLU-113: carry the extracted durable creator facts across the seam (§4.4).
+    // Same field-by-field caveat — uncopied means the executor never builds a
+    // memory write. Keep only well-formed items (a known key + string value);
+    // drop anything malformed rather than letting it reach the write plan.
+    const creatorFacts = asFactArray(data["creatorFacts"]);
+    if (creatorFacts) {
+      response.creatorFacts = creatorFacts;
     }
     return response;
   }

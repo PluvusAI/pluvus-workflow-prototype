@@ -12,6 +12,7 @@ export * from "./paymentInfo.js";
 export * from "./dealHandoffs.js";
 export * from "./brandApprovals.js";
 export * from "./conversationObligations.js";
+export * from "./campaignCreatorMemory.js";
 export * from "./partnerships.js";
 export * from "./clicks.js";
 export * from "./conversions.js";

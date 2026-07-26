@@ -26,8 +26,20 @@ import {
   resolveInstanceObligation,
   isManualResolveStatus,
   MANUAL_RESOLVE_STATUSES,
+  correctInstanceMemory,
+  createInstanceMemory,
+  isCorrectMemoryAction,
+  CORRECT_MEMORY_ACTIONS,
 } from "../observability/repository.js";
 import { WORKFLOW_STATE_ORDER, TERMINAL_STATES, WAITING_STATES } from "../observability/dto.js";
+import type { MemoryFactKey } from "../db/schema.js";
+import {
+  MEMORY_FACT_KEYS,
+  isSingletonMemoryKey,
+  isNumericMemoryKey,
+  normalizeMemoryValue,
+  memoryDedupKey,
+} from "../engine/executors/creatorMemory.js";
 
 const router = Router();
 
@@ -227,6 +239,109 @@ router.post("/instances/:id/obligations/:obligationId/resolve", async (req, res)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: "obligation_resolve_failed", message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /observability/instances/:id/memory/:factId/correct  (PLU-113, §4.10)
+// ---------------------------------------------------------------------------
+// Operator-gated by the /observability mount (requireOperatorKey). Body:
+// { action, value?, note? } where action ∈ {EDIT, RESOLVE_CONFLICT, REMOVE}.
+// The server recomputes normalizedValue from the new value using the same
+// normalizeMemoryValue the extractor uses, so the live-unique dedup stays correct.
+
+router.post("/instances/:id/memory/:factId/correct", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!isCorrectMemoryAction(body["action"])) {
+      res.status(400).json({
+        error: "invalid_action",
+        allowed: CORRECT_MEMORY_ACTIONS,
+        value: body["action"] ?? null,
+      });
+      return;
+    }
+    const value = typeof body["value"] === "string" ? body["value"] : undefined;
+    const note = typeof body["note"] === "string" ? body["note"] : undefined;
+    // For EDIT with a new value, recompute the dedup key + numeric mirror.
+    const normalizedValue =
+      value !== undefined ? normalizeMemoryValue(value) : undefined;
+    const valueNumber =
+      value !== undefined && /^[$\s]*[\d.,]+$/.test(value.trim())
+        ? Number(value.replace(/[^0-9.]/g, "")) || null
+        : undefined;
+
+    const outcome = await correctInstanceMemory(req.params.id, req.params.factId, {
+      action: body["action"],
+      ...(value !== undefined ? { value } : {}),
+      ...(normalizedValue !== undefined ? { normalizedValue } : {}),
+      ...(valueNumber !== undefined ? { valueNumber } : {}),
+      ...(note !== undefined ? { note } : {}),
+    });
+    if (!outcome.ok) {
+      res.status(404).json({ error: outcome.reason, id: req.params.factId });
+      return;
+    }
+    res.json({ memory: outcome.memory });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "memory_correct_failed", message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POST /observability/instances/:id/memory  (PLU-113, §4.10 / O7)
+// ---------------------------------------------------------------------------
+// Operator-authored fact create. Body: { key, value, category?, note? }. The
+// server derives singleton/numeric shape + normalizedValue from the key/value.
+
+router.post("/instances/:id/memory", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const key = body["key"];
+    if (
+      typeof key !== "string" ||
+      !MEMORY_FACT_KEYS.includes(key as MemoryFactKey)
+    ) {
+      res.status(400).json({
+        error: "invalid_key",
+        allowed: MEMORY_FACT_KEYS,
+        value: key ?? null,
+      });
+      return;
+    }
+    const value = typeof body["value"] === "string" ? body["value"].trim() : "";
+    if (!value) {
+      res.status(400).json({ error: "missing_value" });
+      return;
+    }
+    const factKey = key as MemoryFactKey;
+    const category =
+      typeof body["category"] === "string" ? body["category"] : undefined;
+    const note = typeof body["note"] === "string" ? body["note"] : undefined;
+    const singleton = isSingletonMemoryKey(factKey);
+    const normalizedValue = memoryDedupKey(factKey, normalizeMemoryValue(value));
+    const valueNumber = isNumericMemoryKey(factKey)
+      ? Number(value.replace(/[^0-9.]/g, "")) || null
+      : null;
+
+    const outcome = await createInstanceMemory(req.params.id, {
+      key: factKey,
+      singleton,
+      value,
+      valueNumber,
+      normalizedValue,
+      ...(category !== undefined ? { category } : {}),
+      ...(note !== undefined ? { note } : {}),
+    });
+    if (!outcome.ok) {
+      res.status(404).json({ error: outcome.reason, id: req.params.id });
+      return;
+    }
+    res.status(201).json({ memory: outcome.memory });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "memory_create_failed", message });
   }
 });
 

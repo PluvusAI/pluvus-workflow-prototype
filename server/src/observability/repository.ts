@@ -12,6 +12,7 @@ import { db } from "../db/drizzle.js";
 import {
   brandNotifications,
   conversationObligations as conversationObligationsTable,
+  campaignCreatorMemory as campaignCreatorMemoryTable,
   creators,
   events as eventsTable,
   executionInstances,
@@ -20,6 +21,7 @@ import {
   workflows,
   workflowVersions,
   type ConversationObligation,
+  type CampaignCreatorMemory,
   type Event,
   type ExecutionInstance,
   type InstanceState,
@@ -34,6 +36,13 @@ import {
   listObligationsByInstance,
   type ManualResolveStatus,
 } from "../db/conversationObligations.js";
+import {
+  isLiveMemoryStatus,
+  listMemoryByInstance,
+  correctMemoryFact,
+  createOperatorMemoryFact,
+  type CorrectMemoryAction,
+} from "../db/campaignCreatorMemory.js";
 import { collectWorkerMetrics } from "../workers/workerMetrics.js";
 import { buildAlertsReport, type AlertInputs, type AlertsReportDTO } from "./alerts.js";
 import {
@@ -58,6 +67,7 @@ import {
   type LlmUsageSummaryDTO,
   type LlmSpendGuardDTO,
   type ConversationObligationDTO,
+  type CampaignCreatorMemoryDTO,
 } from "./dto.js";
 
 // An instance in a waiting state is "stuck" if its dueAt passed more than this
@@ -484,6 +494,27 @@ function mapObligation(o: ConversationObligation): ConversationObligationDTO {
   };
 }
 
+/** PLU-113: map a CampaignCreatorMemory row to its inspector DTO. */
+function mapMemory(m: CampaignCreatorMemory): CampaignCreatorMemoryDTO {
+  return {
+    id: m.id,
+    key: m.key,
+    status: m.status,
+    live: isLiveMemoryStatus(m.status),
+    value: m.value,
+    valueNumber: m.valueNumber,
+    category: m.category,
+    source: m.source,
+    confidence: m.confidence,
+    priorValue: m.priorValue,
+    sourceMessageId: m.sourceMessageId,
+    priorSourceMessageId: m.priorSourceMessageId,
+    note: m.note,
+    createdAt: m.createdAt.toISOString(),
+    updatedAt: m.updatedAt.toISOString(),
+  };
+}
+
 /** Extract agent (AI) decisions from the event log for the inspector. */
 function extractAgentDecisions(events: Event[]): AgentDecisionDTO[] {
   const out: AgentDecisionDTO[] = [];
@@ -533,26 +564,30 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
     .limit(1);
   const versionInfo = versionRows[0] ?? null;
 
-  const [instMessages, instEvents, instLlmCalls, instObligations] = await Promise.all([
-    db
-      .select()
-      .from(messagesTable)
-      .where(eq(messagesTable.instanceId, id))
-      .orderBy(asc(messagesTable.createdAt)),
-    db
-      .select()
-      .from(eventsTable)
-      .where(eq(eventsTable.instanceId, id))
-      .orderBy(asc(eventsTable.occurredAt)),
-    db
-      .select()
-      .from(llmCallsTable)
-      .where(eq(llmCallsTable.instanceId, id))
-      .orderBy(asc(llmCallsTable.createdAt)),
-    // PLU-111: every obligation for the instance (open + resolved), oldest-first.
-    // Reuses the DB access module (same query, one source of truth).
-    listObligationsByInstance(id),
-  ]);
+  const [instMessages, instEvents, instLlmCalls, instObligations, instMemory] =
+    await Promise.all([
+      db
+        .select()
+        .from(messagesTable)
+        .where(eq(messagesTable.instanceId, id))
+        .orderBy(asc(messagesTable.createdAt)),
+      db
+        .select()
+        .from(eventsTable)
+        .where(eq(eventsTable.instanceId, id))
+        .orderBy(asc(eventsTable.occurredAt)),
+      db
+        .select()
+        .from(llmCallsTable)
+        .where(eq(llmCallsTable.instanceId, id))
+        .orderBy(asc(llmCallsTable.createdAt)),
+      // PLU-111: every obligation for the instance (open + resolved), oldest-first.
+      // Reuses the DB access module (same query, one source of truth).
+      listObligationsByInstance(id),
+      // PLU-113: every memory fact for the instance (live + superseded/removed),
+      // oldest-first. Same reuse-the-access-module pattern.
+      listMemoryByInstance(id),
+    ]);
 
   // Attribute each outbound message to a negotiation round, when discoverable
   // from the surrounding NEGOTIATION_TURN events sharing the same body.
@@ -606,6 +641,7 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
       calls: instLlmCalls.map(mapLlmCall),
     },
     obligations: instObligations.map(mapObligation),
+    memory: instMemory.map(mapMemory),
   };
 }
 
@@ -656,6 +692,85 @@ export async function resolveInstanceObligation(
   const updated = await resolveObligationManual(obligationId, opts, "operator");
   if (!updated) return { ok: false, reason: "obligation_not_found" };
   return { ok: true, obligation: mapObligation(updated) };
+}
+
+// ---------------------------------------------------------------------------
+// PLU-113 — operator inspect + correct (§4.10)
+// ---------------------------------------------------------------------------
+
+export const CORRECT_MEMORY_ACTIONS: readonly CorrectMemoryAction[] = [
+  "EDIT",
+  "RESOLVE_CONFLICT",
+  "REMOVE",
+];
+
+export function isCorrectMemoryAction(v: unknown): v is CorrectMemoryAction {
+  return (
+    typeof v === "string" &&
+    (CORRECT_MEMORY_ACTIONS as readonly string[]).includes(v)
+  );
+}
+
+export type CorrectMemoryOutcome =
+  | { ok: true; memory: CampaignCreatorMemoryDTO }
+  | { ok: false; reason: "instance_not_found" | "memory_not_found" };
+
+/**
+ * Correct one memory fact (§4.10) — EDIT / RESOLVE_CONFLICT / REMOVE. Guards that
+ * the fact belongs to the instance in the URL so an operator can't correct an
+ * unrelated instance's fact by id. Operator writes carry source="operator". The
+ * caller passes a canonical `normalizedValue` for EDIT (computed with the same
+ * normalizeMemoryValue the extractor uses) so the live-unique dedup stays correct.
+ */
+export async function correctInstanceMemory(
+  instanceId: string,
+  factId: string,
+  args: {
+    action: CorrectMemoryAction;
+    value?: string | null;
+    valueNumber?: number | null;
+    normalizedValue?: string | null;
+    note?: string | null;
+  },
+): Promise<CorrectMemoryOutcome> {
+  const rows = await db
+    .select()
+    .from(campaignCreatorMemoryTable)
+    .where(eq(campaignCreatorMemoryTable.id, factId))
+    .limit(1);
+  const existing = rows[0];
+  if (!existing || existing.instanceId !== instanceId) {
+    return { ok: false, reason: "memory_not_found" };
+  }
+  const updated = await correctMemoryFact(factId, args);
+  if (!updated) return { ok: false, reason: "memory_not_found" };
+  return { ok: true, memory: mapMemory(updated) };
+}
+
+/**
+ * Create a purely operator-authored memory fact (O7). source="operator",
+ * confidence=1.0, no source message. Confirms the instance exists first.
+ */
+export async function createInstanceMemory(
+  instanceId: string,
+  args: {
+    key: import("../db/schema.js").MemoryFactKey;
+    singleton: boolean;
+    value: string;
+    valueNumber?: number | null;
+    normalizedValue: string;
+    category?: string | null;
+    note?: string | null;
+  },
+): Promise<CorrectMemoryOutcome> {
+  const inst = await db
+    .select({ id: executionInstances.id })
+    .from(executionInstances)
+    .where(eq(executionInstances.id, instanceId))
+    .limit(1);
+  if (!inst[0]) return { ok: false, reason: "instance_not_found" };
+  const created = await createOperatorMemoryFact({ instanceId, ...args });
+  return { ok: true, memory: mapMemory(created) };
 }
 
 // ---------------------------------------------------------------------------

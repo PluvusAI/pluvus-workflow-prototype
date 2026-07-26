@@ -17,8 +17,9 @@ import { AgentDecisions } from "./AgentDecisions";
 import { LogsTrace } from "./LogsTrace";
 import { InstanceLlmUsage } from "./LlmUsagePanel";
 import { ObligationsPanel } from "./ObligationsPanel";
+import { MemoryPanel } from "./MemoryPanel";
 
-type Tab = "timeline" | "messages" | "decisions" | "obligations" | "usage" | "logs";
+type Tab = "timeline" | "messages" | "decisions" | "obligations" | "memory" | "usage" | "logs";
 
 interface Props {
   instanceId: string;
@@ -108,6 +109,12 @@ export function InstanceInspector({ instanceId, onClose }: Props) {
           onClick={() => setTab("obligations")}
           count={d?.obligations?.filter((o) => o.open).length}
         />
+        <TabButton
+          label="Memory"
+          active={tab === "memory"}
+          onClick={() => setTab("memory")}
+          count={d?.memory?.filter((m) => m.live).length}
+        />
         <TabButton label="AI Usage" active={tab === "usage"} onClick={() => setTab("usage")} count={d?.llmUsage?.calls.length} />
         <TabButton label="Logs" active={tab === "logs"} onClick={() => setTab("logs")} count={logs.data?.trace.length} />
       </div>
@@ -139,6 +146,16 @@ export function InstanceInspector({ instanceId, onClose }: Props) {
               <Spinner />
             ) : (
               <ObligationsPanel instanceId={instanceId} obligations={d?.obligations ?? []} />
+            )}
+          </>
+        )}
+        {tab === "memory" && (
+          <>
+            <SectionTitle>Creator Memory</SectionTitle>
+            {detail.isLoading ? (
+              <Spinner />
+            ) : (
+              <MemoryPanel instanceId={instanceId} memory={d?.memory ?? []} />
             )}
           </>
         )}

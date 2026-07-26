@@ -16,7 +16,7 @@ import type { ClassificationProvider } from "../adapters/classification/Classifi
 import { LangGraphNegotiationProvider } from "../adapters/negotiation/LangGraphNegotiationProvider.js";
 import { MockNegotiationProvider } from "../adapters/negotiation/MockNegotiationProvider.js";
 import type { NegotiationProvider } from "../adapters/negotiation/NegotiationProvider.js";
-import type { NegotiationTerm, DraftHistoryEntry } from "../adapters/negotiation/types.js";
+import type { NegotiationTerm, DraftHistoryEntry, CreatorMemoryPayload } from "../adapters/negotiation/types.js";
 import type {
   ClassifyResult,
   NegotiateResult,
@@ -292,6 +292,9 @@ export class AgentProviderAdapter implements IAgentProvider {
       // Option A (negotiate→draft answer sync): the /negotiate model's own vetted
       // reply, so the copy rephrases approved answers instead of inventing them.
       negotiatorAnswers?: string;
+      // PLU-113: durable creator facts so the copy honors them without re-parsing
+      // the transcript. Sanitized DATA agent-side; never the offer figure.
+      creatorMemory?: CreatorMemoryPayload;
     },
   ): Promise<EmailDraft | null> {
     // PLU-109: the CSV import accepts creator-discovery vendor exports carrying
@@ -342,6 +345,10 @@ export class AgentProviderAdapter implements IAgentProvider {
       // authoritative <vetted_answers> block. Undefined → Python default (None)
       // omits the block, so the copy is byte-identical for callers that pass none.
       negotiatorAnswers: extra?.negotiatorAnswers,
+      // PLU-113: forward the durable creator facts so /draft renders the
+      // <creator_memory> DATA block. Undefined → Python default (None) omits the
+      // block, so the copy is byte-identical for callers that pass none.
+      creatorMemory: extra?.creatorMemory,
       // Strip the internal price band before handing config to the copy
       // generator. The negotiation prompt is told to keep floor/ceiling
       // secret, but the draft endpoint was being handed the raw band

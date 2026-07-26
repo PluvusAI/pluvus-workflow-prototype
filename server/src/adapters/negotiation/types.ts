@@ -4,6 +4,45 @@
 
 export type NegotiationAction = "ACCEPT" | "COUNTER" | "REJECT" | "ESCALATE" | "PRESENT_OFFER";
 
+/** PLU-113: the 9-key durable-fact taxonomy. Mirrors MemoryFactKey (db/schema). */
+export type MemoryFactKey =
+  | "REQUESTED_RATE"
+  | "MINIMUM_RATE"
+  | "AVAILABILITY"
+  | "LOGISTICS_CONSTRAINT"
+  | "OBJECTION"
+  | "DELIVERABLE_PREFERENCE"
+  | "COMPENSATION_PREFERENCE"
+  | "MANAGER_INVOLVED"
+  | "MANAGER_CONTACT";
+
+/** PLU-113: one durable creator fact extracted from the creator's inbound this
+ *  turn (§4.4). Additive on the /negotiate response; empty in rules mode + when
+ *  CREATOR_MEMORY_ENABLED is off. Only recorded when the creator STATED it. */
+export interface ExtractedFact {
+  key: MemoryFactKey;
+  value: string;
+  confidence?: number;
+  category?: string | null;
+}
+
+/** PLU-113: the sanitized creator-memory read payload (§4.8) — the durable facts
+ *  the creator has told us THIS campaign, rendered by the agent as a DATA block in
+ *  /negotiate + /draft. requestedRate/minimumRate are CONTEXT, never the offer
+ *  figure (invariant #6). Absent/empty → no block (byte-identical, invariant #8). */
+export interface CreatorMemoryPayload {
+  requestedRate?: string;
+  minimumRate?: string;
+  availability?: string;
+  logisticsConstraints?: string[];
+  objections?: string[];
+  deliverablePreferences?: string[];
+  compensationPreferences?: string[];
+  managerInvolved?: boolean;
+  managerContact?: string;
+  conflicts?: { key: MemoryFactKey; current: string; prior: string | null }[];
+}
+
 export interface NegotiationTerm {
   rate?: number;
   deliverables?: string[];
@@ -44,6 +83,23 @@ export interface NegotiationRequest {
    * (round >= 1 skips classify) or an un-classified row → agent renders no hint.
    */
   intent?: string;
+  /**
+   * PLU-113: the durable creator facts we've persisted THIS campaign (§4.8) —
+   * requested/minimum rate as CONTEXT, availability, objections, logistics,
+   * deliverable/compensation preferences, manager. Rendered agent-side as a
+   * sanitized DATA block so the money-decision model knows the creator's stated
+   * positions without re-scanning the transcript. NEVER a money input (invariant
+   * #6): requestedRate/minimumRate are labeled "not the offer figure". Absent/empty
+   * (flag off, empty memory) → no block, byte-identical to today (invariant #8).
+   */
+  creatorMemory?: CreatorMemoryPayload;
+  /**
+   * PLU-113: the server-side CREATOR_MEMORY_ENABLED flag, so the agent knows
+   * whether to ask the model to EXTRACT durable facts this turn. Explicit (not
+   * inferred from creatorMemory being present) because memory is empty on the first
+   * turn even when the feature is on. Absent/false → no extraction, byte-identical.
+   */
+  extractCreatorFacts?: boolean;
   campaignConstraints: {
     /**
      * The floor of the fee band — "Preferred Budget" in the product (V1 #1):
@@ -127,6 +183,13 @@ export interface NegotiationResponse {
    *  this is our final rate and no further negotiation is possible. Absent/false
    *  on every non-final turn. */
   isFinalRound?: boolean;
+  /** PLU-113: durable creator facts the model extracted from THIS turn's inbound
+   *  (§4.4) — availability, objections, logistics, manager, preferences, and an
+   *  optional MINIMUM_RATE. REQUESTED_RATE is NOT here — the executor derives it
+   *  from the validated creatorRequestedRate so the two can't disagree. Empty in
+   *  rules mode + when CREATOR_MEMORY_ENABLED is off. Only written when the creator
+   *  STATED the fact (grounded extraction; low-confidence guesses dropped). */
+  creatorFacts?: ExtractedFact[];
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +283,13 @@ export interface DraftRequest {
    *  so the copy can never restate a number that contradicts the recorded deal.
    *  Absent = today's behavior (block omitted). */
   negotiatorAnswers?: string | undefined;
+  /** PLU-113: the durable creator facts we've persisted THIS campaign (§4.8), so
+   *  the copy honors availability / objections / preferences / manager involvement
+   *  without re-parsing the transcript wall. Same sanitized DATA block the
+   *  negotiator receives; requestedRate/minimumRate are CONTEXT, never the offer
+   *  figure (invariant #6). Absent/empty → block omitted (copy unchanged,
+   *  invariant #8). */
+  creatorMemory?: CreatorMemoryPayload | undefined;
 }
 
 /** HARD-N2: one turn of the threaded /draft conversation. `role` is "us" for a

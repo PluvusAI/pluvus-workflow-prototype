@@ -7,9 +7,10 @@ import type {
   PriorNegotiationContext,
 } from "./types.js";
 import { MockNegotiationProvider } from "../adapters/negotiation/MockNegotiationProvider.js";
-import type { NegotiationTerm, NegotiationHistoryEntry, DraftHistoryEntry } from "../adapters/negotiation/types.js";
+import type { NegotiationTerm, NegotiationHistoryEntry, DraftHistoryEntry, CreatorMemoryPayload } from "../adapters/negotiation/types.js";
 import { resolveBand } from "./band.js";
 import { resolveOutreachTemplate } from "./outreachVariables.js";
+import { creatorMemoryEnabled } from "./executors/creatorMemoryConfig.js";
 
 // ---------------------------------------------------------------------------
 // IEmailProvider
@@ -301,6 +302,11 @@ export interface IAgentProvider {
       // draft, so the copy can never restate a number that contradicts the recorded
       // deal). Absent = today's behavior exactly.
       negotiatorAnswers?: string;
+      // PLU-113: the creator's durable facts THIS campaign (availability,
+      // objections, preferences, manager, rate/floor as CONTEXT), so the copy
+      // honors them without re-parsing the transcript (§4.8). Sanitized DATA; never
+      // the offer figure. Absent = today's behavior.
+      creatorMemory?: CreatorMemoryPayload;
     },
   ): Promise<EmailDraft | null>;
 }
@@ -468,6 +474,14 @@ export function buildNegotiationRequest(
   // Attached only when present so a mid-negotiation / un-classified turn is unchanged.
   const intent = priorContext?.intent;
 
+  // PLU-113: the durable creator facts (sanitized DATA) + the extraction flag.
+  // creatorMemory is attached only when non-null (flag on + non-empty facts) so the
+  // prompt is unchanged otherwise. extractCreatorFacts is set whenever the flag is
+  // on (independent of whether memory has facts yet) so the model starts extracting
+  // from turn 1. Both absent when the flag is off → byte-identical request.
+  const creatorMemory = priorContext?.creatorMemory;
+  const extractCreatorFacts = creatorMemoryEnabled();
+
   return {
     creatorReply,
     currentOffer,
@@ -477,6 +491,8 @@ export function buildNegotiationRequest(
     ...(conversationHistory && conversationHistory.length ? { conversationHistory } : {}),
     ...(openCommitments && openCommitments.length ? { openCommitments } : {}),
     ...(intent ? { intent } : {}),
+    ...(creatorMemory ? { creatorMemory } : {}),
+    ...(extractCreatorFacts ? { extractCreatorFacts: true } : {}),
     campaignConstraints: {
       termFloor,
       termCeiling,
@@ -509,6 +525,7 @@ export function mapNegotiationResponse(
     creatorRequestedRate?: number;
     escalationReason?: string;
     isFinalRound?: boolean;
+    creatorFacts?: import("../adapters/negotiation/types.js").ExtractedFact[];
   },
   round: number,
 ): NegotiateResult {
@@ -540,6 +557,10 @@ export function mapNegotiationResponse(
     ...(typeof resp.responseDraft === "string" && resp.responseDraft.trim()
       ? { negotiatorAnswers: resp.responseDraft }
       : {}),
+    // PLU-113: carry the extracted durable creator facts on every outcome so the
+    // executor builds the memory write plan regardless of accept/counter/escalate.
+    // Only spread when non-empty so rules mode / flag-off leaves it undefined.
+    ...(resp.creatorFacts?.length ? { creatorFacts: resp.creatorFacts } : {}),
   };
 
   switch (resp.action) {

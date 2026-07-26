@@ -19,6 +19,7 @@ import {
   linkResolutionMessage,
   escalateObligations,
   listOpenObligationsByInstance,
+  upsertMemoryFact,
 } from "../db/index.js";
 import type { Db, DbTx } from "../db/drizzle.js";
 import { findCampaignById } from "../db/campaigns.js";
@@ -337,6 +338,26 @@ export class WorkflowRuntime {
       // on the resolving Message's sentAt (resolveObligationsByResolutionMessage).
       if (result.obligationWrites) {
         await applyObligationWrites(instanceId, result.obligationWrites, tx);
+      }
+
+      // PLU-113: apply the campaign-creator-memory write-plan INSIDE this same
+      // transaction (§4.7) — so a rolled-back turn (stale OCC above) leaves no
+      // half-written fact, exactly like obligations. Wrapped so a bug in the
+      // plan-application layer (a malformed item, an unexpected shape) degrades to
+      // "no memory this turn" and never throws out of the tx callback — memory is
+      // additive context, never worth costing a reply (invariant #9). A genuine DB
+      // error still surfaces (the turn retries), same as obligations; the internal
+      // upsert already absorbs the expected unique-violation race.
+      if (result.memoryWrites) {
+        try {
+          await applyMemoryWrites(instanceId, result.memoryWrites, tx);
+        } catch (err) {
+          console.error(
+            `[runtime] memory writes failed for instance ${instanceId} — ` +
+              `continuing without memory this turn. ` +
+              `${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
       }
 
       return row;
@@ -1374,6 +1395,35 @@ async function applyObligationWrites(
   if (writes.escalateAfterWrite) {
     await escalateObligations(
       openRows.map((r) => r.id),
+      tx,
+    );
+  }
+}
+
+// PLU-113: apply the campaign-creator-memory write-plan INSIDE stepInstance's
+// transaction (§4.7), mirroring applyObligationWrites. Each item is an
+// insert-or-touch-or-conflict via upsertMemoryFact (which absorbs the concurrent-
+// double-insert race on the partial-unique live index). A rolled-back turn rolls
+// these back too — no half-written fact. Source is the creator's inbound row.
+async function applyMemoryWrites(
+  instanceId: string,
+  writes: NonNullable<NodeResult["memoryWrites"]>,
+  tx: Db | DbTx,
+): Promise<void> {
+  for (const item of writes.plan) {
+    await upsertMemoryFact(
+      {
+        instanceId,
+        key: item.key,
+        singleton: item.singleton,
+        value: item.value,
+        valueNumber: item.valueNumber,
+        normalizedValue: item.normalizedValue,
+        matchValue: item.matchValue,
+        sourceMessageId: writes.sourceMessageId ?? null,
+        confidence: item.confidence,
+        ...(item.category ? { category: item.category } : {}),
+      },
       tx,
     );
   }
