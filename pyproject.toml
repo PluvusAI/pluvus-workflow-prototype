@@ -10,7 +10,9 @@ dependencies = [
     "langchain-ollama>=0.2.0",
     "langchain-openai>=0.2.0",
     "langgraph>=0.1.0",
+    "ocrmypdf>=16.0.0",
     "pypdf>=4.0.0",
+    "pypdfium2>=4.0.0",
     "python-dotenv>=1.0.1",
     "uvicorn[standard]>=0.30.0",
 ]
