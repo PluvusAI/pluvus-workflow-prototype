@@ -84,6 +84,8 @@ const REASON_LABELS: Record<string, string> = {
   content_links_submitted: "Creator submitted content links",
   // PLU-70. Not a failure: the AI closed a deal and a human finishes it.
   needs_deal_finalization: "Agreement reached — ready for operator onboarding",
+  // Brand-approval gate: the brand rejected the closed deal via the magic link.
+  brand_rejected: "Brand rejected the deal — needs a human to follow up",
 };
 
 function reasonLabel(reason: string): string {
@@ -120,6 +122,11 @@ function deriveEscalation(events: Event[]): { reason: string; escalatedAt: strin
           escalatedAt: e.occurredAt.toISOString(),
         };
       }
+    }
+    // Brand-approval gate: a brand Reject halts to MANUAL_REVIEW via a direct
+    // transition (no MANUAL_REVIEW_FLAGGED event), so recognize the audit event.
+    if (e.type === "BRAND_REJECTED") {
+      return { reason: "brand_rejected", escalatedAt: e.occurredAt.toISOString() };
     }
   }
   // Fallback: the STATE_TRANSITION into MANUAL_REVIEW carries the timestamp.

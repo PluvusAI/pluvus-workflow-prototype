@@ -1,6 +1,7 @@
 import { count, desc, eq, inArray } from "drizzle-orm";
 import { db, type DbTx } from "./drizzle.js";
 import {
+  brandApprovals,
   brandNotifications,
   campaigns,
   clicks,
@@ -94,6 +95,12 @@ export async function deleteInstanceCascade(
   // Message (sourceMessageId / resolutionMessageId, no ON DELETE rule), so it must
   // be gone BEFORE the messages delete below or that delete FK-violates in turn.
   await tx.delete(dealHandoffs).where(inArray(dealHandoffs.instanceId, instanceIds));
+  // Brand-approval gate (PLU-117): BrandApproval carries a UNIQUE instanceId FK
+  // with no ON DELETE rule, so any instance that reached ACCEPTED under the gate
+  // (AWAITING_BRAND_APPROVAL / approved / rejected) blocks the executionInstances
+  // DELETE below — the same 500 DealHandoff/ConversationObligation caused. Purge
+  // it here alongside the other post-acceptance snapshots.
+  await tx.delete(brandApprovals).where(inArray(brandApprovals.instanceId, instanceIds));
   await tx
     .delete(conversationObligations)
     .where(inArray(conversationObligations.instanceId, instanceIds));

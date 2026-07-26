@@ -23,6 +23,7 @@ import attributionRouter from "./routes/attribution.js";
 import partnershipsRouter from "./routes/partnerships.js";
 import payoutsRouter from "./routes/payouts.js";
 import payoutConfirmRouter from "./routes/payoutConfirm.js";
+import brandApprovalRouter from "./routes/brandApproval.js";
 import { requireOperatorKey } from "./middleware/requireOperatorKey.js";
 
 // ---------------------------------------------------------------------------
@@ -157,6 +158,10 @@ export function createApp(): Express {
   // (GET renders, POST mutates — I-5). Token-gated; must reach creators with no
   // operator key. Distinct from the operator /payouts router above.
   app.use("/payout", publicLimiter, payoutConfirmRouter);
+  // Brand-approval gate — brand-facing approve/reject magic-link pages (GET
+  // renders, POST mutates — same I-5 precedent). Token-gated; must reach the brand
+  // with no operator key, same as the payout confirm/dispute pages.
+  app.use("/brand-approval", publicLimiter, brandApprovalRouter);
 
   // -------------------------------------------------------------------------
   // Static SPA (single-origin deploy) — serve the built dashboard.
