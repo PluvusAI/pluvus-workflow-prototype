@@ -241,6 +241,29 @@ export const convObligationStatusEnum = pgEnum("ConversationObligationStatus", [
   "NO_LONGER_RELEVANT",
 ]);
 
+// PLU-113: Campaign-Scoped Creator Memory. The narrow durable-fact taxonomy +
+// the fact lifecycle. Member order mirrors the DB (created whole by CREATE TYPE
+// in the migration). Distinct from the payout Obligation and the PLU-111
+// ConversationObligation — named CampaignCreatorMemory / MemoryFactKey /
+// MemoryFactStatus to avoid any collision.
+export const memoryFactKeyEnum = pgEnum("MemoryFactKey", [
+  "REQUESTED_RATE",
+  "MINIMUM_RATE",
+  "AVAILABILITY",
+  "LOGISTICS_CONSTRAINT",
+  "OBJECTION",
+  "DELIVERABLE_PREFERENCE",
+  "COMPENSATION_PREFERENCE",
+  "MANAGER_INVOLVED",
+  "MANAGER_CONTACT",
+]);
+export const memoryFactStatusEnum = pgEnum("MemoryFactStatus", [
+  "ACTIVE",
+  "CONFLICTED",
+  "SUPERSEDED",
+  "REMOVED",
+]);
+
 export const workflowStatusEnum = pgEnum("WorkflowStatus", [
   "DRAFT",
   "PUBLISHED",
@@ -337,6 +360,9 @@ export type BrandApprovalStatus =
 export type ObligationType = (typeof obligationTypeEnum.enumValues)[number];
 export type ConversationObligationStatus =
   (typeof convObligationStatusEnum.enumValues)[number];
+// PLU-113 — campaign-scoped creator memory.
+export type MemoryFactKey = (typeof memoryFactKeyEnum.enumValues)[number];
+export type MemoryFactStatus = (typeof memoryFactStatusEnum.enumValues)[number];
 
 // ---------------------------------------------------------------------------
 // Definition models
@@ -860,6 +886,66 @@ export const conversationObligations = pgTable(
   ],
 );
 
+// PLU-113: campaign-scoped creator memory — one row per durable creator fact,
+// keyed on ExecutionInstance (NEVER Creator, invariant #1). A fact is durable
+// state + a pointer back to the inbound Message that stated it (sourceMessageId,
+// invariant #3), NOT a second copy of the conversation (invariant #2). See
+// .claude/spec/plu-113-campaign-scoped-creator-memory/PLAN.md.
+export const campaignCreatorMemory = pgTable(
+  "CampaignCreatorMemory",
+  {
+    id: cuidId("id"),
+    // Campaign-scoped key — NEVER Creator (invariant #1).
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+    key: memoryFactKeyEnum("key").notNull(),
+    status: memoryFactStatusEnum("status").notNull().default("ACTIVE"),
+    // Canonical value as text (numbers stringified). e.g. "600", "unavailable
+    // until August", "no perpetual usage rights", "Jane <jane@mgmt.co>".
+    value: text("value").notNull(),
+    // Convenience numeric mirror for the rate facts (null for non-numeric keys).
+    valueNumber: doublePrecision("valueNumber"),
+    // Dedup key (§4.6): normalized(value) for list keys; a per-key sentinel for
+    // singleton keys so the partial-unique live index collapses to one row per
+    // (instance, key).
+    normalizedValue: text("normalizedValue").notNull(),
+    // Optional light bucket for objections (reuse topic-gate categories), best-effort.
+    category: text("category"),
+    // Provenance (invariant #3). The inbound Message that stated it; null for
+    // operator entries.
+    sourceMessageId: text("sourceMessageId").references(() => messages.id),
+    // "ai" (extracted from creator inbound) | "operator" (entered/corrected).
+    source: text("source").notNull().default("ai"),
+    // 0..1. Model-reported extraction confidence; 1.0 for operator-entered/confirmed.
+    confidence: doublePrecision("confidence").notNull().default(0),
+    // Conflict trail (invariant #5): when a singleton value materially changes we
+    // keep the PRIOR value + its source here and set status = CONFLICTED.
+    priorValue: text("priorValue"),
+    priorSourceMessageId: text("priorSourceMessageId").references(
+      () => messages.id,
+    ),
+    // Operator note on a correction/resolution.
+    note: text("note"),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    index("CampaignCreatorMemory_instanceId_status_idx").on(
+      table.instanceId,
+      table.status,
+    ),
+    // At most one LIVE (ACTIVE/CONFLICTED) row per (instance, key,
+    // normalizedValue). For SINGLETON keys normalizedValue is a per-key sentinel
+    // → one live row per (instance, key). For LIST keys it's normalized(value) →
+    // one row per distinct value. Partial so superseded/removed history can
+    // accumulate. Mirrors migration 20260726120000_plu113_campaign_creator_memory.
+    uniqueIndex("CampaignCreatorMemory_live_key")
+      .on(table.instanceId, table.key, table.normalizedValue)
+      .where(sql`${table.status} IN ('ACTIVE', 'CONFLICTED')`),
+  ],
+);
+
 // HARD-O1: one row per LLM call the agent service made on behalf of a workflow
 // instance — the durable token/latency/cost telemetry the in-process agent ring
 // buffer cannot provide. Rows are written best-effort by the observability sink
@@ -1103,6 +1189,9 @@ export const insertDealHandoffSchema = createInsertSchema(dealHandoffs).omit({
 export const insertConversationObligationSchema = createInsertSchema(
   conversationObligations,
 ).omit({ id: true, createdAt: true, updatedAt: true });
+export const insertCampaignCreatorMemorySchema = createInsertSchema(
+  campaignCreatorMemory,
+).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertPartnershipSchema = createInsertSchema(partnerships).omit({
   id: true,
   createdAt: true,
@@ -1146,6 +1235,9 @@ export type PaymentInfo = typeof paymentInfo.$inferSelect;
 export type DealHandoff = typeof dealHandoffs.$inferSelect;
 export type BrandApproval = typeof brandApprovals.$inferSelect;
 export type ConversationObligation = typeof conversationObligations.$inferSelect;
+export type CampaignCreatorMemory = typeof campaignCreatorMemory.$inferSelect;
+export type CampaignCreatorMemoryInsert =
+  typeof campaignCreatorMemory.$inferInsert;
 export type Partnership = typeof partnerships.$inferSelect;
 export type Click = typeof clicks.$inferSelect;
 export type Conversion = typeof conversions.$inferSelect;
@@ -1171,6 +1263,9 @@ export type InsertPaymentInfo = z.infer<typeof insertPaymentInfoSchema>;
 export type InsertDealHandoff = z.infer<typeof insertDealHandoffSchema>;
 export type InsertConversationObligation = z.infer<
   typeof insertConversationObligationSchema
+>;
+export type InsertCampaignCreatorMemory = z.infer<
+  typeof insertCampaignCreatorMemorySchema
 >;
 export type InsertPartnership = z.infer<typeof insertPartnershipSchema>;
 export type InsertClick = z.infer<typeof insertClickSchema>;

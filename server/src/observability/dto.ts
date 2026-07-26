@@ -14,6 +14,8 @@ import type {
   ReplyIntent,
   ObligationType,
   ConversationObligationStatus,
+  MemoryFactKey,
+  MemoryFactStatus,
 } from "../db/schema.js";
 
 // ---------------------------------------------------------------------------
@@ -301,6 +303,27 @@ export interface ContextDTO {
   bandPresent: boolean;
 }
 
+// PLU-113: one campaign-scoped creator-memory fact for the inspector (a durable
+// creator position/constraint learned this campaign).
+export interface CampaignCreatorMemoryDTO {
+  id: string;
+  key: MemoryFactKey;
+  status: MemoryFactStatus;
+  /** True for ACTIVE/CONFLICTED — still fed to the model. */
+  live: boolean;
+  value: string;
+  valueNumber: number | null;
+  category: string | null;
+  source: string;
+  confidence: number;
+  priorValue: string | null;
+  sourceMessageId: string | null;
+  priorSourceMessageId: string | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface InstanceDetailDTO {
   instance: {
     instanceId: string;
@@ -345,6 +368,9 @@ export interface InstanceDetailDTO {
    *  context (labels/keys/counts only — never values, band presence only). Absent
    *  when no turn has run yet ("empty = no turn ran," §7.1). */
   context?: ContextDTO;
+  /** PLU-113: the campaign-scoped creator memory — durable creator facts (live +
+   *  superseded/removed history) — for the inspector. */
+  memory: CampaignCreatorMemoryDTO[];
 }
 
 // ---------------------------------------------------------------------------

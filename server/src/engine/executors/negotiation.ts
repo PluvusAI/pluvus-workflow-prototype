@@ -2,6 +2,7 @@ import {
   listMessagesByInstance,
   listEventsByInstance,
   listOpenObligationsByInstance,
+  listLiveMemoryByInstance,
 } from "../../db/index.js";
 import type { ConversationObligation, Message } from "../../db/schema.js";
 import type { ExecutionContext, NodeResult, NegotiationHistoryEntryLite, PriorNegotiationContext, EmailDraft } from "../types.js";
@@ -18,12 +19,26 @@ import { type BriefFieldConflict } from "./briefKnowledge.js";
 // PLU-81: the centralized, purpose-aware context builder. executeNegotiation calls
 // it ONCE per turn and projects it for BOTH the NEGOTIATION_DECISION and EMAIL_DRAFT
 // purposes (the AC "negotiation uses the builder" + "another AI path reuses it").
+// PLU-81 absorbed the direct resolveBriefKnowledge call that PLU-113 imported here —
+// brief resolution now happens once inside buildConversationContext.
 import {
   buildConversationContext,
   toDecisionContext,
   toDraftContext,
   buildContextRecord,
 } from "../conversationContext.js";
+// PLU-113: campaign-scoped creator memory. All behind CREATOR_MEMORY_ENABLED
+// (off → none of this runs, prompts byte-identical). The read builder threads the
+// live facts into /negotiate + /draft as sanitized DATA; the write-plan builder
+// turns this turn's extracted facts into the in-tx write plan.
+import {
+  creatorMemoryEnabled,
+  memoryMinConfidence,
+} from "./creatorMemoryConfig.js";
+import {
+  buildCreatorMemoryBlock,
+  buildMemoryWritePlan,
+} from "./creatorMemory.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { randomSendDelayMs } from "../sendDelay.js";
@@ -691,13 +706,39 @@ export async function executeNegotiation(
   const briefSections = cc.briefSections;
   const structuredObligations = cc.structuredObligations;
 
+  // PLU-113: campaign-scoped creator memory (§4.8). Behind CREATOR_MEMORY_ENABLED
+  // (off → memoryOn is false, nothing loads, no block is threaded, no writes are
+  // built → /negotiate + /draft prompts are byte-identical to today, invariant #8).
+  // On: load the LIVE facts (ACTIVE + CONFLICTED) and build the sanitized read
+  // payload once — it feeds BOTH the money-decision model and the copywriter. An
+  // instance with no facts yet (pre-existing / first turn) → null block → no-op.
+  //
+  // PLU-69 reconciliation: PLU-81 centralized context assembly and exposes an
+  // injectable `loadCreatorMemory` seam on buildConversationContext. Until that
+  // loader is wired (a later step), memory is loaded HERE and threaded onto the
+  // projected decision context below — preserving PLU-113's as-built behavior
+  // (memory reaches BOTH the money-decision model and the copywriter). The rate is
+  // a STRING labeled "not the offer figure" (invariant #6), so it is money-safe on
+  // the decision path by construction — never a fee input.
+  const memoryOn = creatorMemoryEnabled();
+  const creatorMemory = memoryOn
+    ? buildCreatorMemoryBlock(await listLiveMemoryByInstance(instance.id))
+    : null;
+
   // NEGOTIATION_DECISION projection: the band-FULL PriorNegotiationContext threaded
   // into agent.negotiate. It already carries the band-free knowledge campaignContext,
   // the both-sides transcript, openCommitments, and the classify intent — attached
   // by the projection ONLY when non-empty (§5.7 emptiness contract). The band is NOT
   // on this object; buildNegotiationRequest resolves it from `config` at request-build
   // time (§5.3 / §5.7). This is byte-identical to the old inline assembly (§10).
-  const negotiationContext: PriorNegotiationContext = toDecisionContext(cc).decisionHistory;
+  //
+  // PLU-113: the creator's durable facts THIS campaign are folded onto the projected
+  // context as sanitized DATA (§4.8) — attached ONLY when non-null (flag on +
+  // non-empty memory) so the prompt is unchanged otherwise. Never a money input.
+  const negotiationContext: PriorNegotiationContext = {
+    ...toDecisionContext(cc).decisionHistory,
+    ...(creatorMemory ? { creatorMemory } : {}),
+  };
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
   // (the creator's questions + which fixed terms they pushed), threaded across
@@ -711,7 +752,7 @@ export async function executeNegotiation(
   // feeds the MONEY path (context.creatorRate on a brand decision, which a brand
   // APPROVE records as the deal rate). The regex remains a fallback for copy
   // acknowledgment and guard allowlisting only.
-  const { outcome, message, proposedRate, creatorQuestions, pushedFixedTerms, creatorRequestedRate, escalationReason, isFinalRound, negotiatorAnswers } =
+  const { outcome, message, proposedRate, creatorQuestions, pushedFixedTerms, creatorRequestedRate, escalationReason, isFinalRound, negotiatorAnswers, creatorFacts } =
     await agent.negotiate(instance.negotiationRound, config, creatorReply, negotiationContext);
 
   // For acknowledgment copy + the output-guard allowlist (NOT the money path):
@@ -882,6 +923,10 @@ export async function executeNegotiation(
     // before. Spread only when non-empty to keep the request minimal. Renders in the
     // offer/onboarding prompts (the answer-bearing purposes); a no-op elsewhere.
     ...(negotiatorAnswers && negotiatorAnswers.trim() ? { negotiatorAnswers } : {}),
+    // PLU-113: the same creator-memory DATA block the negotiator got, so the copy
+    // honors availability/objections/preferences/manager without re-parsing the
+    // transcript wall (§4.8). Attached only when non-null → copy unchanged otherwise.
+    ...(creatorMemory ? { creatorMemory } : {}),
   };
 
   // The reserve-time obligation writes shared across the send branches. The
@@ -895,6 +940,36 @@ export async function executeNegotiation(
     ...(latestInbound?.id ? { sourceMessageId: latestInbound.id } : {}),
     ...(reservedMessageId ? { reservedResolutionMessageId: reservedMessageId } : {}),
   });
+
+  // PLU-113 (§4.5): the memory write-plan for THIS turn — pure, applied in-tx by
+  // the runtime (mirrors obligationWrites). Built ONLY when the flag is on;
+  // otherwise undefined so no NodeResult carries memoryWrites (nothing to apply).
+  // REQUESTED_RATE is derived from the validated creatorRequestedRate (not the
+  // model's facts) so the memory rate and the copy-side ack rate can't disagree.
+  // Source is the creator's inbound row (already persisted). Attached uniformly to
+  // every return below (including escalate — facts stated in an escalating reply
+  // are still recorded). The whole path is wrapped by the runtime in try/catch so a
+  // bad plan degrades to "no memory this turn", never a lost reply (invariant #9).
+  //
+  // Built BEFORE the PLU-82 material-conflict early-return below so that escalation
+  // path also carries memoryWrites (PLU-69 reconciliation — facts stated in a reply
+  // that triggers a material-conflict escalation are still recorded).
+  const memoryPlan = memoryOn
+    ? buildMemoryWritePlan({
+        ...(creatorFacts ? { creatorFacts } : {}),
+        ...(creatorRequestedRate !== undefined
+          ? { creatorRequestedRate }
+          : {}),
+        minConfidence: memoryMinConfidence(),
+      })
+    : [];
+  const memoryWrites: NodeResult["memoryWrites"] =
+    memoryOn && memoryPlan.length
+      ? {
+          plan: memoryPlan,
+          ...(latestInbound?.id ? { sourceMessageId: latestInbound.id } : {}),
+        }
+      : undefined;
 
   // PLU-82 §4.5 — MATERIAL-CONFLICT ESCALATION (flag-gated, POST-model).
   //
@@ -938,10 +1013,18 @@ export async function executeNegotiation(
           ...buildObligationWrites(undefined),
           escalateAfterWrite: true,
         },
+        // PLU-113: facts stated in an escalating reply are still recorded.
+        ...(memoryWrites ? { memoryWrites } : {}),
       };
     }
   }
 
+  // PLU-113: the outcome switch is wrapped so the per-turn memoryWrites (built
+  // above, constant across branches) is injected onto EVERY NodeResult uniformly
+  // — including escalate/reject/guard-block — without threading it through each of
+  // the ~12 return sites. `memoryWrites` is undefined when the flag is off or no
+  // fact was extracted, so this spread is a no-op there (byte-identical result).
+  const outcomeResult: NodeResult = await (async (): Promise<NodeResult> => {
   switch (outcome) {
     case "present_offer": {
       // The creator ASKED about terms (no number proposed). Present the fee
@@ -1341,4 +1424,9 @@ export async function executeNegotiation(
       });
     }
   }
+  })();
+
+  // PLU-113: attach this turn's memory write-plan to the chosen result. Undefined
+  // (flag off / no facts) → spread is a no-op → byte-identical to today.
+  return memoryWrites ? { ...outcomeResult, memoryWrites } : outcomeResult;
 }

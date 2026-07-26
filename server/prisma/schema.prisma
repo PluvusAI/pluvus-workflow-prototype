@@ -214,6 +214,36 @@ enum ConversationObligationStatus {
   NO_LONGER_RELEVANT
 }
 
+/// PLU-113: the narrow, fixed taxonomy of durable creator facts kept in
+/// CampaignCreatorMemory. Singleton keys (REQUESTED_RATE, MINIMUM_RATE,
+/// AVAILABILITY, MANAGER_INVOLVED, MANAGER_CONTACT) hold one live value per
+/// instance (a material change → CONFLICTED, not a new row); list keys
+/// (LOGISTICS_CONSTRAINT, OBJECTION, DELIVERABLE_PREFERENCE,
+/// COMPENSATION_PREFERENCE) accumulate multiple distinct rows.
+enum MemoryFactKey {
+  REQUESTED_RATE
+  MINIMUM_RATE
+  AVAILABILITY
+  LOGISTICS_CONSTRAINT
+  OBJECTION
+  DELIVERABLE_PREFERENCE
+  COMPENSATION_PREFERENCE
+  MANAGER_INVOLVED
+  MANAGER_CONTACT
+}
+
+/// PLU-113: the lifecycle of a CampaignCreatorMemory fact.
+///   Live (fed to the model): ACTIVE (current, trusted), CONFLICTED (creator gave
+///     two different answers; surfaced with its priorValue).
+///   Non-live (not fed): SUPERSEDED (a prior value replaced after an operator
+///     resolved a conflict; kept for audit), REMOVED (operator marked wrong/stale).
+enum MemoryFactStatus {
+  ACTIVE
+  CONFLICTED
+  SUPERSEDED
+  REMOVED
+}
+
 /// Lifecycle of a Workflow definition.
 enum WorkflowStatus {
   DRAFT
@@ -521,6 +551,7 @@ model ExecutionInstance {
   dealHandoff        DealHandoff?
   outboxJobs         OutboxJob[]
   conversationObligations ConversationObligation[]
+  creatorMemory      CampaignCreatorMemory[]
 
   @@unique([workflowVersionId, creatorId])
   /// HARD-R1: the poller and reconciliation sweep both query by currentState
@@ -586,6 +617,10 @@ model Message {
   /// (inbound) or the one that resolved them (a sent outbound answer).
   raisedObligations   ConversationObligation[] @relation("ConversationObligationSource")
   resolvedObligations ConversationObligation[] @relation("ConversationObligationResolution")
+  /// PLU-113: memory facts pointing at this row as the inbound that stated them
+  /// (sourceMemory) or as the prior source retained on a resolved conflict.
+  sourceMemory        CampaignCreatorMemory[]  @relation("CampaignCreatorMemorySource")
+  priorSourceMemory   CampaignCreatorMemory[]  @relation("CampaignCreatorMemoryPriorSource")
 
   @@index([threadId])
   @@index([instanceId])
@@ -877,6 +912,58 @@ model ConversationObligation {
   instance         ExecutionInstance @relation(fields: [instanceId], references: [id])
   sourceMessage    Message?          @relation("ConversationObligationSource", fields: [sourceMessageId], references: [id])
   resolutionMessage Message?         @relation("ConversationObligationResolution", fields: [resolutionMessageId], references: [id])
+
+  @@index([instanceId, status])
+}
+
+/// PLU-113: a small, campaign-scoped (per-ExecutionInstance — NEVER Creator) memory
+/// of durable creator facts. One row per fact, each carrying its own value,
+/// confidence, status, and a pointer back to the inbound Message that stated it
+/// (sourceMessageId). Updated ONLY from creator communication (source="ai",
+/// extracted from the creator's inbound) or operator confirmation
+/// (source="operator"). A material value change on a singleton key sets
+/// status=CONFLICTED and retains the prior value (priorValue / priorSourceMessageId)
+/// rather than silently overwriting it. This is NOT a second copy of the
+/// conversation (the transcript stays sourced from Message rows, PLU-85) and is NOT
+/// a money input (finalized commercial terms stay on the event-sourced money path).
+model CampaignCreatorMemory {
+  id         String           @id @default(cuid())
+  instanceId String
+  key        MemoryFactKey
+  status     MemoryFactStatus @default(ACTIVE)
+
+  /// Canonical value as text (numbers stringified, e.g. "600").
+  value String
+  /// Convenience numeric mirror for the rate facts (null for non-numeric keys).
+  valueNumber Float?
+  /// Dedup key (§4.6): normalized(value) for list keys; a per-key sentinel for
+  /// singleton keys so the partial-unique live index collapses to one row per
+  /// (instance, key).
+  normalizedValue String
+  /// Optional light bucket for objections (reuse topic-gate categories), best-effort.
+  category String?
+
+  /// The inbound Message row that stated it; null for operator entries (that IS
+  /// their provenance).
+  sourceMessageId String?
+  /// "ai" (extracted from creator inbound) | "operator" (entered/corrected).
+  source String @default("ai")
+  /// 0..1. Model-reported extraction confidence; 1.0 for operator-entered/confirmed.
+  confidence Float @default(0)
+
+  /// Conflict trail (invariant #5): when a singleton value materially changes we
+  /// keep the PRIOR value + its source here and set status=CONFLICTED.
+  priorValue           String?
+  priorSourceMessageId String?
+  /// Operator note on a correction/resolution.
+  note String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  instance           ExecutionInstance @relation(fields: [instanceId], references: [id])
+  sourceMessage      Message?          @relation("CampaignCreatorMemorySource", fields: [sourceMessageId], references: [id])
+  priorSourceMessage Message?          @relation("CampaignCreatorMemoryPriorSource", fields: [priorSourceMessageId], references: [id])
 
   @@index([instanceId, status])
 }

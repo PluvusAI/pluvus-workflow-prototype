@@ -8,10 +8,17 @@ import type {
 } from "../db/schema.js";
 // F-H1: the full both-sides transcript entry, reused from the draft seam so the
 // negotiator receives the same conversation shape the copywriter already gets.
-import type { DraftHistoryEntry } from "../adapters/negotiation/types.js";
+import type {
+  DraftHistoryEntry,
+  CreatorMemoryPayload,
+  ExtractedFact,
+} from "../adapters/negotiation/types.js";
 // PLU-111: the pure obligation write-plan the executor returns and the runtime
 // applies in-tx.
 import type { QuestionObligationPlanItem } from "./executors/negotiationHistory.js";
+// PLU-113: the pure memory write-plan the executor returns and the runtime applies
+// in-tx (mirrors obligationWrites).
+import type { MemoryWritePlanItem } from "./executors/creatorMemory.js";
 
 // NodeSnapshot — matches what is stored in WorkflowVersion.nodeGraph
 export interface NodeSnapshot {
@@ -90,6 +97,22 @@ export interface NodeResult {
      *  context AND surface in the Manual Queue. The runtime resolves the ids AFTER
      *  applying questionPlan (so newly-minted rows are included). */
     escalateAfterWrite?: boolean | undefined;
+  };
+  /**
+   * PLU-113: the campaign-creator-memory write-plan for this turn, applied by the
+   * runtime INSIDE stepInstance's db.transaction — alongside the NEGOTIATION_TURN
+   * event + obligation writes — so a rolled-back turn (StaleInstanceError) leaves no
+   * half-written fact (§4.7). The executor keeps the plan pure (build-only); the
+   * runtime owns the tx-scoped writes (mirrors obligationWrites). Wrapped in a
+   * try/catch so a memory-write failure degrades to "no memory this turn" and never
+   * costs a reply (invariant #9). Absent when CREATOR_MEMORY_ENABLED is off or the
+   * turn extracted no facts.
+   */
+  memoryWrites?: {
+    /** The per-fact write plan (§4.5). */
+    plan: MemoryWritePlanItem[];
+    /** The inbound Message row that stated this turn's facts (provenance, §4.5). */
+    sourceMessageId?: string | undefined;
   };
 }
 
@@ -187,6 +210,14 @@ export interface NegotiateResult {
    * hallucinating) them. Undefined when there is no genuine draft to pass.
    */
   negotiatorAnswers?: string;
+  /**
+   * PLU-113: the durable creator facts the /negotiate model extracted from THIS
+   * turn's inbound (§4.4) — availability, objections, logistics, manager,
+   * preferences, and an optional MINIMUM_RATE. The executor turns these (plus the
+   * validated creatorRequestedRate, which owns REQUESTED_RATE) into the in-tx
+   * memory write plan. Undefined in rules mode + when CREATOR_MEMORY_ENABLED is off.
+   */
+  creatorFacts?: ExtractedFact[];
 }
 
 // PriorNegotiationContext — assembled by the executor (the state authority) and
@@ -227,6 +258,12 @@ export interface PriorNegotiationContext {
   // executor only when the BRIEF_INTO_NEGOTIATE sub-flag is on; the agent applies
   // the §4.10 knowledge-turn cost gate. Absent → /negotiate prompt byte-identical.
   campaignContext?: Record<string, unknown> | undefined;
+  // PLU-113: the durable creator facts persisted THIS campaign (§4.8), rendered by
+  // /negotiate as sanitized DATA so the money-decision model knows the creator's
+  // stated positions (rate/floor as CONTEXT, availability, objections, manager,
+  // preferences) without re-scanning the transcript. NEVER a money input (invariant
+  // #6). Absent/empty (flag off, empty memory) → no block, byte-identical.
+  creatorMemory?: CreatorMemoryPayload | undefined;
 }
 
 // A trimmed history entry the executor can build purely from persisted events.

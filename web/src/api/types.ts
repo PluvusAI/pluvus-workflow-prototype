@@ -173,6 +173,9 @@ export interface InstanceDetail {
   // only — never values). Absent when no turn has assembled context ("empty = no
   // turn ran").
   context?: ContextDTO;
+  // PLU-113: campaign-scoped creator memory — durable creator facts (live +
+  // superseded/removed history).
+  memory: CampaignCreatorMemoryDTO[];
 }
 
 // ---- Knowledge (PLU-82) ----
@@ -260,6 +263,43 @@ export type ManualResolveStatus =
   | "COMPLETED"
   | "CANCELED"
   | "NO_LONGER_RELEVANT";
+
+// ---- Campaign-scoped creator memory (PLU-113) ----
+
+export type MemoryFactKey =
+  | "REQUESTED_RATE"
+  | "MINIMUM_RATE"
+  | "AVAILABILITY"
+  | "LOGISTICS_CONSTRAINT"
+  | "OBJECTION"
+  | "DELIVERABLE_PREFERENCE"
+  | "COMPENSATION_PREFERENCE"
+  | "MANAGER_INVOLVED"
+  | "MANAGER_CONTACT";
+
+export type MemoryFactStatus = "ACTIVE" | "CONFLICTED" | "SUPERSEDED" | "REMOVED";
+
+export interface CampaignCreatorMemoryDTO {
+  id: string;
+  key: MemoryFactKey;
+  status: MemoryFactStatus;
+  /** True for ACTIVE/CONFLICTED — still fed to the model. */
+  live: boolean;
+  value: string;
+  valueNumber: number | null;
+  category: string | null;
+  source: string;
+  confidence: number;
+  priorValue: string | null;
+  sourceMessageId: string | null;
+  priorSourceMessageId: string | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The correction actions an operator may apply to a memory fact. */
+export type CorrectMemoryAction = "EDIT" | "RESOLVE_CONFLICT" | "REMOVE";
 
 // ---- LLM usage (HARD-O1) ----
 
