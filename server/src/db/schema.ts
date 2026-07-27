@@ -211,9 +211,15 @@ export const dealHandoffStatusEnum = pgEnum("DealHandoffStatus", [
 
 // Brand-approval gate: lifecycle of the brand's Approve/Reject decision on a
 // creator the AI closed. AWAITING_APPROVAL until the brand clicks a magic link;
-// then APPROVED (content brief released) or REJECTED (halt to manual review).
+// PROCESSING is a short-lived intermediate claim held ONLY while the workflow
+// action (content-brief send / halt to manual review) runs, so the decision is
+// finalized (APPROVED / REJECTED) exactly once, and STRICTLY AFTER that action
+// succeeds. A PROCESSING row whose action failed reverts to AWAITING_APPROVAL so
+// the brand can retry the same link instead of being told "already actioned"
+// while the execution is still parked (PLU-118, Calvin review §2).
 export const brandApprovalStatusEnum = pgEnum("BrandApprovalStatus", [
   "AWAITING_APPROVAL",
+  "PROCESSING",
   "APPROVED",
   "REJECTED",
 ]);
@@ -757,9 +763,22 @@ export const brandApprovals = pgTable(
     creatorName: text("creatorName").notNull(),
     creatorEmail: text("creatorEmail").notNull(),
     campaignName: text("campaignName"),
+    // The brand's DISPLAY name (resolveBrandName: node config → campaign.brand),
+    // distinct from the campaign name. The hosted approval page headed itself with
+    // campaignName, which could show the wrong brand (PLU-118, Calvin review). We
+    // persist the resolved brand name so the page can head with the real brand and
+    // still say "…for {campaignName}". Nullable: rows written before this column
+    // fall back to campaignName at read time (legacy-safe).
+    brandName: text("brandName"),
     // Null for commission-only deals. Present on fee deals — the brand email
     // states this figure, so the executor escalates rather than snapshotting a
     // fabricated fee (CRITICAL-3 parity with the merged Content Brief email).
+    // NOTE (PLU-118): fixedFee/commissionRate are DISPLAY-ONLY snapshots — the
+    // brand email + hosted page render them, nothing does arithmetic on them, and
+    // the authoritative money lives in the payout ledger (Obligation/Payout).
+    // doublePrecision matches the proto-wide convention for these display figures
+    // (Campaign.*, DealHandoff.*); switching this one table to minor-units would
+    // diverge from every sibling snapshot without any correctness gain here.
     fixedFee: doublePrecision("fixedFee"),
     commissionRate: doublePrecision("commissionRate"),
     negotiationFloor: doublePrecision("negotiationFloor"),

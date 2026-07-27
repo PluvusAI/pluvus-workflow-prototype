@@ -2,7 +2,9 @@ import { Router, urlencoded } from "express";
 import type { Request, Response } from "express";
 import {
   findBrandApprovalById,
-  markBrandApprovalDecided,
+  claimBrandApprovalForProcessing,
+  finalizeBrandApprovalDecision,
+  revertBrandApprovalToAwaiting,
   findInstanceById,
 } from "../db/index.js";
 import type { BrandApproval } from "../db/schema.js";
@@ -19,6 +21,7 @@ import {
   renderBrandApprovalAlreadyActionedPage,
   renderBrandApprovalExpiredPage,
   renderBrandApprovalInvalidPage,
+  renderBrandApprovalRetryPage,
 } from "./brandApprovalPage.js";
 
 // ---------------------------------------------------------------------------
@@ -36,6 +39,20 @@ import {
 // ---------------------------------------------------------------------------
 
 const router = Router();
+
+// The raw magic-link token rides in the URL query string (?token=…). Suppress the
+// Referer header outright so the token is never leaked to any resource the page
+// references, and forbid caching/indexing of the token-bearing response (PLU-118,
+// Calvin review — "please make sure … the page uses a strict referrer policy").
+// helmet already sets a global Referrer-Policy, but we set it explicitly here so
+// this sensitive surface self-documents and stays strict regardless of global
+// config drift. The GET only renders (never mutates), so caching is pure downside.
+router.use((_req: Request, res: Response, next) => {
+  res.setHeader("Referrer-Policy", "no-referrer");
+  res.setHeader("Cache-Control", "no-store, max-age=0");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  next();
+});
 
 // The POST carries the token in a hidden urlencoded form field.
 router.use(urlencoded({ extended: false }));
@@ -106,12 +123,16 @@ function respondForNonOkGuard(res: Response, guard: Guard): boolean {
       res
         .status(410)
         .type("html")
-        .send(renderBrandApprovalExpiredPage({ brandName: guard.approval.campaignName }));
+        .send(
+          renderBrandApprovalExpiredPage({
+            brandName: guard.approval.brandName ?? guard.approval.campaignName,
+          }),
+        );
       return true;
     case "already":
       res.type("html").send(
         renderBrandApprovalAlreadyActionedPage({
-          brandName: guard.approval.campaignName ?? "Your brand",
+          brandName: pageBrandName(guard.approval),
           status: guard.approval.status,
         }),
       );
@@ -136,7 +157,9 @@ function registerGet(action: Action): void {
         renderBrandApprovalInterstitialPage({
           approvalId,
           token: token!,
-          brandName: a.campaignName ?? "Your brand",
+          // Heading uses the real brand name (persisted; legacy rows fall back to
+          // campaignName). The "for {campaignName}" phrase below stays the campaign.
+          brandName: pageBrandName(a),
           creatorName: a.creatorName,
           creatorHandle: a.creatorHandle,
           creatorPlatform: a.creatorPlatform,
@@ -178,17 +201,19 @@ async function handleDecisionPost(
   if (respondForNonOkGuard(res, guard)) return;
   if (guard.kind !== "ok") return; // narrows for the compiler (unreachable)
 
-  const brandName = guard.approval.campaignName ?? "Your brand";
+  const brandName = pageBrandName(guard.approval);
   const creatorName = guard.approval.creatorName;
 
-  // Mutate the row first (idempotency lock): the WHERE requires AWAITING_APPROVAL,
-  // so a concurrent/duplicate POST makes this a no-op → treat as already-actioned.
-  const updated = await markBrandApprovalDecided(approvalId, {
-    status: decision,
+  // ── Phase 1: CLAIM (AWAITING_APPROVAL → PROCESSING) — the idempotency lock ──
+  // The WHERE requires AWAITING_APPROVAL, so a concurrent/duplicate POST (or a
+  // request that races another) matches 0 rows → treat as already-actioned. The
+  // row is NOT yet decided — PROCESSING is a short-lived claim, and the decision is
+  // written ONLY after the workflow action succeeds (PLU-118, Calvin review §2).
+  const claimed = await claimBrandApprovalForProcessing(approvalId, {
     decidedIp: clientIp(req),
     decidedUserAgent: clientUserAgent(req),
   });
-  if (!updated) {
+  if (!claimed) {
     const latest = await findBrandApprovalById(approvalId);
     res.type("html").send(
       renderBrandApprovalAlreadyActionedPage({
@@ -199,41 +224,73 @@ async function handleDecisionPost(
     return;
   }
 
-  // Drive the instance. handleBrandApproval requires AWAITING_BRAND_APPROVAL; a
-  // race that already advanced it surfaces as StaleInstanceError → the row is
-  // decided regardless, so render the result page (the decision is recorded).
+  // ── Phase 2: drive the instance. Only on SUCCESS do we finalize the decision. ─
+  // handleBrandApproval requires AWAITING_BRAND_APPROVAL; a race that already
+  // advanced it surfaces as StaleInstanceError. We distinguish three outcomes:
+  //   success            → finalize PROCESSING → APPROVED/REJECTED, show result.
+  //   already-advanced   → the effect is already realized by another actor; finalize
+  //                        (record the brand's decision) and show the result.
+  //   transient failure  → the instance is STILL parked in AWAITING_BRAND_APPROVAL;
+  //                        REVERT PROCESSING → AWAITING_APPROVAL so the brand can
+  //                        click the same link again, and show a retry-friendly page.
   const runtime = new WorkflowRuntime(emailProvider(), agentProvider());
   try {
-    await runtime.handleBrandApproval(updated.instanceId, decision, {
+    await runtime.handleBrandApproval(claimed.instanceId, decision, {
       source: "brand-approval-link",
       worker: "brand-approval-route",
     });
   } catch (err) {
     if (err instanceof StaleInstanceError) {
-      // The instance already moved on (e.g. an opt-out landed first). The decision
-      // is recorded on the row; show the result rather than an error.
+      // The instance already moved on (e.g. an opt-out landed first). The transition
+      // this decision would drive is already realized; finalize the row so the
+      // decision is recorded, then show the result.
       console.warn(
-        `[brandApproval] instance ${updated.instanceId} not in AWAITING_BRAND_APPROVAL on ${decision} — decision recorded, skipping step`,
+        `[brandApproval] instance ${claimed.instanceId} not in AWAITING_BRAND_APPROVAL on ${decision} — recording decision, skipping step`,
       );
-    } else {
-      // A wrong-state error (instance not AWAITING) or other failure. The row is
-      // already decided; surface the result page rather than a stack trace, but log.
-      console.error(`[brandApproval] handleBrandApproval ${decision} error:`, err);
-      // If the instance genuinely wasn't in the gate state, still show the page —
-      // the operator can reconcile via the Manual Queue.
-      const inst = await findInstanceById(updated.instanceId).catch(() => null);
-      if (inst && inst.currentState === "AWAITING_BRAND_APPROVAL") {
-        // A transient failure mid-step and the instance is still parked — surface a
-        // retry-friendly error so the brand can click again.
-        res
-          .status(500)
-          .type("html")
-          .send(renderBrandApprovalInvalidPage());
-        return;
-      }
+      await finalizeBrandApprovalDecision(approvalId, { status: decision });
+      renderResult(res, decision, brandName, creatorName);
+      return;
     }
+    // Any other failure. Re-read the instance: if it is STILL parked in the gate
+    // state, the action did not take — revert the claim so the brand can retry.
+    console.error(`[brandApproval] handleBrandApproval ${decision} error:`, err);
+    const inst = await findInstanceById(claimed.instanceId).catch(() => null);
+    if (!inst || inst.currentState === "AWAITING_BRAND_APPROVAL") {
+      await revertBrandApprovalToAwaiting(approvalId).catch((revertErr) => {
+        console.error(
+          `[brandApproval] failed to revert PROCESSING → AWAITING_APPROVAL for ` +
+            `${approvalId}; a stuck PROCESSING row can be re-driven via the manual ` +
+            `queue resend. ${revertErr instanceof Error ? revertErr.message : String(revertErr)}`,
+        );
+      });
+      res.status(500).type("html").send(renderBrandApprovalRetryPage({ brandName }));
+      return;
+    }
+    // The instance left the gate state by some other path despite the error — the
+    // effect is realized. Finalize and show the result rather than a stack trace.
+    await finalizeBrandApprovalDecision(approvalId, { status: decision });
+    renderResult(res, decision, brandName, creatorName);
+    return;
   }
 
+  // Success — finalize the decision now that the workflow action has completed.
+  await finalizeBrandApprovalDecision(approvalId, { status: decision });
+  renderResult(res, decision, brandName, creatorName);
+}
+
+/** The brand's display name for the page — the persisted brandName, falling back
+ *  to campaignName for rows written before the brandName column existed. */
+function pageBrandName(approval: BrandApproval): string {
+  return approval.brandName ?? approval.campaignName ?? "Your brand";
+}
+
+/** Render the terminal approve/reject result page for a finalized decision. */
+function renderResult(
+  res: Response,
+  decision: "APPROVED" | "REJECTED",
+  brandName: string,
+  creatorName: string,
+): void {
   res
     .type("html")
     .send(

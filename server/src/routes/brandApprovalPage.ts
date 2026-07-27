@@ -23,6 +23,10 @@ function shell(title: string, inner: string): string {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- The raw magic-link token is in the URL query string; never leak it via the
+       Referer header to any linked/loaded resource (PLU-118, Calvin review). This
+       mirrors the Referrer-Policy header the route also sets. -->
+  <meta name="referrer" content="no-referrer" />
   <title>${esc(title)}</title>
   <style>
     :root {
@@ -209,6 +213,21 @@ export function renderBrandApprovalAlreadyActionedPage(input: {
   brandName: string;
   status: string;
 }): string {
+  // PROCESSING means a decision from a concurrent click is in flight (the claim is
+  // held only for the duration of the workflow action). Show a gentle "in progress"
+  // notice rather than a definitive "approved/rejected" the row hasn't reached yet.
+  if (input.status === "PROCESSING") {
+    const inner = `
+    <div class="head">
+      <div class="brand">${esc(input.brandName)}</div>
+      <h1>Working on it</h1>
+    </div>
+    <div class="note">
+      <div class="badge info">…</div>
+      <p class="sub">Your response is being processed. There's nothing more to do here — you can safely close this page.</p>
+    </div>`;
+    return shell("Working On It", inner);
+  }
   const label =
     input.status === "APPROVED"
       ? "already approved"
@@ -240,6 +259,26 @@ export function renderBrandApprovalExpiredPage(input: { brandName: string | null
       Please reach out to your Pluvus contact to approve ${brand}'s creator.</p>
     </div>`;
   return shell("Link Expired", inner);
+}
+
+/**
+ * Retry-friendly page: the brand's click was accepted but the follow-on action
+ * (sending the brief / halting the deal) hit a transient failure, so the decision
+ * was NOT finalized and the claim was reverted to AWAITING_APPROVAL. The SAME link
+ * still works — the brand can simply click again (PLU-118, Calvin review §2).
+ */
+export function renderBrandApprovalRetryPage(input: { brandName: string }): string {
+  const inner = `
+    <div class="head">
+      <div class="brand">${esc(input.brandName)}</div>
+      <h1>Something went wrong</h1>
+    </div>
+    <div class="note">
+      <div class="badge warn">!</div>
+      <p class="sub">We couldn't finish processing your response just now, so nothing has changed yet.<br/>
+      Please click the button in your email again in a moment. If it keeps failing, reach out to your Pluvus contact.</p>
+    </div>`;
+  return shell("Please Try Again", inner);
 }
 
 /** Invalid / not-found link (unknown approval or token mismatch — no detail). */

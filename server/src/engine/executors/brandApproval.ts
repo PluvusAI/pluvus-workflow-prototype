@@ -1,6 +1,8 @@
 import type { JsonObject } from "../../db/schema.js";
 import {
   createBrandApprovalOnce,
+  rotateBrandApprovalToken,
+  findMessageByIdempotencyKey,
   listEventsByInstance,
   listMessagesByInstance,
 } from "../../db/index.js";
@@ -37,9 +39,14 @@ import { resolveBrandRecipient } from "../../notifications/escalation.js";
 // Reject the route halts to MANUAL_REVIEW. Neither the money ledger nor any
 // creator-facing email happens in this executor — it is a pure gate.
 //
-// Idempotency: the BrandApproval insert is UNIQUE on instanceId (a retry reuses
-// the same row + token, so the emailed links stay valid), and the send is keyed by
-// sendOnce. A BullMQ retry re-runs the whole function and changes nothing.
+// Idempotency: the BrandApproval insert is UNIQUE on instanceId, and the send is
+// keyed by sendOnce. A BullMQ retry re-runs the whole function. Token consistency
+// across retries (PLU-118, Calvin review §1) is handled in step 3b: on a retry
+// that finds an existing row whose email never went out, the token is ROTATED to
+// the one we are about to send (hash + expiry together) so the emailed links match
+// the stored hash; on a retry where the email already reserved/sent, the original
+// token stays and the send dedupes. Either way the brand always receives links
+// that validate against the stored hash.
 
 export async function executeBrandApproval(
   ctx: ExecutionContext,
@@ -125,17 +132,18 @@ export async function executeBrandApproval(
     );
   }
 
-  // 3. Mint the token + persist the snapshot. Idempotent: a retry returns the
-  //    existing row WITH its original token hash, so the already-emailed links
-  //    stay valid. We therefore read the raw token from the mint only on a fresh
-  //    insert; on a retry the email was already sent (sendOnce dedupes) so the raw
-  //    token is not needed again.
+  // 3. Mint a candidate token + persist the snapshot. `created` tells us whether
+  //    THIS attempt inserted the row (so the minted token's hash is what we stored)
+  //    or whether a prior attempt's row already existed (so the stored hash is from
+  //    an EARLIER mint — see the token-reconciliation step below, which decides
+  //    whether the freshly minted token is safe to email or must be rotated in).
   const minted = mintBrandApprovalToken();
-  const approval = await createBrandApprovalOnce({
+  const { approval, created } = await createBrandApprovalOnce({
     instanceId: instance.id,
     creatorName: creator.name,
     creatorEmail: creator.email,
     campaignName: campaign?.name ?? null,
+    brandName,
     fixedFee: fixedFee ?? null,
     commissionRate: commissionRate ?? null,
     negotiationFloor: negotiationFloor ?? null,
@@ -152,47 +160,93 @@ export async function executeBrandApproval(
     tokenExpiresAt: minted.expiresAt,
   });
 
+  // 3b. Reconcile the token with the persisted row (PLU-118, Calvin review §1).
+  //     The failure window: a prior attempt INSERTED the row but crashed BEFORE the
+  //     email reserved/sent. On retry `created` is false and `approval` carries the
+  //     PRIOR attempt's token hash — but `minted` is a brand-new raw token whose
+  //     hash does NOT match. Emailing links built from `minted` would be unusable
+  //     (the route hashes the presented token and compares to the stored hash).
+  //
+  //     We resolve it by the send state of the brand-approval message:
+  //       - FRESH insert (created)            → the stored hash IS minted's hash;
+  //                                             email `minted`. (rawToken = minted)
+  //       - retry, NO brand email row yet     → the stored-hash token never went
+  //                                             out; ROTATE the row to `minted`
+  //                                             (hash + expiry together) so the
+  //                                             links we send match. (rawToken = minted)
+  //       - retry, brand email already reserved/sent → the ORIGINAL token is already
+  //                                             in the brand's inbox and matches the
+  //                                             stored hash; do NOT rotate and do NOT
+  //                                             resend a link we can't reproduce.
+  //                                             sendOnce dedupes the send below.
+  const sendKey = `brand-approval:${instance.id}`;
+  let rawToken = minted.rawToken;
+  let approvalRow = approval;
+  if (!created) {
+    const priorSend = await findMessageByIdempotencyKey(sendKey);
+    if (!priorSend) {
+      // Row exists but the email never reserved — rotate to the token we will send.
+      const rotated = await rotateBrandApprovalToken(approval.id, {
+        approveTokenHash: minted.tokenHash,
+        tokenExpiresAt: minted.expiresAt,
+      });
+      if (rotated) {
+        approvalRow = rotated;
+        rawToken = minted.rawToken;
+      } else {
+        // Rotation matched nothing → the row is no longer AWAITING_APPROVAL (already
+        // decided/PROCESSING). Nothing to (re)send; fall through to park.
+        rawToken = "";
+      }
+    } else {
+      // The original token is already emailed and matches the stored hash. We can't
+      // reproduce it here (only its hash persisted), so we MUST NOT build fresh
+      // links — sendOnce will dedupe the send. Signal "no fresh token" with "".
+      rawToken = "";
+    }
+  }
+
   // 4. Email the BRAND. Recipient is the campaign.notifyEmail → BRAND_NOTIFY_EMAIL
   //    → operator fallback chain (resolveBrandRecipient). The brand is an explicit
   //    recipient (unlike creator-facing sends); if none resolves we still park in
-  //    AWAITING_BRAND_APPROVAL — the row is visible and the notice can be re-sent.
+  //    AWAITING_BRAND_APPROVAL — the row is visible and the notice can be re-sent
+  //    via the manual-queue resend action (POST …/brand-approval/resend), which
+  //    rotates the token and sends. We only build + send fresh links when we hold a
+  //    token that matches the stored hash (rawToken !== ""); on an already-sent
+  //    retry rawToken is "" and sendOnce would dedupe anyway, so we skip the send.
   const recipient = resolveBrandRecipient(campaign?.notifyEmail);
-  const draft = renderBrandApprovalEmail({
-    brandName,
-    creatorName: creator.name,
-    creatorHandle: creator.handle,
-    creatorPlatform: creator.platform,
-    campaignName: campaign?.name ?? null,
-    fixedFee: fixedFee ?? null,
-    commissionRate: commissionRate ?? null,
-    negotiationFloor: negotiationFloor ?? null,
-    negotiationCeiling: negotiationCeiling ?? null,
-    deliverables: deliverables ?? null,
-    timeline: timeline ?? null,
-    paymentTerms: paymentTerms ?? null,
-    rewardDescription: rewardDescription ?? null,
-    // The links carry the FRESH raw token on a first send. On an idempotent retry
-    // sendOnce skips the send entirely (the row is reserved), so re-deriving links
-    // from a new mint here is harmless — they never go out.
-    approveLink: brandApproveLink(approval.id, minted.rawToken),
-    rejectLink: brandRejectLink(approval.id, minted.rawToken),
-  });
-
-  if (recipient) {
+  if (recipient && rawToken) {
+    const draft = renderBrandApprovalEmail({
+      brandName,
+      creatorName: creator.name,
+      creatorHandle: creator.handle,
+      creatorPlatform: creator.platform,
+      campaignName: campaign?.name ?? null,
+      fixedFee: fixedFee ?? null,
+      commissionRate: commissionRate ?? null,
+      negotiationFloor: negotiationFloor ?? null,
+      negotiationCeiling: negotiationCeiling ?? null,
+      deliverables: deliverables ?? null,
+      timeline: timeline ?? null,
+      paymentTerms: paymentTerms ?? null,
+      rewardDescription: rewardDescription ?? null,
+      approveLink: brandApproveLink(approvalRow.id, rawToken),
+      rejectLink: brandRejectLink(approvalRow.id, rawToken),
+    });
     await sendOnce(
       email,
       instance.id,
       creator,
       draft,
-      `brand-approval:${instance.id}`,
+      sendKey,
       undefined, // deps — default
       { email: recipient, name: brandName },
       campaign?.name, // Gmail Campaign Labels (§6.3)
     );
-  } else {
+  } else if (!recipient) {
     console.error(
       `[brandApproval] no brand recipient for ${instance.id} — parked in ` +
-        `AWAITING_BRAND_APPROVAL without a sent request (re-send via the queue).`,
+        `AWAITING_BRAND_APPROVAL without a sent request (re-send via the manual queue).`,
     );
   }
 
@@ -204,7 +258,7 @@ export async function executeBrandApproval(
     nextNodeId: node.id,
     eventType: "BRAND_APPROVAL_REQUESTED",
     eventPayload: {
-      approvalId: approval.id,
+      approvalId: approvalRow.id,
       ...(fixedFee !== undefined ? { fixedFee } : {}),
       ...(commissionRate !== undefined ? { commissionRate } : {}),
       recipient: recipient ?? null,

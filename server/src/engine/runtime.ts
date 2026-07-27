@@ -901,8 +901,11 @@ export class WorkflowRuntime {
   // -------------------------------------------------------------------------
   // The brand clicked Approve or Reject on the magic-link email while the instance
   // is parked in AWAITING_BRAND_APPROVAL (brand-approval gate). Driven by the
-  // /brand-approval route AFTER it has recorded the decision on the BrandApproval
-  // row (markBrandApprovalDecided).
+  // /brand-approval route AFTER it has CLAIMED the decision on the BrandApproval row
+  // (claimBrandApprovalForProcessing: AWAITING_APPROVAL → PROCESSING). The route
+  // finalizes the row (→ APPROVED/REJECTED) only when THIS method returns; if it
+  // throws a transient failure the route reverts the claim so the brand can retry
+  // (PLU-118, Calvin review §2).
   //
   //   APPROVED → step the node. Dispatch sees AWAITING_BRAND_APPROVAL on the
   //              CONTENT_BRIEF node and runs executeContentBrief's SEND phase (the
@@ -913,10 +916,10 @@ export class WorkflowRuntime {
   //              would send the content brief). The standard post-commit brand
   //              escalation notice then fires so a human picks it up.
   //
-  // Idempotency: the route only calls this after markBrandApprovalDecided matched a
-  // still-AWAITING row (so a double-click no-ops at the row level and never reaches
-  // here twice). The APPROVED path additionally rides stepInstance's version-guarded
-  // OCC; the REJECTED path uses the same OCC helper, so a racing call is a no-op.
+  // Idempotency: the route only calls this after the claim matched a still-AWAITING
+  // row (so a double-click no-ops at the row level and never reaches here twice).
+  // The APPROVED path additionally rides stepInstance's version-guarded OCC; the
+  // REJECTED path uses the same OCC helper, so a racing call is a no-op.
 
   async handleBrandApproval(
     instanceId: string,
@@ -940,18 +943,25 @@ export class WorkflowRuntime {
     if (decision === "APPROVED") {
       // Step the node — dispatch sees AWAITING_BRAND_APPROVAL on CONTENT_BRIEF and
       // runs the merged SEND phase (→ PAYMENT_PENDING), reusing the standard OCC +
-      // event-writing path. Record the BRAND_APPROVED audit event first.
+      // event-writing path. Record the BRAND_APPROVED audit event ONLY after the
+      // step succeeds: if the step throws (transient failure), the route reverts the
+      // approval to AWAITING_APPROVAL for a retry (PLU-118, Calvin review §2), so a
+      // BRAND_APPROVED event appended up-front would falsely claim an approval that
+      // did not take. stepInstance is OCC-guarded, so its own transition is atomic;
+      // appending the audit event after it is the correct order. A later successful
+      // retry re-runs this path and appends the event then.
+      const ctx = await this.stepInstance(instanceId, {
+        source: opts.source ?? "brand-approval-link",
+        worker: opts.worker,
+        queueJobId: opts.queueJobId,
+      });
       await appendEvent({
         instanceId,
         type: "BRAND_APPROVED",
         nodeId: instance.currentNodeId ?? null,
         payload: { source: opts.source ?? "brand-approval-link" },
       });
-      return this.stepInstance(instanceId, {
-        source: opts.source ?? "brand-approval-link",
-        worker: opts.worker,
-        queueJobId: opts.queueJobId,
-      });
+      return ctx;
     }
 
     // REJECTED — direct, version-guarded OCC transition to MANUAL_REVIEW. We do NOT
