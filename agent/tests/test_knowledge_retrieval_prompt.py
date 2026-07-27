@@ -147,14 +147,44 @@ def test_negotiate_block_on_single_topic(monkeypatch):
     assert block.startswith("---")  # same ---wrapped slot the brief block used
 
 
-def test_negotiate_block_on_no_match_is_empty(monkeypatch):
+def test_negotiate_block_on_no_match_falls_back_to_full_context(monkeypatch):
+    """Calvin follow-up §3.2 (replaces test_negotiate_block_on_no_match_is_empty).
+    On no_match the negotiate side must degrade to the SAME broader context /draft
+    falls back to — the flat knowledge facts — NOT a stripped "" prompt."""
     monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
     req = _neg_req(
         creatorReply="Sounds great, looking forward to it!",
         campaignContext=dict(FLAT_CTX),
     )
-    # no_match → no knowledge block on the decision prompt this turn.
-    assert neg._negotiate_knowledge_block(req) == ""
+    block = neg._negotiate_knowledge_block(req)
+    # Not stripped: the flat knowledge facts are present (parity with /draft's flat
+    # _knowledge_block fallback).
+    assert block != ""
+    assert "Net-30 after content goes live." in block
+    assert block.startswith("---")
+
+
+def test_negotiate_no_match_matches_draft_full_context(monkeypatch):
+    """§3.2 parity: on a non-knowledge (no_match) turn, the negotiate full-context
+    fallback carries the same flat knowledge facts the draft fallback would."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    ctx = dict(FLAT_CTX)
+    neg_req = _neg_req(creatorReply="Sounds great!", campaignContext=ctx)
+    draft_req = _draft_req(creatorReply="Sounds great!")
+    # Draft side: no_match → None → caller renders the flat _knowledge_block.
+    assert (
+        neg._selected_knowledge_block(
+            draft_req.creatorReply, neg._router_fields_from_draft(draft_req, ctx), ctx, "draft"
+        )
+        is None
+    )
+    draft_flat = neg._knowledge_block(draft_req, ctx)
+    neg_block = neg._negotiate_knowledge_block(neg_req)
+    # Every flat fact the draft path would render is present in the negotiate
+    # fallback too.
+    for _key, label in neg._KNOWLEDGE_LABELS:
+        if label in draft_flat:
+            assert ctx[_key] in neg_block
 
 
 def test_draft_block_on_no_match_falls_back(monkeypatch):
@@ -224,3 +254,154 @@ def test_on_open_obligation_widens_the_block(monkeypatch):
     )
     assert block is not None
     assert "5 business days" in block
+
+
+# ---------------------------------------------------------------------------
+# Concern #1 (W1): the four flat knowledge fields reach the negotiate router via
+# campaignContext, so /negotiate answers a configured term instead of deferring —
+# and resolves the SAME value /draft does (parity).
+# ---------------------------------------------------------------------------
+
+
+def test_negotiate_router_reads_flat_fields_from_campaign_context(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    # A usage-rights question on /negotiate, with the four flat fields on
+    # campaignContext (as the executor now threads them, W1).
+    req = _neg_req(
+        creatorReply="How long can the brand use my content?",
+        campaignContext=dict(FLAT_CTX),
+    )
+    block = neg._negotiate_knowledge_block(req)
+    # The configured VALUE is stated — NOT a "we'll confirm" defer.
+    assert "30-day reshare on paid + organic." in block
+    low = block.lower()
+    assert "we'll confirm" not in low and "follow up" not in low
+
+
+def test_negotiate_draft_resolve_same_usage_value(monkeypatch):
+    """§2.4 parity: the same campaign config produces the same resolved usage-rights
+    value on /negotiate and /draft."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    ctx = dict(FLAT_CTX)
+    q = "How long can the brand use my content?"
+    neg_req = _neg_req(creatorReply=q, campaignContext=ctx)
+    draft_req = _draft_req(creatorReply=q)
+    neg_block = neg._negotiate_knowledge_block(neg_req)
+    draft_block = neg._selected_knowledge_block(
+        draft_req.creatorReply, neg._router_fields_from_draft(draft_req, ctx), ctx, "draft"
+    )
+    assert draft_block is not None
+    val = FLAT_CTX["usageRights"]
+    assert val in neg_block and val in draft_block
+
+
+# ---------------------------------------------------------------------------
+# Concern #2 (W3/W4): strengthened patterns + confidence-driven fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_when_will_funds_hit_selects_payment(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _draft_req(creatorReply="When will the funds hit?")
+    ctx = dict(FLAT_CTX)
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    assert "Net-30 after content goes live." in block
+
+
+def test_bare_address_is_low_confidence_falls_back(monkeypatch):
+    """§3.3/§3.5: a contract-address question ("what's your address for the
+    contract?") must NOT produce a narrow shipping-only block — the bare `address`
+    match is low confidence → the caller degrades to the full-context fallback."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _draft_req(creatorReply="what's your address for the contract?")
+    ctx = {"briefSections": {"shipping": "We ship within 5 business days."}}
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    # low confidence → None → caller renders the full flat context, not a
+    # shipping-only block.
+    assert block is None
+
+
+def test_ship_my_sample_to_this_address_is_shipping_match(monkeypatch):
+    """§3.5: a genuine shipping ask WITH a co-signal is a confident shipping match."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _draft_req(creatorReply="where do I send my address so you can ship the sample?")
+    ctx = {"briefSections": {"shipping": "We ship within 5 business days."}}
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    assert block is not None
+    assert "5 business days" in block
+
+
+# ---------------------------------------------------------------------------
+# Concern #3 (W5): flat-brief fallback — a matched-but-unavailable section while a
+# briefKnowledge blob is present must NOT emit a false defer; it falls back to the
+# full context (which carries the blob).
+# ---------------------------------------------------------------------------
+
+
+def test_flat_brief_fallback_when_matched_but_unavailable(monkeypatch):
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    # Retrieval ON, structured parsing OFF (no briefSections), no flat usageRights
+    # field — but the answer sits in the flat briefKnowledge blob.
+    req = _draft_req(creatorReply="How long can you use my content?")
+    ctx = {"briefKnowledge": "USAGE RIGHTS: the brand may reshare for 45 days."}
+    block = neg._selected_knowledge_block(
+        req.creatorReply, neg._router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    # None → caller renders the full context (which includes the blob) rather than a
+    # bare "we'll confirm" defer that suppresses the real answer.
+    assert block is None
+
+
+def test_no_false_defer_when_flat_brief_has_answer_negotiate(monkeypatch):
+    """§4.2 on the negotiate side: matched-but-unavailable + briefKnowledge present →
+    the negotiate block carries the flat brief blob, never a stripped/defer prompt."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    req = _neg_req(
+        creatorReply="How long can you use my content?",
+        campaignContext={"briefKnowledge": "USAGE RIGHTS: reshare for 45 days."},
+    )
+    block = neg._negotiate_knowledge_block(req)
+    assert "<campaign_brief>" in block  # the blob framing is present
+    assert "reshare for 45 days" in block
+
+
+# ---------------------------------------------------------------------------
+# W6: flag-dependency warning (diagnostics only).
+# ---------------------------------------------------------------------------
+
+
+def test_warn_flag_dependency_when_parsing_off(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    monkeypatch.delenv("STRUCTURED_BRIEF_PARSING_ENABLED", raising=False)
+    with caplog.at_level(logging.WARNING, logger="agent.negotiate"):
+        neg.warn_knowledge_flag_dependency()
+    assert any("STRUCTURED_BRIEF_PARSING_ENABLED" in r.message for r in caplog.records)
+
+
+def test_no_warn_when_both_on(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    monkeypatch.setenv("STRUCTURED_BRIEF_PARSING_ENABLED", "true")
+    with caplog.at_level(logging.WARNING, logger="agent.negotiate"):
+        neg.warn_knowledge_flag_dependency()
+    assert not any("STRUCTURED_BRIEF_PARSING_ENABLED" in r.message for r in caplog.records)
+
+
+def test_no_warn_when_retrieval_off(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.delenv("KNOWLEDGE_RETRIEVAL_ENABLED", raising=False)
+    monkeypatch.delenv("STRUCTURED_BRIEF_PARSING_ENABLED", raising=False)
+    with caplog.at_level(logging.WARNING, logger="agent.negotiate"):
+        neg.warn_knowledge_flag_dependency()
+    assert not any("STRUCTURED_BRIEF_PARSING_ENABLED" in r.message for r in caplog.records)

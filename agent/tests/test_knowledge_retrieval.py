@@ -352,3 +352,83 @@ def test_section_never_duplicated_when_message_and_obligation_agree():
     src = next(s for s in result.sources if s.section == "paymentTerms")
     assert src.rule == "obligation_category"
     assert src.trigger == "obligation:p"
+
+
+# ---------------------------------------------------------------------------
+# Calvin follow-up §3.4 — strengthened payment / shipping patterns
+# ---------------------------------------------------------------------------
+
+
+def test_when_will_the_funds_hit_selects_payment():
+    result = select_knowledge_sections(
+        "When will the funds hit?", [], _avail(**FULL_FIELDS)
+    )
+    assert result.outcome == "matched"
+    assert _sel_keys(result) == ["paymentTerms"]
+    assert result.confidence == "high"
+
+
+def test_money_synonyms_select_payment():
+    for msg in (
+        "when does the money land in my account?",
+        "how does the deposit work?",
+        "when do you remit payment?",
+        "when will it settle?",
+    ):
+        result = select_knowledge_sections(msg, [], _avail(**FULL_FIELDS))
+        assert "paymentTerms" in _sel_keys(result), msg
+
+
+# ---------------------------------------------------------------------------
+# Calvin follow-up §3.3 — confidence: bare `address` is low, corroborated is high
+# ---------------------------------------------------------------------------
+
+
+def test_bare_address_is_low_confidence_shipping():
+    # A contract/legal address ask with NO shipping co-signal → shipping section
+    # but LOW confidence (the caller degrades to full-context fallback).
+    result = select_knowledge_sections(
+        "what's your address for the contract?", [], _avail(**FULL_FIELDS)
+    )
+    assert result.outcome == "matched"
+    assert _sel_keys(result) == ["shipping"]
+    assert result.confidence == "low"
+
+
+def test_address_with_ship_cosignal_is_high_confidence():
+    result = select_knowledge_sections(
+        "where do I send my address so you can ship the sample?",
+        [],
+        _avail(**FULL_FIELDS),
+    )
+    assert result.outcome == "matched"
+    assert "shipping" in _sel_keys(result)
+    assert result.confidence == "high"
+
+
+def test_can_you_use_my_address_on_file_not_shipping_only():
+    # A usage/logistics aside — usage-rights (from "use my") should be the confident
+    # match; the bare `address` is a low-confidence shipping trigger that does NOT
+    # make the whole selection a narrow shipping-only block.
+    result = select_knowledge_sections(
+        "can you use my address on file", [], _avail(**FULL_FIELDS)
+    )
+    keys = set(_sel_keys(result))
+    assert "usageRights" in keys
+    # usageRights is a non-greedy match → the whole selection is high confidence.
+    assert result.confidence == "high"
+
+
+def test_specific_payment_question_is_high_confidence():
+    result = select_knowledge_sections(
+        "when do I get paid?", [], _avail(**FULL_FIELDS)
+    )
+    assert result.confidence == "high"
+
+
+def test_broad_question_is_high_confidence():
+    result = select_knowledge_sections(
+        "can you walk me through the terms?", [], _avail(**FULL_FIELDS)
+    )
+    assert result.outcome == "broad"
+    assert result.confidence == "high"

@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 from dotenv import load_dotenv
 # Load from repo root (.env sits one level above agent/)
@@ -8,10 +9,21 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.routes.classify import router as classify_router
 from app.routes.negotiate import router as negotiate_router
+from app.routes.negotiate import warn_knowledge_flag_dependency
 from app.routes.outreach_template import router as outreach_template_router
 from app.security import require_api_key
 
-app = FastAPI(title="Pluvus Agent Service", version="0.3.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # PLU-114 Calvin follow-up W6: surface a retrieval-on / brief-parsing-off
+    # misconfiguration at startup (diagnostics only; the flat-brief fallback still
+    # keeps retrieval safe).
+    warn_knowledge_flag_dependency()
+    yield
+
+
+app = FastAPI(title="Pluvus Agent Service", version="0.3.0", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,

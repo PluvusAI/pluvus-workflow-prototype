@@ -63,6 +63,34 @@ function projectBriefSections(
   return Object.keys(out).length ? out : undefined;
 }
 
+// PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
+// fields (usageRights / exclusivity / paymentTerms / attributionWindow) live on
+// `config` and reach /draft (via draftConfig = {...config}) but were NEVER placed
+// on the negotiate campaignContext — so the negotiate router resolved a configured
+// term to requested_but_unavailable and steered the model to defer a KNOWN answer,
+// an asymmetry with /draft. Project them (trimmed, non-empty only) so they can be
+// spread onto the negotiate knowledgeContext the same additive way as briefSections.
+// These are REFERENCE DATA only — campaignContext is documented "NEVER a money
+// input"; adding four string fields does not change that (guards + fee path
+// untouched). Exported for the request-shape unit test.
+export const FLAT_KNOWLEDGE_KEYS = [
+  "usageRights",
+  "exclusivity",
+  "paymentTerms",
+  "attributionWindow",
+] as const;
+
+export function projectFlatKnowledge(
+  config: Record<string, unknown>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of FLAT_KNOWLEDGE_KEYS) {
+    const v = config[key];
+    if (typeof v === "string" && v.trim()) out[key] = v.trim();
+  }
+  return out;
+}
+
 // FIX-11 + Randomized Send Delay (§4.1, §4.3a): outbound AI replies use the
 // reserve-before-send helper, keyed on negotiation:<purpose>:<instance>:<round>,
 // so a crash between email.send() and the row write cannot double-send a turn on
@@ -624,7 +652,27 @@ export async function executeNegotiation(
   //     when this turn's message is silent on it (invariant #5).
   const briefSections = projectBriefSections(resolvedBrief.sections);
   const structuredObligations = buildStructuredObligations(openObligationRows);
+
+  // PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
+  // fields must reach the negotiate router too. Today they only feed conflict
+  // detection above (resolveBriefKnowledge :590-594) and reach /draft (via
+  // draftConfig = {...config}) but are NEVER placed on the negotiate campaignContext
+  // — so the negotiate router resolves a *configured* term to
+  // requested_but_unavailable and steers the model to defer a known answer, an
+  // asymmetry with /draft. Resolve them from `config` the same way /draft does and
+  // spread them onto knowledgeContext as additive string keys. Inert with the agent
+  // flag OFF (the selected-knowledge block never renders), and threaded
+  // independently of BRIEF_INTO_NEGOTIATE (the router resolves from the flat FIELDS,
+  // not the brief blob, so it must see them regardless of that sub-flag).
+  //
+  // Guardrail: these are REFERENCE DATA only. campaignContext is documented as
+  // "NEVER a money input" (providers.ts) — adding four string fields does not change
+  // that; the guards and fee path are untouched. Kept on campaignContext (alongside
+  // the other knowledge keys), NOT campaignConstraints (which feeds band/decision).
+  const flatKnowledge = projectFlatKnowledge(config);
+
   const knowledgeContext: Record<string, unknown> = {
+    ...flatKnowledge,
     ...(negotiateBrief ? { briefKnowledge: negotiateBrief } : {}),
     ...(briefSections ? { briefSections } : {}),
     ...(structuredObligations.length ? { structuredObligations } : {}),

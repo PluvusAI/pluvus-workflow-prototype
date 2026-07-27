@@ -89,6 +89,12 @@ class _SectionRule:
     topic: str
     test: re.Pattern[str]
     sections: tuple[SectionKey, ...]
+    # Calvin follow-up §3.3: a rule that fires on a GREEDY / over-broad signal
+    # (e.g. a bare `address`, which is as likely to mean a contract address as a
+    # shipping one). Such a match is `low` confidence UNLESS a corroborating
+    # high-confidence rule also fired this turn — low confidence triggers the
+    # caller's full-context fallback rather than a narrow (possibly wrong) block.
+    greedy: bool = False
 
 
 SECTION_MAP: tuple[_SectionRule, ...] = (
@@ -104,7 +110,24 @@ SECTION_MAP: tuple[_SectionRule, ...] = (
     ),
     _SectionRule(
         "payment_question",
-        re.compile(r"paid|payment|net[- ]?\d|invoic|payout|when.*(get|do).*pay", re.I),
+        # Calvin follow-up §3.4: broaden beyond "pay/payment/net/invoice/payout" to
+        # the money-arrival synonyms creators actually use — "when will the funds
+        # hit?", "when does the money land / clear / settle", "deposit", "remit".
+        # Without these, "When will the funds hit?" fell through to no_match.
+        #   - `fund(s)?|money|deposit|remit` are money NOUNS that fire on their own.
+        #   - the arrival-VERB branch (hit/land/clear/settle) is scoped to a money
+        #     noun in the same clause so it does NOT steal a shipping "when does the
+        #     product arrive" (arrive is deliberately excluded — it is a shipping
+        #     verb; "funds hit" is caught by the noun `fund` anyway).
+        # Kept deterministic; no value is ever produced from the match.
+        re.compile(
+            r"paid|payment|net[- ]?\d|invoic|payout"
+            r"|\bfunds?\b|\bmoney\b|deposit|remit|settle"
+            r"|when.*(get|do).*pay"
+            r"|(fund|money|payment|cash|invoice|deposit).*(hit|land|clear)"
+            r"|(hit|land|clear).*(fund|money|payment|cash|invoice|account|bank)",
+            re.I,
+        ),
         ("paymentTerms",),
     ),
     _SectionRule(
@@ -131,12 +154,34 @@ SECTION_MAP: tuple[_SectionRule, ...] = (
     ),
     _SectionRule(
         "shipping_question",
-        # `deliver(y)?` as a bare stem matched "deliverables" too; anchor it to
-        # shipping senses (delivery/delivered, not "deliverables"). "address" is
-        # kept broad — a creator asking for "the address" in negotiation means the
-        # shipping address.
-        re.compile(r"ship|shipping|\baddress\b|\bdeliver(y|ed|ing)?\b|tracking|send.*(product|sample)|when.*arrive", re.I),
+        # Calvin follow-up §3.4: the STRONG shipping signals — an explicit ship /
+        # shipping / tracking mention, a shipping-sense deliver(y) (not
+        # "deliverables"), sending a product/sample, "when will it arrive", or
+        # `address` WITH a shipping co-signal (ship/send/product/sample/deliver/
+        # tracking). `deliver(y)?` as a bare stem also matched "deliverables"; it's
+        # anchored to the shipping senses (delivery/delivered/delivering). This rule
+        # is HIGH confidence.
+        re.compile(
+            r"ship|shipping|tracking|\bdeliver(y|ed|ing)?\b"
+            r"|send.*(product|sample)|when.*arrive"
+            r"|\baddress\b.*(ship|send|product|sample|deliver|tracking)"
+            r"|(ship|send|product|sample|deliver|tracking).*\baddress\b",
+            re.I,
+        ),
         ("shipping",),
+    ),
+    _SectionRule(
+        "shipping_address_bare",
+        # Calvin follow-up §3.3: a BARE `address` with no shipping co-signal. In
+        # negotiation this is as likely a contract/legal address as a shipping one
+        # ("what's your address for the contract?"), so it is GREEDY → `low`
+        # confidence. On its own it degrades to the caller's full-context fallback
+        # rather than emitting a narrow (possibly wrong) shipping-only block; it is
+        # only kept as a shipping match when the high-confidence shipping rule above
+        # ALSO fires this turn.
+        re.compile(r"\baddress\b", re.I),
+        ("shipping",),
+        True,  # greedy
     ),
     _SectionRule(
         "attribution_question",
@@ -244,6 +289,15 @@ class SelectedSection:
 
 Outcome = Literal["matched", "broad", "no_match"]
 
+# Calvin follow-up §3.3: coarse confidence in the SELECTION (not in any value).
+#   "high" — a specific topic matched, a broad question fired, or an obligation
+#            drove the pull → the caller trusts the selected sections.
+#   "low"  — the ONLY thing that fired was a greedy/over-broad rule (bare
+#            `address`) with no corroborating high-confidence match → the caller
+#            degrades to the full-context fallback rather than a narrow block.
+# no_match carries no confidence (it is its own outcome).
+Confidence = Literal["high", "low"]
+
 
 @dataclass(frozen=True)
 class KnowledgeSelection:
@@ -257,6 +311,11 @@ class KnowledgeSelection:
     unavailable: tuple[SectionKey, ...] = ()
     # Sections dropped by the §4.8 cap — logged, never silent-truncated (invariant #7).
     dropped: tuple[SectionKey, ...] = ()
+    # Calvin follow-up §3.3: "high" on a matched/broad selection the caller trusts;
+    # "low" when only a greedy rule fired (→ full-context fallback). Always "high"
+    # for `broad` and for obligation-driven pulls; "low" only when the sole trigger
+    # was a greedy rule. Defaults "high" so existing constructors are unaffected.
+    confidence: Confidence = "high"
 
 
 # ---------------------------------------------------------------------------
@@ -276,16 +335,20 @@ class _Candidate:
     # True when first selected from an obligation — obligation-sourced sections win
     # the cap (we OWE those answers) and their provenance is preferred (§4.8).
     from_obligation: bool
+    # Calvin follow-up §3.3: True when this candidate was selected ONLY via a greedy
+    # rule (bare `address`). Cleared the moment a non-greedy selection touches the
+    # same section — a corroborated match is high confidence.
+    greedy_only: bool = False
 
 
-def _match_message(text: str) -> list[tuple[SectionKey, str]]:
-    """Run every SECTION_MAP entry against `text`; return (section, topic) for each
-    firing entry. Broad-question widening is handled by the caller."""
-    hits: list[tuple[SectionKey, str]] = []
+def _match_message(text: str) -> list[tuple[SectionKey, str, bool]]:
+    """Run every SECTION_MAP entry against `text`; return (section, topic, greedy) for
+    each firing entry. Broad-question widening is handled by the caller."""
+    hits: list[tuple[SectionKey, str, bool]] = []
     for rule in SECTION_MAP:
         if rule.test.search(text):
             for section in rule.sections:
-                hits.append((section, rule.topic))
+                hits.append((section, rule.topic, rule.greedy))
     return hits
 
 
@@ -334,21 +397,43 @@ def select_knowledge_sections(
     # section key → candidate, dedup keeping the highest-priority provenance.
     candidates: dict[SectionKey, _Candidate] = {}
 
-    def add(section: SectionKey, rule: str, trigger: str, from_obligation: bool) -> None:
+    def add(
+        section: SectionKey,
+        rule: str,
+        trigger: str,
+        from_obligation: bool,
+        greedy: bool = False,
+    ) -> None:
         existing = candidates.get(section)
         if existing is None:
-            candidates[section] = _Candidate(section, rule, trigger, from_obligation)
+            candidates[section] = _Candidate(
+                section, rule, trigger, from_obligation, greedy_only=greedy
+            )
             return
+        # Calvin follow-up §3.3: any NON-greedy selection touching this section
+        # corroborates it → clear greedy_only regardless of which side wins the
+        # provenance contest below (a section is greedy_only iff EVERY selection of
+        # it was greedy).
+        if not greedy:
+            existing.greedy_only = False
         # An obligation-sourced selection outranks a message-sourced one for the
         # cap and for provenance (we owe the obligation answer). Otherwise keep the
         # first (message, in SECTION_MAP order).
         if from_obligation and not existing.from_obligation:
-            candidates[section] = _Candidate(section, rule, trigger, from_obligation)
+            candidates[section] = _Candidate(
+                section,
+                rule,
+                trigger,
+                from_obligation,
+                # Preserve corroboration: the merged candidate is greedy_only only
+                # if BOTH the incoming and the prior selection were greedy.
+                greedy_only=greedy and existing.greedy_only,
+            )
 
     # (1) Message-derived sections.
     message_hits = _match_message(norm_message)
-    for section, topic in message_hits:
-        add(section, topic, "message", from_obligation=False)
+    for section, topic, greedy in message_hits:
+        add(section, topic, "message", from_obligation=False, greedy=greedy)
 
     # (2) Broad-question widening (§4.5). Fires only when a broad ask is present and
     # no *specific* section already dominates — a specific "when do I get paid?"
@@ -361,7 +446,8 @@ def select_knowledge_sections(
 
     # (3) Obligation-derived sections (invariant #5). Non-terminal obligations only
     # (the caller feeds OPEN/DEFERRED/ESCALATED). Category → sections when mapped;
-    # else route the obligation's own text through SECTION_MAP.
+    # else route the obligation's own text through SECTION_MAP. Obligation pulls are
+    # never greedy_only — we OWE that answer, so the selection is high confidence.
     for ob in open_obligations:
         trigger = f"obligation:{ob.id}" if ob.id else "obligation"
         cat = (ob.category or "").strip()
@@ -371,7 +457,7 @@ def select_knowledge_sections(
                 add(section, "obligation_category", trigger, from_obligation=True)
         else:
             norm_ob = normalize_untrusted_text(ob.original_text or "")
-            for section, topic in _match_message(norm_ob):
+            for section, topic, _greedy in _match_message(norm_ob):
                 add(section, topic, trigger, from_obligation=True)
 
     # No message topic AND no obligation section → explicit no_match (invariant #3).
@@ -404,12 +490,21 @@ def select_knowledge_sections(
         )
 
     outcome: Outcome = "broad" if outcome_is_broad else "matched"
+    # Calvin follow-up §3.3: the selection is `low` confidence only when EVERY kept
+    # candidate fired solely on a greedy rule (bare `address`) — i.e. nothing
+    # corroborated it. A broad question is high confidence by construction, and any
+    # non-greedy or obligation-sourced candidate makes the whole selection high. The
+    # caller degrades a `low` selection to the full-context fallback (§3.2).
+    confidence: Confidence = "high"
+    if not outcome_is_broad and kept and all(c.greedy_only for c in kept):
+        confidence = "low"
     return KnowledgeSelection(
         outcome=outcome,
         sections=tuple(selected),
         sources=tuple(sources),
         unavailable=tuple(unavailable),
         dropped=dropped,
+        confidence=confidence,
     )
 
 
