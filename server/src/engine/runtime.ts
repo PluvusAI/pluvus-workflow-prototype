@@ -969,14 +969,6 @@ export class WorkflowRuntime {
     // the brief we are precisely trying to withhold). The BRAND_REJECTED +
     // STATE_TRANSITION events commit atomically with the state write.
 
-    // Reserve the courteous creator close email BEFORE the OCC commit (so a
-    // rolled-back reject never emails). The delayed flush is enqueued AFTER the
-    // commit below — same reserve-then-flush discipline as the max-rounds
-    // auto-close. Best-effort + idempotent (keyed per instance): it never throws
-    // and a double-click / retry can't double-email, so it can't block the reject.
-    const rejectCtx = await this.loadContext(instanceId);
-    const closeSend = await reserveBrandRejectCloseEmail(rejectCtx, this.email);
-
     const now = new Date();
     const updated = await db.transaction(async (tx) => {
       const row = await updateInstanceStateConditional(
@@ -1032,10 +1024,21 @@ export class WorkflowRuntime {
       nodeId: instance.currentNodeId ?? null,
     });
 
-    // Enqueue the delayed flush of the reserved creator close email, strictly AFTER
-    // the OCC transaction committed. Best-effort: a Redis blip must not undo the
-    // committed reject — the poller safety-net sweep reclaims a reservation whose
-    // enqueue was lost. (Mirrors the deferredSend flush in stepInstance.)
+    // Reserve + flush the courteous creator close email — STRICTLY AFTER the OCC
+    // reject committed (PLU-118, Calvin review §2). Reserving BEFORE the commit was
+    // the bug: reserveOutbound writes the Message row on its own auto-commit, so a
+    // reject whose OCC then rolled back (StaleInstanceError) left a committed
+    // reserved row the poller safety-net could later flush — emailing the creator a
+    // rejection that never happened. The reservation is outside the OCC tx (a
+    // Message insert can't share the state-write tx handle here), so the only way to
+    // guarantee "no committed reject ⇒ no reserved email" is to reserve after we
+    // KNOW the reject committed. The close email's body depends only on
+    // creator/campaign/node config — not the instance state — so loading context now
+    // (instance already in MANUAL_REVIEW) yields identical copy. Idempotent (keyed
+    // per instance) + best-effort: it never throws, and a double-click / retry can't
+    // double-email, so it can't undo the committed reject.
+    const rejectCtx = await this.loadContext(instanceId);
+    const closeSend = await reserveBrandRejectCloseEmail(rejectCtx, this.email);
     if (closeSend) {
       try {
         await this.enqueueDelayedSendFn({ messageId: closeSend.messageId }, closeSend.delayMs);

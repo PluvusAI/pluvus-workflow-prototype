@@ -1,6 +1,7 @@
 import {
   findBrandApprovalByInstance,
   rotateBrandApprovalToken,
+  revertBrandApprovalToAwaiting,
   findInstanceById,
   findVersionById,
 } from "../../db/index.js";
@@ -80,7 +81,21 @@ export async function resendBrandApprovalRequest(
 
   const row = await findBrandApprovalByInstance(instanceId);
   if (!row) return { ok: false, reason: "no_approval_row" };
-  if (row.status !== "AWAITING_APPROVAL") return { ok: false, reason: "not_awaiting" };
+
+  // Stale-claim recovery (PLU-118, Calvin review §1): a row stranded in PROCESSING
+  // by a route that crashed between claim and finalize/revert can be reclaimed HERE
+  // — the operator's manual exit, complementing the poller stale-claim sweep. We
+  // already confirmed the instance is still parked in AWAITING_BRAND_APPROVAL above,
+  // which proves the decision never took effect, so reverting PROCESSING →
+  // AWAITING_APPROVAL is safe (it can't re-open a decided deal). Predicate-guarded,
+  // so a racing finalize/revert that resolved it first yields null → treat as
+  // no-longer-awaiting rather than resend against a decided row.
+  if (row.status === "PROCESSING") {
+    const reverted = await revertBrandApprovalToAwaiting(row.id);
+    if (!reverted) return { ok: false, reason: "not_awaiting" };
+  } else if (row.status !== "AWAITING_APPROVAL") {
+    return { ok: false, reason: "not_awaiting" };
+  }
 
   const campaign = await resolveCampaign(instance.workflowVersionId);
   const recipient = resolveBrandRecipient(campaign?.notifyEmail ?? null);

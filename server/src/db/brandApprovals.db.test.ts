@@ -29,6 +29,7 @@ import {
   claimBrandApprovalForProcessing,
   finalizeBrandApprovalDecision,
   revertBrandApprovalToAwaiting,
+  listStaleProcessingApprovals,
   findBrandApprovalById,
 } from "./brandApprovals.js";
 
@@ -258,6 +259,39 @@ async function main(): Promise<void> {
     await finalizeBrandApprovalDecision(approval.id, { status: "REJECTED" }, pgdb);
     const revertDecided = await revertBrandApprovalToAwaiting(approval.id, pgdb);
     assert.equal(revertDecided, null, "cannot revert a finalized (non-PROCESSING) row");
+  });
+
+  await test("listStaleProcessingApprovals returns ONLY PROCESSING rows older than the cutoff (§1)", async () => {
+    // A freshly-claimed PROCESSING row. updatedAt was stamped ~now by the claim.
+    const staleInst = await seedInstance(pgdb);
+    const { approval: staleRow } = await createBrandApprovalOnce(snapshot(staleInst), pgdb);
+    await claimBrandApprovalForProcessing(staleRow.id, {}, pgdb);
+
+    // A second PROCESSING row we then FINALIZE — it must never be listed (decided).
+    const decidedInst = await seedInstance(pgdb);
+    const { approval: decidedRow } = await createBrandApprovalOnce(snapshot(decidedInst), pgdb);
+    await claimBrandApprovalForProcessing(decidedRow.id, {}, pgdb);
+    await finalizeBrandApprovalDecision(decidedRow.id, { status: "APPROVED" }, pgdb);
+
+    // A third row left AWAITING_APPROVAL (never claimed) — must never be listed.
+    const awaitingInst = await seedInstance(pgdb);
+    const { approval: awaitingRow } = await createBrandApprovalOnce(snapshot(awaitingInst), pgdb);
+
+    // Cutoff in the FUTURE so the just-claimed row counts as "older than" it.
+    const future = new Date(Date.now() + 60_000);
+    const stale = await listStaleProcessingApprovals({ olderThan: future }, pgdb);
+    const ids = stale.map((r) => r.id);
+    assert.ok(ids.includes(staleRow.id), "the stale PROCESSING row is listed");
+    assert.ok(!ids.includes(decidedRow.id), "a finalized (APPROVED) row is NOT listed");
+    assert.ok(!ids.includes(awaitingRow.id), "an AWAITING_APPROVAL row is NOT listed");
+
+    // A cutoff in the PAST (before the claim) lists nothing — the grace window holds.
+    const past = new Date(Date.now() - 60_000);
+    const none = await listStaleProcessingApprovals({ olderThan: past }, pgdb);
+    assert.ok(
+      !none.some((r) => r.id === staleRow.id),
+      "a claim younger than the cutoff is left alone (grace window)",
+    );
   });
 
   console.log(`\n  brandApprovals.db: ${n} assertions passed.\n`);

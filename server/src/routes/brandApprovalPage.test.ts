@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 import {
   renderBrandApprovalInterstitialPage,
   renderBrandApprovalAlreadyActionedPage,
+  renderBrandApprovalHandledElsewherePage,
   renderBrandApprovalRetryPage,
   renderBrandApprovedPage,
 } from "./brandApprovalPage.js";
@@ -102,6 +103,17 @@ test("already-actioned page shows the decision for a finalized row", () => {
   assert.match(approved, /already approved/i);
   const rejected = renderBrandApprovalAlreadyActionedPage({ brandName: "Stridr", status: "REJECTED" });
   assert.match(rejected, /already rejected/i);
+});
+
+test("handled-elsewhere page is neutral — never claims approved OR rejected (§3)", () => {
+  const html = renderBrandApprovalHandledElsewherePage({ brandName: "Stridr" });
+  assert.match(html, /class="brand">Stridr</, "shows the brand name");
+  assert.match(html, /moved forward|no action|nothing to do/i, "neutral 'handled' notice");
+  assert.doesNotMatch(
+    html,
+    /approved|rejected|awaiting/i,
+    "must NOT fabricate a decision or leak the reverted AWAITING status",
+  );
 });
 
 console.log(`\n${n} passed\n`);

@@ -246,6 +246,26 @@ export function renderBrandApprovalAlreadyActionedPage(input: {
   return shell("Already Handled", inner);
 }
 
+/**
+ * Neutral "handled elsewhere" notice (PLU-118, Calvin review §3). Shown when the
+ * brand's click raced another actor (a creator opt-out, or the OTHER decision) that
+ * moved the deal to a state THIS decision did not produce — so we do NOT record
+ * this decision. Deliberately says neither "approved" nor "rejected": the deal's
+ * true outcome lives on the instance and is surfaced to the operator.
+ */
+export function renderBrandApprovalHandledElsewherePage(input: { brandName: string }): string {
+  const inner = `
+    <div class="head">
+      <div class="brand">${esc(input.brandName)}</div>
+      <h1>Nothing to do</h1>
+    </div>
+    <div class="note">
+      <div class="badge info">✓</div>
+      <p class="sub">This deal has already moved forward through another update, so no action is needed here. Our team has the latest status — you can safely close this page.</p>
+    </div>`;
+  return shell("Already Handled", inner);
+}
+
 /** Friendly expired-link page. */
 export function renderBrandApprovalExpiredPage(input: { brandName: string | null }): string {
   const brand = input.brandName ? esc(input.brandName) : "your account";

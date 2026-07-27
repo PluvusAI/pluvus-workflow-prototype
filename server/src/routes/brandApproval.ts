@@ -6,6 +6,7 @@ import {
   finalizeBrandApprovalDecision,
   revertBrandApprovalToAwaiting,
   findInstanceById,
+  listEventsByInstance,
 } from "../db/index.js";
 import type { BrandApproval } from "../db/schema.js";
 import { WorkflowRuntime, StaleInstanceError } from "../engine/runtime.js";
@@ -19,6 +20,7 @@ import {
   renderBrandApprovedPage,
   renderBrandRejectedPage,
   renderBrandApprovalAlreadyActionedPage,
+  renderBrandApprovalHandledElsewherePage,
   renderBrandApprovalExpiredPage,
   renderBrandApprovalInvalidPage,
   renderBrandApprovalRetryPage,
@@ -228,8 +230,14 @@ async function handleDecisionPost(
   // handleBrandApproval requires AWAITING_BRAND_APPROVAL; a race that already
   // advanced it surfaces as StaleInstanceError. We distinguish three outcomes:
   //   success            → finalize PROCESSING → APPROVED/REJECTED, show result.
-  //   already-advanced   → the effect is already realized by another actor; finalize
-  //                        (record the brand's decision) and show the result.
+  //   already-realized   → the instance left the gate AND reached the state THIS
+  //                        decision produces (verified — not merely "moved"); a
+  //                        concurrent retry of the SAME decision already did the
+  //                        work. Finalize and show the result.
+  //   diverged           → the instance left the gate to some OTHER state (a racing
+  //                        opt-out, or the OTHER decision won). Recording THIS
+  //                        decision would lie. Revert the claim (un-strand the row)
+  //                        and show a safe already-actioned notice — never finalize.
   //   transient failure  → the instance is STILL parked in AWAITING_BRAND_APPROVAL;
   //                        REVERT PROCESSING → AWAITING_APPROVAL so the brand can
   //                        click the same link again, and show a retry-friendly page.
@@ -241,14 +249,11 @@ async function handleDecisionPost(
     });
   } catch (err) {
     if (err instanceof StaleInstanceError) {
-      // The instance already moved on (e.g. an opt-out landed first). The transition
-      // this decision would drive is already realized; finalize the row so the
-      // decision is recorded, then show the result.
-      console.warn(
-        `[brandApproval] instance ${claimed.instanceId} not in AWAITING_BRAND_APPROVAL on ${decision} — recording decision, skipping step`,
-      );
-      await finalizeBrandApprovalDecision(approvalId, { status: decision });
-      renderResult(res, decision, brandName, creatorName);
+      // The instance already left AWAITING_BRAND_APPROVAL. Leaving the gate does NOT
+      // prove THIS decision succeeded — a concurrent opt-out or the OTHER decision
+      // could have moved it (PLU-118, Calvin review §3). Verify the instance reached
+      // the state THIS decision produces before recording it.
+      await finalizeIfDecisionRealized(res, approvalId, claimed.instanceId, decision, brandName, creatorName);
       return;
     }
     // Any other failure. Re-read the instance: if it is STILL parked in the gate
@@ -256,26 +261,121 @@ async function handleDecisionPost(
     console.error(`[brandApproval] handleBrandApproval ${decision} error:`, err);
     const inst = await findInstanceById(claimed.instanceId).catch(() => null);
     if (!inst || inst.currentState === "AWAITING_BRAND_APPROVAL") {
-      await revertBrandApprovalToAwaiting(approvalId).catch((revertErr) => {
-        console.error(
-          `[brandApproval] failed to revert PROCESSING → AWAITING_APPROVAL for ` +
-            `${approvalId}; a stuck PROCESSING row can be re-driven via the manual ` +
-            `queue resend. ${revertErr instanceof Error ? revertErr.message : String(revertErr)}`,
-        );
-      });
+      await revertClaim(approvalId);
       res.status(500).type("html").send(renderBrandApprovalRetryPage({ brandName }));
       return;
     }
-    // The instance left the gate state by some other path despite the error — the
-    // effect is realized. Finalize and show the result rather than a stack trace.
-    await finalizeBrandApprovalDecision(approvalId, { status: decision });
-    renderResult(res, decision, brandName, creatorName);
+    // The instance left the gate state by some other path despite the error. Same
+    // rule as the StaleInstanceError branch: only finalize if the instance reached
+    // the state THIS decision produces — otherwise a diverging transition would get
+    // the wrong decision recorded (PLU-118, Calvin review §3).
+    await finalizeIfDecisionRealized(res, approvalId, claimed.instanceId, decision, brandName, creatorName);
     return;
   }
 
   // Success — finalize the decision now that the workflow action has completed.
   await finalizeBrandApprovalDecision(approvalId, { status: decision });
   renderResult(res, decision, brandName, creatorName);
+}
+
+/**
+ * The instance has LEFT AWAITING_BRAND_APPROVAL but this request's own
+ * handleBrandApproval call did not complete (it raced another actor). Record THIS
+ * decision ONLY if the instance actually reached the state this decision produces
+ * (PLU-118, Calvin review §3): leaving the gate is necessary but NOT sufficient —
+ * a racing opt-out (→ OPTED_OUT / MANUAL_REVIEW without BRAND_REJECTED) or the
+ * OTHER decision winning the claim would otherwise cause the WRONG decision to be
+ * recorded. If the realized state doesn't match, we do NOT finalize this decision;
+ * we revert the PROCESSING claim (so the row is never stranded) and show a safe
+ * already-actioned notice reflecting where the instance truly landed.
+ */
+async function finalizeIfDecisionRealized(
+  res: Response,
+  approvalId: string,
+  instanceId: string,
+  decision: "APPROVED" | "REJECTED",
+  brandName: string,
+  creatorName: string,
+): Promise<void> {
+  const realized = await decisionEffectRealized(instanceId, decision).catch((err) => {
+    // A verification read failed. Fail SAFE: do not record an unverified decision.
+    console.error(
+      `[brandApproval] decision-verification read failed for ${instanceId} (${decision}):`,
+      err instanceof Error ? err.message : err,
+    );
+    return false;
+  });
+
+  if (realized) {
+    console.warn(
+      `[brandApproval] instance ${instanceId} already reached the ${decision} outcome ` +
+        `by a concurrent actor — recording the decision, skipping the step`,
+    );
+    await finalizeBrandApprovalDecision(approvalId, { status: decision });
+    renderResult(res, decision, brandName, creatorName);
+    return;
+  }
+
+  // The instance diverged (a different decision or an opt-out won). Recording THIS
+  // decision would misrepresent what happened. Un-strand the claim and surface a
+  // safe, neutral "handled elsewhere" notice — NOT a fabricated approved/rejected
+  // result, and NOT the reverted row's AWAITING_APPROVAL status (which would read
+  // as a nonsensical "already awaiting_approval"). The deal's true state lives on
+  // the instance and is surfaced to the operator via the Manual Queue.
+  console.warn(
+    `[brandApproval] instance ${instanceId} left AWAITING_BRAND_APPROVAL WITHOUT the ${decision} ` +
+      `outcome — NOT recording ${decision}; reverting the claim and showing a neutral notice`,
+  );
+  await revertClaim(approvalId);
+  res.type("html").send(renderBrandApprovalHandledElsewherePage({ brandName }));
+}
+
+/**
+ * Verify the instance reached the state THIS decision produces, using BOTH the
+ * current state AND a corroborating audit event so a same-target-state divergence
+ * can't masquerade as success:
+ *   APPROVED → PAYMENT_PENDING (the content brief was sent) with a BRAND_APPROVED event.
+ *   REJECTED → MANUAL_REVIEW with a BRAND_REJECTED event. The event matters: an
+ *              opt-out also lands in MANUAL_REVIEW but writes NO BRAND_REJECTED, so
+ *              the state alone would false-positive.
+ */
+async function decisionEffectRealized(
+  instanceId: string,
+  decision: "APPROVED" | "REJECTED",
+): Promise<boolean> {
+  const inst = await findInstanceById(instanceId);
+  if (!inst) return false;
+  const expected = expectedOutcomeFor(decision);
+  if (inst.currentState !== expected.state) return false;
+  const events = await listEventsByInstance(instanceId, { type: expected.event });
+  return events.length > 0;
+}
+
+/**
+ * The state + corroborating audit event a completed brand decision produces. Pure
+ * (no I/O) so the decision-verification rule (PLU-118, Calvin review §3) can be
+ * unit-tested directly. Kept in one place so the route and its tests can't drift.
+ */
+export function expectedOutcomeFor(
+  decision: "APPROVED" | "REJECTED",
+): { state: "PAYMENT_PENDING" | "MANUAL_REVIEW"; event: "BRAND_APPROVED" | "BRAND_REJECTED" } {
+  return decision === "APPROVED"
+    ? { state: "PAYMENT_PENDING", event: "BRAND_APPROVED" }
+    : { state: "MANUAL_REVIEW", event: "BRAND_REJECTED" };
+}
+
+/** Revert a PROCESSING claim to AWAITING_APPROVAL, logging (never throwing) on
+ *  failure. A stuck PROCESSING row is separately recovered by the operator resend
+ *  and the poller stale-claim sweep (PLU-118 §1). */
+async function revertClaim(approvalId: string): Promise<void> {
+  await revertBrandApprovalToAwaiting(approvalId).catch((revertErr) => {
+    console.error(
+      `[brandApproval] failed to revert PROCESSING → AWAITING_APPROVAL for ` +
+        `${approvalId}; a stuck PROCESSING row is recovered by the manual-queue ` +
+        `resend or the poller stale-claim sweep. ` +
+        `${revertErr instanceof Error ? revertErr.message : String(revertErr)}`,
+    );
+  });
 }
 
 /** The brand's display name for the page — the persisted brandName, falling back

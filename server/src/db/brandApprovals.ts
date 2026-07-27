@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq, lt } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
 import { isUniqueViolation } from "./errors.js";
 import {
@@ -181,6 +181,34 @@ export async function finalizeBrandApprovalDecision(
     )
     .returning();
   return rows[0] ?? null;
+}
+
+/**
+ * List PROCESSING rows whose claim has been held longer than `olderThan` — the
+ * stale-claim recovery input (PLU-118, Calvin review §1). A PROCESSING row is a
+ * short-lived claim held ONLY across handleBrandApproval; a row still PROCESSING
+ * well past that means the route crashed between claim and finalize/revert and the
+ * decision is stranded (the resend refuses PROCESSING). The poller sweep re-reads
+ * each candidate's instance and reverts ONLY those still parked in
+ * AWAITING_BRAND_APPROVAL (proving the decision never took effect) via
+ * revertBrandApprovalToAwaiting. `updatedAt` is the claim timestamp (stamped on the
+ * AWAITING → PROCESSING update). Oldest-first so the most-stranded recover first.
+ */
+export async function listStaleProcessingApprovals(
+  args: { olderThan: Date; limit?: number },
+  client: Db | DbTx = db,
+): Promise<BrandApproval[]> {
+  const q = client
+    .select()
+    .from(brandApprovals)
+    .where(
+      and(
+        eq(brandApprovals.status, "PROCESSING"),
+        lt(brandApprovals.updatedAt, args.olderThan),
+      ),
+    )
+    .orderBy(asc(brandApprovals.updatedAt));
+  return args.limit ? q.limit(args.limit) : q;
 }
 
 /**
