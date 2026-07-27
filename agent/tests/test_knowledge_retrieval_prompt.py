@@ -296,6 +296,65 @@ def test_negotiate_draft_resolve_same_usage_value(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# §4.2 flat-brief safety net on /negotiate: the blob must reach the router
+# whenever retrieval is on (not only when BRIEF_INTO_NEGOTIATE is on), so a
+# matched-but-unavailable section falls back to the blob instead of a false defer.
+# ---------------------------------------------------------------------------
+
+
+def test_negotiate_retrieval_on_brief_into_negotiate_off_answer_only_in_blob(monkeypatch):
+    """PLU-114 §4.2: retrieval ON, structured parse OFF, BRIEF_INTO_NEGOTIATE off
+    (simulated by the FIXED server behavior — the blob is threaded because retrieval is
+    on). A usage question whose answer lives ONLY in the flat brief blob (usageRights
+    omitted from the flat fields, no briefSections) must fall back to the blob, NOT emit
+    a false 'we'll confirm and follow up' defer."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    # usageRights DELIBERATELY omitted so the matched usageRights section resolves to
+    # requested_but_unavailable; the answer lives only in the flat brief blob (which the
+    # fixed server now threads onto campaignContext when retrieval is on).
+    ctx = {
+        "exclusivity": "No category exclusivity.",
+        "paymentTerms": "Net-30 after content goes live.",
+        "attributionWindow": "30-day attribution window.",
+        "briefKnowledge": "Usage rights: 90-day paid usage across all channels.",
+    }
+    req = _neg_req(
+        creatorReply="How long can the brand use my content?",
+        campaignContext=ctx,
+    )
+    block = neg._negotiate_knowledge_block(req)
+    # §4.2 safety net fired → full-context fallback → the flat brief blob is rendered.
+    assert "<campaign_brief>" in block
+    assert "90-day paid usage across all channels" in block
+    # And NO per-section false-defer line. The distinctive marker of the honest-defer
+    # instruction (_render_selected_knowledge) is "we do NOT have a configured value";
+    # the fallback's positive framing ("do NOT defer... the answer is known") is the
+    # opposite and must not be mistaken for it, so match on the defer-specific phrase.
+    low = block.lower()
+    assert "we do not have a configured value" not in low
+    assert "do not invent one" not in low
+
+
+def test_negotiate_confident_match_still_drops_the_blob(monkeypatch):
+    """Invariant (ii): even with the blob now on ctx (retrieval on), a CONFIDENT match
+    on an AVAILABLE flat field renders only the selected section — never the 4000-char
+    blob. Guards against a blob-leak regression; the negotiate analogue of the /draft
+    `test_draft_block_on_drops_the_whole_brief_blob`."""
+    monkeypatch.setenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true")
+    ctx = dict(FLAT_CTX)
+    ctx["briefKnowledge"] = "The brand may use content for 90 days across all channels."
+    req = _neg_req(
+        creatorReply="How long can the brand use my content?",
+        campaignContext=ctx,
+    )
+    block = neg._negotiate_knowledge_block(req)
+    # The confident usage-rights match states the flat field value...
+    assert FLAT_CTX["usageRights"] in block
+    # ...and the whole brief blob is NOT folded in.
+    assert "<campaign_brief>" not in block
+
+
+# ---------------------------------------------------------------------------
 # Concern #2 (W3/W4): strengthened patterns + confidence-driven fallback.
 # ---------------------------------------------------------------------------
 

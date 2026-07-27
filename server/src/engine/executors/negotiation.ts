@@ -42,6 +42,16 @@ function briefIntoNegotiateEnabled(): boolean {
   return process.env["BRIEF_INTO_NEGOTIATE"] === "true";
 }
 
+// PLU-114 §4.2: the agent's flat-brief safety net (_has_flat_brief) reads
+// ctx["briefKnowledge"] to avoid a false defer when a matched section is
+// unavailable but the answer may sit in the blob. That net fires only when the
+// blob is threaded — so it must reach /negotiate whenever RETRIEVAL is on, not
+// just when the separate BRIEF_INTO_NEGOTIATE sub-flag is on. Byte-identical when
+// retrieval is OFF (blob still not threaded → invariant #9).
+function knowledgeRetrievalEnabled(): boolean {
+  return process.env["KNOWLEDGE_RETRIEVAL_ENABLED"] === "true";
+}
+
 // PLU-114 (§4.9): project ResolvedBrief.sections ({key: CampaignBriefSection}) to
 // the {key: text} map the agent's AvailableSections.brief consumes. Returns
 // undefined when there are no sections (no brief / structured parse off / parse
@@ -624,14 +634,23 @@ export async function executeNegotiation(
   const briefKnowledge = resolvedBrief.flatText;
 
   // §4.9 / §4.10: thread the brief into the DECISION model as source-of-truth for
-  // knowledge answers — but ONLY when BRIEF_INTO_NEGOTIATE is on (de-risks the
-  // two-step rollout independently, §6). The agent applies the §4.10 knowledge-turn
-  // cost gate itself (it renders the block only on knowledge questions), so here we
-  // just make the brief text AVAILABLE to it via campaignContext. Off/absent →
-  // /negotiate prompt byte-identical to today (invariant #9). The brief is
-  // reference DATA on this endpoint too — NEVER a money input (the guards are
-  // unchanged; a brief number can't move the fee).
-  const negotiateBrief = briefIntoNegotiateEnabled() && briefKnowledge ? briefKnowledge : undefined;
+  // knowledge answers. Made available when EITHER the BRIEF_INTO_NEGOTIATE sub-flag
+  // is on (the PLU-107 whole-blob interim, de-risked independently §6) OR retrieval
+  // is on (PLU-114). The retrieval case is why: the agent's §4.2 flat-brief safety
+  // net (_has_flat_brief) reads ctx["briefKnowledge"] to fall back to the blob
+  // instead of emitting a false defer when a matched section is unavailable — so the
+  // blob must reach the router regardless of that separate sub-flag, exactly as the
+  // flat FIELDS / briefSections / obligations below already do. The agent still
+  // applies the §4.10 knowledge-turn cost gate (renders the block only on knowledge
+  // questions) AND, with retrieval on, only surfaces the blob on the FALLBACK path
+  // (a confident match renders selected sections, never the blob). Both flags off →
+  // /negotiate prompt byte-identical to today (invariant #9). The brief is reference
+  // DATA on this endpoint too — NEVER a money input (guards unchanged; a brief
+  // number can't move the fee).
+  const negotiateBrief =
+    (briefIntoNegotiateEnabled() || knowledgeRetrievalEnabled()) && briefKnowledge
+      ? briefKnowledge
+      : undefined;
 
   // PLU-114 (§4.9 / §5, REVIEW #1+#2): the two structured INPUTS the agent-side
   // knowledge router needs but which do NOT reach it today — the parsed brief
