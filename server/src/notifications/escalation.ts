@@ -89,6 +89,13 @@ const REASON_LABELS: Record<string, string> = {
   // content. An objective statement of fact — no judgment implied; a human opens
   // the links and reviews. (No payout/ledger action is triggered automatically.)
   content_links_submitted: "the creator submitted content links for review",
+  // PLU-82 §4.5: the campaign brief and the campaign's own term disagree on a
+  // field the creator asked about, so the AI cannot answer without picking between
+  // two conflicting sources — a human adjudicates. NB: keep this key in sync with
+  // the identical one in routes/manualQueue.ts REASON_LABELS (no shared constant —
+  // §8-h).
+  material_knowledge_conflict:
+    "the campaign brief and the campaign settings disagree on a term the creator asked about, so a human needs to confirm which is correct",
 };
 
 // PLU-70: the reason codes the operator-handoff branch notifies under. Kept

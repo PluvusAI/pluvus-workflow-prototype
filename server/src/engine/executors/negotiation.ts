@@ -17,7 +17,12 @@ import {
   computeChangedFields,
   computeRelationshipWarmth,
 } from "./negotiationHistory.js";
-import { resolveBriefKnowledge, type ResolvedBrief } from "./briefKnowledge.js";
+import {
+  resolveBriefKnowledge,
+  deriveBriefAvailability,
+  type ResolvedBrief,
+  type BriefFieldConflict,
+} from "./briefKnowledge.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { randomSendDelayMs } from "../sendDelay.js";
@@ -50,6 +55,17 @@ function briefIntoNegotiateEnabled(): boolean {
 // retrieval is OFF (blob still not threaded → invariant #9).
 function knowledgeRetrievalEnabled(): boolean {
   return process.env["KNOWLEDGE_RETRIEVAL_ENABLED"] === "true";
+}
+
+// PLU-82 §4.5 / §6: gates ONLY the material-conflict escalation DECISION (not the
+// detection or observability surfacing, which ship unconditionally). Default OFF
+// → today's behavior (console.warn + the observability record), byte-identical on
+// every real deal. Orthogonal to the two brief-into-prompt flags above; has a
+// HIDDEN dependency on the agent's STRUCTURED_BRIEF_PARSING_ENABLED (no structured
+// sections → resolvedBrief.conflicts is always empty → this path is inert
+// regardless of its own flag, invariant #9 / §8-f).
+function materialConflictEscalationEnabled(): boolean {
+  return process.env["MATERIAL_CONFLICT_ESCALATION_ENABLED"] === "true";
 }
 
 // PLU-114 (§4.9): project ResolvedBrief.sections ({key: CampaignBriefSection}) to
@@ -471,6 +487,116 @@ function detectObligationCategory(question: string): string | undefined {
   return undefined;
 }
 
+// PLU-82 §4.5: the four authoritative conflict fields, mapped to the obligation
+// CATEGORY detectObligationCategory emits for a creator question about that field.
+// A creator asking about `paymentTerms` produces a `payment`-category question /
+// obligation; usageRights/exclusivity produce `usage_rights`. attributionWindow
+// has no keyword pattern (detectObligationCategory can't emit it), so a conflict on
+// it never matches a creator question here — conservative by design (§8; a
+// false-negative reverts to today's silence, a false-positive dumps a deal to
+// MANUAL_REVIEW, so we bias hard toward the former).
+const CONFLICT_FIELD_TO_CATEGORY: Record<string, string | undefined> = {
+  usageRights: "usage_rights",
+  exclusivity: "usage_rights",
+  paymentTerms: "payment",
+  attributionWindow: undefined,
+};
+
+/**
+ * PLU-82 §4.5 / invariant #7 — the gate that stops false-positive escalation. A
+ * brief-vs-Campaign conflict exists on EVERY turn from round 0, independent of the
+ * creator; escalating on conflict-existence alone would dump the deal to
+ * MANUAL_REVIEW on "yes I'm interested". So a conflict escalates ONLY when it would
+ * produce an unsupported AUTOMATED ANSWER — i.e. the creator asked about that exact
+ * field this turn, or has a non-terminal open obligation on it.
+ *
+ * Returns the list of conflict fields that are BOTH material (∈ the four conflict
+ * keys) AND asked-about; an empty list means NO escalation (the common case).
+ * Pure — the caller adds the flag + `outcome !== "escalate"` guards.
+ *
+ * The `outcome !== "escalate"` clause is applied by the CALLER (defer to the topic
+ * gate's reason, never race it — invariant #8).
+ */
+export function conflictAffectsCreatorCommitment(
+  conflicts: ReadonlyArray<{ campaignField: string }>,
+  creatorQuestions: string[] | undefined,
+  pushedFixedTerms: string[] | undefined,
+  openObligations: ReadonlyArray<Pick<ConversationObligation, "category">>,
+): string[] {
+  if (!conflicts.length) return [];
+
+  // The categories the creator surfaced THIS turn (from their questions + pushed
+  // terms), plus the categories of any non-terminal open obligation (a field asked
+  // about in an earlier round but silent this turn still counts — §8-g). All rows
+  // from listOpenObligationsByInstance are already non-terminal, so their presence
+  // is sufficient (no status re-check needed).
+  const surfacedCategories = new Set<string>();
+  for (const q of [...(creatorQuestions ?? []), ...(pushedFixedTerms ?? [])]) {
+    const cat = detectObligationCategory(q);
+    if (cat) surfacedCategories.add(cat);
+  }
+  for (const o of openObligations) {
+    if (o.category) surfacedCategories.add(o.category);
+  }
+
+  const matched: string[] = [];
+  const seen = new Set<string>();
+  for (const c of conflicts) {
+    const field = c.campaignField;
+    // (a) the field must be one of the four creator-commitment conflict keys.
+    const category = CONFLICT_FIELD_TO_CATEGORY[field];
+    if (!(field in CONFLICT_FIELD_TO_CATEGORY)) continue;
+    // (b) the creator asked about that field's category this turn OR has an open
+    //     obligation in it. attributionWindow (category undefined) can never match.
+    if (category && surfacedCategories.has(category) && !seen.has(field)) {
+      seen.add(field);
+      matched.push(field);
+    }
+  }
+  return matched;
+}
+
+/**
+ * PLU-82 §4.5 — route a turn to MANUAL_REVIEW because a MATERIAL brief-vs-Campaign
+ * conflict on a field the creator asked about would otherwise let the AI give an
+ * unsupported automated answer. Mirrors escalateOverCeiling's NodeResult shape so
+ * the existing MANUAL_REVIEW machinery (Manual Queue + brand FYI keyed on
+ * eventPayload.reason) picks it up with no runtime change. Exported for the
+ * escalation-routing test.
+ *
+ * The section VALUES ride the payload (persisted, operator-only via the
+ * /observability gate) so the inspector can show both disagreeing sources; they
+ * are NEVER logged to stdout (the caller keeps the keys/reason-only console.warn).
+ */
+export function escalateMaterialConflict(args: {
+  round: number;
+  message: string;
+  /** The material fields in conflict AND asked-about (from the gate). */
+  conflictFields: string[];
+  /** The full conflict rows for the observability record (values shown only in
+   *  the operator-gated inspector). */
+  conflicts: ReadonlyArray<BriefFieldConflict>;
+}): NodeResult {
+  const { round, message, conflictFields, conflicts } = args;
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "NEGOTIATION_TURN",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "material_knowledge_conflict",
+      round,
+      message,
+      conflictFields,
+      // The full conflict rows so the inspector's Knowledge panel shows both
+      // sources. Same masking posture as the observability record (§4.6): values
+      // are in the payload (operator-gated), never in stdout.
+      conflicts: conflicts as unknown as BriefFieldConflict[],
+    },
+  };
+}
+
 export async function executeNegotiation(
   ctx: ExecutionContext,
   email: IEmailProvider,
@@ -745,7 +871,9 @@ export async function executeNegotiation(
 
   // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
   // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the
-  // section VALUES are not logged (keys/pages/reason only).
+  // section VALUES are not logged (keys/pages/reason only) — the operator sees the
+  // values in the inspector's operator-gated Knowledge panel, never in stdout
+  // (§4.6 / §8-j).
   if (resolvedBrief.conflicts && resolvedBrief.conflicts.length) {
     console.warn(
       `[briefKnowledge] material brief-vs-Campaign conflict(s) on instance ${instance.id}: ` +
@@ -754,6 +882,40 @@ export async function executeNegotiation(
           .join("; "),
     );
   }
+
+  // PLU-82 §4.6: the compact KNOWLEDGE observability record folded onto THIS turn's
+  // NEGOTIATION_TURN payload (one per round — a BullMQ retry recomputes the same
+  // record under OCC, so the audit log never bloats, §8-e). Ships UNFLAGGED: it is
+  // pure surfacing (invariant #9 / §6) — the escalation FLAG gates only the routing
+  // decision (§4.5). No new EventType/table (invariant #10); it rides the existing
+  // payload. Byte-identical to a real DEAL — this adds only debug keys.
+  //
+  //   briefAvailability — the four-state result (§4.4). expectedSections = the
+  //     authoritative Campaign knowledge fields the campaign actually declared
+  //     (∩ the conflict keys) so a term the campaign never set never makes the
+  //     brief read PARTIAL forever.
+  //   knowledgeConflicts — the FULL conflict rows (field/reason/page + the
+  //     campaignValue/briefExcerpt) so the operator-gated panel can show both
+  //     disagreeing sources. Values ride the payload (persisted, operator-only via
+  //     the /observability gate) but are NEVER logged to stdout (above).
+  const CONFLICT_KEYS = ["usageRights", "exclusivity", "paymentTerms", "attributionWindow"] as const;
+  const expectedSections = CONFLICT_KEYS.filter(
+    (k) => typeof config[k] === "string" && (config[k] as string).trim(),
+  );
+  const briefAvailability = deriveBriefAvailability(resolvedBrief, expectedSections);
+  const knowledgeConflicts: BriefFieldConflict[] = resolvedBrief.conflicts ?? [];
+  // Fold onto the turn payload only when there is something to report — a fully
+  // available brief with no conflicts adds nothing (keeps the payload minimal and
+  // "byte-identical when nothing to say"). AVAILABLE + no conflicts ⇒ omitted.
+  const knowledgeRecord: Record<string, unknown> =
+    knowledgeConflicts.length || briefAvailability.status !== "AVAILABLE"
+      ? {
+          knowledge: {
+            briefAvailability,
+            ...(knowledgeConflicts.length ? { conflicts: knowledgeConflicts } : {}),
+          },
+        }
+      : {};
 
   // PLU-111: the durable obligation ledger (loaded above) supersedes the event-
   // diff as the source of "what creator questions are still open". FALLBACK
@@ -846,6 +1008,52 @@ export async function executeNegotiation(
     ...(latestInbound?.id ? { sourceMessageId: latestInbound.id } : {}),
     ...(reservedMessageId ? { reservedResolutionMessageId: reservedMessageId } : {}),
   });
+
+  // PLU-82 §4.5 — MATERIAL-CONFLICT ESCALATION (flag-gated, POST-model).
+  //
+  // Placed HERE (after the model, before switch(outcome)) because the gate needs
+  // this turn's creatorQuestions / pushedFixedTerms — a brief-vs-Campaign conflict
+  // exists on every turn from round 0 regardless of the creator, so we can only
+  // escalate the "unsupported automated answer" case once we know what the creator
+  // actually asked (invariant #7, §8-b). All of:
+  //   - the flag is on (default OFF → today's behavior);
+  //   - a conflict was detected (inert unless STRUCTURED_BRIEF_PARSING is on
+  //     agent-side → resolvedBrief.conflicts non-empty, invariant #9);
+  //   - the agent did NOT itself escalate (defer to the topic gate's reason —
+  //     usage_rights_or_licensing / undefined_terms already always-escalate with a
+  //     specific reason BEFORE any conflict logic, invariant #8);
+  //   - the conflict is on a creator-commitment field the creator asked about this
+  //     turn or has an open obligation on (the gate, invariant #7).
+  // On a match → MANUAL_REVIEW with reason material_knowledge_conflict; the open
+  // obligations move to ESCALATED (escalateAfterWrite) so a later silent turn does
+  // not re-escalate on the same stale obligation (no-loop, §8-g). Detection +
+  // observability already ran above (unflagged) — this is only the routing decision.
+  if (materialConflictEscalationEnabled() && outcome !== "escalate") {
+    const matchedFields = conflictAffectsCreatorCommitment(
+      resolvedBrief.conflicts ?? [],
+      creatorQuestions,
+      pushedFixedTerms,
+      openObligationRows,
+    );
+    if (matchedFields.length) {
+      return {
+        ...escalateMaterialConflict({
+          round: instance.negotiationRound,
+          message: creatorReply,
+          conflictFields: matchedFields,
+          conflicts: resolvedBrief.conflicts ?? [],
+        }),
+        // Parity with the escalate case: record this turn's questions AND move every
+        // open obligation to ESCALATED (non-terminal, stays in AI context + visible
+        // to the operator). No send happens → no resolution link. This is also the
+        // no-loop mechanism (§8-g).
+        obligationWrites: {
+          ...buildObligationWrites(undefined),
+          escalateAfterWrite: true,
+        },
+      };
+    }
+  }
 
   switch (outcome) {
     case "present_offer": {
@@ -943,6 +1151,8 @@ export async function executeNegotiation(
           ...(presentConsumesRound
             ? { consumedRound: true, consecutivePresentOffers: trailingPresents + 1 }
             : {}),
+          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
+          ...knowledgeRecord,
         },
       };
     }
@@ -972,6 +1182,8 @@ export async function executeNegotiation(
             round: instance.negotiationRound,
             message,
             ...(proposedRate !== undefined ? { rate: proposedRate } : {}),
+            // PLU-82 §4.6: fold the knowledge observability record onto this turn.
+            ...knowledgeRecord,
           },
         };
       }
@@ -1052,6 +1264,8 @@ export async function executeNegotiation(
           ...(proposedRate !== undefined ? { rate: proposedRate } : {}),
           // §9: drawn delay, *scheduled* not *sent*.
           sendScheduledInMs: accept.sendScheduledInMs,
+          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
+          ...knowledgeRecord,
         },
       };
     }
@@ -1062,7 +1276,13 @@ export async function executeNegotiation(
         nextNodeId: null,
         completedAt: new Date(),
         eventType: "NEGOTIATION_TURN",
-        eventPayload: { outcome, round: instance.negotiationRound, message },
+        eventPayload: {
+          outcome,
+          round: instance.negotiationRound,
+          message,
+          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
+          ...knowledgeRecord,
+        },
       };
     }
 
@@ -1201,6 +1421,8 @@ export async function executeNegotiation(
           // HARD-N2: persist this turn's creator questions for the answered-
           // questions ledger on any subsequent turn.
           ...(creatorQuestions?.length ? { creatorQuestions } : {}),
+          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
+          ...knowledgeRecord,
         },
       };
     }

@@ -1,0 +1,189 @@
+# Campaign Knowledge Precedence & Failure States (PLU-82)
+
+**One documented, deterministic source order per knowledge category — plus a brief
+result that says *why* it's empty, and a material conflict that stops the AI from
+confidently answering a creator with a value two sources disagree on.**
+
+This is the human-readable rendering of `server/src/engine/knowledgePrecedence.ts`
+(`PRECEDENCE_BY_CATEGORY`) and the surrounding failure-state machinery. It is a
+**consolidation/refactor** — the precedence already existed, scattered as inline
+`firstString(config, negotiationConfig, campaign)` chains across three
+post-acceptance executors; PLU-82 unifies it behind one resolver and closes three
+gaps (undocumented precedence, no availability state, swallowed conflicts).
+
+---
+
+## 1. The resolver — `resolveKnowledgeField(category, sources)`
+
+The **LLM never decides between conflicting sources — code does, deterministically,
+by documented order.** The resolver walks a category's ordered slot list, returns
+the **first present value** *and a label naming which source won*, and reuses
+`firstString` / `firstNumber` from `agreedFee.ts` so its emptiness semantics
+(whitespace-only = empty, `NaN` = absent) are byte-identical to the inline chains it
+replaces.
+
+The winning-source label is recorded on the post-acceptance executors' event
+payloads (`resolvedSources: { deliverables: "workflow_config", … }`) and surfaced in
+the observability inspector's **Knowledge** panel — the "selected source in internal
+debug context" requirement.
+
+### Source slots (the canonical ladder)
+
+| Label | Slot | Meaning |
+|---|---|---|
+| `confirmed_agreement` | `confirmedAgreement` | A real confirmed creator agreement (e.g. `resolveAgreedFee` for the fee). |
+| `operator_override` | `operatorOverride` | **PLU-113 seam — no producer on this branch; always `undefined`.** Position fixed + unit-proven so a future feature lights up with no resolver change. |
+| `negotiation_state` | `negotiationState` | The NEGOTIATION node's config. |
+| `workflow_config` | `workflowConfig` | THIS node's published config (`node.config`) — "node config wins". |
+| `campaign_default` | `campaignDefault` | The `campaign.*` column. |
+
+> The brief is **not** a slot. It is a **conflict challenger, never a resolution
+> fallback** (see §3). A brief value can never silently win a resolution.
+
+---
+
+## 2. Precedence BY FIELD CATEGORY
+
+**One universal hierarchy does not fit every field.** There are two families.
+
+### Finalized-terms family
+
+Node config wins over negotiation state wins over campaign — i.e. exactly
+`firstString(config, negotiationConfig, campaign)`.
+
+| Field (category) | Ordered precedence | "Universal ladder doesn't fit" note |
+|---|---|---|
+| **fixedFee** | CA (`resolveAgreedFee`) → *[OO]* → **else escalate** | **Special-cased OUT of the resolver.** Never NS/WC/CD/band — code must never fabricate a fee. Contract-forming callers escalate on absence. |
+| **commissionRate** | OO → **WC → NS** | No CA (commission is a fixed brand term, not per-creator-negotiated). No CD, no brief. |
+| **deliverables** | OO → **WC → NS → CD** | The canonical 3-tier. |
+| **timeline** | OO → **WC → NS → CD** | Same. |
+| **rewardDescription** | OO → **WC → NS → CD** | Same. |
+| **paymentTerms** | OO → **WC → CD** | **NS deliberately SKIPPED** — the preserved inconsistency (see §2.1). |
+
+### General-knowledge family
+
+Campaign field is authoritative for the value; the brief only *disagrees loudly*.
+
+| Field (category) | Ordered precedence | Note |
+|---|---|---|
+| **usageRights** | OO → WC → CD | Brief = conflict challenger, not a fallback tier. Always-escalate topic when the creator *asks* (`topic_gate.py`). |
+| **exclusivity** | OO → WC → CD | Same as usageRights. |
+| **attributionWindow** | OO → WC → CD | Brief = conflict challenger only. |
+
+> **brandName / senderName / brandDescription** resolve through
+> `resolveBrandName` / `mergeCampaignFallback` (a *different, untouched* layer). They
+> are not arbitrated by this resolver.
+
+### 2.1 The `paymentTerms` inconsistency is PRESERVED, not fixed
+
+`operatorHandoff.ts` resolves `paymentTerms` as `config → campaign`, **skipping
+`negotiationConfig`**, while deliverables/timeline include it. `paymentTerms`
+snapshots into `DealHandoff` and renders to the brand, so silently changing its
+source order would change a real deal's stated terms. The mechanical migration keeps
+it byte-identical (WC → CD). Harmonizing it (adding NS) is a **separate, labeled,
+golden-tested** change — out of scope for v1. The golden per-executor tests
+(`finalizedTermsPrecedence.golden.test.ts`) lock this.
+
+---
+
+## 3. Brief availability — the four-state failure result
+
+`deriveBriefAvailability(resolved, expectedSections)` projects the existing
+`ResolvedBrief.status` (PLU-107) + which *expected* sections are present into the
+issue's four-state result. **Missing ≠ failed ≠ absent.**
+
+| `ResolvedBrief.status` | + section presence | `BriefKnowledgeResult.status` |
+|---|---|---|
+| `no_brief` (no ref on the graph) | — | **`NO_BRIEF`** |
+| `parse_failed` (unreadable / agent down) | — | **`PARSE_FAILED`** (error set) |
+| `empty` (parsed, no extractable text — scanned/image PDF) | — | **`PARSE_FAILED`** — present-but-unreadable ≠ absent |
+| `ok` | every *expected* section present | **`AVAILABLE`** |
+| `ok` | ≥1 *expected* section absent | **`PARTIAL`** (lists the missing keys) |
+
+- **`expectedSections` = the campaign's declared fields ∩ the four conflict keys**,
+  NOT all possible keys — otherwise every brief is `PARTIAL` forever.
+- This is a **pure projection** — no parser change, no cache change (`empty` stays
+  cached, `parse_failed` stays uncached — the BUG-E8 fix), and it **gates no prompt
+  in v1**. It is an observability label surfaced in the inspector's Knowledge panel;
+  the agent already owns honest-defer.
+
+---
+
+## 4. Material conflict → MANUAL_REVIEW (flag-gated)
+
+`detectBriefConflicts` (PLU-107) already flags a "Net 60" brief against a "Net 30"
+campaign. PLU-82 **routes** that to MANUAL_REVIEW — but only when it would let the AI
+give an *unsupported automated answer*.
+
+**The gate (`conflictAffectsCreatorCommitment`) requires ALL of:**
+1. the conflicting field is a creator-commitment field (`usageRights` / `exclusivity`
+   / `paymentTerms` / `attributionWindow`);
+2. the creator **asked about that field this turn** (`creatorQuestions` /
+   `pushedFixedTerms`, matched via `detectObligationCategory`) **OR** has a
+   non-terminal open obligation on it;
+3. the agent did **not** already escalate (`outcome !== "escalate"` — defer to the
+   topic gate's reason, never race it).
+
+**Why the gate matters:** a brief-vs-campaign conflict exists on *every* turn from
+round 0, independent of the creator. Escalating on conflict-*existence* alone would
+dump the deal to MANUAL_REVIEW on "yes I'm interested" — a catastrophic
+false-positive rate. This is why the escalation sits **after** `agent.negotiate`.
+
+On a match → MANUAL_REVIEW with reason `material_knowledge_conflict`; the brand FYI
+fires automatically (`eventPayload.reason`), and the open obligations move to
+`ESCALATED` (`escalateAfterWrite`). The escalation is a **terminal** MANUAL_REVIEW,
+so the negotiation executor never runs again — no escalation loop.
+
+> **`attributionWindow`** has no keyword category (`detectObligationCategory` can't
+> emit it), so a conflict on it never matches a creator question — conservative by
+> design (a false-negative reverts to today's silence).
+
+---
+
+## 5. Flags
+
+| Flag | Side | Default | Gates |
+|---|---|---|---|
+| `MATERIAL_CONFLICT_ESCALATION_ENABLED` | server | **OFF** | ONLY the escalation *decision* (§4). Detection + observability ship unconditionally. |
+| `STRUCTURED_BRIEF_PARSING_ENABLED` | agent | OFF | Whether the brief parses to structured `sections` — a **hidden dependency**: no sections → no conflicts → escalation inert regardless of the flag above. |
+| `KNOWLEDGE_RETRIEVAL_ENABLED` / `BRIEF_INTO_NEGOTIATE` | server | OFF | Brief *text into the prompt* — **orthogonal** to the escalation flag. |
+
+### Flag matrix (what fires)
+
+| `STRUCTURED_BRIEF_PARSING_ENABLED` | `MATERIAL_CONFLICT_ESCALATION_ENABLED` | Behavior |
+|---|---|---|
+| OFF | any | no sections → no conflicts → **no escalation**; availability = `NO_BRIEF` / `PARSE_FAILED` (never `PARTIAL`, no sections) |
+| ON | OFF | conflicts detected + **surfaced in observability**; **no escalation** (`console.warn` + Knowledge panel) |
+| ON | ON | conflicts detected + surfaced + **escalate to MANUAL_REVIEW** when the §4 gate fires |
+
+The precedence-resolver migration and the availability projection are **not flagged**
+— they are pure refactors/projections that are byte-identical to today.
+
+**Flags OFF ⇒ byte-identical to today on every prompt and every real deal.**
+
+---
+
+## 6. What this does NOT touch
+
+- No dollar figure moves — `fixedFee` still comes only from `resolveAgreedFee` or
+  escalates; conflict detection *reports* a money disagreement, never changes a fee.
+- No real deal's resolved terms change (byte-identical migration, golden-tested;
+  `paymentTerms` order preserved).
+- `mergeCampaignFallback` + its tests are untouched (a different layer).
+- The brief never becomes a resolution source — conflict challenger only.
+- No migration, no new table, no new `EventType` — the debug record rides the
+  existing event payload.
+
+---
+
+## 7. Where it lives
+
+| Concern | File |
+|---|---|
+| The resolver + `PRECEDENCE_BY_CATEGORY` | `server/src/engine/knowledgePrecedence.ts` |
+| Executor migration (3 call sites) | `operatorHandoff.ts` / `rewardSetup.ts` / `contentBrief.ts` |
+| Brief availability projection | `server/src/engine/executors/briefKnowledge.ts` (`deriveBriefAvailability`) |
+| Conflict gate + escalate helper | `server/src/engine/executors/negotiation.ts` (`conflictAffectsCreatorCommitment`, `escalateMaterialConflict`) |
+| Reason labels (two maps — keep in sync) | `routes/manualQueue.ts` + `notifications/escalation.ts` |
+| Observability DTO / mapper / panel | `observability/dto.ts` (`KnowledgeDTO`), `repository.ts` (`mapKnowledge`), `web/src/components/KnowledgePanel.tsx` |
+| Tests | `knowledgePrecedence.test.ts`, `finalizedTermsPrecedence.golden.test.ts`, `briefKnowledge.availability.test.ts`, `knowledgeMapper.test.ts`, `materialConflictEscalation.test.ts`, `reasonLabelParity.test.ts` |

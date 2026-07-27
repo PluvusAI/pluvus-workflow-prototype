@@ -229,6 +229,43 @@ export interface ConversationObligationDTO {
   resolvedAt: string | null;
 }
 
+// PLU-82 §4.6: the knowledge observability block. Read-only; operator-gated via
+// the /observability requireOperatorKey. Backed entirely by the existing event
+// log (no new EventType/table).
+
+/** One material brief-vs-Campaign conflict (mirrors BriefFieldConflict). The
+ *  campaignValue + briefExcerpt are the two disagreeing sources shown to the
+ *  operator (requirement: expose the conflicting sources). */
+export interface KnowledgeConflictDTO {
+  section: string;
+  campaignField: string;
+  campaignValue: string;
+  briefExcerpt: string;
+  pageStart?: number;
+  reason: string;
+  /** The round this conflict was recorded on (from the NEGOTIATION_TURN payload). */
+  round: number | null;
+}
+
+/** The four-state brief availability (§4.4), as last surfaced on a turn. */
+export interface BriefAvailabilityDTO {
+  status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
+  error: string | null;
+  missingSections: string[];
+  /** The round this availability was recorded on. */
+  round: number | null;
+}
+
+export interface KnowledgeDTO {
+  /** Latest brief availability seen across the instance's turns (null if none). */
+  briefAvailability: BriefAvailabilityDTO | null;
+  /** All material conflicts recorded across turns (deduped by field+reason). */
+  conflicts: KnowledgeConflictDTO[];
+  /** The winning-source label per finalized term, from the post-acceptance
+   *  executor's event payload (deliverables/timeline/paymentTerms/… → label). */
+  resolvedSources: Record<string, string | null>;
+}
+
 export interface InstanceDetailDTO {
   instance: {
     instanceId: string;
@@ -265,6 +302,10 @@ export interface InstanceDetailDTO {
   /** PLU-111: the conversation obligations — open creator questions + Pluvus
    *  commitments (and their resolved history) — for the inspector. */
   obligations: ConversationObligationDTO[];
+  /** PLU-82: the knowledge block — brief availability, material conflicts, and
+   *  the selected finalized-terms sources. Absent (undefined) when nothing has
+   *  been recorded yet, so older instances render an empty panel. */
+  knowledge?: KnowledgeDTO;
 }
 
 // ---------------------------------------------------------------------------
