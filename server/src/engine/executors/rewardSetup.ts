@@ -1,7 +1,8 @@
 import { listEventsByInstance } from "../../db/index.js";
 import type { ExecutionContext, NodeResult } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
-import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
+import { resolveAgreedFee } from "./agreedFee.js";
+import { resolveKnowledgeField, type SourceLabel } from "../knowledgePrecedence.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { sendOnce } from "./idempotentSend.js";
 import { blockedByGuard, blockedByMissingBrand } from "./guardEscalation.js";
@@ -54,29 +55,44 @@ export async function executeRewardSetup(
   // Assemble the finalized terms from persisted negotiation history + config.
   const events = await listEventsByInstance(instance.id, { type: "NEGOTIATION_TURN" });
   const agreedFee = resolveAgreedFee(events, negotiationConfig, config);
-  const commissionRate = firstNumber(
-    config["commissionRate"],
-    negotiationConfig["commissionRate"],
-  );
+  // PLU-82 (§4.3): finalized terms resolve through the ONE documented precedence
+  // resolver instead of the inline firstString/firstNumber chains — byte-identical
+  // (invariant #3), golden-test locked. This executor's inline chains are 2-tier
+  // (config → negotiationConfig, NO campaign fallback), so campaignDefault is not
+  // passed (undefined = skipped) and the resolved value/label match the inline
+  // read exactly. `resolvedSources` records the winning label per field (§4.6).
+  const resolvedSources: Record<string, SourceLabel> = {};
+  const commission = resolveKnowledgeField("commissionRate", {
+    workflowConfig: config["commissionRate"],
+    negotiationState: negotiationConfig["commissionRate"],
+  });
+  const commissionRate = commission.value as number | undefined;
+  resolvedSources["commissionRate"] = commission.source;
   // Deliverables are a campaign-level field stamped into every node's config
   // (see campaigns.ts / restampBrand). Prefer this node's stamped copy, then the
   // negotiation node's value.
-  const deliverables = firstString(
-    config["deliverables"],
-    negotiationConfig["deliverables"],
-  );
+  const deliverablesR = resolveKnowledgeField("deliverables", {
+    workflowConfig: config["deliverables"],
+    negotiationState: negotiationConfig["deliverables"],
+  });
+  const deliverables = deliverablesR.value as string | undefined;
+  resolvedSources["deliverables"] = deliverablesR.source;
   // Timeline is likewise a campaign-level field stamped into node config; state
   // it in the confirmation only when present.
-  const timeline = firstString(
-    config["timeline"],
-    negotiationConfig["timeline"],
-  );
+  const timelineR = resolveKnowledgeField("timeline", {
+    workflowConfig: config["timeline"],
+    negotiationState: negotiationConfig["timeline"],
+  });
+  const timeline = timelineR.value as string | undefined;
+  resolvedSources["timeline"] = timelineR.source;
   // Product/sample reward blurb — also a campaign-level stamped field; rendered
   // as its own bullet in the confirmation only when present.
-  const rewardDescription = firstString(
-    config["rewardDescription"],
-    negotiationConfig["rewardDescription"],
-  );
+  const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
+    workflowConfig: config["rewardDescription"],
+    negotiationState: negotiationConfig["rewardDescription"],
+  });
+  const rewardDescription = rewardDescriptionR.value as string | undefined;
+  resolvedSources["rewardDescription"] = rewardDescriptionR.source;
 
   // Draft the "Campaign Agreement Confirmation" email. The confirmation copy is
   // a fixed template (renderRewardConfirmationEmail); we still offer the AI draft
@@ -156,6 +172,8 @@ export async function executeRewardSetup(
       ...(agreedFee !== undefined ? { fixedFee: agreedFee } : {}),
       ...(commissionRate !== undefined ? { commission: commissionRate } : {}),
       ...(deliverables ? { deliverables } : {}),
+      // PLU-82 (§4.6): winning-source label per finalized term. Debug metadata only.
+      resolvedSources,
     },
   };
 }
