@@ -518,3 +518,84 @@ def _apply_cap(candidates: dict[SectionKey, _Candidate]) -> list[_Candidate]:
         candidates.values(),
         key=lambda c: (0 if c.from_obligation else 1, key_order.get(c.section, 99)),
     )
+
+
+def build_selection_from_sections(
+    sections: list[SectionKey],
+    available: AvailableSections,
+    *,
+    rule: str,
+    trigger: str,
+) -> KnowledgeSelection:
+    """Build a KnowledgeSelection from an EXPLICIT list of section keys (W8 / Calvin
+    follow-up §5 — the constrained topic classifier).
+
+    The deterministic `select_knowledge_sections` derives the section set from the
+    message + obligations via regex; the LLM classifier instead *names* the section
+    set directly. But everything downstream of that choice — the §4.8 cap, value
+    resolution (`_resolve_value`), the honest-defer marker for a
+    requested_but_unavailable section (invariant #4), and the observability record
+    (invariant #7) — is IDENTICAL and stays deterministic here. This is the hard
+    invariant of §5: **the classifier only decides WHICH sections to pull; values
+    are still resolved deterministically from the authoritative fields / brief
+    sections, and the classifier never fabricates a value or moves a dollar figure.**
+
+    `rule`/`trigger` are stamped on every SourceRecord so the observability log
+    distinguishes a classifier-sourced pull (rule="classifier") from a regex one.
+    Duplicate keys are de-duped (first occurrence wins, preserving caller order);
+    unknown keys are dropped defensively. An empty/all-dropped input returns
+    `no_match` (invariant #3) so the caller keeps its full-context fallback — the
+    classifier can never *narrow* the prompt to nothing.
+
+    Confidence is always "high": the caller only invokes this path on a CONFIDENT
+    classifier result (`unknown`/`broad`/low-confidence classifier outputs never
+    reach here — see the wiring in negotiate.py). A `low` here would loop the caller
+    straight back into the fallback it was trying to escape."""
+    # De-dup while preserving order; keep only real section keys.
+    seen: set[str] = set()
+    ordered_keys: list[SectionKey] = []
+    for key in sections:
+        if key in SECTION_KEYS and key not in seen:
+            seen.add(key)
+            ordered_keys.append(key)
+
+    if not ordered_keys:
+        return KnowledgeSelection(outcome="no_match")
+
+    # Reuse the SAME cap the deterministic path uses. These candidates are all
+    # message-sourced and non-greedy (the classifier is a message-level signal), so
+    # cap ordering falls back to the stable SECTION_KEYS order within the group.
+    candidates: dict[SectionKey, _Candidate] = {
+        key: _Candidate(key, rule, trigger, from_obligation=False, greedy_only=False)
+        for key in ordered_keys
+    }
+    kept_candidates = _apply_cap(candidates)[:MAX_SELECTED_SECTIONS]
+    kept = [c.section for c in kept_candidates]
+    dropped = tuple(
+        c.section for c in _apply_cap(candidates)[MAX_SELECTED_SECTIONS:]
+    )
+
+    selected: list[SelectedSection] = []
+    sources: list[SourceRecord] = []
+    unavailable: list[SectionKey] = []
+    for section in kept:
+        value, resolved_from = _resolve_value(section, available)
+        if value is not None:
+            selected.append(
+                SelectedSection(section, "available", value, resolved_from)
+            )
+        else:
+            selected.append(
+                SelectedSection(section, "requested_but_unavailable", None, None)
+            )
+            unavailable.append(section)
+        sources.append(SourceRecord(section, rule, trigger, resolved_from))
+
+    return KnowledgeSelection(
+        outcome="matched",
+        sections=tuple(selected),
+        sources=tuple(sources),
+        unavailable=tuple(unavailable),
+        dropped=dropped,
+        confidence="high",
+    )

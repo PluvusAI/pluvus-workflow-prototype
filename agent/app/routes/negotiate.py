@@ -55,7 +55,12 @@ from app.knowledge_retrieval import (
     KnowledgeSelection,
     Obligation,
     SECTION_KEYS,
+    build_selection_from_sections,
     select_knowledge_sections,
+)
+from app.knowledge_classifier import (
+    classify_knowledge_topics,
+    knowledge_classifier_enabled,
 )
 from app.llm import get_llm
 from app.security import rate_limiter, require_api_key
@@ -3073,6 +3078,17 @@ def warn_knowledge_flag_dependency() -> None:
     means retrieval loses its per-section brief granularity and leans on the
     fallback. Emit a one-time WARNING at startup so a misconfiguration is visible.
     Called once from app startup; safe to call more than once."""
+    # W8 (§5): the classifier is a fallback *within* retrieval — enabling it while
+    # retrieval is OFF is a no-op the operator almost certainly did not intend. Warn
+    # regardless of the retrieval-on checks below (which early-return when off).
+    if knowledge_classifier_enabled() and not _knowledge_retrieval_enabled():
+        logger.warning(
+            "KNOWLEDGE_CLASSIFIER_ENABLED is on but KNOWLEDGE_RETRIEVAL_ENABLED is "
+            "off: the constrained topic classifier only runs as a fallback inside "
+            "the retrieval path, so with retrieval off it never executes. Enable "
+            "KNOWLEDGE_RETRIEVAL_ENABLED too (see .env.example)."
+        )
+
     if not _knowledge_retrieval_enabled():
         return
     parsing_on = os.getenv("STRUCTURED_BRIEF_PARSING_ENABLED", "").strip().lower() == "true"
@@ -3083,6 +3099,12 @@ def warn_knowledge_flag_dependency() -> None:
             "resolve from flat campaign fields and degrade to the full-brief "
             "fallback on unmatched sections. Recommended: enable both together "
             "(see .env.example)."
+        )
+    if knowledge_classifier_enabled():
+        logger.info(
+            "KNOWLEDGE_CLASSIFIER_ENABLED is on: the constrained topic classifier "
+            "will run as a fallback on uncertain (no_match / low-confidence) turns "
+            "only. It selects topic keys only; values stay deterministic."
         )
 
 
@@ -3288,19 +3310,80 @@ def _selected_knowledge_block(
     selection = select_knowledge_sections(message or "", obligations, available)
     _log_retrieval(selection, endpoint)
     # §3.2 + §3.3: no_match, or a low-confidence (greedy-only) match, degrades to the
-    # full-context fallback — identical policy on /negotiate and /draft.
+    # full-context fallback — identical policy on /negotiate and /draft. W8 (§5): on
+    # THIS uncertain branch only (never the confident fast path above), the optional
+    # constrained classifier gets a chance to recover a paraphrased question the
+    # regexes missed BEFORE we fall back.
     if selection.outcome == "no_match" or selection.confidence == "low":
+        classified = _classifier_selection(message or "", obligations, available, ctx, endpoint)
+        if classified is not None:
+            return classified
         return None
-    # §4.2 flat-brief fallback: a matched section we have NO configured value for is a
-    # false-defer risk when the answer may sit in the flat briefKnowledge blob the
-    # selected block would otherwise REPLACE. When any selected section is
-    # requested_but_unavailable AND a briefKnowledge blob is present, fall back to the
-    # full context (which includes that blob) instead of emitting a defer line — we
-    # only tell a creator "we'll confirm" after checking ALL sources (flat field,
-    # brief section, AND the flat blob).
+    return _render_or_fallback(selection, ctx)
+
+
+def _render_or_fallback(selection: KnowledgeSelection, ctx: dict[str, Any]) -> str | None:
+    """Apply the §4.2 flat-brief safety net, then render (§4.7). Shared by the
+    deterministic match and the W8 classifier match so BOTH honor the identical
+    "never emit a false defer while the answer may sit in the flat blob" contract.
+
+    §4.2 flat-brief fallback: a selected section we have NO configured value for is a
+    false-defer risk when the answer may sit in the flat briefKnowledge blob the
+    selected block would otherwise REPLACE. When any selected section is
+    requested_but_unavailable AND a briefKnowledge blob is present, fall back to the
+    full context (which includes that blob) instead of emitting a defer line — we
+    only tell a creator "we'll confirm" after checking ALL sources (flat field,
+    brief section, AND the flat blob)."""
     if selection.unavailable and _has_flat_brief(ctx):
         return None
     return _render_selected_knowledge(selection)
+
+
+def _classifier_selection(
+    message: str,
+    obligations: list[Obligation],
+    available: AvailableSections,
+    ctx: dict[str, Any],
+    endpoint: str,
+) -> str | None:
+    """W8 / Calvin follow-up §5: the constrained-classifier fallback, invoked ONLY
+    from the uncertain branch of `_selected_knowledge_block` (deterministic
+    no_match / low-confidence). Guarded by its OWN sub-flag on top of
+    KNOWLEDGE_RETRIEVAL_ENABLED — the deterministic path always runs first and stays
+    the high-precision floor.
+
+    Returns a rendered block (str) ONLY on a CONFIDENT classifier result that maps to
+    real sections and survives the flat-brief safety net; otherwise None → the caller
+    keeps its full-context fallback. `unknown`, `broad`-that-resolves-to-nothing, and
+    low-confidence classifier outputs all yield None, so an uncertain classifier can
+    never narrow the prompt (invariant: it only ADDS recall on the hard turns).
+
+    The classifier decides WHICH sections; `build_selection_from_sections` resolves
+    the VALUES deterministically — the classifier never produces a value or a rate."""
+    if not knowledge_classifier_enabled():
+        return None
+    try:
+        result = classify_knowledge_topics(message)
+    except Exception as exc:  # noqa: BLE001 — never let the classifier break a turn.
+        logger.warning("knowledge_classifier call failed, keeping fallback: %s", exc)
+        return None
+    # Low confidence or nothing to pull → keep the full-context fallback (parity with
+    # a deterministic low-confidence/no_match).
+    if result.confidence == "low" or not result.sections:
+        logger.info(
+            "knowledge_classifier endpoint=%s outcome=fallback confidence=%s categories=%s",
+            endpoint,
+            result.confidence,
+            result.raw_categories,
+        )
+        return None
+    selection = build_selection_from_sections(
+        result.sections, available, rule="classifier", trigger="classifier"
+    )
+    _log_retrieval(selection, f"{endpoint}:classifier")
+    if selection.outcome == "no_match":
+        return None
+    return _render_or_fallback(selection, ctx)
 
 
 def _has_flat_brief(ctx: dict[str, Any]) -> bool:
