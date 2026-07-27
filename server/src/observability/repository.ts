@@ -58,6 +58,9 @@ import {
   type LlmUsageSummaryDTO,
   type LlmSpendGuardDTO,
   type ConversationObligationDTO,
+  type KnowledgeDTO,
+  type KnowledgeConflictDTO,
+  type BriefAvailabilityDTO,
 } from "./dto.js";
 
 // An instance in a waiting state is "stuck" if its dueAt passed more than this
@@ -514,6 +517,114 @@ function extractAgentDecisions(events: Event[]): AgentDecisionDTO[] {
   return out;
 }
 
+// PLU-82 §4.6: assemble the knowledge observability block from the EXISTING event
+// log (no new EventType/table, invariant #10):
+//   - briefAvailability + conflicts: folded onto NEGOTIATION_TURN payloads under a
+//     `knowledge` key (§4.6). We take the LATEST availability across turns and the
+//     UNION of conflicts (deduped by field+reason), each stamped with its round.
+//   - resolvedSources: on the post-acceptance executors' event payloads
+//     (DEAL_HANDOFF_REQUESTED / REWARD_SETUP_SENT / PAYMENT_INFO_SENT). We take the
+//     latest such map.
+// Returns undefined when the log carries nothing knowledge-related, so an older
+// instance renders an empty panel rather than a misleading empty object.
+// Exported for the mapper unit test (event-log → DTO shape).
+export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
+  let briefAvailability: BriefAvailabilityDTO | null = null;
+  const conflicts: KnowledgeConflictDTO[] = [];
+  const seenConflict = new Set<string>();
+  let resolvedSources: Record<string, string | null> = {};
+  let sawAnything = false;
+
+  for (const e of events) {
+    const p = asRecord(e.payload);
+    if (!p) continue;
+
+    // Harvest conflict rows from a raw array (deduped by field+reason), stamping
+    // each with the turn's round. Shared by the folded observability record
+    // (NEGOTIATION_TURN.knowledge.conflicts) and the material-conflict escalation
+    // payload (top-level NEGOTIATION_TURN.conflicts) so BOTH surface in the panel.
+    const harvestConflicts = (raw: unknown, round: number | null): void => {
+      if (!Array.isArray(raw)) return;
+      for (const c of raw) {
+        const cr = asRecord(c as JsonValue);
+        if (!cr) continue;
+        const field = payloadString(cr, "campaignField") ?? payloadString(cr, "section");
+        const reason = payloadString(cr, "reason");
+        const key = `${field}::${reason}`;
+        if (!field || seenConflict.has(key)) continue;
+        seenConflict.add(key);
+        const pageStart = payloadNumber(cr, "pageStart");
+        conflicts.push({
+          section: payloadString(cr, "section") ?? field,
+          campaignField: field,
+          campaignValue: payloadString(cr, "campaignValue") ?? "",
+          briefExcerpt: payloadString(cr, "briefExcerpt") ?? "",
+          ...(pageStart !== null ? { pageStart } : {}),
+          reason: reason ?? "",
+          round,
+        });
+        sawAnything = true;
+      }
+    };
+
+    if (e.type === "NEGOTIATION_TURN") {
+      const round = payloadNumber(p, "round");
+      const knowledge = asRecord(p["knowledge"] as JsonValue | undefined);
+
+      if (knowledge) {
+        const avail = asRecord(knowledge["briefAvailability"] as JsonValue | undefined);
+        if (avail) {
+          const status = payloadString(avail, "status");
+          if (
+            status === "NO_BRIEF" ||
+            status === "AVAILABLE" ||
+            status === "PARTIAL" ||
+            status === "PARSE_FAILED"
+          ) {
+            const missingRaw = avail["missingSections"];
+            // LATEST wins — events are chronological (oldest-first), so overwrite.
+            briefAvailability = {
+              status,
+              error: payloadString(avail, "error"),
+              missingSections: Array.isArray(missingRaw)
+                ? missingRaw.filter((s): s is string => typeof s === "string")
+                : [],
+              round,
+            };
+            sawAnything = true;
+          }
+        }
+        harvestConflicts(knowledge["conflicts"], round);
+      }
+
+      // The material-conflict ESCALATION payload (reason material_knowledge_conflict)
+      // carries its conflict rows at the TOP LEVEL (not under `knowledge`), so pick
+      // those up too — otherwise the very turn that escalated wouldn't show its
+      // conflicts in the panel.
+      if (payloadString(p, "reason") === "material_knowledge_conflict") {
+        harvestConflicts(p["conflicts"], round);
+      }
+    } else if (
+      e.type === "DEAL_HANDOFF_REQUESTED" ||
+      e.type === "REWARD_SETUP_SENT" ||
+      e.type === "PAYMENT_INFO_SENT"
+    ) {
+      const rs = asRecord(p["resolvedSources"] as JsonValue | undefined);
+      if (rs) {
+        const next: Record<string, string | null> = {};
+        for (const [k, v] of Object.entries(rs)) {
+          next[k] = typeof v === "string" ? v : null;
+        }
+        resolvedSources = next; // latest post-acceptance event wins
+        sawAnything = true;
+      }
+    }
+  }
+
+  if (!sawAnything) return undefined;
+  return { briefAvailability, conflicts, resolvedSources };
+}
+
 export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO | null> {
   const instRows = await db
     .select({ instance: executionInstances, creator: creators })
@@ -571,6 +682,9 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
     .find((e) => e.type === "STATE_TRANSITION");
   const lastTransitionSource = payloadString(asRecord(lastTransition?.payload ?? null), "source");
 
+  // PLU-82: the knowledge block, computed once from the event log.
+  const knowledge = mapKnowledge(instEvents);
+
   return {
     instance: {
       instanceId: inst.id,
@@ -606,6 +720,9 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
       calls: instLlmCalls.map(mapLlmCall),
     },
     obligations: instObligations.map(mapObligation),
+    // PLU-82: the knowledge block (brief availability + conflicts + selected
+    // sources) from the event log. Undefined → the panel renders empty.
+    ...(knowledge ? { knowledge } : {}),
   };
 }
 

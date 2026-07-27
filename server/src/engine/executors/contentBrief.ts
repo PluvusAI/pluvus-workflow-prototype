@@ -6,7 +6,8 @@ import { resolvePartnership } from "./partnership.js";
 import { readStoredFile } from "../../storage/localFileStorage.js";
 import { sendOnce } from "./idempotentSend.js";
 import { renderContentBriefEmail } from "./contentBriefEmail.js";
-import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
+import { resolveAgreedFee } from "./agreedFee.js";
+import { resolveKnowledgeField, type SourceLabel } from "../knowledgePrecedence.js";
 import { resolvePaymentToken } from "./paymentInfo.js";
 import { paymentFormLink } from "./paymentEmail.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
@@ -113,6 +114,10 @@ export async function executeContentBrief(
   let timeline: string | undefined;
   let formLink = "";
   let token: string | undefined;
+  // PLU-82 (§4.6): the winning-source label per finalized term, populated in the
+  // merged branch below (the legacy brief-only flow resolves no terms). Debug
+  // metadata for the event payload only — never a money/term input.
+  const resolvedSources: Record<string, SourceLabel> = {};
 
   if (isMerged) {
     // The negotiation commission is stamped onto THIS node's config at save/publish
@@ -136,9 +141,28 @@ export async function executeContentBrief(
         eventPayload: { outcome: "ESCALATE", reason: "no_agreed_fee", node: node.type },
       };
     }
-    commissionRate = firstNumber(config["commissionRate"], negotiationConfig["commissionRate"]);
-    deliverables = firstString(config["deliverables"], negotiationConfig["deliverables"]);
-    timeline = firstString(config["timeline"], negotiationConfig["timeline"]);
+    // PLU-82 (§4.3): resolve through the documented precedence resolver instead of
+    // the inline chains — byte-identical (invariant #3), golden-test locked. 2-tier
+    // here (config → negotiationConfig, no campaign fallback), so campaignDefault
+    // is omitted (undefined = skipped).
+    const commission = resolveKnowledgeField("commissionRate", {
+      workflowConfig: config["commissionRate"],
+      negotiationState: negotiationConfig["commissionRate"],
+    });
+    commissionRate = commission.value as number | undefined;
+    resolvedSources["commissionRate"] = commission.source;
+    const deliverablesR = resolveKnowledgeField("deliverables", {
+      workflowConfig: config["deliverables"],
+      negotiationState: negotiationConfig["deliverables"],
+    });
+    deliverables = deliverablesR.value as string | undefined;
+    resolvedSources["deliverables"] = deliverablesR.source;
+    const timelineR = resolveKnowledgeField("timeline", {
+      workflowConfig: config["timeline"],
+      negotiationState: negotiationConfig["timeline"],
+    });
+    timeline = timelineR.value as string | undefined;
+    resolvedSources["timeline"] = timelineR.source;
 
     token = await resolvePaymentToken(instance.id);
     formLink = paymentFormLink(token);
@@ -196,6 +220,8 @@ export async function executeContentBrief(
         ...(token ? { token, formLink } : {}),
         ...(fixedFee !== undefined ? { fixedFee } : {}),
         ...(commissionRate !== undefined ? { commission: commissionRate } : {}),
+        // PLU-82 (§4.6): winning-source label per finalized term. Debug metadata only.
+        resolvedSources,
       } as JsonObject,
     };
   }

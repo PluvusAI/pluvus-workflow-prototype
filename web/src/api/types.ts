@@ -166,6 +166,37 @@ export interface InstanceDetail {
   };
   // PLU-111: open creator questions + Pluvus commitments (and resolved history).
   obligations: ConversationObligationDTO[];
+  // PLU-82: the knowledge block — brief availability, material conflicts, and the
+  // selected finalized-terms sources. Absent for older instances.
+  knowledge?: KnowledgeDTO;
+}
+
+// ---- Knowledge (PLU-82) ----
+// Read-only observability: which source won each finalized term, the four-state
+// brief availability, and any material brief-vs-Campaign conflict surfaced to the
+// operator (the conflicting sources are shown, not auto-resolved).
+
+export interface KnowledgeConflictDTO {
+  section: string;
+  campaignField: string;
+  campaignValue: string;
+  briefExcerpt: string;
+  pageStart?: number;
+  reason: string;
+  round: number | null;
+}
+
+export interface BriefAvailabilityDTO {
+  status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
+  error: string | null;
+  missingSections: string[];
+  round: number | null;
+}
+
+export interface KnowledgeDTO {
+  briefAvailability: BriefAvailabilityDTO | null;
+  conflicts: KnowledgeConflictDTO[];
+  resolvedSources: Record<string, string | null>;
 }
 
 // ---- Conversation obligations (PLU-111) ----

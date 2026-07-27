@@ -324,6 +324,90 @@ export function normalizeStatus(raw: unknown): BriefParseStatus {
   return raw === "empty" || raw === "parse_failed" ? raw : "ok";
 }
 
+// ---------------------------------------------------------------------------
+// PLU-82 §4.4: explicit brief AVAILABILITY (the issue's four-state result)
+// ---------------------------------------------------------------------------
+// The issue's core complaint: the brief resolver could not say WHY it had no
+// knowledge — "no brief uploaded" and "a brief exists but parsing failed" both
+// historically collapsed to text = "". PLU-107 already separated the INTERNAL
+// status (no_brief / ok / empty / parse_failed); PLU-82 projects that (plus which
+// EXPECTED sections are present) to the issue's four-state BriefKnowledgeResult so
+// an operator finally sees the distinction.
+//
+// This is a PURE PROJECTION over the already-cached ResolvedBrief (invariant #5,
+// #10): it changes no parser logic, no cache logic (empty stays cached,
+// parse_failed stays uncached — the BUG-E8 fix), and gates NO prompt in v1 — the
+// agent already owns honest-defer. It is an observability label only (§4.6).
+
+export interface BriefKnowledgeResult {
+  status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
+  /** The immutable upload ref, when a brief is configured on the graph. */
+  fileReference?: string;
+  /** ResolvedBrief.flatText, when present (non-empty). */
+  text?: string;
+  /** A short reason on PARSE_FAILED (which underlying status produced it). */
+  error?: string;
+  /** For PARTIAL: the EXPECTED sections that were absent (observability detail). */
+  missingSections?: string[];
+}
+
+/**
+ * Project a ResolvedBrief + the campaign's expected sections to the four-state
+ * availability result (§4.4). Pure — no I/O, no cache touch.
+ *
+ * `expectedSections` must be the campaign's DECLARED knowledge fields ∩
+ * _CONFLICT_KEYS (usageRights/exclusivity/paymentTerms/attributionWindow that the
+ * campaign actually populated) — NOT every possible section key, or every brief is
+ * PARTIAL forever (§4.4). A section is only "expected" if the campaign has that
+ * term. `fileReference` (optional) is the brief upload ref, threaded through for
+ * the panel; it does not affect the status.
+ *
+ * Mapping (invariant #5):
+ *   no_brief      → NO_BRIEF
+ *   parse_failed  → PARSE_FAILED (error set)
+ *   empty         → PARSE_FAILED — present-but-unreadable ≠ absent (a scanned/
+ *                   image PDF that parsed to no text must never read as "no brief")
+ *   ok + all expected sections present → AVAILABLE
+ *   ok + ≥1 expected section absent    → PARTIAL
+ */
+export function deriveBriefAvailability(
+  resolved: ResolvedBrief,
+  expectedSections: string[],
+  fileReference?: string,
+): BriefKnowledgeResult {
+  const refPart = fileReference && fileReference.trim() ? { fileReference } : {};
+
+  switch (resolved.status) {
+    case "no_brief":
+      return { status: "NO_BRIEF", ...refPart };
+    case "parse_failed":
+      return { status: "PARSE_FAILED", error: "agent unreadable / malformed parse", ...refPart };
+    case "empty":
+      // Present-but-unreadable (parsed to no extractable text) — NOT absent
+      // (invariant #5). Caching is untouched: empty stays cached; this map is a
+      // pure view over that cached result (§8-i).
+      return { status: "PARSE_FAILED", error: "empty extraction (no readable text)", ...refPart };
+    case "ok": {
+      const sections = resolved.sections ?? {};
+      const missing = expectedSections.filter((k) => {
+        const s = sections[k];
+        return !s || typeof s.text !== "string" || !s.text.trim();
+      });
+      const textPart = resolved.flatText.trim() ? { text: resolved.flatText } : {};
+      if (missing.length === 0) {
+        return { status: "AVAILABLE", ...textPart, ...refPart };
+      }
+      return { status: "PARTIAL", missingSections: missing, ...textPart, ...refPart };
+    }
+    default: {
+      // Exhaustiveness backstop — an unknown status is treated as unreadable
+      // rather than silently "available".
+      const _never: never = resolved.status;
+      return { status: "PARSE_FAILED", error: `unknown status ${String(_never)}`, ...refPart };
+    }
+  }
+}
+
 /** Test hook: clear the in-process cache. */
 export function _clearBriefCache(): void {
   _cache.clear();
