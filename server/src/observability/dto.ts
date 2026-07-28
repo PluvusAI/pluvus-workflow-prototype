@@ -266,6 +266,41 @@ export interface KnowledgeDTO {
   resolvedSources: Record<string, string | null>;
 }
 
+// ---------------------------------------------------------------------------
+// PLU-81 §7.2 — the sanitized AI-context record (folded onto NEGOTIATION_TURN)
+// ---------------------------------------------------------------------------
+// "Expose a sanitized internal representation of the context." Every field is
+// labels/keys/counts — NEVER values. Band PRESENCE only, never the floor/ceiling
+// numbers (§7.5); estimatedTokens is a LABELED coarse chars/4 proxy — the real
+// token truth is LlmCall.inputTokens (§7.3). Read from the LATEST turn that carries
+// a `context` sub-object (mirrors mapKnowledge's latest-wins).
+export interface ContextDTO {
+  /** The purpose the context was assembled for (NEGOTIATION_DECISION today). */
+  purpose: string;
+  /** The round this context record was recorded on. */
+  round: number | null;
+  /** Message row ids included in the both-sides transcript. */
+  messageIdsIncluded: string[];
+  /** NEGOTIATION_TURN events used for the decision history. */
+  eventCount: number;
+  /** Knowledge campaign-field KEYS selected (e.g. ["usageRights","paymentTerms"]). */
+  campaignFieldsSelected: string[];
+  /** Brief section KEYS used (e.g. ["paymentTerms"]). */
+  briefSectionsUsed: string[];
+  /** Open obligation row ids included. */
+  openObligationIds: string[];
+  /** PLU-112 summary version, when a rolling summary is present (absent today). */
+  summaryVersion?: string;
+  /** A LABELED coarse chars/4 proxy (over-counts; excludes agent template
+   *  boilerplate + retrieval pruning). For real tokens, see LlmCall.inputTokens. */
+  estimatedTokens: number;
+  /** Deduped provenance LABELS — "available" sources offered to the agent
+   *  (e.g. "campaign:usageRights", "brief:paymentTerms", "band:present"). */
+  sourcesUsed: string[];
+  /** Band PRESENCE only — never the floor/ceiling values (§7.5). */
+  bandPresent: boolean;
+}
+
 export interface InstanceDetailDTO {
   instance: {
     instanceId: string;
@@ -306,6 +341,10 @@ export interface InstanceDetailDTO {
    *  the selected finalized-terms sources. Absent (undefined) when nothing has
    *  been recorded yet, so older instances render an empty panel. */
   knowledge?: KnowledgeDTO;
+  /** PLU-81: the sanitized AI-context record from the LATEST turn that assembled
+   *  context (labels/keys/counts only — never values, band presence only). Absent
+   *  when no turn has run yet ("empty = no turn ran," §7.1). */
+  context?: ContextDTO;
 }
 
 // ---------------------------------------------------------------------------
