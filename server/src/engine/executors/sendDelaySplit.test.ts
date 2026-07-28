@@ -22,11 +22,12 @@ import assert from "node:assert/strict";
 import {
   reserveOutbound,
   flushOutbound,
+  sendOnce,
   type FlushDeps,
 } from "./idempotentSend.js";
 import type { IEmailProvider, EmailSendOptions, EmailRecipient } from "../providers.js";
 import type { ThreadContext } from "../threadContext.js";
-import type { EmailDraft } from "../types.js";
+import type { EmailAttachment, EmailDraft } from "../types.js";
 
 const draft: EmailDraft = { subject: "Hi", body: "Let's collaborate." };
 
@@ -256,6 +257,54 @@ test("§4.1a: flush on a missing message is a safe no-op", async () => {
   const f = await flushOutbound(email, "does-not-exist", deps);
   assert.equal(f.skipped, true);
   assert.equal(sends(), 0);
+});
+
+// ── attachments (Content Brief PDF) survive the send split ───────────────────
+// Regression: the reserve/flush split rebuilt the wire draft from the Message row
+// (which has no attachments column), silently dropping the Content Brief PDF. The
+// synchronous sendOnce path must carry draft.attachments straight into flush.
+
+const pdfAttachment: EmailAttachment = {
+  filename: "brief.pdf",
+  contentType: "application/pdf",
+  content: Buffer.from("%PDF-1.4 fake bytes"),
+};
+
+test("flushOutbound sends preResolved.attachments on the wire", async () => {
+  const { deps } = makeFlushDeps();
+  const { email, calls } = makeEmail();
+  const r = await reserveOutbound("i1", draft, "content-brief:i1", deps);
+  await flushOutbound(email, r.messageId, deps, { attachments: [pdfAttachment] });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(
+    calls[0]!.draft.attachments,
+    [pdfAttachment],
+    "the PDF reaches provider.send()",
+  );
+});
+
+test("sendOnce threads draft.attachments through to the wire (synchronous path)", async () => {
+  const { deps } = makeFlushDeps();
+  const { email, calls } = makeEmail();
+  const briefDraft: EmailDraft = { ...draft, attachments: [pdfAttachment] };
+  const creator = { id: "c1", name: "Robin", email: "robin@creator.test" } as any;
+  await sendOnce(email, "i1", creator, briefDraft, "content-brief:i1", deps);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0]!.draft.attachments?.length, 1, "attachment present");
+  assert.equal(calls[0]!.draft.attachments?.[0]!.filename, "brief.pdf");
+});
+
+test("a draft with NO attachments still sends an attachment-free wire draft", async () => {
+  const { deps } = makeFlushDeps();
+  const { email, calls } = makeEmail();
+  const creator = { id: "c1", name: "Robin", email: "robin@creator.test" } as any;
+  await sendOnce(email, "i1", creator, draft, "negotiation:counter:i1:1", deps);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0]!.draft.attachments,
+    undefined,
+    "no attachments key added when the draft has none",
+  );
 });
 
 // ── §4.2a flush serialization ────────────────────────────────────────────────

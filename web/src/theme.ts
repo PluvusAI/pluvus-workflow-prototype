@@ -308,6 +308,7 @@ export const stateColor: Record<InstanceState, string> = {
   CONTENT_BRIEF_SENT: "#238055", // green — campaign brief sent (terminal success)
   NEEDS_DEAL_FINALIZATION: "#c98a1e", // amber — parked, waiting on an operator
   HANDOFF_COMPLETE: "#238055", // green — operator finished onboarding (terminal)
+  AWAITING_BRAND_APPROVAL: "#6b5fc4", // active — parked, waiting on the brand
   REJECTED: "#d0402c", // failure
   OPTED_OUT: "#c76032", // opted out
   NO_RESPONSE: "#8a7f6c", // timed out
@@ -329,6 +330,7 @@ export const stateLabel: Record<InstanceState, string> = {
   CONTENT_BRIEF_SENT: "Brief Sent",
   NEEDS_DEAL_FINALIZATION: "Needs Finalization",
   HANDOFF_COMPLETE: "Handoff Complete",
+  AWAITING_BRAND_APPROVAL: "Awaiting Brand Approval",
   REJECTED: "Rejected",
   OPTED_OUT: "Opted Out",
   NO_RESPONSE: "No Response",
@@ -353,6 +355,8 @@ export const stateDescription: Record<InstanceState, string> = {
     "Creator agreed. Paused for an operator to finalize the deal and onboard them in Pluvus.",
   HANDOFF_COMPLETE:
     "An operator finalized the deal and onboarded the creator — terminal success state.",
+  AWAITING_BRAND_APPROVAL:
+    "Creator agreed. Paused for the brand to Approve or Reject before the content brief goes out.",
   REJECTED: "Creator declined — terminal state.",
   OPTED_OUT: "Creator asked to stop being contacted — terminal state.",
   NO_RESPONSE: "All follow-ups exhausted with no reply — terminal state.",

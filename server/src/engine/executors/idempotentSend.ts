@@ -11,7 +11,7 @@ import { findWorkflowById, findVersionById } from "../../db/workflows.js";
 import { isUniqueViolation } from "../../db/errors.js";
 import type { DeferralClassifier } from "../../db/conversationObligations.js";
 import type { ConversationObligation, Creator, Message, MessageInsert } from "../../db/schema.js";
-import type { EmailDraft } from "../types.js";
+import type { EmailAttachment, EmailDraft } from "../types.js";
 import { isQuestionDeferredBySentBody } from "./commitmentDetection.js";
 import type { IEmailProvider, EmailRecipient, EmailSendOptions } from "../providers.js";
 import { isThreadLabeler } from "../providers.js";
@@ -322,6 +322,12 @@ export async function flushOutbound(
      *  needn't reload it. Absent on the delayed path → flush loads from the
      *  instance. */
     syncCreator?: Creator;
+    /** Out-of-body file attachments (Content Brief PDF). Carried straight from
+     *  the caller's draft because the Message row does NOT persist attachments —
+     *  so only the SYNCHRONOUS sendOnce path (which has the live draft in hand)
+     *  can supply them. The delayed path passes nothing → no attachments, which
+     *  is correct: only Content Brief attaches, and it always sends synchronously. */
+    attachments?: EmailAttachment[];
   },
 ): Promise<FlushResult> {
   if (!messageId) return { messageId: "", threadId: "", skipped: true };
@@ -387,7 +393,15 @@ export async function flushOutbound(
 
   // The wire draft uses the subject STORED on the row (already threaded), so a
   // config/thread change between reserve and flush can't re-thread the subject.
-  const wireDraft: EmailDraft = { subject: row.subject ?? draftSubjectFallback(row), body: row.body };
+  // Attachments are NOT persisted on the row (no column) — they only exist on the
+  // synchronous caller's live draft, carried in via preResolved. Absent on the
+  // delayed path, which never attaches. Conditional spread so a draft with no
+  // attachments stays byte-identical to before (exactOptionalPropertyTypes).
+  const wireDraft: EmailDraft = {
+    subject: row.subject ?? draftSubjectFallback(row),
+    body: row.body,
+    ...(preResolved?.attachments?.length ? { attachments: preResolved.attachments } : {}),
+  };
 
   // campaign name for the label: reload unless pre-resolved (§4.1a step 4).
   const campaignName =
@@ -519,6 +533,10 @@ export async function sendOnce(
     // Address the caller-supplied creator on the synchronous path (the delayed
     // path reloads it from the instance). Carried so flush needn't reload.
     syncCreator: creator,
+    // Carry the live draft's attachments (Content Brief PDF) into the flush. The
+    // Message row can't persist them, so the synchronous path is the only one that
+    // can — it still holds the original draft. Absent → no attachments (unchanged).
+    ...(draft.attachments?.length ? { attachments: draft.attachments } : {}),
   });
 
   return {

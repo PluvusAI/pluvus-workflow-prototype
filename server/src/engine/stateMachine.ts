@@ -41,8 +41,19 @@ const TRANSITIONS: Record<InstanceState, InstanceState[]> = {
     "PAYMENT_PENDING",
     "REWARD_PENDING",
     "NEEDS_DEAL_FINALIZATION",
+    // Brand-approval gate (BRAND_APPROVAL_GATE_ENABLED): a local_payment deal is
+    // held for the brand's Approve/Reject before the content brief goes out.
+    "AWAITING_BRAND_APPROVAL",
     "MANUAL_REVIEW",
   ],
+  // Brand-approval gate waiting state. Waits on the brand the way PAYMENT_PENDING
+  // waits on the payout form. On Approve it advances to PAYMENT_PENDING (the merged
+  // Content Brief SEND phase runs and sends the brief + payout link); on Reject it
+  // halts to MANUAL_REVIEW for a human. OPTED_OUT is reachable for parity with every
+  // other waiting state — an "unsubscribe" while awaiting brand sign-off must opt the
+  // creator out (CAN-SPAM). NOT terminal: the inbound worker still routes a creator
+  // reply that lands here.
+  AWAITING_BRAND_APPROVAL: ["PAYMENT_PENDING", "MANUAL_REVIEW", "OPTED_OUT"],
   // PLU-70 operator handoff. A WAITING state, not a terminal one: it waits on a
   // human the way PAYMENT_PENDING waits on the payout form. The only forward
   // edge is the operator marking the handoff done. OPTED_OUT is reachable for

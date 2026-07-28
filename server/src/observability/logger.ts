@@ -28,6 +28,7 @@ export type TransitionSource =
   | "classification-agent" // reply classification decided the route
   | "negotiation-agent" // negotiation decided the route
   | "payment-form" // the creator submitted the hosted payout form
+  | "brand-approval-link" // the brand clicked an approve/reject magic link
   | "manual" // a human / harness / API call drove the transition
   | "system"; // unattributed / internal
 
