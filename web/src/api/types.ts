@@ -169,6 +169,10 @@ export interface InstanceDetail {
   // PLU-82: the knowledge block — brief availability, material conflicts, and the
   // selected finalized-terms sources. Absent for older instances.
   knowledge?: KnowledgeDTO;
+  // PLU-81: the sanitized AI-context record from the latest turn (labels/keys/counts
+  // only — never values). Absent when no turn has assembled context ("empty = no
+  // turn ran").
+  context?: ContextDTO;
 }
 
 // ---- Knowledge (PLU-82) ----
@@ -197,6 +201,25 @@ export interface KnowledgeDTO {
   briefAvailability: BriefAvailabilityDTO | null;
   conflicts: KnowledgeConflictDTO[];
   resolvedSources: Record<string, string | null>;
+}
+
+// ---- Context (PLU-81) ----
+// The sanitized AI-context record from the latest turn. Labels/keys/counts only —
+// never values. Band PRESENCE only (never the floor/ceiling numbers). estimatedTokens
+// is a LABELED coarse chars/4 proxy; the real token truth is the LLM usage tab
+// (LlmCall.inputTokens). Absent when no turn has assembled context.
+export interface ContextDTO {
+  purpose: string;
+  round: number | null;
+  messageIdsIncluded: string[];
+  eventCount: number;
+  campaignFieldsSelected: string[];
+  briefSectionsUsed: string[];
+  openObligationIds: string[];
+  summaryVersion?: string;
+  estimatedTokens: number;
+  sourcesUsed: string[];
+  bandPresent: boolean;
 }
 
 // ---- Conversation obligations (PLU-111) ----

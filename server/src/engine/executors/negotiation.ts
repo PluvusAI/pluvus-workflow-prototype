@@ -7,22 +7,23 @@ import type { ConversationObligation, Message } from "../../db/schema.js";
 import type { ExecutionContext, NodeResult, NegotiationHistoryEntryLite, PriorNegotiationContext, EmailDraft } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import {
-  buildPriorContextFromEvents,
-  buildDraftHistory,
   computeOpenQuestions,
   buildOpenObligations,
-  buildStructuredObligations,
   buildQuestionObligationPlan,
   type QuestionObligationPlanItem,
   computeChangedFields,
   computeRelationshipWarmth,
 } from "./negotiationHistory.js";
+import { type BriefFieldConflict } from "./briefKnowledge.js";
+// PLU-81: the centralized, purpose-aware context builder. executeNegotiation calls
+// it ONCE per turn and projects it for BOTH the NEGOTIATION_DECISION and EMAIL_DRAFT
+// purposes (the AC "negotiation uses the builder" + "another AI path reuses it").
 import {
-  resolveBriefKnowledge,
-  deriveBriefAvailability,
-  type ResolvedBrief,
-  type BriefFieldConflict,
-} from "./briefKnowledge.js";
+  buildConversationContext,
+  toDecisionContext,
+  toDraftContext,
+  buildContextRecord,
+} from "../conversationContext.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { randomSendDelayMs } from "../sendDelay.js";
@@ -36,26 +37,13 @@ import { resolveBand } from "../band.js";
 // each carried a byte-identical copy — a drift hazard on a safety path.
 import { blockedByGuard } from "./guardEscalation.js";
 
-// PLU-107 §4.9/§6: the /negotiate wiring carries its OWN sub-flag (separate from
-// the agent-side STRUCTURED_BRIEF_PARSING_ENABLED) so structured parsing can ship
-// and be validated before the decision-prompt change flips on. Default OFF → the
-// brief is threaded into /draft exactly as today but NOT into /negotiate, so the
-// negotiate prompt is byte-identical to today. When on, the brief flat text is made
-// available to /negotiate via campaignContext; the AGENT still applies the §4.10
-// knowledge-turn cost gate (it renders the block only on knowledge questions).
-function briefIntoNegotiateEnabled(): boolean {
-  return process.env["BRIEF_INTO_NEGOTIATE"] === "true";
-}
-
-// PLU-114 §4.2: the agent's flat-brief safety net (_has_flat_brief) reads
-// ctx["briefKnowledge"] to avoid a false defer when a matched section is
-// unavailable but the answer may sit in the blob. That net fires only when the
-// blob is threaded — so it must reach /negotiate whenever RETRIEVAL is on, not
-// just when the separate BRIEF_INTO_NEGOTIATE sub-flag is on. Byte-identical when
-// retrieval is OFF (blob still not threaded → invariant #9).
-function knowledgeRetrievalEnabled(): boolean {
-  return process.env["KNOWLEDGE_RETRIEVAL_ENABLED"] === "true";
-}
+// PLU-81: the /negotiate brief-into-prompt gating (BRIEF_INTO_NEGOTIATE /
+// KNOWLEDGE_RETRIEVAL_ENABLED) + the flat-knowledge / brief-section projections that
+// used to live here are now owned by the centralized context builder
+// (conversationContext.ts) — the builder assembles the band-free knowledge
+// campaignContext once and both projections re-shape it (byte-identical, §10). Only
+// the material-conflict escalation FLAG stays here (it gates a routing DECISION, not
+// context — §3).
 
 // PLU-82 §4.5 / §6: gates ONLY the material-conflict escalation DECISION (not the
 // detection or observability surfacing, which ship unconditionally). Default OFF
@@ -66,27 +54,6 @@ function knowledgeRetrievalEnabled(): boolean {
 // regardless of its own flag, invariant #9 / §8-f).
 function materialConflictEscalationEnabled(): boolean {
   return process.env["MATERIAL_CONFLICT_ESCALATION_ENABLED"] === "true";
-}
-
-// PLU-114 (§4.9): project ResolvedBrief.sections ({key: CampaignBriefSection}) to
-// the {key: text} map the agent's AvailableSections.brief consumes. Returns
-// undefined when there are no sections (no brief / structured parse off / parse
-// failed) so the caller omits the wire key entirely (the router then resolves
-// from the flat fields, or defers). Only the text crosses the wire — page/source
-// provenance stays server-side (the observability record is built agent-side from
-// keys/rules, not values).
-function projectBriefSections(
-  sections: ResolvedBrief["sections"],
-): Record<string, string> | undefined {
-  if (!sections) return undefined;
-  const out: Record<string, string> = {};
-  for (const [key, section] of Object.entries(sections)) {
-    const text = section?.text;
-    if (typeof text === "string" && text.trim()) {
-      out[key] = text;
-    }
-  }
-  return Object.keys(out).length ? out : undefined;
 }
 
 // PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
@@ -654,17 +621,10 @@ export async function executeNegotiation(
   // (e.g. "hybrid — fixed fee plus commission") instead of only quoting a fee.
   const dealDescription = describeDeal(config);
 
-  // Latest creator reply, skipping brand escalation replies (see helper). H1:
-  // strip quoted thread + signature so the negotiation agent reasons about (and
-  // the counter copy acknowledges) the creator's ACTUAL words, not our own quoted
-  // outreach. Also feeds extractRequestedRate below — a "$500" in our quoted
-  // history must not be mistaken for the creator's ask.
-  const { messages: allInboundSource, brandReplyMsgIds, latest: latestInbound } =
-    await loadCreatorInbounds(instance.id);
-  const creatorReply = latestInbound?.body ? extractReplyText(latestInbound.body) : "";
-
-  // Hard stop — enforce maxRounds before calling the agent.
-  // This prevents the agent from even being consulted past the ceiling.
+  // Hard stop — enforce maxRounds before calling the agent (and BEFORE the full
+  // context build — §5.2). This prevents the agent from even being consulted past
+  // the ceiling, and — critically — keeps a misconfigured/round-exhausted campaign
+  // from paying for a full context assembly + /parse-brief HTTP round-trip.
   //
   // V1 (#15): a negotiation that never reached agreement within maxRounds
   // auto-CLOSES — a courteous close email to the creator, then REJECTED. No human
@@ -675,7 +635,15 @@ export async function executeNegotiation(
   // (_rounds_exhausted / is_final_round in negotiate.py). Without the `> 0` guard
   // a `maxRounds: 0` config would auto-reject on round 0 here while the agent
   // treats 0 as unlimited — the split semantic this guard removes.
+  //
+  // PLU-81 §5.2: the precondition needs the creator's latest words only for the
+  // audit-payload rate, so it does a lightweight latest-inbound read (the same read
+  // the builder would do) rather than the full assembly. This runs ONLY when the
+  // round ceiling is reached; the normal path skips it and goes straight to the
+  // single build below.
   if (maxRounds > 0 && instance.negotiationRound >= maxRounds) {
+    const { latest } = await loadCreatorInbounds(instance.id);
+    const creatorReplyForStop = latest?.body ? extractReplyText(latest.body) : "";
     return maxRoundsReject(ctx, email, config, {
       maxRounds,
       round: instance.negotiationRound,
@@ -683,153 +651,53 @@ export async function executeNegotiation(
       // the LLM extraction isn't available here — the deterministic regex read
       // (range-rejecting; digits provably in the reply) is the documented
       // fallback for this one caller (MED-N3), used for the audit payload only.
-      creatorRate: extractRequestedRate(creatorReply),
+      creatorRate: extractRequestedRate(creatorReplyForStop),
     });
   }
 
-  // FIX-1/FIX-2: assemble the conversation so far from persisted NEGOTIATION_TURN
-  // events and thread it into the (stateless) agent so it can reason about the
-  // trajectory and knows its own last offer.
-  const priorEvents = await listEventsByInstance(instance.id, { type: "NEGOTIATION_TURN" });
-  const priorContext = buildPriorContextFromEvents(priorEvents);
-
-  // HARD-N2 / PLU-85: the full conversation transcript (both sides) + the
-  // answered-questions ledger, threaded into /draft so the SENT email stays
-  // consistent with prior emails, doesn't repeat wording, and re-surfaces any
-  // earlier unanswered question. `draftHistory` interleaves our SENT outbound
-  // messages and the creator's inbound messages chronologically.
+  // PLU-81 §4 / §6: the ONE build. buildConversationContext does ALL the DB reads
+  // (messages, events, obligations), the single /parse-brief HTTP call, and the
+  // injectable optional-slot loaders (creatorMemory / conversationSummary — stubs →
+  // undefined until PLU-113/112 land) ONCE, and returns the band-FULL internal
+  // read-model. The two PURE projections (toDecisionContext / toDraftContext)
+  // re-shape it with zero new I/O — so the brief resolves exactly once per turn.
   //
-  // PLU-85: the transcript is now sourced from `Message` rows (what was actually
-  // communicated), not from `NEGOTIATION_TURN` event payloads (the AI's decision-
-  // step drafts). `allInboundSource` already holds BOTH directions (it's the full
-  // message list for the instance), so no new query is needed. `priorEvents` is
-  // passed only to ENRICH each sent outbound entry with round/action/rate — the
-  // events themselves remain the separate decision history (priorContext above).
-  // Empty on the first negotiation turn, so first-contact copy is unchanged.
-  const draftHistory = buildDraftHistory(allInboundSource, brandReplyMsgIds, priorEvents);
-
-  // PLU-111: load this instance's NON-TERMINAL obligations ONCE, up front. The
-  // outstanding Pluvus commitments feed BOTH /negotiate (below) and /draft (§4.7,
-  // O6); the open questions + the write-plan are derived after the model returns
-  // (they depend on this turn's creatorQuestions). Empty for pre-existing / fresh
-  // instances → every downstream use no-ops and falls back to today's behavior.
-  const openObligationRows = await listOpenObligationsByInstance(instance.id);
-  const ledgerSplit = buildOpenObligations(openObligationRows);
-  const openCommitments = ledgerSplit.openCommitments;
-
-  // F-H1: thread that SAME full both-sides transcript into the money-decision
-  // model (not just the copywriter). The negotiator previously saw only our-side
-  // moves (`priorContext.history`) + the single latest inbound line, so it was
-  // blind to the creator's EARLIER words — prior anchors, firm positions,
-  // concession trajectory. Reusing `draftHistory` (already assembled above) gives
-  // it the creator's own turns too. Empty on the first turn → no change to
-  // first-contact behavior. `buildNegotiationRequest` only attaches it when
-  // non-empty, and the agent renders it as a sanitized <conversation_history>
-  // DATA block, so the money guards and injection defenses are unaffected.
-  //
-  // PLU-111 (O6): openCommitments ride along as sanitized DATA so the negotiator
-  // knows it owes an action — NEVER a money input. Attached only when non-empty.
-  //
-  // classify→negotiate hint: the first-reply classifier's intent for the reply
-  // being negotiated (persisted on the inbound Message row). Threaded as a SOFT
-  // advisory signal only — never a money input, never an override of the guards. A
-  // mid-negotiation reply (round >= 1) skips classify so replyIntent is null there;
-  // NEGATIVE/OPT_OUT never reach negotiation (routed terminal upstream). Attached
-  // only when present so the prompt renders exactly as before otherwise.
-  const classifiedIntent =
-    typeof latestInbound?.replyIntent === "string" ? latestInbound.replyIntent : undefined;
-
-  // HARD-K1 / PLU-107: parse the campaign brief PDF (once per run, cached by
-  // ref::parserVersion) into text the models can consult to answer a creator's
-  // question from real campaign data instead of inventing it.
-  //
-  // ORDERING FIX (§3): resolve the brief BEFORE agent.negotiate so its text can be
-  // threaded into the DECISION model too (not only the copywriter). The resolver
-  // never throws; a no-brief/unreadable brief degrades to flatText "" + a status.
-  //
-  // Conflict detection (§4.5): the four authoritative Campaign knowledge columns
-  // are already merged onto `config` (mergeCampaignFallback / BRAND_KEYS), so we
-  // hand them to the resolver to surface any material brief-vs-Campaign conflict.
-  const resolvedBrief = await resolveBriefKnowledge(nodeGraph, {
-    usageRights: typeof config["usageRights"] === "string" ? config["usageRights"] : undefined,
-    exclusivity: typeof config["exclusivity"] === "string" ? config["exclusivity"] : undefined,
-    paymentTerms: typeof config["paymentTerms"] === "string" ? config["paymentTerms"] : undefined,
-    attributionWindow:
-      typeof config["attributionWindow"] === "string" ? config["attributionWindow"] : undefined,
+  // This absorbs the ~150 lines of inline assembly that used to live here: merge
+  // fallback, latest-inbound + creatorReply, prior context, both-sides transcript,
+  // obligations split, brief resolution + section/flat-knowledge projection, the
+  // band-free knowledge campaignContext, and the classify intent. The prompt-facing
+  // request objects are BYTE-IDENTICAL to before (golden matrix, §10).
+  const cc = await buildConversationContext({
+    instanceId: instance.id,
+    purpose: "NEGOTIATION_DECISION",
+    nodeGraph,
+    node,
+    campaign: ctx.campaign,
+    instance,
+    creator,
   });
+
+  // Names the branches below already use, sourced from the builder (§6). The
+  // builder derived `latestInbound`/`creatorReply` with the SAME logic (§5.4), so
+  // the present-offer idempotency key + obligation sourceMessageId are unchanged.
+  const latestInbound = cc.latestInbound;
+  const creatorReply = cc.creatorReply;
+  const priorContext = cc.decisionHistory;
+  const draftHistory = cc.recentMessages;
+  const openObligationRows = cc.openObligationRows;
+  const openCommitments = cc.openCommitments;
+  const resolvedBrief = cc.brief;
   const briefKnowledge = resolvedBrief.flatText;
+  const briefSections = cc.briefSections;
+  const structuredObligations = cc.structuredObligations;
 
-  // §4.9 / §4.10: thread the brief into the DECISION model as source-of-truth for
-  // knowledge answers. Made available when EITHER the BRIEF_INTO_NEGOTIATE sub-flag
-  // is on (the PLU-107 whole-blob interim, de-risked independently §6) OR retrieval
-  // is on (PLU-114). The retrieval case is why: the agent's §4.2 flat-brief safety
-  // net (_has_flat_brief) reads ctx["briefKnowledge"] to fall back to the blob
-  // instead of emitting a false defer when a matched section is unavailable — so the
-  // blob must reach the router regardless of that separate sub-flag, exactly as the
-  // flat FIELDS / briefSections / obligations below already do. The agent still
-  // applies the §4.10 knowledge-turn cost gate (renders the block only on knowledge
-  // questions) AND, with retrieval on, only surfaces the blob on the FALLBACK path
-  // (a confident match renders selected sections, never the blob). Both flags off →
-  // /negotiate prompt byte-identical to today (invariant #9). The brief is reference
-  // DATA on this endpoint too — NEVER a money input (guards unchanged; a brief
-  // number can't move the fee).
-  const negotiateBrief =
-    (briefIntoNegotiateEnabled() || knowledgeRetrievalEnabled()) && briefKnowledge
-      ? briefKnowledge
-      : undefined;
-
-  // PLU-114 (§4.9 / §5, REVIEW #1+#2): the two structured INPUTS the agent-side
-  // knowledge router needs but which do NOT reach it today — the parsed brief
-  // SECTIONS (not just the flat blob) and the open obligations WITH their category.
-  // Both are threaded as ADDITIVE campaignContext keys (old callers ignore them),
-  // and the agent applies KNOWLEDGE_RETRIEVAL_ENABLED itself — so with the agent
-  // flag OFF these keys are inert (the new selected-knowledge block never renders)
-  // and both prompts are byte-identical to today. Threaded independently of
-  // BRIEF_INTO_NEGOTIATE: the router resolves values from the flat FIELDS too, so
-  // it must see sections/obligations regardless of that separate sub-flag.
-  //
-  //   briefSections — resolvedBrief.sections projected to {sectionKey: text}. The
-  //     router resolves a brief-sourced value from this; only present when the
-  //     structured parse produced sections (STRUCTURED_BRIEF_PARSING_ENABLED on +
-  //     an ok parse), else omitted → the router falls back to flat fields.
-  //   structuredObligations — {id, originalText, category} per non-terminal row,
-  //     so an open obligation pulls in the section it's on the hook to answer even
-  //     when this turn's message is silent on it (invariant #5).
-  const briefSections = projectBriefSections(resolvedBrief.sections);
-  const structuredObligations = buildStructuredObligations(openObligationRows);
-
-  // PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
-  // fields must reach the negotiate router too. Today they only feed conflict
-  // detection above (resolveBriefKnowledge :590-594) and reach /draft (via
-  // draftConfig = {...config}) but are NEVER placed on the negotiate campaignContext
-  // — so the negotiate router resolves a *configured* term to
-  // requested_but_unavailable and steers the model to defer a known answer, an
-  // asymmetry with /draft. Resolve them from `config` the same way /draft does and
-  // spread them onto knowledgeContext as additive string keys. Inert with the agent
-  // flag OFF (the selected-knowledge block never renders), and threaded
-  // independently of BRIEF_INTO_NEGOTIATE (the router resolves from the flat FIELDS,
-  // not the brief blob, so it must see them regardless of that sub-flag).
-  //
-  // Guardrail: these are REFERENCE DATA only. campaignContext is documented as
-  // "NEVER a money input" (providers.ts) — adding four string fields does not change
-  // that; the guards and fee path are untouched. Kept on campaignContext (alongside
-  // the other knowledge keys), NOT campaignConstraints (which feeds band/decision).
-  const flatKnowledge = projectFlatKnowledge(config);
-
-  const knowledgeContext: Record<string, unknown> = {
-    ...flatKnowledge,
-    ...(negotiateBrief ? { briefKnowledge: negotiateBrief } : {}),
-    ...(briefSections ? { briefSections } : {}),
-    ...(structuredObligations.length ? { structuredObligations } : {}),
-  };
-
-  const negotiationContext: PriorNegotiationContext = {
-    ...priorContext,
-    ...(draftHistory.length ? { conversationHistory: draftHistory } : {}),
-    ...(openCommitments.length ? { openCommitments } : {}),
-    ...(classifiedIntent ? { intent: classifiedIntent } : {}),
-    ...(Object.keys(knowledgeContext).length ? { campaignContext: knowledgeContext } : {}),
-  };
+  // NEGOTIATION_DECISION projection: the band-FULL PriorNegotiationContext threaded
+  // into agent.negotiate. It already carries the band-free knowledge campaignContext,
+  // the both-sides transcript, openCommitments, and the classify intent — attached
+  // by the projection ONLY when non-empty (§5.7 emptiness contract). The band is NOT
+  // on this object; buildNegotiationRequest resolves it from `config` at request-build
+  // time (§5.3 / §5.7). This is byte-identical to the old inline assembly (§10).
+  const negotiationContext: PriorNegotiationContext = toDecisionContext(cc).decisionHistory;
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
   // (the creator's questions + which fixed terms they pushed), threaded across
@@ -862,12 +730,16 @@ export async function executeNegotiation(
   // band strip untouched. Inert with the agent flag OFF — the DraftRequest ignores
   // unknown campaignContext keys and the selected-knowledge block never renders, so
   // /draft is byte-identical to today.
-  const draftConfig: Record<string, unknown> = {
-    ...config,
-    ...(briefKnowledge ? { briefKnowledge } : {}),
-    ...(briefSections ? { briefSections } : {}),
-    ...(structuredObligations.length ? { structuredObligations } : {}),
-  };
+  // PLU-81 §4.4: the EMAIL_DRAFT projection — this is the AC "another AI path
+  // reuses the builder". It is a PURE re-shape of the SAME `cc` (no re-read, no
+  // second /parse-brief): draftConfig = stripBandFromContext(mergedConfig) merged
+  // with the /draft FALLBACK briefKnowledge + briefSections + structuredObligations,
+  // byte-identical to the old inline `{...config, ...}` after the seam's band strip
+  // (golden matrix, §10). The band is STRUCTURALLY absent from DraftContext (§4.3);
+  // providerFactory.draftEmail keeps its own strip as defense-in-depth. Fed to all
+  // three agent.draftEmail branches below via `draftConfig`.
+  const draftContext = toDraftContext(cc);
+  const draftConfig: Record<string, unknown> = draftContext.draftConfig;
 
   // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
   // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the
@@ -898,11 +770,11 @@ export async function executeNegotiation(
   //     campaignValue/briefExcerpt) so the operator-gated panel can show both
   //     disagreeing sources. Values ride the payload (persisted, operator-only via
   //     the /observability gate) but are NEVER logged to stdout (above).
-  const CONFLICT_KEYS = ["usageRights", "exclusivity", "paymentTerms", "attributionWindow"] as const;
-  const expectedSections = CONFLICT_KEYS.filter(
-    (k) => typeof config[k] === "string" && (config[k] as string).trim(),
-  );
-  const briefAvailability = deriveBriefAvailability(resolvedBrief, expectedSections);
+  //
+  // PLU-81: the four-state availability is computed ONCE by the builder (over the
+  // campaign's declared knowledge fields, §4.4) and read back here — byte-identical
+  // to the old inline deriveBriefAvailability call.
+  const briefAvailability = cc.briefAvailability;
   const knowledgeConflicts: BriefFieldConflict[] = resolvedBrief.conflicts ?? [];
   // Fold onto the turn payload only when there is something to report — a fully
   // available brief with no conflicts adds nothing (keeps the payload minimal and
@@ -917,26 +789,41 @@ export async function executeNegotiation(
         }
       : {};
 
-  // PLU-111: the durable obligation ledger (loaded above) supersedes the event-
-  // diff as the source of "what creator questions are still open". FALLBACK
-  // (invariant #6, §4.7): when the ledger has NO rows for this instance (a
+  // PLU-81 §7.2: the sanitized CONTEXT observability record, folded onto THIS turn's
+  // NEGOTIATION_TURN payload the SAME way as knowledgeRecord (the PLU-82 fold-onto-
+  // payload pattern — NOT a live-rebuild endpoint, §7.1). Every field is labels/keys/
+  // counts, never values: message/obligation IDs, campaign-field + brief-section KEYS,
+  // event count, provenance labels, band PRESENCE (never the floor/ceiling numbers —
+  // §7.5), and a LABELED coarse chars/4 token proxy (real token truth is
+  // LlmCall.inputTokens). Read back by mapContext(events) → InstanceDetailDTO.context
+  // → the operator-gated ContextPanel. A BullMQ retry recomputes the same record under
+  // OCC, so the audit log never bloats. This is pure surfacing (unflagged) — it only
+  // adds debug keys, so a real DEAL's money path is byte-identical.
+  const contextRecord = { context: buildContextRecord(cc) };
+
+  // PLU-111: the durable obligation ledger (loaded by the builder) supersedes the
+  // event-diff as the source of "what creator questions are still open". This is a
+  // POST-decision read (§5.6): it mixes THIS turn's creatorQuestions, so it stays in
+  // the executor — the builder supplies its INPUTS (openObligationRows, priorEvents).
+  // FALLBACK (invariant #6, §4.7): when the ledger has NO rows for this instance (a
   // pre-existing/old instance created before this feature, or a genuinely empty
-  // table), fall back to computeOpenQuestions so behavior is byte-identical to
-  // today. The ledger's ANSWERED rows have already dropped out, so a still-open
-  // question surfaces here and an answered one does not.
+  // table), fall back to computeOpenQuestions so behavior is byte-identical to today.
+  // The ledger's ANSWERED rows have already dropped out, so a still-open question
+  // surfaces here and an answered one does not.
   let openQuestions: string[];
   if (openObligationRows.length > 0) {
     const seen = new Set<string>();
     openQuestions = [];
-    for (const q of ledgerSplit.openQuestions) {
+    for (const q of buildOpenObligations(openObligationRows).openQuestions) {
       const k = q.trim().toLowerCase();
       if (!k || seen.has(k)) continue;
       seen.add(k);
       openQuestions.push(q);
     }
   } else {
-    // Empty ledger → today's HARD-N2 event-diff behavior, byte-identical.
-    openQuestions = computeOpenQuestions(priorEvents, creatorQuestions);
+    // Empty ledger → today's HARD-N2 event-diff behavior, byte-identical. The builder
+    // exposes the NEGOTIATION_TURN events it already loaded (§5.6), so no re-query.
+    openQuestions = computeOpenQuestions(cc.priorEvents, creatorQuestions);
   }
 
   // PLU-111 (§4.4): the create/update plan for THIS turn's creator questions
@@ -1153,6 +1040,8 @@ export async function executeNegotiation(
             : {}),
           // PLU-82 §4.6: fold the knowledge observability record onto this turn.
           ...knowledgeRecord,
+          // PLU-81 §7.2: fold the sanitized context observability record too.
+          ...contextRecord,
         },
       };
     }
@@ -1184,6 +1073,8 @@ export async function executeNegotiation(
             ...(proposedRate !== undefined ? { rate: proposedRate } : {}),
             // PLU-82 §4.6: fold the knowledge observability record onto this turn.
             ...knowledgeRecord,
+            // PLU-81 §7.2: fold the sanitized context observability record too.
+            ...contextRecord,
           },
         };
       }
@@ -1266,6 +1157,8 @@ export async function executeNegotiation(
           sendScheduledInMs: accept.sendScheduledInMs,
           // PLU-82 §4.6: fold the knowledge observability record onto this turn.
           ...knowledgeRecord,
+          // PLU-81 §7.2: fold the sanitized context observability record too.
+          ...contextRecord,
         },
       };
     }
@@ -1282,6 +1175,8 @@ export async function executeNegotiation(
           message,
           // PLU-82 §4.6: fold the knowledge observability record onto this turn.
           ...knowledgeRecord,
+          // PLU-81 §7.2: fold the sanitized context observability record too.
+          ...contextRecord,
         },
       };
     }
@@ -1423,6 +1318,8 @@ export async function executeNegotiation(
           ...(creatorQuestions?.length ? { creatorQuestions } : {}),
           // PLU-82 §4.6: fold the knowledge observability record onto this turn.
           ...knowledgeRecord,
+          // PLU-81 §7.2: fold the sanitized context observability record too.
+          ...contextRecord,
         },
       };
     }

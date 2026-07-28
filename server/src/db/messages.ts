@@ -1,5 +1,5 @@
 import { and, asc, eq, isNull, gt, lt, sql } from "drizzle-orm";
-import { db } from "./drizzle.js";
+import { db, type Db, type DbTx } from "./drizzle.js";
 import { messages, type Message, type MessageInsert } from "./schema.js";
 import {
   resolveObligationsByResolutionMessage,
@@ -113,8 +113,15 @@ export async function findMessagesByThreadId(threadId: string): Promise<Message[
     .orderBy(asc(messages.createdAt));
 }
 
-export async function listMessagesByInstance(instanceId: string): Promise<Message[]> {
-  return db
+// PLU-81 §8: `client` is injectable (defaults to the top-level `db`) so the
+// centralized context builder's I/O shell can be exercised against a test
+// transaction if desired. Backward-compatible — every existing caller passes no
+// client and reads through the default `db`.
+export async function listMessagesByInstance(
+  instanceId: string,
+  client: Db | DbTx = db,
+): Promise<Message[]> {
+  return client
     .select()
     .from(messages)
     .where(eq(messages.instanceId, instanceId))
