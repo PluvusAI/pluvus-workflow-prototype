@@ -5,6 +5,7 @@ import { reconcileStuckInstances } from "./reconciliation.js";
 import { redriveInboundDeadLetters } from "./inboundRedrive.js";
 import { sweepAutoSettlePayouts } from "./payoutSweep.js";
 import { sweepStrandedSends } from "./sendDelaySweep.js";
+import { sweepStaleBrandApprovalClaims } from "./brandApprovalSweep.js";
 import { logWorkerMetrics } from "../workers/workerMetrics.js";
 import { acquireOrRenewLeadership } from "./lock.js";
 
@@ -67,6 +68,20 @@ async function poll(): Promise<void> {
     await sweepStrandedSends();
   } catch (err) {
     console.error("[scheduler/poller] send-delay sweep failed:", err instanceof Error ? err.message : err);
+  }
+
+  // PLU-118 §1: brand-approval stale-claim recovery — revert a PROCESSING claim
+  // stranded by a route that crashed between claim and finalize/revert (only when
+  // the instance is still parked in AWAITING_BRAND_APPROVAL) so the brand's magic
+  // link works again. Runs under the leader lease; wrapped so a sweep DB blip can
+  // never disturb the due-instance path.
+  try {
+    await sweepStaleBrandApprovalClaims();
+  } catch (err) {
+    console.error(
+      "[scheduler/poller] brand-approval stale-claim sweep failed:",
+      err instanceof Error ? err.message : err,
+    );
   }
 
   // HARD-S1: emit worker-fleet metrics (queue depth + stuck-state counts) on the

@@ -41,6 +41,7 @@ const MAP: Record<InstanceState, Icon> = {
   CONTENT_BRIEF_SENT: FileCheck,
   NEEDS_DEAL_FINALIZATION: UserCog,
   HANDOFF_COMPLETE: CheckCircle2,
+  AWAITING_BRAND_APPROVAL: BadgeCheck,
   REJECTED: XCircle,
   OPTED_OUT: UserX,
   NO_RESPONSE: Clock4,

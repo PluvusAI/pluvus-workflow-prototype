@@ -755,6 +755,18 @@ export async function executeNegotiation(
     );
   }
 
+  // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
+  // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the
+  // section VALUES are not logged (keys/pages/reason only).
+  if (resolvedBrief.conflicts && resolvedBrief.conflicts.length) {
+    console.warn(
+      `[briefKnowledge] material brief-vs-Campaign conflict(s) on instance ${instance.id}: ` +
+        resolvedBrief.conflicts
+          .map((c) => `${c.section}(${c.reason}${c.pageStart ? `, p${c.pageStart}` : ""})`)
+          .join("; "),
+    );
+  }
+
   // PLU-111: the durable obligation ledger (loaded above) supersedes the event-
   // diff as the source of "what creator questions are still open". FALLBACK
   // (invariant #6, §4.7): when the ledger has NO rows for this instance (a

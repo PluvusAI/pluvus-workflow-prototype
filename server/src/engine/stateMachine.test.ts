@@ -136,4 +136,52 @@ test("HANDOFF_COMPLETE is terminal and cannot be reopened", () => {
   );
 });
 
+// ---------------------------------------------------------------------------
+// Brand-approval gate — the ACCEPTED → AWAITING_BRAND_APPROVAL branch
+// ---------------------------------------------------------------------------
+
+console.log("\nstate machine — brand-approval gate\n");
+
+test("ACCEPTED branches to AWAITING_BRAND_APPROVAL", () => {
+  assert.doesNotThrow(() => assertTransition("ACCEPTED", "AWAITING_BRAND_APPROVAL"));
+});
+
+test("ACCEPTED still keeps every existing post-acceptance edge (all gates additive)", () => {
+  // The gate edge must not have displaced the local / reward / handoff edges.
+  assert.doesNotThrow(() => assertTransition("ACCEPTED", "PAYMENT_PENDING"));
+  assert.doesNotThrow(() => assertTransition("ACCEPTED", "REWARD_PENDING"));
+  assert.doesNotThrow(() => assertTransition("ACCEPTED", "NEEDS_DEAL_FINALIZATION"));
+});
+
+test("AWAITING_BRAND_APPROVAL is a WAITING state, not terminal", () => {
+  // Load-bearing: a terminal gate state would make the inbound worker DROP a
+  // creator reply (e.g. an opt-out) that arrives while waiting on the brand.
+  assert.equal(isTerminal("AWAITING_BRAND_APPROVAL"), false);
+});
+
+test("AWAITING_BRAND_APPROVAL → PAYMENT_PENDING is the Approve exit (brief released)", () => {
+  assert.doesNotThrow(() => assertTransition("AWAITING_BRAND_APPROVAL", "PAYMENT_PENDING"));
+});
+
+test("AWAITING_BRAND_APPROVAL → MANUAL_REVIEW is the Reject exit", () => {
+  assert.doesNotThrow(() => assertTransition("AWAITING_BRAND_APPROVAL", "MANUAL_REVIEW"));
+});
+
+test("AWAITING_BRAND_APPROVAL accepts an opt-out (CAN-SPAM parity)", () => {
+  assert.doesNotThrow(() => assertTransition("AWAITING_BRAND_APPROVAL", "OPTED_OUT"));
+});
+
+test("AWAITING_BRAND_APPROVAL cannot jump straight to a success terminal", () => {
+  // Approve must go THROUGH the content-brief send (→ PAYMENT_PENDING); it must
+  // never shortcut to CONTENT_BRIEF_SENT without collecting payout.
+  assert.throws(
+    () => assertTransition("AWAITING_BRAND_APPROVAL", "CONTENT_BRIEF_SENT"),
+    InvalidTransitionError,
+  );
+  assert.throws(
+    () => assertTransition("AWAITING_BRAND_APPROVAL", "HANDOFF_COMPLETE"),
+    InvalidTransitionError,
+  );
+});
+
 console.log(`\n${n} passed\n`);

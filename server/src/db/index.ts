@@ -10,6 +10,7 @@ export * from "./deadLetterJobs.js";
 export * from "./brandNotifications.js";
 export * from "./paymentInfo.js";
 export * from "./dealHandoffs.js";
+export * from "./brandApprovals.js";
 export * from "./conversationObligations.js";
 export * from "./partnerships.js";
 export * from "./clicks.js";

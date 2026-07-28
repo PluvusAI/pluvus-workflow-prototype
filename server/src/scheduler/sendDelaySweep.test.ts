@@ -15,7 +15,12 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { sweepStrandedSends, type SendDelaySweepDeps } from "./sendDelaySweep.js";
+import {
+  sweepStrandedSends,
+  committingEventType,
+  BRAND_REJECT_CLOSE_PREFIX,
+  type SendDelaySweepDeps,
+} from "./sendDelaySweep.js";
 import type { Message } from "../db/schema.js";
 
 const NOW = new Date("2026-07-22T12:00:00.000Z");
@@ -180,4 +185,46 @@ test("sweep: an empty stranded set is a clean no-op", async () => {
   const res = await sweepStrandedSends(deps);
   assert.deepEqual(res, { reclaimed: 0, orphansSkipped: 0 });
   assert.equal(enqueued.length, 0);
+});
+
+// ── Reservation-type-aware orphan guard (PLU-118, Calvin review §2) ─────────────
+// A brand-reject close email is committed by BRAND_REJECTED, never NEGOTIATION_TURN.
+// The orphan guard must pick the committing event by the reservation's
+// idempotencyKey, or a genuinely-committed reject's close email would be mistaken
+// for an orphan and dropped.
+
+test("committingEventType: a brand-reject-close reservation maps to BRAND_REJECTED", () => {
+  const rejectClose = reservation({ idempotencyKey: `${BRAND_REJECT_CLOSE_PREFIX}i9` });
+  assert.equal(committingEventType(rejectClose), "BRAND_REJECTED");
+});
+
+test("committingEventType: a negotiation reservation maps to NEGOTIATION_TURN", () => {
+  const negotiation = reservation({ idempotencyKey: "negotiation:counter:i1:1" });
+  assert.equal(committingEventType(negotiation), "NEGOTIATION_TURN");
+  // A null key (defensive) also defaults to the negotiation event.
+  assert.equal(committingEventType(reservation({ idempotencyKey: null })), "NEGOTIATION_TURN");
+});
+
+test("orphan guard: a brand-reject close reservation is re-driven when its commit event is queried", async () => {
+  // Prove the guard is passed the ROW (so it can key on idempotencyKey), not just an
+  // instanceId. The injected guard here asserts the row it receives is the
+  // reject-close reservation and that the sweep re-drives it once committed.
+  const rejectClose = reservation({
+    id: "mRC",
+    idempotencyKey: `${BRAND_REJECT_CLOSE_PREFIX}i1`,
+  });
+  let sawRejectClose = false;
+  const { deps, enqueued } = makeDeps({
+    stranded: [rejectClose],
+    turnCommitted: async (row: Message) => {
+      // The sweep must hand the guard the row so committingEventType(row) can pick
+      // BRAND_REJECTED. A committed reject → re-drive.
+      if (committingEventType(row) === "BRAND_REJECTED") sawRejectClose = true;
+      return true;
+    },
+  });
+  const res = await sweepStrandedSends(deps);
+  assert.equal(sawRejectClose, true, "the guard received the reject-close row");
+  assert.equal(res.reclaimed, 1, "a committed reject's close email is recovered");
+  assert.equal(enqueued[0]!.jobId, "send|mRC|redrive-1");
 });

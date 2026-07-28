@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -44,6 +45,42 @@ MAX_BRIEF_CHARS = 4000
 # on `${ref}::${PARSER_VERSION}` miss every stale entry and re-parse. Every section
 # stamps the version that produced it (invariant #4).
 PARSER_VERSION = "brief-parser-v1.1"
+
+# --- OCR fallback (scanned / image-only briefs) ----------------------------
+# pypdf's page.extract_text() only sees an EMBEDDED text layer. A brand that
+# uploads a scanned or image-only PDF therefore extracts to nothing even though
+# the pages carry readable terms — which silently blinds the whole downstream
+# chain (briefKnowledge → /draft context, and the PLU-107 structured parser on
+# top: it returns status="empty"). When BRIEF_OCR_FALLBACK_ENABLED is on AND the
+# embedded-text pass produced no usable pages, we run OCRmyPDF+Tesseract over the
+# bytes and re-extract with pypdf. OCR is CPU-only, invoked as a subprocess, and —
+# like everything in this module — degrades to "" / no pages on any failure, so a
+# brief we still can't read never breaks a negotiation. It never runs on ordinary
+# text PDFs (the guard), so the common path pays zero extra cost.
+BRIEF_OCR_FALLBACK_ENV = "BRIEF_OCR_FALLBACK_ENABLED"
+
+# Below this many characters of embedded text, treat the pypdf pass as a miss and
+# try OCR. A handful of stray glyphs (a page number, a watermark) on an otherwise
+# image-only brief shouldn't count as "we read it". Small and conservative — a
+# genuine text brief clears this by orders of magnitude.
+_OCR_MIN_USEFUL_CHARS = 32
+
+# Cap the pages OCRmyPDF processes: our briefs are short, the output is capped at
+# MAX_BRIEF_CHARS anyway, and OCR cost is per-page. Also bounds a pathological
+# many-page upload. A page range keeps a giant scan from pinning the worker.
+_OCR_MAX_PAGES = 10
+
+# Wall-clock budget for the whole OCR subprocess. OCR is a one-time, off-hot-path
+# pass (cached per brief on the TS side), so a generous budget is fine — but it
+# must be bounded so a stuck ghostscript/tesseract can't hold the FastAPI worker.
+_OCR_TIMEOUT_SECONDS = 120
+
+
+def _ocr_fallback_enabled() -> bool:
+    raw = os.getenv(BRIEF_OCR_FALLBACK_ENV)
+    if raw is None or raw.strip() == "":
+        return False  # dark by default — opt in explicitly per deploy
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -98,14 +135,122 @@ def _extract_pages(pdf_bytes: bytes) -> list[PageText]:
     return pages
 
 
+def _extract_pages_with_ocr(pdf_bytes: bytes) -> list[PageText]:
+    """`_extract_pages`, but with the OCR fallback layered in for scanned briefs.
+
+    Behaves exactly like `_extract_pages` (same raise/return contract) EXCEPT
+    that when the embedded-text pass yields no usable pages AND the OCR fallback
+    is enabled, it OCRs the bytes and returns the pages extracted from the OCR'd
+    PDF. Both `extract_brief_text` and `parse_brief_structured` route through
+    this, so a scanned brief is recovered for the flat blob AND the structured
+    parse. OCR failure degrades to the original (empty) result — never raises
+    beyond what `_extract_pages` already does.
+    """
+    pages = _extract_pages(pdf_bytes)
+    if _pages_are_usable(pages) or not _ocr_fallback_enabled():
+        return pages
+    ocr_bytes = _ocr_pdf(pdf_bytes)
+    if not ocr_bytes:
+        return pages  # OCR unavailable / failed → keep the (empty) embedded result
+    try:
+        return _extract_pages(ocr_bytes)
+    except _ExtractFailed:
+        return pages
+
+
+def _pages_are_usable(pages: list[PageText]) -> bool:
+    """True when the embedded-text pass produced enough text to skip OCR. A few
+    stray glyphs (page number, watermark) on an otherwise image-only brief do not
+    count — mirrors the _OCR_MIN_USEFUL_CHARS guard for the flat path."""
+    return sum(len(p.text) for p in pages) >= _OCR_MIN_USEFUL_CHARS
+
+
+def _ocr_pdf(pdf_bytes: bytes) -> bytes:
+    """OCR a scanned / image-only PDF, returning the OCR'd PDF *bytes* (with an
+    invisible searchable text layer), or b"" on ANY failure.
+
+    Runs OCRmyPDF+Tesseract (CPU-only) as a subprocess. Returns bytes (not text)
+    so the caller can feed them back through the normal `_extract_pages` path and
+    keep page boundaries for PLU-107's structured parser. Best-effort: a missing
+    binary, a timeout, or an unreadable scan all yield b"", so the caller degrades
+    to "no extra knowledge" exactly as before.
+
+    Design notes:
+      * `--skip-text` copies pages that already have a text layer untouched and
+        OCRs only the image-only ones — a second layer of "don't do unnecessary
+        work" on top of the caller's empty-pages guard.
+      * pypdfium2 is the rasterizer (BSD) — avoids Ghostscript's AGPL.
+      * Bounded pages + wall-clock timeout so a giant/pathological scan can't pin
+        the worker.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    # Cheap availability probe: if the CLI isn't installed, don't spawn — degrade.
+    if shutil.which("ocrmypdf") is None:
+        logger.warning("brief: OCR fallback enabled but 'ocrmypdf' not on PATH; skipping")
+        return b""
+
+    tmpdir = tempfile.mkdtemp(prefix="brief-ocr-")
+    in_path = os.path.join(tmpdir, "in.pdf")
+    out_path = os.path.join(tmpdir, "out.pdf")
+    try:
+        with open(in_path, "wb") as fh:
+            fh.write(pdf_bytes)
+
+        cmd = [
+            "ocrmypdf",
+            "--skip-text",            # OCR only image-only pages; keep text pages as-is
+            "--optimize", "0",        # no image re-compression — we only want the text layer
+            "--output-type", "pdf",   # plain PDF out (no PDF/A validation overhead)
+            "--pages", f"1-{_OCR_MAX_PAGES}",
+            "--quiet",
+            in_path,
+            out_path,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=_OCR_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            logger.warning("brief: OCR timed out after %ss; degrading to no-knowledge", _OCR_TIMEOUT_SECONDS)
+            return b""
+        except Exception as exc:  # spawn failure, OSError, …
+            logger.warning("brief: OCR subprocess failed to run: %s", exc)
+            return b""
+
+        # OCRmyPDF can exit non-zero for benign reasons; we only trust an output
+        # PDF that exists and is non-empty (otherwise degrade to b"").
+        if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            detail = proc.stderr.decode("utf-8", "replace")[:200] if proc.stderr else ""
+            logger.warning("brief: OCR produced no usable output (rc=%s): %s", proc.returncode, detail)
+            return b""
+
+        with open(out_path, "rb") as fh:
+            return fh.read()
+    except Exception as exc:  # pragma: no cover - defensive: any I/O surprise degrades
+        logger.warning("brief: OCR fallback errored, returning empty: %s", exc)
+        return b""
+    finally:
+        try:
+            import shutil as _sh
+
+            _sh.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def extract_brief_text(pdf_bytes: bytes, *, max_chars: int = MAX_BRIEF_CHARS) -> str:
     """Extract plain text from a PDF's bytes, normalized and length-capped.
 
     Returns "" (never raises) on any parse failure or empty input — a brief we
     can't read must degrade to "no extra knowledge", never break a negotiation.
+
+    If the embedded-text pass yields nothing usable and the OCR fallback is
+    enabled (BRIEF_OCR_FALLBACK_ENABLED), OCR the bytes and re-extract — this
+    recovers scanned / image-only briefs that carry no text layer.
     """
     try:
-        pages = _extract_pages(pdf_bytes)
+        pages = _extract_pages_with_ocr(pdf_bytes)
     except _ExtractFailed:
         return ""
 
@@ -486,9 +631,14 @@ def parse_brief_structured(pdf_bytes: bytes) -> ParsedBrief:
     returns "empty"; a readable PDF returns "ok" with whatever sections segmented.
     `flat_text` is always populated on ok/empty so the drafting fallback is intact.
     The caller (the /parse-brief route) stamps `source_file_reference` on each
-    section (this function is ref-agnostic)."""
+    section (this function is ref-agnostic).
+
+    When the OCR fallback is enabled (BRIEF_OCR_FALLBACK_ENABLED) and the brief is
+    scanned / image-only, extraction routes through OCR so the structured parse
+    recovers too — a scanned brief becomes "ok" with sections instead of "empty".
+    """
     try:
-        pages = _extract_pages(pdf_bytes)
+        pages = _extract_pages_with_ocr(pdf_bytes)
     except _ExtractFailed:
         return ParsedBrief(status="parse_failed", flat_text="", page_count=0)
 

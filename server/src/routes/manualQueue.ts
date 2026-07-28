@@ -7,6 +7,8 @@
 //   GET  /manual-queue/workflows/:workflowId    queue items + notification status
 //   POST /manual-queue/instances/:id/notify     (re)send the notice for one
 //   POST /manual-queue/instances/:id/handoff/complete   mark a deal onboarded
+//   POST /manual-queue/instances/:id/brand-approval/resend  rotate token + re-send
+//        the brand-approval request (recovery for a no-recipient / expired gate)
 //
 // Two KINDS of item share this queue (PLU-70), discriminated by `kind`:
 //   - "escalation" (MANUAL_REVIEW) — the AI could not safely proceed. The reason
@@ -41,6 +43,7 @@ import {
   appendEvent,
 } from "../db/index.js";
 import { emailProvider } from "../engine/providerFactory.js";
+import { resendBrandApprovalRequest } from "../engine/executors/brandApprovalResend.js";
 import {
   notifyBrandOfEscalation,
   notifyOperatorOfDealFinalization,
@@ -84,6 +87,8 @@ const REASON_LABELS: Record<string, string> = {
   content_links_submitted: "Creator submitted content links",
   // PLU-70. Not a failure: the AI closed a deal and a human finishes it.
   needs_deal_finalization: "Agreement reached — ready for operator onboarding",
+  // Brand-approval gate: the brand rejected the closed deal via the magic link.
+  brand_rejected: "Brand rejected the deal — needs a human to follow up",
 };
 
 function reasonLabel(reason: string): string {
@@ -120,6 +125,11 @@ function deriveEscalation(events: Event[]): { reason: string; escalatedAt: strin
           escalatedAt: e.occurredAt.toISOString(),
         };
       }
+    }
+    // Brand-approval gate: a brand Reject halts to MANUAL_REVIEW via a direct
+    // transition (no MANUAL_REVIEW_FLAGGED event), so recognize the audit event.
+    if (e.type === "BRAND_REJECTED") {
+      return { reason: "brand_rejected", escalatedAt: e.occurredAt.toISOString() };
     }
   }
   // Fallback: the STATE_TRANSITION into MANUAL_REVIEW carries the timestamp.
@@ -397,6 +407,48 @@ router.post("/instances/:instanceId/notify", async (req: Request, res: Response)
     res.status(500).json({ error: "internal server error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// POST /manual-queue/instances/:instanceId/brand-approval/resend  (PLU-118)
+// ---------------------------------------------------------------------------
+// Recovery for a brand-approval gate that got stuck with no way out:
+//   - the gate parked in AWAITING_BRAND_APPROVAL but NO brand recipient resolved,
+//     so the request email was never sent, or
+//   - the magic-link token expired (default 14 days) before the brand acted.
+// Rotates the token (fresh hash + expiry) and re-sends the request from the stored
+// snapshot. Only valid while the instance is still parked AND the approval row is
+// still AWAITING_APPROVAL — a decided/in-flight deal is left untouched.
+
+router.post(
+  "/instances/:instanceId/brand-approval/resend",
+  async (req: Request, res: Response) => {
+    try {
+      const instanceId = req.params["instanceId"]!;
+      const result = await resendBrandApprovalRequest(emailProvider(), instanceId);
+      if (result.ok) {
+        res.json({ instanceId, resent: true, recipient: result.recipient });
+        return;
+      }
+      // Map each expected "can't resend" reason to a clean status.
+      const status =
+        result.reason === "no_approval_row" ? 404 :
+        result.reason === "no_recipient" ? 422 :
+        409;
+      const message =
+        result.reason === "no_approval_row"
+          ? "no brand-approval request exists for this instance"
+          : result.reason === "no_recipient"
+            ? "no brand recipient could be resolved — set the campaign notifyEmail or BRAND_NOTIFY_EMAIL"
+            : result.reason === "not_awaiting"
+              ? "the brand-approval decision is no longer pending"
+              : "instance is not awaiting brand approval";
+      res.status(status).json({ instanceId, resent: false, reason: result.reason, error: message });
+    } catch (err) {
+      console.error("[manual-queue] brand-approval resend error:", err);
+      res.status(500).json({ error: "internal server error" });
+    }
+  },
+);
 
 // ---------------------------------------------------------------------------
 // POST /manual-queue/instances/:instanceId/handoff/complete  (PLU-70)

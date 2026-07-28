@@ -47,8 +47,11 @@ import {
   executeContentBriefSubmission,
   executeContentLinksReply,
   executeOperatorHandoff,
+  executeBrandApproval,
   executeEnd,
 } from "./executors/index.js";
+import { brandApprovalGateEnabled } from "./executors/brandApprovalConfig.js";
+import { reserveBrandRejectCloseEmail } from "./executors/brandRejectEmail.js";
 import { markPaymentReceived } from "../db/index.js";
 import type { PayoutMethod } from "../db/schema.js";
 import { enqueueDelayedSend } from "../workers/queues.js";
@@ -152,6 +155,18 @@ export class WorkflowRuntime {
     // to Content Brief" (the payment node never handles it), so resolve to the
     // CONTENT_BRIEF node even if currentNodeId still points at the payment node.
     if (instance.currentState === "PAYMENT_RECEIVED") {
+      const contentBriefNode = nodeGraph.find((n) => n.type === "CONTENT_BRIEF");
+      if (contentBriefNode && node?.type !== "CONTENT_BRIEF") {
+        node = contentBriefNode;
+      }
+    }
+
+    // Brand-approval gate: the AWAITING_BRAND_APPROVAL waiting state is owned by
+    // the CONTENT_BRIEF node (same owner as PAYMENT_PENDING). On the brand's
+    // Approve, the route steps this node's SEND phase, which sends the merged brief
+    // + payout link and advances to PAYMENT_PENDING. Resolve to CONTENT_BRIEF even
+    // if currentNodeId still points at it — dispatch stays state-driven.
+    if (instance.currentState === "AWAITING_BRAND_APPROVAL") {
       const contentBriefNode = nodeGraph.find((n) => n.type === "CONTENT_BRIEF");
       if (contentBriefNode && node?.type !== "CONTENT_BRIEF") {
         node = contentBriefNode;
@@ -392,6 +407,17 @@ export class WorkflowRuntime {
     ) {
       await notifyOperatorOfDealFinalization(this.email, instanceId);
     }
+
+    // NOTE (brand-approval gate): unlike the escalation / deal-finalization
+    // notices above, the brand-approval REQUEST email is NOT fired here. The
+    // request carries magic-link tokens whose raw value exists only at mint time
+    // (the DB stores just the sha256 hash), so it MUST be sent inline by
+    // executeBrandApproval, which holds the raw token — a post-commit notifier
+    // rebuilding from the row could not reconstruct the links. executeBrandApproval
+    // sends it idempotently via sendOnce, so the durability guarantee is the same;
+    // there is simply no second sender. (A future operator-triggered RE-SEND from
+    // the Manual Queue would re-mint a token + update the row hash — out of scope
+    // for v1.)
 
     // Return updated context
     return this.loadContext(instanceId);
@@ -871,6 +897,168 @@ export class WorkflowRuntime {
   }
 
   // -------------------------------------------------------------------------
+  // handleBrandApproval
+  // -------------------------------------------------------------------------
+  // The brand clicked Approve or Reject on the magic-link email while the instance
+  // is parked in AWAITING_BRAND_APPROVAL (brand-approval gate). Driven by the
+  // /brand-approval route AFTER it has CLAIMED the decision on the BrandApproval row
+  // (claimBrandApprovalForProcessing: AWAITING_APPROVAL → PROCESSING). The route
+  // finalizes the row (→ APPROVED/REJECTED) only when THIS method returns; if it
+  // throws a transient failure the route reverts the claim so the brand can retry
+  // (PLU-118, Calvin review §2).
+  //
+  //   APPROVED → step the node. Dispatch sees AWAITING_BRAND_APPROVAL on the
+  //              CONTENT_BRIEF node and runs executeContentBrief's SEND phase (the
+  //              merged brief + payout link finally go out), landing on
+  //              PAYMENT_PENDING — the exact behavior a non-gated ACCEPT would have
+  //              had, just deferred until sign-off.
+  //   REJECTED → a DIRECT OCC transition to MANUAL_REVIEW (NOT via dispatch, which
+  //              would send the content brief). The standard post-commit brand
+  //              escalation notice then fires so a human picks it up.
+  //
+  // Idempotency: the route only calls this after the claim matched a still-AWAITING
+  // row (so a double-click no-ops at the row level and never reaches here twice).
+  // The APPROVED path additionally rides stepInstance's version-guarded OCC; the
+  // REJECTED path uses the same OCC helper, so a racing call is a no-op.
+
+  async handleBrandApproval(
+    instanceId: string,
+    decision: "APPROVED" | "REJECTED",
+    opts: {
+      source?: TransitionSource;
+      worker?: string | undefined;
+      queueJobId?: string | undefined;
+    } = {},
+  ): Promise<ExecutionContext> {
+    const instance = await findInstanceById(instanceId);
+    if (!instance) {
+      throw new Error(`Instance not found: ${instanceId}`);
+    }
+    if (instance.currentState !== "AWAITING_BRAND_APPROVAL") {
+      throw new Error(
+        `handleBrandApproval expects AWAITING_BRAND_APPROVAL state, got ${instance.currentState}`,
+      );
+    }
+
+    if (decision === "APPROVED") {
+      // Step the node — dispatch sees AWAITING_BRAND_APPROVAL on CONTENT_BRIEF and
+      // runs the merged SEND phase (→ PAYMENT_PENDING), reusing the standard OCC +
+      // event-writing path. Record the BRAND_APPROVED audit event ONLY after the
+      // step succeeds: if the step throws (transient failure), the route reverts the
+      // approval to AWAITING_APPROVAL for a retry (PLU-118, Calvin review §2), so a
+      // BRAND_APPROVED event appended up-front would falsely claim an approval that
+      // did not take. stepInstance is OCC-guarded, so its own transition is atomic;
+      // appending the audit event after it is the correct order. A later successful
+      // retry re-runs this path and appends the event then.
+      const ctx = await this.stepInstance(instanceId, {
+        source: opts.source ?? "brand-approval-link",
+        worker: opts.worker,
+        queueJobId: opts.queueJobId,
+      });
+      await appendEvent({
+        instanceId,
+        type: "BRAND_APPROVED",
+        nodeId: instance.currentNodeId ?? null,
+        payload: { source: opts.source ?? "brand-approval-link" },
+      });
+      return ctx;
+    }
+
+    // REJECTED — direct, version-guarded OCC transition to MANUAL_REVIEW. We do NOT
+    // step the dispatcher (that would run executeContentBrief and email the creator
+    // the brief we are precisely trying to withhold). The BRAND_REJECTED +
+    // STATE_TRANSITION events commit atomically with the state write.
+
+    const now = new Date();
+    const updated = await db.transaction(async (tx) => {
+      const row = await updateInstanceStateConditional(
+        instanceId,
+        instance.currentState,
+        {
+          currentState: "MANUAL_REVIEW",
+          currentNodeId: instance.currentNodeId ?? null,
+          completedAt: now,
+          dueAt: null,
+        },
+        tx,
+        instance.version, // BUG-E1: version-guarded OCC.
+      );
+      if (!row) return null;
+
+      await appendEvent(
+        {
+          instanceId,
+          type: "BRAND_REJECTED",
+          nodeId: instance.currentNodeId ?? null,
+          payload: { source: opts.source ?? "brand-approval-link" },
+          occurredAt: now,
+        },
+        tx,
+      );
+      await appendEvent(
+        {
+          instanceId,
+          type: "STATE_TRANSITION",
+          nodeId: instance.currentNodeId ?? null,
+          payload: {
+            from: instance.currentState,
+            to: "MANUAL_REVIEW",
+            source: opts.source ?? "brand-approval-link",
+          },
+          occurredAt: now,
+        },
+        tx,
+      );
+      return row;
+    });
+    if (!updated) {
+      throw new StaleInstanceError(instanceId, instance.currentState);
+    }
+
+    logTransition({
+      instanceId,
+      creatorId: instance.creatorId,
+      fromState: instance.currentState,
+      toState: "MANUAL_REVIEW",
+      source: opts.source ?? "brand-approval-link",
+      nodeId: instance.currentNodeId ?? null,
+    });
+
+    // Reserve + flush the courteous creator close email — STRICTLY AFTER the OCC
+    // reject committed (PLU-118, Calvin review §2). Reserving BEFORE the commit was
+    // the bug: reserveOutbound writes the Message row on its own auto-commit, so a
+    // reject whose OCC then rolled back (StaleInstanceError) left a committed
+    // reserved row the poller safety-net could later flush — emailing the creator a
+    // rejection that never happened. The reservation is outside the OCC tx (a
+    // Message insert can't share the state-write tx handle here), so the only way to
+    // guarantee "no committed reject ⇒ no reserved email" is to reserve after we
+    // KNOW the reject committed. The close email's body depends only on
+    // creator/campaign/node config — not the instance state — so loading context now
+    // (instance already in MANUAL_REVIEW) yields identical copy. Idempotent (keyed
+    // per instance) + best-effort: it never throws, and a double-click / retry can't
+    // double-email, so it can't undo the committed reject.
+    const rejectCtx = await this.loadContext(instanceId);
+    const closeSend = await reserveBrandRejectCloseEmail(rejectCtx, this.email);
+    if (closeSend) {
+      try {
+        await this.enqueueDelayedSendFn({ messageId: closeSend.messageId }, closeSend.delayMs);
+      } catch (err) {
+        console.error(
+          `[runtime] enqueueDelayedSend failed for brand-reject close email ` +
+            `${closeSend.messageId} (instance ${instanceId}); the poller sweep will reclaim it. ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // Fire the standard brand-escalation notice (best-effort, never throws) so the
+    // rejected deal surfaces in the Manual Queue / operator inbox with a reason.
+    await notifyBrandOfEscalation(this.email, instanceId, "brand_rejected");
+
+    return this.loadContext(instanceId);
+  }
+
+  // -------------------------------------------------------------------------
   // runUntilWaiting
   // -------------------------------------------------------------------------
 
@@ -954,6 +1142,14 @@ export class WorkflowRuntime {
         return state;
       }
 
+      // Brand-approval gate: stop at AWAITING_BRAND_APPROVAL — the deal is parked on
+      // the BRAND clicking Approve/Reject (delivered via handleBrandApproval from the
+      // magic-link route). It leaves this state only via that action, never by
+      // stepping, so without this stop the loop would re-run executeBrandApproval.
+      if (state === "AWAITING_BRAND_APPROVAL") {
+        return state;
+      }
+
       ctx = await this.stepInstance(instanceId);
     }
   }
@@ -1018,6 +1214,21 @@ export class WorkflowRuntime {
       ctx.instance.postAcceptanceMode === "operator_handoff"
     ) {
       return executeOperatorHandoff(ctx, this.email);
+    }
+
+    // Brand-approval gate: on ACCEPTED for a local_payment execution, when the
+    // gate flag is ON, hold the deal for the brand's Approve/Reject BEFORE the
+    // content brief goes out. Same keying discipline as operator_handoff — checked
+    // before the node switch so it works for any graph. OFF by default, so every
+    // existing run is unchanged; the flag is read here at ACCEPT time only, so
+    // flipping it never re-gates an in-flight run. operator_handoff takes
+    // precedence (its branch is above), so the two gates never both fire.
+    if (
+      ctx.instance.currentState === "ACCEPTED" &&
+      ctx.instance.postAcceptanceMode === "local_payment" &&
+      brandApprovalGateEnabled()
+    ) {
+      return executeBrandApproval(ctx, this.email);
     }
 
     switch (node.type) {

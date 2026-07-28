@@ -55,13 +55,19 @@ export async function executeContentBrief(
   const config = node.config;
 
   // The merged flow enters on ACCEPTED (Content Brief directly follows negotiation).
-  // Legacy graphs still enter on PAYMENT_RECEIVED (Payment Info already collected
-  // payout); in that case we send a brief-only email and complete immediately.
-  const isMerged = instance.currentState === "ACCEPTED";
+  // With the brand-approval gate ON, the SEND phase is deferred until the brand
+  // Approves — the route then steps this node from AWAITING_BRAND_APPROVAL, which
+  // is treated identically to ACCEPTED here (send the merged brief + payout link,
+  // park in PAYMENT_PENDING). Legacy graphs still enter on PAYMENT_RECEIVED
+  // (Payment Info already collected payout); in that case we send a brief-only
+  // email and complete immediately.
+  const isMerged =
+    instance.currentState === "ACCEPTED" ||
+    instance.currentState === "AWAITING_BRAND_APPROVAL";
   const isLegacy = instance.currentState === "PAYMENT_RECEIVED";
   if (!isMerged && !isLegacy) {
     throw new Error(
-      `CONTENT_BRIEF expects ACCEPTED or PAYMENT_RECEIVED state, got ${instance.currentState}`,
+      `CONTENT_BRIEF expects ACCEPTED, AWAITING_BRAND_APPROVAL or PAYMENT_RECEIVED state, got ${instance.currentState}`,
     );
   }
 
