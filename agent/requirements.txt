@@ -8,6 +8,17 @@ python-dotenv>=1.0.1
 # campaign terms (deliverables/usage/timeline) instead of hallucinating them.
 pypdf>=4.0.0
 
+# OCR fallback for SCANNED / image-only briefs (BRIEF_OCR_FALLBACK_ENABLED, dark
+# by default). pypdf only reads an embedded text layer; a scanned brief has none,
+# so app/brief.py shells out to OCRmyPDF+Tesseract (CPU-only) to add a text layer
+# and re-extract. The Python package is light; it needs the system binaries
+# `tesseract-ocr`, `tesseract-ocr-eng`, and `qpdf` present on PATH (installed in
+# the agent image / CI, NOT via pip). pypdfium2 is the BSD-licensed rasterizer
+# (avoids Ghostscript's AGPL). All optional at runtime — a missing binary
+# degrades to "no extra knowledge", never breaks a run.
+ocrmypdf>=16.0.0
+pypdfium2>=4.0.0
+
 # AI — LangGraph (provider-agnostic orchestration)
 langgraph>=0.1.0
 

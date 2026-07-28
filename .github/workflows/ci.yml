@@ -25,6 +25,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install OCR system binaries (scanned-brief fallback)
+        # The OCR brief fallback (BRIEF_OCR_FALLBACK_ENABLED, app/brief.py) shells
+        # out to OCRmyPDF+Tesseract, which are system binaries pip cannot provide.
+        # Installing them here lets the OCR test actually exercise the path instead
+        # of self-skipping. Cheap on ubuntu-latest; the flag is off for every other
+        # test so the rest of the suite is unaffected.
+        working-directory: .
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng qpdf ghostscript
+
       - name: Install dependencies
         # The unit tests use fake LLMs and pure gate functions — no network. We
         # DO install langgraph + langchain-ollama so the tests that wrap the graph
@@ -44,6 +53,10 @@ jobs:
           pip install "langchain-openai>=0.2.0"
           # HARD-K1: pypdf is used by the brief-parser (app/brief.py) + its tests.
           pip install "pypdf>=4.0.0"
+          # OCR fallback (app/brief.py): ocrmypdf drives the tesseract/qpdf
+          # binaries installed above; pypdfium2 is the BSD rasterizer. Present so
+          # the scanned-brief OCR test runs instead of self-skipping.
+          pip install "ocrmypdf>=16.0.0" "pypdfium2>=4.0.0"
 
       - name: Run pytest
         # Includes the HARD-T1 deterministic negotiation eval gate

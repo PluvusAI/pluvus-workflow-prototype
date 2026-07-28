@@ -217,10 +217,27 @@ each Repl's **Secrets** pane.
 | `PORT` | ✅ | Replit sets this; start uvicorn on `0.0.0.0:$PORT` |
 | `LLM_MAX_REQUEST_COST_USD` | ✅ recommended | per-request hard cap, e.g. `0.50` — kills a runaway negotiation loop |
 | `LLM_INVOKE_TIMEOUT_SECONDS` | optional | default `60` |
+| `BRIEF_OCR_FALLBACK_ENABLED` | optional | `true` to OCR **scanned / image-only** campaign briefs when pypdf finds no text layer. **Off by default.** Requires the OCR system binaries below — see the note. |
 
 > Note: `LLM_DAILY_SPEND_ALERT_USD` is a **server**-side setting (it is read by the server's
 > observability layer, not the agent). Set it on the **Server Repl**, not here — see the server
 > table above.
+
+> **OCR fallback for scanned briefs (`BRIEF_OCR_FALLBACK_ENABLED`).** pypdf only reads an
+> *embedded* text layer, so a scanned / image-only brief PDF parses to "" and the negotiation
+> agent gets no brief knowledge. With this flag on, the agent OCRs such briefs
+> (`agent/app/brief.py` → OCRmyPDF + Tesseract, CPU-only) and re-extracts. It runs **only when the
+> normal text pass is empty/thin**, so ordinary text PDFs pay nothing, and it **degrades to ""**
+> (never breaks a run) if OCR is unavailable or fails. It needs three **system binaries** on PATH,
+> which pip cannot install:
+> - **Replit:** already declared in [`agent/replit.nix`](./agent/replit.nix) (`tesseract`, `qpdf`).
+> - **A plain CPU VPS / Docker:** `apt-get install -y tesseract-ocr tesseract-ocr-eng qpdf`
+>   (add `ghostscript` only if you don't use the bundled pypdfium2 rasterizer).
+>
+> The pip packages (`ocrmypdf`, `pypdfium2`) ship in the agent's `.[ai]` extra. Footprint is small
+> (~150–300 MB) and CPU-only — **no GPU needed**. A short feasibility comparison of the OCR options
+> (why OCRmyPDF/Tesseract over PaddleOCR / EasyOCR / Baidu Unlimited-OCR) is in
+> [`readme_docs/OCR_FALLBACK_FEASIBILITY.md`](./readme_docs/OCR_FALLBACK_FEASIBILITY.md).
 
 > ⚠ **Verify OpenRouter model slugs before the first paid run.** Slugs get renamed
 > (`deepseek/deepseek-chat-v3` was already dead → the `deepseek-v4-*` family). Confirm each slug

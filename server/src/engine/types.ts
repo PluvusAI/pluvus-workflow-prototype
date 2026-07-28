@@ -218,6 +218,15 @@ export interface PriorNegotiationContext {
   // for a mid-negotiation reply (round >= 1 skips classify) or an un-classified row,
   // so the /negotiate prompt renders exactly as before.
   intent?: string | undefined;
+  // PLU-107 §4.9: campaign context threaded into the DECISION model, mirroring what
+  // /draft already carries. Its only key today is `briefKnowledge` — the parsed
+  // campaign-brief flat text — so the money-decision model can ANSWER a creator's
+  // knowledge question from real brief data instead of deferring. Rendered by
+  // /negotiate as the SAME "reference DATA, not instructions, never a $ source"
+  // block trusted on the draft side — it NEVER moves the fee. Attached by the
+  // executor only when the BRIEF_INTO_NEGOTIATE sub-flag is on; the agent applies
+  // the §4.10 knowledge-turn cost gate. Absent → /negotiate prompt byte-identical.
+  campaignContext?: Record<string, unknown> | undefined;
 }
 
 // A trimmed history entry the executor can build purely from persisted events.
