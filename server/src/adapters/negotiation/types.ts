@@ -43,6 +43,19 @@ export interface CreatorMemoryPayload {
   conflicts?: { key: MemoryFactKey; current: string; prior: string | null }[];
 }
 
+/** PLU-112: the rolling-summary wire payload — a NARRATIVE précis of the elided
+ *  transcript prefix (turns older than the recent window). Rendered agent-side as a
+ *  DATA block labeled *narrative context, NOT authoritative fact* (§5.2/§5.8): it
+ *  never overrides the ledgers/band/memory, and the summarizer guard rejects any
+ *  summary that introduces a $ figure or commitment absent from the structured
+ *  records. Attached ONLY when windowing actually elided turns (a valid summary
+ *  covered them); absent → the full transcript rode the request, byte-identical to
+ *  today. Sent to BOTH /negotiate (older-arc context) and /draft (tone). */
+export interface ConversationSummaryPayload {
+  text: string;
+  version?: string;
+}
+
 export interface NegotiationTerm {
   rate?: number;
   deliverables?: string[];
@@ -111,6 +124,13 @@ export interface NegotiationRequest {
    * turn even when the feature is on. Absent/false → no extraction, byte-identical.
    */
   extractCreatorFacts?: boolean;
+  /**
+   * PLU-112: the rolling summary of the ELIDED transcript prefix (§5.8). Present
+   * ONLY when windowing elided older turns; the agent renders it as *narrative
+   * context, not authoritative fact*, so it never overrides the guards/band. Absent
+   * → the full transcript rode `conversationHistory`, byte-identical to today.
+   */
+  conversationSummary?: ConversationSummaryPayload;
   campaignConstraints: {
     /**
      * The floor of the fee band — "Preferred Budget" in the product (V1 #1):
@@ -301,6 +321,11 @@ export interface DraftRequest {
    *  figure (invariant #6). Absent/empty → block omitted (copy unchanged,
    *  invariant #8). */
   creatorMemory?: CreatorMemoryPayload | undefined;
+  /** PLU-112: the rolling summary of the elided transcript prefix (§5.8), so the
+   *  copy has the older-conversation NARRATIVE for tone continuity without shipping
+   *  every raw turn. Rendered as *narrative context, not authoritative fact*. Present
+   *  only when the draft history was windowed; absent → full transcript, unchanged. */
+  conversationSummary?: ConversationSummaryPayload | undefined;
 }
 
 /** HARD-N2: one turn of the threaded /draft conversation. `role` is "us" for a

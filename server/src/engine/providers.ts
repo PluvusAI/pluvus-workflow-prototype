@@ -491,6 +491,9 @@ export function buildNegotiationRequest(
   // from turn 1. Both absent when the flag is off → byte-identical request.
   const creatorMemory = priorContext?.creatorMemory;
   const extractCreatorFacts = creatorMemoryEnabled();
+  // PLU-112: the rolling summary rides through only when the projection attached it
+  // (windowing elided turns). Absent → byte-identical request.
+  const conversationSummary = priorContext?.conversationSummary;
 
   return {
     creatorReply,
@@ -504,6 +507,7 @@ export function buildNegotiationRequest(
     ...(campaignContext && Object.keys(campaignContext).length ? { campaignContext } : {}),
     ...(creatorMemory ? { creatorMemory } : {}),
     ...(extractCreatorFacts ? { extractCreatorFacts: true } : {}),
+    ...(conversationSummary ? { conversationSummary } : {}),
     campaignConstraints: {
       termFloor,
       termCeiling,

@@ -11,6 +11,7 @@ import type {
 import type {
   DraftHistoryEntry,
   CreatorMemoryPayload,
+  ConversationSummaryPayload,
   ExtractedFact,
 } from "../adapters/negotiation/types.js";
 // PLU-111: the pure obligation write-plan the executor returns and the runtime
@@ -264,6 +265,11 @@ export interface PriorNegotiationContext {
   // preferences) without re-scanning the transcript. NEVER a money input (invariant
   // #6). Absent/empty (flag off, empty memory) → no block, byte-identical.
   creatorMemory?: CreatorMemoryPayload | undefined;
+  // PLU-112: the rolling summary of the elided transcript prefix (§5.8), rendered by
+  // /negotiate as *narrative context, NOT authoritative fact* so it gives the older
+  // deal arc without overriding the guards/band. Present ONLY when windowing elided
+  // turns (a valid summary covered them); absent → full transcript, byte-identical.
+  conversationSummary?: ConversationSummaryPayload | undefined;
 }
 
 // A trimmed history entry the executor can build purely from persisted events.

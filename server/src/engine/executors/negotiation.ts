@@ -698,7 +698,6 @@ export async function executeNegotiation(
   const latestInbound = cc.latestInbound;
   const creatorReply = cc.creatorReply;
   const priorContext = cc.decisionHistory;
-  const draftHistory = cc.recentMessages;
   const openObligationRows = cc.openObligationRows;
   const openCommitments = cc.openCommitments;
   const resolvedBrief = cc.brief;
@@ -735,9 +734,17 @@ export async function executeNegotiation(
   // PLU-113: the creator's durable facts THIS campaign are folded onto the projected
   // context as sanitized DATA (§4.8) — attached ONLY when non-null (flag on +
   // non-empty memory) so the prompt is unchanged otherwise. Never a money input.
+  //
+  // PLU-112: the rolling summary is threaded ONLY when the projection windowed the
+  // transcript (a valid summary covered the elided prefix — §5.8). Absent otherwise
+  // → the full transcript rode `conversationHistory`, byte-identical to today.
+  const decisionCtx = toDecisionContext(cc);
   const negotiationContext: PriorNegotiationContext = {
-    ...toDecisionContext(cc).decisionHistory,
+    ...decisionCtx.decisionHistory,
     ...(creatorMemory ? { creatorMemory } : {}),
+    ...(decisionCtx.conversationSummary
+      ? { conversationSummary: decisionCtx.conversationSummary }
+      : {}),
   };
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
@@ -909,7 +916,10 @@ export async function executeNegotiation(
   // below spread this into exactly those. Empty changedFields is omitted so the
   // request stays minimal; every field defaults so the copy is unchanged when unset.
   const draftHistoryExtra = {
-    ...(draftHistory.length ? { history: draftHistory } : {}),
+    // PLU-112: the WINDOWED draft history (from toDraftContext) — the newest turns
+    // raw, older turns elided into the summary when windowing fired. Flag OFF / no
+    // valid summary → this is the full transcript (cc.recentMessages), byte-identical.
+    ...(draftContext.history.length ? { history: draftContext.history } : {}),
     ...(openQuestions.length ? { openQuestions } : {}),
     ...(openCommitments.length ? { openCommitments } : {}),
     ...(changedFields.length ? { changedFields } : {}),
@@ -927,6 +937,11 @@ export async function executeNegotiation(
     // honors availability/objections/preferences/manager without re-parsing the
     // transcript wall (§4.8). Attached only when non-null → copy unchanged otherwise.
     ...(creatorMemory ? { creatorMemory } : {}),
+    // PLU-112: the rolling summary the copy uses for older-conversation tone (§5.8),
+    // threaded ONLY when the draft history was windowed. Absent → copy unchanged.
+    ...(draftContext.conversationSummary
+      ? { conversationSummary: draftContext.conversationSummary }
+      : {}),
   };
 
   // The reserve-time obligation writes shared across the send branches. The
