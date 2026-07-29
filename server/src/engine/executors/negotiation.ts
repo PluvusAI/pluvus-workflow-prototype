@@ -39,6 +39,9 @@ import {
   buildCreatorMemoryBlock,
   buildMemoryWritePlan,
 } from "./creatorMemory.js";
+// PLU-112: the in-turn rolling-summary refresh (behind CONVERSATION_SUMMARY_ENABLED,
+// fail-soft — never blocks/fails a turn).
+import { refreshConversationSummary } from "./summaryRefresh.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { randomSendDelayMs } from "../sendDelay.js";
@@ -691,6 +694,16 @@ export async function executeNegotiation(
     instance,
     creator,
   });
+
+  // PLU-112: refresh the rolling summary from the full transcript the builder just
+  // assembled (§5.4). Entirely behind CONVERSATION_SUMMARY_ENABLED and fail-soft —
+  // a no-op / failure leaves the prior summary and the projection falls back to the
+  // full transcript (§5.6). The refresh reuses `cc.recentMessages` (no extra read);
+  // the freshly-written summary is picked up by the NEXT turn's build, and THIS
+  // turn's window still ships the recent turns verbatim, so a one-turn refresh lag
+  // is invisible to the model. Awaited so a slow agent can't leak into later work,
+  // but it never throws (the helper swallows all failures).
+  await refreshConversationSummary(instance.id, cc.recentMessages, agent);
 
   // Names the branches below already use, sourced from the builder (§6). The
   // builder derived `latestInbound`/`creatorReply` with the SAME logic (§5.4), so

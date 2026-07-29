@@ -1024,8 +1024,10 @@ export const llmCalls = pgTable(
   ],
 );
 
-/** The agent paths that produce LLM calls (LlmCall.role values). */
-export type LlmCallRole = "classify" | "negotiate" | "draft";
+/** The agent paths that produce LLM calls (LlmCall.role values). PLU-112 adds
+ *  "summarize" (the rolling-summary refresh call). `role` is a plain text column,
+ *  not a Postgres enum, so a new value needs no migration. */
+export type LlmCallRole = "classify" | "negotiate" | "draft" | "summarize";
 
 // ---------------------------------------------------------------------------
 // Attribution & Payout ledger (Phase 1+)

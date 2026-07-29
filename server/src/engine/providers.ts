@@ -255,6 +255,16 @@ export interface IAgentProvider {
     priorContext?: PriorNegotiationContext,
   ): Promise<NegotiateResult>;
   /**
+   * PLU-112: generate/refresh the rolling narrative summary of the elided transcript
+   * prefix. OPTIONAL — the mock and legacy providers omit it, so the refresh helper
+   * feature-detects and no-ops when absent (dark path). Returns null on failure or a
+   * guard rejection (the caller keeps the prior summary / full transcript — §5.6).
+   */
+  summarizeConversation?(
+    priorSummary: string,
+    turns: DraftHistoryEntry[],
+  ): Promise<{ text: string; version?: string } | null>;
+  /**
    * Generate email copy via the draft agent.
    * Phase 8: executors call this instead of the raw template when
    * NEGOTIATION_PROVIDER=langgraph (or mock with richer copy).

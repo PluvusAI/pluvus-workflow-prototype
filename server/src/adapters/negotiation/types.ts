@@ -56,6 +56,23 @@ export interface ConversationSummaryPayload {
   version?: string;
 }
 
+/** PLU-112: the /summarize request — the prior rolling summary to extend + the
+ *  turns to fold in (the ones after the cursor, §5.4). */
+export interface SummarizeRequest {
+  priorSummary: string;
+  turns: DraftHistoryEntry[];
+}
+
+/** PLU-112: the /summarize response. `ok` false means generation failed OR the
+ *  post-gen guard rejected the output — the caller keeps the prior summary and the
+ *  full transcript rides (§5.6). */
+export interface SummarizeResponse {
+  ok: boolean;
+  text?: string;
+  version?: string;
+  rejectedReason?: string;
+}
+
 export interface NegotiationTerm {
   rate?: number;
   deliverables?: string[];

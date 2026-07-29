@@ -7,6 +7,8 @@ import type {
   DraftResponse,
   ExtractedFact,
   MemoryFactKey,
+  SummarizeRequest,
+  SummarizeResponse,
 } from "./types.js";
 import { agentBaseUrl, agentPostJson } from "../agentServiceClient.js";
 import { recordAgentLlmUsage } from "../../observability/llmUsage.js";
@@ -168,5 +170,23 @@ export class LangGraphNegotiationProvider implements NegotiationProvider {
     }
 
     return { subject: data["subject"], body: data["body"] };
+  }
+
+  async summarize(req: SummarizeRequest): Promise<SummarizeResponse> {
+    const data = await agentPostJson(this.baseUrl, "/summarize", req);
+    recordAgentLlmUsage("summarize", data);
+    // Malformed / missing ok → treat as a failed refresh (the caller keeps the prior
+    // summary and the full transcript rides — §5.6). Never throw into the turn path.
+    const ok = data["ok"] === true;
+    const text = typeof data["text"] === "string" ? (data["text"] as string) : undefined;
+    const version = typeof data["version"] === "string" ? (data["version"] as string) : undefined;
+    const rejectedReason =
+      typeof data["rejectedReason"] === "string" ? (data["rejectedReason"] as string) : undefined;
+    return {
+      ok,
+      ...(text !== undefined ? { text } : {}),
+      ...(version !== undefined ? { version } : {}),
+      ...(rejectedReason !== undefined ? { rejectedReason } : {}),
+    };
   }
 }

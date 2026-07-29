@@ -386,6 +386,25 @@ export class AgentProviderAdapter implements IAgentProvider {
     );
     return null;
   }
+
+  // PLU-112: refresh the rolling summary via the agent /summarize route. Fail-soft
+  // by contract (§5.6): a missing capability (mock), an unreachable agent, or a
+  // guard rejection all return null so the caller keeps the prior summary and the
+  // full transcript rides — a summary refresh NEVER blocks or fails a turn.
+  async summarizeConversation(
+    priorSummary: string,
+    turns: DraftHistoryEntry[],
+  ): Promise<{ text: string; version?: string } | null> {
+    if (typeof this.negotiator.summarize !== "function") return null;
+    try {
+      const resp = await this.negotiator.summarize({ priorSummary, turns });
+      if (!resp.ok || typeof resp.text !== "string" || !resp.text.trim()) return null;
+      return { text: resp.text, ...(resp.version ? { version: resp.version } : {}) };
+    } catch (err) {
+      console.error(`[agentProvider] summarize failed, keeping prior summary: ${errMessage(err)}`);
+      return null;
+    }
+  }
 }
 
 function errMessage(err: unknown): string {
