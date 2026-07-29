@@ -11,12 +11,13 @@ import {
   buildDraftHistory,
   computeOpenQuestions,
   buildOpenObligations,
+  buildStructuredObligations,
   buildQuestionObligationPlan,
   type QuestionObligationPlanItem,
   computeChangedFields,
   computeRelationshipWarmth,
 } from "./negotiationHistory.js";
-import { resolveBriefKnowledge } from "./briefKnowledge.js";
+import { resolveBriefKnowledge, type ResolvedBrief } from "./briefKnowledge.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { randomSendDelayMs } from "../sendDelay.js";
@@ -39,6 +40,65 @@ import { blockedByGuard } from "./guardEscalation.js";
 // knowledge-turn cost gate (it renders the block only on knowledge questions).
 function briefIntoNegotiateEnabled(): boolean {
   return process.env["BRIEF_INTO_NEGOTIATE"] === "true";
+}
+
+// PLU-114 §4.2: the agent's flat-brief safety net (_has_flat_brief) reads
+// ctx["briefKnowledge"] to avoid a false defer when a matched section is
+// unavailable but the answer may sit in the blob. That net fires only when the
+// blob is threaded — so it must reach /negotiate whenever RETRIEVAL is on, not
+// just when the separate BRIEF_INTO_NEGOTIATE sub-flag is on. Byte-identical when
+// retrieval is OFF (blob still not threaded → invariant #9).
+function knowledgeRetrievalEnabled(): boolean {
+  return process.env["KNOWLEDGE_RETRIEVAL_ENABLED"] === "true";
+}
+
+// PLU-114 (§4.9): project ResolvedBrief.sections ({key: CampaignBriefSection}) to
+// the {key: text} map the agent's AvailableSections.brief consumes. Returns
+// undefined when there are no sections (no brief / structured parse off / parse
+// failed) so the caller omits the wire key entirely (the router then resolves
+// from the flat fields, or defers). Only the text crosses the wire — page/source
+// provenance stays server-side (the observability record is built agent-side from
+// keys/rules, not values).
+function projectBriefSections(
+  sections: ResolvedBrief["sections"],
+): Record<string, string> | undefined {
+  if (!sections) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, section] of Object.entries(sections)) {
+    const text = section?.text;
+    if (typeof text === "string" && text.trim()) {
+      out[key] = text;
+    }
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+// PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
+// fields (usageRights / exclusivity / paymentTerms / attributionWindow) live on
+// `config` and reach /draft (via draftConfig = {...config}) but were NEVER placed
+// on the negotiate campaignContext — so the negotiate router resolved a configured
+// term to requested_but_unavailable and steered the model to defer a KNOWN answer,
+// an asymmetry with /draft. Project them (trimmed, non-empty only) so they can be
+// spread onto the negotiate knowledgeContext the same additive way as briefSections.
+// These are REFERENCE DATA only — campaignContext is documented "NEVER a money
+// input"; adding four string fields does not change that (guards + fee path
+// untouched). Exported for the request-shape unit test.
+export const FLAT_KNOWLEDGE_KEYS = [
+  "usageRights",
+  "exclusivity",
+  "paymentTerms",
+  "attributionWindow",
+] as const;
+
+export function projectFlatKnowledge(
+  config: Record<string, unknown>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of FLAT_KNOWLEDGE_KEYS) {
+    const v = config[key];
+    if (typeof v === "string" && v.trim()) out[key] = v.trim();
+  }
+  return out;
 }
 
 // FIX-11 + Randomized Send Delay (§4.1, §4.3a): outbound AI replies use the
@@ -574,21 +634,75 @@ export async function executeNegotiation(
   const briefKnowledge = resolvedBrief.flatText;
 
   // §4.9 / §4.10: thread the brief into the DECISION model as source-of-truth for
-  // knowledge answers — but ONLY when BRIEF_INTO_NEGOTIATE is on (de-risks the
-  // two-step rollout independently, §6). The agent applies the §4.10 knowledge-turn
-  // cost gate itself (it renders the block only on knowledge questions), so here we
-  // just make the brief text AVAILABLE to it via campaignContext. Off/absent →
-  // /negotiate prompt byte-identical to today (invariant #9). The brief is
-  // reference DATA on this endpoint too — NEVER a money input (the guards are
-  // unchanged; a brief number can't move the fee).
-  const negotiateBrief = briefIntoNegotiateEnabled() && briefKnowledge ? briefKnowledge : undefined;
+  // knowledge answers. Made available when EITHER the BRIEF_INTO_NEGOTIATE sub-flag
+  // is on (the PLU-107 whole-blob interim, de-risked independently §6) OR retrieval
+  // is on (PLU-114). The retrieval case is why: the agent's §4.2 flat-brief safety
+  // net (_has_flat_brief) reads ctx["briefKnowledge"] to fall back to the blob
+  // instead of emitting a false defer when a matched section is unavailable — so the
+  // blob must reach the router regardless of that separate sub-flag, exactly as the
+  // flat FIELDS / briefSections / obligations below already do. The agent still
+  // applies the §4.10 knowledge-turn cost gate (renders the block only on knowledge
+  // questions) AND, with retrieval on, only surfaces the blob on the FALLBACK path
+  // (a confident match renders selected sections, never the blob). Both flags off →
+  // /negotiate prompt byte-identical to today (invariant #9). The brief is reference
+  // DATA on this endpoint too — NEVER a money input (guards unchanged; a brief
+  // number can't move the fee).
+  const negotiateBrief =
+    (briefIntoNegotiateEnabled() || knowledgeRetrievalEnabled()) && briefKnowledge
+      ? briefKnowledge
+      : undefined;
+
+  // PLU-114 (§4.9 / §5, REVIEW #1+#2): the two structured INPUTS the agent-side
+  // knowledge router needs but which do NOT reach it today — the parsed brief
+  // SECTIONS (not just the flat blob) and the open obligations WITH their category.
+  // Both are threaded as ADDITIVE campaignContext keys (old callers ignore them),
+  // and the agent applies KNOWLEDGE_RETRIEVAL_ENABLED itself — so with the agent
+  // flag OFF these keys are inert (the new selected-knowledge block never renders)
+  // and both prompts are byte-identical to today. Threaded independently of
+  // BRIEF_INTO_NEGOTIATE: the router resolves values from the flat FIELDS too, so
+  // it must see sections/obligations regardless of that separate sub-flag.
+  //
+  //   briefSections — resolvedBrief.sections projected to {sectionKey: text}. The
+  //     router resolves a brief-sourced value from this; only present when the
+  //     structured parse produced sections (STRUCTURED_BRIEF_PARSING_ENABLED on +
+  //     an ok parse), else omitted → the router falls back to flat fields.
+  //   structuredObligations — {id, originalText, category} per non-terminal row,
+  //     so an open obligation pulls in the section it's on the hook to answer even
+  //     when this turn's message is silent on it (invariant #5).
+  const briefSections = projectBriefSections(resolvedBrief.sections);
+  const structuredObligations = buildStructuredObligations(openObligationRows);
+
+  // PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
+  // fields must reach the negotiate router too. Today they only feed conflict
+  // detection above (resolveBriefKnowledge :590-594) and reach /draft (via
+  // draftConfig = {...config}) but are NEVER placed on the negotiate campaignContext
+  // — so the negotiate router resolves a *configured* term to
+  // requested_but_unavailable and steers the model to defer a known answer, an
+  // asymmetry with /draft. Resolve them from `config` the same way /draft does and
+  // spread them onto knowledgeContext as additive string keys. Inert with the agent
+  // flag OFF (the selected-knowledge block never renders), and threaded
+  // independently of BRIEF_INTO_NEGOTIATE (the router resolves from the flat FIELDS,
+  // not the brief blob, so it must see them regardless of that sub-flag).
+  //
+  // Guardrail: these are REFERENCE DATA only. campaignContext is documented as
+  // "NEVER a money input" (providers.ts) — adding four string fields does not change
+  // that; the guards and fee path are untouched. Kept on campaignContext (alongside
+  // the other knowledge keys), NOT campaignConstraints (which feeds band/decision).
+  const flatKnowledge = projectFlatKnowledge(config);
+
+  const knowledgeContext: Record<string, unknown> = {
+    ...flatKnowledge,
+    ...(negotiateBrief ? { briefKnowledge: negotiateBrief } : {}),
+    ...(briefSections ? { briefSections } : {}),
+    ...(structuredObligations.length ? { structuredObligations } : {}),
+  };
 
   const negotiationContext: PriorNegotiationContext = {
     ...priorContext,
     ...(draftHistory.length ? { conversationHistory: draftHistory } : {}),
     ...(openCommitments.length ? { openCommitments } : {}),
     ...(classifiedIntent ? { intent: classifiedIntent } : {}),
-    ...(negotiateBrief ? { campaignContext: { briefKnowledge: negotiateBrief } } : {}),
+    ...(Object.keys(knowledgeContext).length ? { campaignContext: knowledgeContext } : {}),
   };
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
@@ -614,7 +728,32 @@ export async function executeNegotiation(
   // as `briefKnowledge` (the /draft FALLBACK role, §4.9) — kept exactly as today so
   // rules-mode / guard-nulled turns still answer from the brief. "" when there's no
   // brief or it can't be read (soft-degrade).
-  const draftConfig = briefKnowledge ? { ...config, briefKnowledge } : config;
+  //
+  // PLU-114 (§5): the SAME two structured inputs threaded into /negotiate above are
+  // added to draftConfig so the agent's knowledge router runs identically on the
+  // /draft endpoint (the whole draftConfig becomes DraftRequest.campaignContext via
+  // stripBandFromContext). Added as keys (not a nested object) so they survive the
+  // band strip untouched. Inert with the agent flag OFF — the DraftRequest ignores
+  // unknown campaignContext keys and the selected-knowledge block never renders, so
+  // /draft is byte-identical to today.
+  const draftConfig: Record<string, unknown> = {
+    ...config,
+    ...(briefKnowledge ? { briefKnowledge } : {}),
+    ...(briefSections ? { briefSections } : {}),
+    ...(structuredObligations.length ? { structuredObligations } : {}),
+  };
+
+  // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
+  // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the
+  // section VALUES are not logged (keys/pages/reason only).
+  if (resolvedBrief.conflicts && resolvedBrief.conflicts.length) {
+    console.warn(
+      `[briefKnowledge] material brief-vs-Campaign conflict(s) on instance ${instance.id}: ` +
+        resolvedBrief.conflicts
+          .map((c) => `${c.section}(${c.reason}${c.pageStart ? `, p${c.pageStart}` : ""})`)
+          .join("; "),
+    );
+  }
 
   // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
   // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the

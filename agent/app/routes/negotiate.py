@@ -50,6 +50,18 @@ from app.injection import (
     normalize_untrusted_text,
     sanitize_creator_text,
 )
+from app.knowledge_retrieval import (
+    AvailableSections,
+    KnowledgeSelection,
+    Obligation,
+    SECTION_KEYS,
+    build_selection_from_sections,
+    select_knowledge_sections,
+)
+from app.knowledge_classifier import (
+    classify_knowledge_topics,
+    knowledge_classifier_enabled,
+)
 from app.llm import get_llm
 from app.security import rate_limiter, require_api_key
 from app.structured import invoke_structured, StructuredOutputError
@@ -1954,7 +1966,12 @@ def _llm_negotiate_decision(
         # briefKnowledge (BRIEF_INTO_NEGOTIATE on) AND this is a knowledge turn
         # (§4.10 gate). NEVER a money input — the fee still comes only from the
         # guarded decision.
-        brief_block=_negotiate_brief_block(req),
+        #
+        # PLU-114 §5: with KNOWLEDGE_RETRIEVAL_ENABLED on, _negotiate_knowledge_block
+        # runs the deterministic per-section router INSTEAD (bypassing the interim
+        # _turn_wants_brief whole-blob gate), rendering only this turn's sections.
+        # Flag OFF → identical to _negotiate_brief_block(req).
+        brief_block=_negotiate_knowledge_block(req),
     )
 
     # HARD-O1 / item 47: stamp the LLM-negotiate prompt version on the telemetry
@@ -2975,7 +2992,14 @@ def _knowledge_block(req: DraftRequest, ctx: dict[str, Any]) -> str:
     creator's usage-rights / exclusivity / payment / attribution question from
     real data instead of inventing it. Returns "" when nothing is known (the
     prompts already instruct honest deferral in that case)."""
-    facts = _knowledge_facts(req, ctx)
+    return _render_knowledge_facts(_knowledge_facts(req, ctx))
+
+
+def _render_knowledge_facts(facts: dict[str, str]) -> str:
+    """Render a {label: value} knowledge-facts dict to the shared HARD-K1 prompt
+    block. Split out of `_knowledge_block` so the negotiate full-context fallback
+    (Calvin follow-up §3.2) renders byte-identical framing from its own
+    campaignContext-sourced facts. Returns "" when `facts` is empty."""
     if not facts:
         return ""
     lines = "\n".join(f"- {label}: {value}" for label, value in facts.items())
@@ -3023,6 +3047,351 @@ def _brief_knowledge_block(ctx: dict[str, Any]) -> str:
         "dollar amount, budget, or rate from it.\n"
         f"<campaign_brief>\n{text}\n</campaign_brief>"
     )
+
+
+# ---------------------------------------------------------------------------
+# PLU-114: deterministic campaign-knowledge retrieval — the selected-knowledge
+# block that REPLACES the whole-brief blocks on a confident match (§4, §5).
+# ---------------------------------------------------------------------------
+# When KNOWLEDGE_RETRIEVAL_ENABLED is ON and the router returns a match, this
+# block renders ONLY the sections relevant to this turn (message + open
+# obligations) instead of the four flat facts + the 4000-char brief blob. On
+# `no_match` (or the flag OFF) the caller keeps the existing flat blocks — so a
+# too-conservative router degrades to exactly today's behavior (invariant #3), and
+# with the flag off both prompts are byte-identical to today (§6).
+
+
+def _knowledge_retrieval_enabled() -> bool:
+    """PLU-114 §6: gate the whole selected-knowledge path. Default OFF → the flat
+    _knowledge_block / _brief_knowledge_block / _negotiate_brief_block render
+    exactly as today (byte-identical, invariant #9). No observability record when
+    off."""
+    return os.getenv("KNOWLEDGE_RETRIEVAL_ENABLED", "").strip().lower() == "true"
+
+
+def warn_knowledge_flag_dependency() -> None:
+    """Calvin follow-up §4.2(b) / W6: diagnostics-only guard. Retrieval resolves a
+    brief-sourced value from the structured `briefSections` the server threads only
+    when STRUCTURED_BRIEF_PARSING_ENABLED is on. With retrieval ON but parsing OFF,
+    the router still resolves from the flat FIELDS and the §4.2 flat-brief fallback
+    still keeps it safe (no false defer), so this is NOT a hard failure — it just
+    means retrieval loses its per-section brief granularity and leans on the
+    fallback. Emit a one-time WARNING at startup so a misconfiguration is visible.
+    Called once from app startup; safe to call more than once."""
+    # W8 (§5): the classifier is a fallback *within* retrieval — enabling it while
+    # retrieval is OFF is a no-op the operator almost certainly did not intend. Warn
+    # regardless of the retrieval-on checks below (which early-return when off).
+    if knowledge_classifier_enabled() and not _knowledge_retrieval_enabled():
+        logger.warning(
+            "KNOWLEDGE_CLASSIFIER_ENABLED is on but KNOWLEDGE_RETRIEVAL_ENABLED is "
+            "off: the constrained topic classifier only runs as a fallback inside "
+            "the retrieval path, so with retrieval off it never executes. Enable "
+            "KNOWLEDGE_RETRIEVAL_ENABLED too (see .env.example)."
+        )
+
+    if not _knowledge_retrieval_enabled():
+        return
+    parsing_on = os.getenv("STRUCTURED_BRIEF_PARSING_ENABLED", "").strip().lower() == "true"
+    if not parsing_on:
+        logger.warning(
+            "KNOWLEDGE_RETRIEVAL_ENABLED is on but STRUCTURED_BRIEF_PARSING_ENABLED "
+            "is off: per-section brief resolution is unavailable, so retrieval will "
+            "resolve from flat campaign fields and degrade to the full-brief "
+            "fallback on unmatched sections. Recommended: enable both together "
+            "(see .env.example)."
+        )
+    if knowledge_classifier_enabled():
+        logger.info(
+            "KNOWLEDGE_CLASSIFIER_ENABLED is on: the constrained topic classifier "
+            "will run as a fallback on uncertain (no_match / low-confidence) turns "
+            "only. It selects topic keys only; values stay deterministic."
+        )
+
+
+# Human-readable label per section key for the rendered block. Mirrors
+# _KNOWLEDGE_LABELS where they overlap so the copy reads the same regardless of
+# which path produced the fact.
+_SECTION_LABELS: dict[str, str] = {
+    "usageRights": "Content usage rights",
+    "exclusivity": "Category exclusivity",
+    "paymentTerms": "Payment terms / schedule",
+    "timeline": "Timeline / go-live",
+    "deliverables": "Deliverables",
+    "shipping": "Shipping",
+    "attributionWindow": "Attribution / cookie window",
+    "overview": "Campaign overview",
+}
+
+
+def _available_sections_from(fields: dict[str, str], ctx: dict[str, Any]) -> AvailableSections:
+    """Build the router's AvailableSections from resolved flat fields + the brief
+    sections threaded on campaignContext (§4.9). `fields` is the authoritative flat
+    knowledge (resolved by the caller the same way `_knowledge_facts` does); `brief`
+    is campaignContext['briefSections'] ({key: text}) — present only when the
+    structured parse produced sections, else empty (router resolves from fields)."""
+    brief_raw = ctx.get("briefSections") if isinstance(ctx, dict) else None
+    brief: dict[str, str] = {}
+    if isinstance(brief_raw, dict):
+        for key, val in brief_raw.items():
+            if key in SECTION_KEYS and isinstance(val, str) and val.strip():
+                brief[key] = val.strip()
+    return AvailableSections(fields={k: v for k, v in fields.items() if v}, brief=brief)
+
+
+# The flat knowledge fields the router resolves a section value from, and where
+# they live. usageRights/exclusivity/paymentTerms/attributionWindow + deliverables/
+# timeline are flat campaign fields (present on DraftRequest and/or campaignContext);
+# shipping/overview have NO flat field (resolved from the brief section only, §4.1).
+_ROUTER_FLAT_KEYS = (
+    "usageRights",
+    "exclusivity",
+    "paymentTerms",
+    "attributionWindow",
+    "deliverables",
+    "timeline",
+)
+
+
+def _router_fields_from_draft(req: "DraftRequest", ctx: dict[str, Any]) -> dict[str, str]:
+    """Resolve the flat knowledge fields for the DRAFT endpoint the SAME way
+    _knowledge_facts does — explicit DraftRequest field first, then campaignContext.
+    Keys with no value are omitted (the router then marks a selected section
+    requested_but_unavailable, or resolves it from the brief)."""
+    out: dict[str, str] = {}
+    for key in _ROUTER_FLAT_KEYS:
+        val = (getattr(req, key, None) or (ctx.get(key) if isinstance(ctx, dict) else None) or "")
+        val = val.strip() if isinstance(val, str) else ""
+        if val:
+            out[key] = val
+    return out
+
+
+def _router_fields_from_negotiate(req: "NegotiateRequest") -> dict[str, str]:
+    """Resolve the flat knowledge fields for the NEGOTIATE endpoint. The four HARD-K1
+    knowledge fields live on campaignContext (the executor threads them there);
+    deliverables/timeline live on campaignConstraints (the negotiate request carries
+    the band + brand context there, not as top-level fields)."""
+    out: dict[str, str] = {}
+    ctx = req.campaignContext if isinstance(req.campaignContext, dict) else {}
+    for key in ("usageRights", "exclusivity", "paymentTerms", "attributionWindow"):
+        val = ctx.get(key)
+        if isinstance(val, str) and val.strip():
+            out[key] = val.strip()
+    constraints = getattr(req, "campaignConstraints", None)
+    for key in ("deliverables", "timeline"):
+        val = getattr(constraints, key, None)
+        if isinstance(val, str) and val.strip():
+            out[key] = val.strip()
+    return out
+
+
+def _obligations_from(ctx: dict[str, Any]) -> list[Obligation]:
+    """Build the router's obligation inputs from campaignContext['structuredObligations']
+    ({id, originalText, category?}) — the structured obligation payload PLU-114 added
+    to the wire (REVIEW #2). Absent/empty → [] (message-only routing)."""
+    raw = ctx.get("structuredObligations") if isinstance(ctx, dict) else None
+    out: list[Obligation] = []
+    if isinstance(raw, list):
+        for row in raw:
+            if not isinstance(row, dict):
+                continue
+            text = row.get("originalText")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            cat = row.get("category")
+            oid = row.get("id")
+            out.append(
+                Obligation(
+                    original_text=text,
+                    category=cat if isinstance(cat, str) and cat else None,
+                    id=oid if isinstance(oid, str) and oid else None,
+                )
+            )
+    return out
+
+
+def _log_retrieval(selection: KnowledgeSelection, endpoint: str) -> None:
+    """§4.10: emit ONE observability record per retrieval. Records WHAT was selected,
+    WHY (rule), WHERE each value resolved from, what was unavailable/dropped, and the
+    flag state — the acceptance criterion + the §8 measurement substrate. Section
+    VALUES are NEVER logged (invariant #7): only section keys, rules, trigger ids,
+    and resolvedFrom origins (which are themselves keys, never values)."""
+    logger.info(
+        "knowledge_retrieval endpoint=%s flag=on outcome=%s selected=%s unavailable=%s "
+        "dropped=%s sources=%s",
+        endpoint,
+        selection.outcome,
+        [s.section for s in selection.sections],
+        list(selection.unavailable),
+        list(selection.dropped),
+        [
+            {
+                "section": s.section,
+                "rule": s.rule,
+                "trigger": s.trigger,
+                "resolvedFrom": s.resolved_from,
+            }
+            for s in selection.sources
+        ],
+    )
+
+
+def _render_selected_knowledge(selection: KnowledgeSelection) -> str:
+    """Render a matched/broad KnowledgeSelection to the prompt block (§4.7). Each
+    AVAILABLE section states its value as fact; each requested_but_unavailable section
+    renders the honest-defer instruction (NEVER an invented value, invariant #4). The
+    framing mirrors _knowledge_block's "these are FACTS, answer with the stated value,
+    never alter the wording" contract so copy quality is unchanged — only the SET of
+    facts is narrowed to what this turn is about."""
+    available_lines: list[str] = []
+    defer_labels: list[str] = []
+    for sec in selection.sections:
+        label = _SECTION_LABELS.get(sec.section, sec.section)
+        if sec.availability == "available" and sec.value:
+            available_lines.append(f"- {label}: {sec.value}")
+        else:
+            defer_labels.append(label)
+
+    parts: list[str] = []
+    if available_lines:
+        parts.append(
+            "Relevant campaign terms for THIS turn — these are FACTS we have. The "
+            "creator's message (and any open commitment) is about the topic(s) below, "
+            "so ANSWER with the stated value; do NOT defer a term listed here, do NOT "
+            "volunteer terms not listed, and never alter the wording:\n"
+            + "\n".join(available_lines)
+        )
+    if defer_labels:
+        # Selected-but-unavailable: the creator asked but we have no value. Instruct
+        # an honest deferral — never fabricate one (the exact _knowledge_block /
+        # negotiate-prompt contract).
+        parts.append(
+            "The creator asked about the following, but we do NOT have a configured "
+            "value for it — do NOT invent one. Acknowledge the question honestly and "
+            "say we'll confirm and follow up: " + ", ".join(defer_labels) + "."
+        )
+    return "\n\n".join(parts)
+
+
+def _selected_knowledge_block(
+    message: str,
+    fields: dict[str, str],
+    ctx: dict[str, Any],
+    endpoint: str,
+) -> str | None:
+    """PLU-114 §5 + Calvin follow-up §3.2/§3.3/§4.2: the flag-gated selected-knowledge
+    block that REPLACES the flat _knowledge_block + _brief_knowledge_block (draft) /
+    _negotiate_brief_block (negotiate) — but ONLY on a CONFIDENT match whose selected
+    sections all resolve to a real value (or defer with no broader context to fall
+    back to).
+
+    Returns:
+      • None  — "fall back to the full flat blocks" (the SAME policy on both
+                endpoints). Returned when: the flag is OFF; the router returned
+                `no_match`; the match is `low` confidence (only a greedy rule fired,
+                §3.3); OR any selected section is requested_but_unavailable while a
+                flat `briefKnowledge` blob exists in ctx (§4.2 — never suppress a
+                real answer sitting in the blob with a false defer). The caller then
+                renders the full context it would render today (draft: flat
+                _knowledge_block + _brief_knowledge_block; negotiate:
+                _negotiate_full_context_fallback), so an uncertain router degrades to
+                today's behavior, never a stripped prompt.
+      • str   — a confident selection rendered to a prompt block (always non-empty:
+                an available section states its value; a genuinely-unavailable section
+                with NO flat brief to fall back to renders an honest-defer line).
+
+    Emits the §4.10 observability record on every retrieval (match/broad/no_match)
+    so the no-match/low-confidence/fallback rates are measurable (§6)."""
+    if not _knowledge_retrieval_enabled():
+        return None
+    ctx = ctx if isinstance(ctx, dict) else {}
+    available = _available_sections_from(fields, ctx)
+    obligations = _obligations_from(ctx)
+    selection = select_knowledge_sections(message or "", obligations, available)
+    _log_retrieval(selection, endpoint)
+    # §3.2 + §3.3: no_match, or a low-confidence (greedy-only) match, degrades to the
+    # full-context fallback — identical policy on /negotiate and /draft. W8 (§5): on
+    # THIS uncertain branch only (never the confident fast path above), the optional
+    # constrained classifier gets a chance to recover a paraphrased question the
+    # regexes missed BEFORE we fall back.
+    if selection.outcome == "no_match" or selection.confidence == "low":
+        classified = _classifier_selection(message or "", obligations, available, ctx, endpoint)
+        if classified is not None:
+            return classified
+        return None
+    return _render_or_fallback(selection, ctx)
+
+
+def _render_or_fallback(selection: KnowledgeSelection, ctx: dict[str, Any]) -> str | None:
+    """Apply the §4.2 flat-brief safety net, then render (§4.7). Shared by the
+    deterministic match and the W8 classifier match so BOTH honor the identical
+    "never emit a false defer while the answer may sit in the flat blob" contract.
+
+    §4.2 flat-brief fallback: a selected section we have NO configured value for is a
+    false-defer risk when the answer may sit in the flat briefKnowledge blob the
+    selected block would otherwise REPLACE. When any selected section is
+    requested_but_unavailable AND a briefKnowledge blob is present, fall back to the
+    full context (which includes that blob) instead of emitting a defer line — we
+    only tell a creator "we'll confirm" after checking ALL sources (flat field,
+    brief section, AND the flat blob)."""
+    if selection.unavailable and _has_flat_brief(ctx):
+        return None
+    return _render_selected_knowledge(selection)
+
+
+def _classifier_selection(
+    message: str,
+    obligations: list[Obligation],
+    available: AvailableSections,
+    ctx: dict[str, Any],
+    endpoint: str,
+) -> str | None:
+    """W8 / Calvin follow-up §5: the constrained-classifier fallback, invoked ONLY
+    from the uncertain branch of `_selected_knowledge_block` (deterministic
+    no_match / low-confidence). Guarded by its OWN sub-flag on top of
+    KNOWLEDGE_RETRIEVAL_ENABLED — the deterministic path always runs first and stays
+    the high-precision floor.
+
+    Returns a rendered block (str) ONLY on a CONFIDENT classifier result that maps to
+    real sections and survives the flat-brief safety net; otherwise None → the caller
+    keeps its full-context fallback. `unknown`, `broad`-that-resolves-to-nothing, and
+    low-confidence classifier outputs all yield None, so an uncertain classifier can
+    never narrow the prompt (invariant: it only ADDS recall on the hard turns).
+
+    The classifier decides WHICH sections; `build_selection_from_sections` resolves
+    the VALUES deterministically — the classifier never produces a value or a rate."""
+    if not knowledge_classifier_enabled():
+        return None
+    try:
+        result = classify_knowledge_topics(message)
+    except Exception as exc:  # noqa: BLE001 — never let the classifier break a turn.
+        logger.warning("knowledge_classifier call failed, keeping fallback: %s", exc)
+        return None
+    # Low confidence or nothing to pull → keep the full-context fallback (parity with
+    # a deterministic low-confidence/no_match).
+    if result.confidence == "low" or not result.sections:
+        logger.info(
+            "knowledge_classifier endpoint=%s outcome=fallback confidence=%s categories=%s",
+            endpoint,
+            result.confidence,
+            result.raw_categories,
+        )
+        return None
+    selection = build_selection_from_sections(
+        result.sections, available, rule="classifier", trigger="classifier"
+    )
+    _log_retrieval(selection, f"{endpoint}:classifier")
+    if selection.outcome == "no_match":
+        return None
+    return _render_or_fallback(selection, ctx)
+
+
+def _has_flat_brief(ctx: dict[str, Any]) -> bool:
+    """§4.2: is a non-empty flat `briefKnowledge` blob present on ctx? Used to decide
+    whether a matched-but-unavailable section should degrade to the full-context
+    fallback (the blob may hold the answer) rather than emit a false defer."""
+    raw = ctx.get("briefKnowledge") if isinstance(ctx, dict) else None
+    return isinstance(raw, str) and bool(raw.strip())
 
 
 # PLU-107 §4.10: intent labels the first-reply classifier assigns to a turn that
@@ -3078,6 +3447,69 @@ def _negotiate_brief_block(req: "NegotiateRequest") -> str:
     # rule + trailing newline so the layout reads cleanly, and keep the empty case
     # a bare "" so the byte-identical-when-off property holds.
     return f"---\n\n{block}\n\n" if block else ""
+
+
+def _negotiate_full_context_fallback(req: "NegotiateRequest") -> str:
+    """Calvin follow-up §3.2: the negotiate-side full-context fallback — the SAME
+    broader context /draft falls back to, so an uncertain router degrades identically
+    on both endpoints (parity), never to a stripped prompt.
+
+    Renders the flat knowledge fields (from campaignContext, via
+    `_router_fields_from_negotiate`) PLUS the flat brief block
+    (`_negotiate_brief_block`, still subject to its `_turn_wants_brief` gate). Both
+    pieces are optional; an empty result is a bare "" (byte-identical to a
+    non-knowledge turn). This is the negotiate analogue of the draft fallback
+    (`_knowledge_block` + `_brief_knowledge_block`)."""
+    parts: list[str] = []
+    # Flat knowledge fields, rendered with the exact HARD-K1 framing /draft uses, from
+    # the four fields the executor now threads onto campaignContext (§2.2 / W1).
+    ctx = req.campaignContext if isinstance(req.campaignContext, dict) else {}
+    facts: dict[str, str] = {}
+    for key, label in _KNOWLEDGE_LABELS:
+        val = ctx.get(key)
+        if isinstance(val, str) and val.strip():
+            facts[label] = val.strip()
+    knowledge = _render_knowledge_facts(facts)
+    if knowledge:
+        parts.append(knowledge)
+    # The flat brief block (its own _turn_wants_brief gate still applies) — the
+    # blob that may carry an answer the router couldn't resolve to a section.
+    brief_block = _brief_knowledge_block(ctx) if _turn_wants_brief(req.creatorReply, req.intent) else ""
+    if brief_block:
+        parts.append(brief_block)
+    if not parts:
+        return ""
+    return "---\n\n" + "\n\n".join(parts) + "\n\n"
+
+
+def _negotiate_knowledge_block(req: "NegotiateRequest") -> str:
+    """PLU-114 §5 + Calvin follow-up §3.2: the DECISION-prompt knowledge block. When
+    KNOWLEDGE_RETRIEVAL_ENABLED is ON, the deterministic router REPLACES
+    `_negotiate_brief_block` on a CONFIDENT match — and crucially BYPASSES
+    `_turn_wants_brief` (PLU-107's interim whole-blob gate): the router IS the
+    per-section gate now, so the two are not stacked (REVIEW minor note). On a
+    confident match it renders the selected sections in the same `---`-wrapped slot.
+
+    On `no_match`, a `low`-confidence (greedy-only) match, or a matched-but-unavailable
+    section while a flat brief blob exists (`_selected_knowledge_block` returns None),
+    it FALLS BACK to `_negotiate_full_context_fallback` — the same broader context
+    /draft falls back to (Calvin follow-up §3.2), NOT "" as it did before. This makes
+    an uncertain router degrade to today's negotiate behavior instead of a stripped
+    prompt. With the flag OFF it defers to `_negotiate_brief_block` verbatim, so the
+    negotiate prompt is byte-identical to today (invariant #9)."""
+    if not _knowledge_retrieval_enabled():
+        return _negotiate_brief_block(req)
+    ctx = req.campaignContext if isinstance(req.campaignContext, dict) else {}
+    selected = _selected_knowledge_block(
+        req.creatorReply or "", _router_fields_from_negotiate(req), ctx, "negotiate"
+    )
+    if selected is None:
+        # no_match / low-confidence / matched-but-unavailable-with-flat-brief →
+        # full-context fallback (parity with /draft), never a stripped prompt.
+        return _negotiate_full_context_fallback(req)
+    if not selected:  # defensive: an empty confident block carries nothing this turn
+        return ""
+    return f"---\n\n{selected}\n\n"
 
 
 # Option A: max chars of the negotiator's own written reply we fold into a draft
@@ -3759,16 +4191,26 @@ def _build_offer_prompt(
         extra_parts.append(_tagged_creator_reply(req.creatorReply))
     if scope_lines:
         extra_parts.extend(scope_lines)
-    # HARD-K1: known campaign terms (usage rights / exclusivity / payment /
-    # attribution) so a creator's question about them is answered from real data
-    # rather than deferred-or-invented.
-    knowledge = _knowledge_block(req, ctx)
-    if knowledge:
-        extra_parts.append(knowledge)
-    # HARD-K1: parsed campaign-brief text (reference data for creator questions).
-    brief_block = _brief_knowledge_block(ctx)
-    if brief_block:
-        extra_parts.append(brief_block)
+    # PLU-114 (§5): on a confident retrieval match, the selected-knowledge block
+    # REPLACES both flat blocks below with ONLY the sections this turn is about.
+    # None → flag OFF or no_match → render the flat blocks verbatim (byte-identical).
+    selected_knowledge = _selected_knowledge_block(
+        req.creatorReply or "", _router_fields_from_draft(req, ctx), ctx, "draft"
+    )
+    if selected_knowledge is not None:
+        if selected_knowledge:
+            extra_parts.append(selected_knowledge)
+    else:
+        # HARD-K1: known campaign terms (usage rights / exclusivity / payment /
+        # attribution) so a creator's question about them is answered from real data
+        # rather than deferred-or-invented.
+        knowledge = _knowledge_block(req, ctx)
+        if knowledge:
+            extra_parts.append(knowledge)
+        # HARD-K1: parsed campaign-brief text (reference data for creator questions).
+        brief_block = _brief_knowledge_block(ctx)
+        if brief_block:
+            extra_parts.append(brief_block)
     # Option A: the negotiator's own vetted answers, LAST so they are the most
     # authoritative reference the model reads before writing. Omitted (byte-identical
     # to before) when nothing was threaded / the guards altered the decision upstream.
@@ -4376,15 +4818,24 @@ def _langgraph_draft(req: DraftRequest) -> DraftResponse:
         if history_block:
             extra_parts.append(history_block)
 
-        # HARD-K1: known campaign terms so a creator question about usage rights /
-        # exclusivity / payment / attribution is answered from real data.
-        knowledge = _knowledge_block(req, ctx)
-        if knowledge:
-            extra_parts.append(knowledge)
-        # HARD-K1: parsed campaign-brief text (reference data for creator questions).
-        brief_block = _brief_knowledge_block(ctx)
-        if brief_block:
-            extra_parts.append(brief_block)
+        # PLU-114 (§5): selected-knowledge block REPLACES both flat blocks on a
+        # confident match; None (flag OFF / no_match) → flat blocks verbatim.
+        selected_knowledge = _selected_knowledge_block(
+            req.creatorReply or "", _router_fields_from_draft(req, ctx), ctx, "draft"
+        )
+        if selected_knowledge is not None:
+            if selected_knowledge:
+                extra_parts.append(selected_knowledge)
+        else:
+            # HARD-K1: known campaign terms so a creator question about usage rights /
+            # exclusivity / payment / attribution is answered from real data.
+            knowledge = _knowledge_block(req, ctx)
+            if knowledge:
+                extra_parts.append(knowledge)
+            # HARD-K1: parsed campaign-brief text (reference data for creator questions).
+            brief_block = _brief_knowledge_block(ctx)
+            if brief_block:
+                extra_parts.append(brief_block)
 
         # The creator's own words, so the email continues the conversation
         # instead of restarting it cold. MED-S2: delimited + framed as DATA.

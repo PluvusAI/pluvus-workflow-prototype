@@ -12,6 +12,7 @@ import {
   normalizeObligationKey,
   buildQuestionObligationPlan,
   buildOpenObligations,
+  buildStructuredObligations,
   computeOpenQuestions,
 } from "./negotiationHistory.js";
 
@@ -181,6 +182,55 @@ test("empty ledger → the executor's fallback yields today's diff output", () =
   assert.deepEqual(fallback, ["when do I get paid?"]);
   // And an empty ledger split contributes nothing on top.
   assert.deepEqual(buildOpenObligations([]).openQuestions, []);
+});
+
+// ---------------------------------------------------------------------------
+// PLU-114: buildStructuredObligations — {id, originalText, category} projection
+// ---------------------------------------------------------------------------
+console.log("\nPLU-114 buildStructuredObligations\n");
+
+test("projects id + originalText + category for each row", () => {
+  const out = buildStructuredObligations([
+    ob({ id: "a", originalText: "when does it ship?", category: "shipping" }),
+    ob({ id: "b", originalText: "how long can you use my content?", category: "usage_rights" }),
+  ]);
+  assert.deepEqual(out, [
+    { id: "a", originalText: "when does it ship?", category: "shipping" },
+    { id: "b", originalText: "how long can you use my content?", category: "usage_rights" },
+  ]);
+});
+
+test("omits category when null (router falls back to originalText routing)", () => {
+  const out = buildStructuredObligations([ob({ id: "a", originalText: "any update?", category: null })]);
+  assert.deepEqual(out, [{ id: "a", originalText: "any update?" }]);
+  assert.ok(!("category" in out[0]!));
+});
+
+test("includes BOTH creator questions and Pluvus commitments", () => {
+  const out = buildStructuredObligations([
+    ob({ id: "q", type: "CREATOR_QUESTION", originalText: "when do I get paid?" }),
+    ob({ id: "c", type: "PLUVUS_COMMITMENT", originalText: "I'll confirm the shipping timeline", category: "shipping" }),
+  ]);
+  assert.equal(out.length, 2);
+  assert.deepEqual(out.map((o) => o.id), ["q", "c"]);
+});
+
+test("dedups by originalText case-insensitively, preserving order", () => {
+  const out = buildStructuredObligations([
+    ob({ id: "a", originalText: "When does it ship?" }),
+    ob({ id: "b", originalText: "when does it SHIP?" }),
+    ob({ id: "c", originalText: "how long can you use it?" }),
+  ]);
+  assert.deepEqual(out.map((o) => o.id), ["a", "c"]);
+});
+
+test("skips blank originalText", () => {
+  const out = buildStructuredObligations([ob({ id: "a", originalText: "   " })]);
+  assert.deepEqual(out, []);
+});
+
+test("empty in → empty out (no wire field attached)", () => {
+  assert.deepEqual(buildStructuredObligations([]), []);
 });
 
 console.log(`\n✓ obligationPlan: all ${n} tests passed\n`);
