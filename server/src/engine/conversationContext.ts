@@ -71,6 +71,16 @@ import {
 } from "./executors/briefKnowledge.js";
 import { extractReplyText } from "./executors/replyText.js";
 import { mergeCampaignFallback } from "./campaignContext.js";
+// PLU-112: budget-aware windowing, applied as a per-purpose POST-projection (§5.1.1).
+// The flag check + the §5.1 "window only with a valid summary" invariant live in the
+// helper; assembleContext / buildDraftHistory stay un-windowed (escalation caller).
+import { applyBudgetWindow } from "./executors/conversationWindow.js";
+import { conversationSummaryEnabled } from "./executors/summaryConfig.js";
+// The REAL loaders that light up the PLU-81 seam (flag checks live inside them).
+import {
+  loadCreatorMemory as realLoadCreatorMemory,
+  loadConversationSummary as realLoadConversationSummary,
+} from "./executors/contextLoaders.js";
 // §4.3: the band-key list is the ONE source of truth. toDraftContext strips using
 // this exact list rather than re-listing the keys (BAND_CONTEXT_KEYS strips the raw
 // minBudget/maxBudget too — the real leak surface).
@@ -106,9 +116,12 @@ export type { CreatorMemoryConflict, CreatorMemoryPayload } from "./executors/cr
 import type { CreatorMemoryPayload } from "./executors/creatorMemory.js";
 
 /**
- * PLU-112 §9.4 — shape UNVERIFIED (canonical owner: PLU-112; adjust on that issue).
- * PLU-112 is not built anywhere; this is a minimal placeholder so the slot + the
- * `summaryVersion` observability field have a type. No budget logic ships (§3).
+ * PLU-112 — the WIRE/projection shape of the rolling summary: the lean narrative
+ * the model receives (text + version stamp), NOT the richer persisted DB row
+ * (`schema.ts` ConversationSummary, which also carries the cursor + audit columns).
+ * The loader maps DB row → this shape. Kept minimal so the summary is *narrative
+ * context, not authoritative fact* (§5.2): it carries no structured money-relevant
+ * field to leak, and the prompt labels it as such.
  */
 export interface ConversationSummary {
   text: string;
@@ -244,6 +257,11 @@ export interface DecisionContext {
   campaignConstraints: CampaignConstraints;
   creatorReply: string;
   round: number;
+  /** PLU-112: the rolling summary of the ELIDED transcript prefix, present ONLY
+   *  when windowing actually elided older turns (a valid summary covered them —
+   *  §5.1). Absent when the flag is off, the transcript fits the window, or no
+   *  valid summary exists → the full transcript rode `decisionHistory` instead. */
+  conversationSummary?: ConversationSummary | undefined;
   debug: ContextDebug;
 }
 
@@ -258,6 +276,10 @@ export interface DraftContext {
    *  read (§5.6) — the builder exposes the slot but does not compute it. */
   openCommitments: string[];
   creatorMemory?: CreatorMemoryPayload | undefined;
+  /** PLU-112: the rolling summary of the ELIDED transcript prefix, present ONLY
+   *  when `history` was windowed (a valid summary covered the older turns — §5.1).
+   *  Absent otherwise → `history` is the full transcript, byte-identical to today. */
+  conversationSummary?: ConversationSummary | undefined;
   debug: ContextDebug;
   // NO campaignConstraints, NO termFloor/termCeiling.
 }
@@ -594,9 +616,17 @@ function dedupe(xs: string[]): string[] {
  * resolved by buildNegotiationRequest from mergedConfig at request-build time.
  */
 export function toDecisionContext(ctx: AssembledContext): DecisionContext {
+  // PLU-112 §5.1.1: window the transcript for THIS purpose. Flag OFF → the helper is
+  // never consulted and the FULL transcript rides through (byte-identical to today).
+  // Flag ON but no valid summary → the helper also returns the full transcript
+  // (§5.6 fallback). Only a valid summary covering the elided prefix elides turns.
+  const win = conversationSummaryEnabled()
+    ? applyBudgetWindow(ctx.recentMessages, ctx.conversationSummary)
+    : { recentMessages: ctx.recentMessages, windowed: false };
+
   const decisionHistory: PriorNegotiationContext = {
     ...ctx.decisionHistory,
-    ...(ctx.recentMessages.length ? { conversationHistory: ctx.recentMessages } : {}),
+    ...(win.recentMessages.length ? { conversationHistory: win.recentMessages } : {}),
     ...(ctx.openCommitments.length ? { openCommitments: ctx.openCommitments } : {}),
     ...(ctx.classifiedIntent ? { intent: ctx.classifiedIntent } : {}),
     ...(Object.keys(ctx.knowledgeContext).length
@@ -609,6 +639,9 @@ export function toDecisionContext(ctx: AssembledContext): DecisionContext {
     campaignConstraints: ctx.campaignConstraints,
     creatorReply: ctx.creatorReply,
     round: ctx.instance.negotiationRound,
+    // Thread the summary ONLY when windowing actually elided turns (§5.1) — so a
+    // no-op window ships no summary and the request stays byte-identical.
+    ...(win.windowed ? { conversationSummary: ctx.conversationSummary } : {}),
     debug,
   };
 }
@@ -640,12 +673,19 @@ export function toDraftContext(ctx: AssembledContext): DraftContext {
       ? { structuredObligations: ctx.structuredObligations }
       : {}),
   };
+  // PLU-112 §5.1.1: window the draft history for THIS purpose (same invariant as
+  // the decision path — flag OFF or no valid summary → the full transcript).
+  const win = conversationSummaryEnabled()
+    ? applyBudgetWindow(ctx.recentMessages, ctx.conversationSummary)
+    : { recentMessages: ctx.recentMessages, windowed: false };
+
   const debug = buildDebug(ctx, draftConfig, ["dealDescription:draft-only"]);
   return {
     draftConfig,
-    history: ctx.recentMessages,
+    history: win.recentMessages,
     openCommitments: ctx.openCommitments,
     creatorMemory: ctx.creatorMemory,
+    ...(win.windowed ? { conversationSummary: ctx.conversationSummary } : {}),
     debug,
   };
 }
@@ -713,14 +753,16 @@ export async function buildConversationContext(
 ): Promise<AssembledContext> {
   const client = args.client ?? db;
   const resolveBrief = deps.resolveBrief ?? resolveBriefKnowledge;
-  // §9.1 — the default loaders are undefined-returning stubs. The unbuilt PLU-112/
-  // 113 flag checks live INSIDE their loader impls, never referenced here — so the
-  // builder compiles with those modules absent from the tree.
+  // §9.1 — the loader slots now default to the REAL loaders (PLU-112 / PLU-113). The
+  // FLAG CHECK lives INSIDE each loader (creatorMemoryEnabled / conversationSummary
+  // Enabled), so a flag OFF returns undefined and NO block is threaded — the builder
+  // body stays flag-agnostic. Tests inject stubs via `deps` to stay pure/offline.
   const loadCreatorMemory =
-    deps.loadCreatorMemory ?? (async (): Promise<CreatorMemoryPayload | undefined> => undefined);
+    deps.loadCreatorMemory ?? ((instanceId: string) => realLoadCreatorMemory(instanceId, client));
   const loadConversationSummary =
     deps.loadConversationSummary ??
-    (async (): Promise<ConversationSummary | undefined> => undefined);
+    ((instanceId: string, purpose: ContextPurpose) =>
+      realLoadConversationSummary(instanceId, purpose, client));
 
   // §5.1 — the merged config drives the brief conflict-detection fields; merge once
   // here for the resolver's campaignFields (assembleContext merges again from the
