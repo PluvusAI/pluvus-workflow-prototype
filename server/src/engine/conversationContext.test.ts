@@ -467,4 +467,100 @@ test("conflicts on the ResolvedBrief survive onto AssembledContext.brief", () =>
   assert.equal(ctx.brief.conflicts?.[0]?.campaignField, "paymentTerms");
 });
 
+// ---------------------------------------------------------------------------
+// PLU-112 — budget windowing at the PROJECTION layer (flag-gated per-purpose)
+// ---------------------------------------------------------------------------
+// The pure applyBudgetWindow helper is unit-tested in conversationWindow.test.ts.
+// These tests exercise the WIRING: toDecisionContext/toDraftContext window only
+// when CONVERSATION_SUMMARY_ENABLED is on AND a valid summary is present, thread the
+// summary only when they actually elided turns, and are byte-identical to today when
+// the flag is off (dark = shipped). Also the cross-flag older-rate cell (§5.7).
+
+console.log("\nPLU-112 — projection windowing (flag-gated)\n");
+
+function withFlags(flags: Record<string, string | undefined>, fn: () => void): void {
+  const prev: Record<string, string | undefined> = {};
+  for (const k of Object.keys(flags)) {
+    prev[k] = process.env[k];
+    if (flags[k] === undefined) delete process.env[k];
+    else process.env[k] = flags[k];
+  }
+  try {
+    fn();
+  } finally {
+    for (const k of Object.keys(flags)) {
+      if (prev[k] === undefined) delete process.env[k];
+      else process.env[k] = prev[k];
+    }
+  }
+}
+
+// A long single-sided-alternating transcript: 20 creator/us INBOUND/OUTBOUND rows so
+// the derived transcript exceeds the window (8). Outbounds carry sentAt; inbounds
+// receivedAt — so buildDraftHistory includes them all in order.
+function longMessages(count: number): Message[] {
+  const out: Message[] = [];
+  for (let i = 0; i < count; i++) {
+    const t = new Date(2026, 0, 1, 0, 0, 10 + i);
+    if (i % 2 === 0) {
+      out.push(msg({ direction: "INBOUND", body: `creator line ${i}`, externalMessageId: `ext-${i}`, receivedAt: t }));
+    } else {
+      out.push(msg({ direction: "OUTBOUND", body: `our line ${i}`, idempotencyKey: `negotiation:counter_offer:${INSTANCE_ID}:${i}`, sentAt: t }));
+    }
+  }
+  return out;
+}
+
+const SUMMARY = { text: "Rounds 1-6: creator opened at $600, conceded to $450; asked about usage (deferred)." };
+
+test("flag OFF → NO windowing even with a long transcript + a summary present (dark = today)", () => {
+  withFlags({ CONVERSATION_SUMMARY_ENABLED: undefined }, () => {
+    const ctx = assembleContext(baseInputs({ messages: longMessages(20), conversationSummary: SUMMARY }));
+    const full = ctx.recentMessages.length;
+    const dec = toDecisionContext(ctx);
+    const drf = toDraftContext(ctx);
+    const decHist = (dec.decisionHistory.conversationHistory ?? []) as unknown[];
+    assert.equal(decHist.length, full, "decision transcript is the FULL transcript when flag off");
+    assert.equal(drf.history.length, full, "draft transcript is the FULL transcript when flag off");
+    assert.ok(!("conversationSummary" in dec), "no summary threaded on the decision projection when flag off");
+    assert.ok(!("conversationSummary" in drf), "no summary threaded on the draft projection when flag off");
+  });
+});
+
+test("flag ON + valid summary → BOTH projections window to the newest 8 and thread the summary", () => {
+  withFlags({ CONVERSATION_SUMMARY_ENABLED: "true" }, () => {
+    const ctx = assembleContext(baseInputs({ messages: longMessages(20), conversationSummary: SUMMARY }));
+    assert.ok(ctx.recentMessages.length > 8, "precondition: the raw transcript exceeds the window");
+    const dec = toDecisionContext(ctx);
+    const drf = toDraftContext(ctx);
+    assert.equal((dec.decisionHistory.conversationHistory ?? []).length, 8, "decision windowed to 8");
+    assert.equal(drf.history.length, 8, "draft windowed to 8");
+    assert.equal(dec.conversationSummary?.text, SUMMARY.text, "decision threads the summary");
+    assert.equal(drf.conversationSummary?.text, SUMMARY.text, "draft threads the summary");
+  });
+});
+
+test("flag ON but NO summary → FULL transcript, no summary threaded (§5.6 fallback)", () => {
+  withFlags({ CONVERSATION_SUMMARY_ENABLED: "true" }, () => {
+    const ctx = assembleContext(baseInputs({ messages: longMessages(20) })); // no conversationSummary
+    const full = ctx.recentMessages.length;
+    const dec = toDecisionContext(ctx);
+    assert.equal((dec.decisionHistory.conversationHistory ?? []).length, full, "no summary → full transcript, never a bare window");
+    assert.ok(!("conversationSummary" in dec));
+  });
+});
+
+test("cross-flag: summary ON + memory OFF → the elided prefix is covered by the summary (older context reachable)", () => {
+  // §5.7 review finding M4: in the realistic dark-rollout cell (summary on, memory
+  // off) an older rate must stay reachable — via the summary, since memory is off.
+  withFlags({ CONVERSATION_SUMMARY_ENABLED: "true", CREATOR_MEMORY_ENABLED: undefined }, () => {
+    const ctx = assembleContext(baseInputs({ messages: longMessages(20), conversationSummary: SUMMARY }));
+    const dec = toDecisionContext(ctx);
+    // The window dropped the older turns, but the summary (which names the $600→$450
+    // arc) is threaded, so the older rate is not lost.
+    assert.equal((dec.decisionHistory.conversationHistory ?? []).length, 8);
+    assert.match(dec.conversationSummary?.text ?? "", /\$600|\$450/, "older rate stays reachable via the summary");
+  });
+});
+
 console.log(`\n${n} passed\n`);
