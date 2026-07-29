@@ -92,31 +92,18 @@ export type ContextPurpose =
 // ---------------------------------------------------------------------------
 
 /**
- * PLU-113 §9.2 — forward-declared to PLU-113's EXACT branch shape (canonical owner:
- * PLU-113; `creatorMemory.ts:235`). PLU-113 makes it canonical on merge (a type
- * move, not a re-implementation), and rebases by supplying `loadCreatorMemory` to
- * the builder deps and DELETING its inline read spreads (§9.3 rebase contract).
- * PLU-81 only declares the READ slot's shape; PLU-113's WRITE path is out of scope.
+ * PLU-113 §9.2/§9.3 rebase contract — RECONCILED (PLU-69 integration). PLU-81
+ * originally forward-declared this shape; on the PLU-113 merge the canonical owner
+ * (`creatorMemory.ts`) becomes the single source of truth and this module
+ * RE-EXPORTS it (a type move, not a re-implementation). The canonical shape differs
+ * from PLU-81's frozen copy in two money-safe ways: `requestedRate`/`minimumRate`
+ * are STRINGS (labeled "context, not the offer figure" — never a fee input), and
+ * `CreatorMemoryConflict` is `{key, current, prior}` (source-traced). Consumers of
+ * `CreatorMemoryPayload` in this file (AssembledContext / DraftContext / the
+ * loadCreatorMemory loader) therefore now carry PLU-113's real shape.
  */
-export interface CreatorMemoryConflict {
-  field: string;
-  priorValue: string;
-  newValue: string;
-  source?: string;
-}
-
-export interface CreatorMemoryPayload {
-  requestedRate?: number;
-  minimumRate?: number;
-  availability?: string;
-  logisticsConstraints: string[];
-  objections: string[];
-  deliverablePreferences: string[];
-  compensationPreferences: string[];
-  managerInvolved?: boolean;
-  managerContact?: string;
-  conflicts: CreatorMemoryConflict[];
-}
+export type { CreatorMemoryConflict, CreatorMemoryPayload } from "./executors/creatorMemory.js";
+import type { CreatorMemoryPayload } from "./executors/creatorMemory.js";
 
 /**
  * PLU-112 §9.4 — shape UNVERIFIED (canonical owner: PLU-112; adjust on that issue).

@@ -325,6 +325,13 @@ interface FlagSet {
   BRIEF_INTO_NEGOTIATE?: boolean;
   KNOWLEDGE_RETRIEVAL_ENABLED?: boolean;
   MATERIAL_CONFLICT_ESCALATION_ENABLED?: boolean;
+  // PLU-69 Step 0: the two epic flags whose features light up by swapping a loader
+  // (§9.1). They MUST appear here so "flag OFF → byte-identical" is a REAL gate for
+  // them and not vacuously true (PLU-69 spec §4 Step 0 / §10). The dark-safety they
+  // guard is proved by the "loader returns a row but the flag is OFF → still
+  // byte-identical" rows below.
+  CREATOR_MEMORY_ENABLED?: boolean;
+  CONVERSATION_SUMMARY_ENABLED?: boolean;
 }
 const MATRIX: Array<{ label: string; flags: FlagSet }> = [
   { label: "all flags off", flags: {} },
@@ -332,9 +339,17 @@ const MATRIX: Array<{ label: string; flags: FlagSet }> = [
   { label: "KNOWLEDGE_RETRIEVAL_ENABLED on", flags: { KNOWLEDGE_RETRIEVAL_ENABLED: true } },
   { label: "both brief-into flags on", flags: { BRIEF_INTO_NEGOTIATE: true, KNOWLEDGE_RETRIEVAL_ENABLED: true } },
   { label: "MATERIAL_CONFLICT_ESCALATION_ENABLED on", flags: { MATERIAL_CONFLICT_ESCALATION_ENABLED: true } },
+  { label: "CREATOR_MEMORY_ENABLED on", flags: { CREATOR_MEMORY_ENABLED: true } },
+  { label: "CONVERSATION_SUMMARY_ENABLED on", flags: { CONVERSATION_SUMMARY_ENABLED: true } },
 ];
 
-const FLAG_KEYS = ["BRIEF_INTO_NEGOTIATE", "KNOWLEDGE_RETRIEVAL_ENABLED", "MATERIAL_CONFLICT_ESCALATION_ENABLED"] as const;
+const FLAG_KEYS = [
+  "BRIEF_INTO_NEGOTIATE",
+  "KNOWLEDGE_RETRIEVAL_ENABLED",
+  "MATERIAL_CONFLICT_ESCALATION_ENABLED",
+  "CREATOR_MEMORY_ENABLED",
+  "CONVERSATION_SUMMARY_ENABLED",
+] as const;
 function withFlags<T>(flags: FlagSet, fn: () => T): T {
   const prev: Record<string, string | undefined> = {};
   for (const k of FLAG_KEYS) {
@@ -526,6 +541,98 @@ test("intent reaches DECISION only; dealDescription reaches DRAFT only (neither 
     assert.ok(!("dealDescription" in b.negotiationContext), "dealDescription must not reach the negotiate context");
     assert.ok(!("dealDescription" in b.draftConfig), "dealDescription is per-branch extra, not on the shared draftConfig");
   });
+});
+
+// ---------------------------------------------------------------------------
+// PLU-69 Step 0 — the two new flags are REAL gates, not vacuous.
+//
+// The forward-compat seam (§9.1) lets PLU-112/113 light up by swapping a loader.
+// The danger the golden gate must catch: a loader that returns a row when its flag
+// is OFF must NOT change any request the agent receives — AND, when the flag is ON,
+// creatorMemory must reach the DRAFT projection but NEVER leak onto the DECISION
+// path via the pure projection (PLU-81 keeps memory draft-only in toDecisionContext;
+// the executor threads it to the decision model separately and deliberately, §3.6).
+//
+// These tests feed a NON-EMPTY creatorMemory / conversationSummary straight into
+// assembleContext (simulating "the loader returned a row") and prove the projection
+// invariants hold regardless of the flag — the case that catches an accidental
+// decision-path leak the 3-flag matrix could never observe.
+// ---------------------------------------------------------------------------
+
+import type { CreatorMemoryPayload, ConversationSummary } from "./conversationContext.js";
+
+function memoryFixture(): CreatorMemoryPayload {
+  return {
+    requestedRate: "500",
+    minimumRate: "400",
+    availability: "weekdays only",
+    logisticsConstraints: ["ships from EU"],
+    objections: ["dislikes exclusivity"],
+    deliverablePreferences: ["Reels over Stories"],
+    compensationPreferences: ["flat fee"],
+    managerInvolved: true,
+    managerContact: "mgr@example.com",
+    conflicts: [{ key: "REQUESTED_RATE", current: "500", prior: "450" }] as CreatorMemoryPayload["conflicts"],
+  };
+}
+function summaryFixture(): ConversationSummary {
+  return { text: "Creator asked about usage rights in round 1; we deferred.", version: "summary-v1", tokensSaved: 120 };
+}
+
+// Assemble twice over the SAME rows (so message/obligation ids match) — once with
+// no loader rows (today's path) and once with the loaders returning real rows.
+function assembleBaselineAndLoaded(): { base: ReturnType<typeof assembleContext>; loaded: ReturnType<typeof assembleContext> } {
+  const r = rows();
+  const common = {
+    purpose: "NEGOTIATION_DECISION" as const,
+    instance: inst(), creator: creator(), campaign: null, node: NODE, nodeGraph: NODE_GRAPH,
+    messages: r.msgs, events: r.evs, obligationRows: r.obs, resolvedBrief: r.brief,
+  };
+  const base = assembleContext({ ...common });
+  const loaded = assembleContext({ ...common, creatorMemory: memoryFixture(), conversationSummary: summaryFixture() });
+  return { base, loaded };
+}
+
+console.log("\nGOLDEN — PLU-69 Step 0: memory/summary never leak onto the DECISION request\n");
+
+for (const flags of [{}, { CREATOR_MEMORY_ENABLED: true }, { CONVERSATION_SUMMARY_ENABLED: true }] as FlagSet[]) {
+  const label = Object.keys(flags)[0] ?? "all off";
+  test(`[${label}] a populated creatorMemory/summary loader row does NOT change the negotiate request`, () => {
+    withFlags(flags, () => {
+      const { base, loaded } = assembleBaselineAndLoaded();
+      const baseReq = buildNegotiationRequest(
+        ROUND, mergeCampaignFallback(NODE.config, null), base.creatorReply, toDecisionContext(base).decisionHistory,
+      );
+      const loadedReq = buildNegotiationRequest(
+        ROUND, mergeCampaignFallback(NODE.config, null), loaded.creatorReply, toDecisionContext(loaded).decisionHistory,
+      );
+      assert.equal(
+        canonical(loadedReq), canonical(baseReq),
+        "a loader row must NOT leak onto the DECISION request via the pure projection",
+      );
+    });
+  });
+}
+
+test("toDecisionContext NEVER carries creatorMemory or conversationSummary (draft-only via projection)", () => {
+  const { loaded } = assembleBaselineAndLoaded();
+  const decision = toDecisionContext(loaded).decisionHistory as unknown as Record<string, unknown>;
+  assert.ok(!("creatorMemory" in decision), "creatorMemory must not be on the decision projection");
+  assert.ok(!("conversationSummary" in decision), "conversationSummary must not be on the decision projection");
+});
+
+test("toDraftContext DOES carry creatorMemory when the loader returned a row (draft-only seam)", () => {
+  const { base, loaded } = assembleBaselineAndLoaded();
+  const draft = toDraftContext(loaded);
+  assert.ok(draft.creatorMemory, "draft projection carries the loaded creatorMemory");
+  assert.equal(draft.creatorMemory?.requestedRate, "500");
+  // and the summary/memory must not corrupt the byte-identity of the draftConfig knowledge keys
+  const noMem = toDraftContext(base);
+  assert.equal(
+    canonical(stripBandFromContext(draft.draftConfig)),
+    canonical(stripBandFromContext(noMem.draftConfig)),
+    "draftConfig knowledge keys are byte-identical whether or not memory loaded (memory rides a separate field)",
+  );
 });
 
 console.log(`\n${n} passed\n`);
