@@ -946,6 +946,50 @@ export const campaignCreatorMemory = pgTable(
   ],
 );
 
+// PLU-112: the rolling conversation summary — one row per ExecutionInstance. It is
+// a DERIVED artifact (a narrative précis of the ELIDED transcript prefix, turns
+// older than the recent window), NOT a second copy of the conversation (PLU-69
+// §1.1). It earns its own table because it has its own LIFECYCLE: a staleness/
+// refresh cursor (`summarizedThroughSentAt`) that advances as newer turns finalize.
+// The summary is NARRATIVE ONLY (§5.2) — it never restates structured facts the
+// obligation ledger / creator memory / decision-history own (rates, specific
+// questions, commitments), so it can never silently upgrade uncertain → fact on a
+// money-relevant field. See .claude/spec/plu-69-conversation-context-memory-knowledge/PLAN.md §5.
+export const conversationSummaries = pgTable(
+  "ConversationSummary",
+  {
+    id: cuidId("id"),
+    // One rolling summary per instance (unique — enforced by the index below).
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+    // The summary body (narrative only — §5.2). Empty until first generated.
+    text: text("text").notNull(),
+    // §5.4.1 — the cursor is the transcript's OWN ordering key (sentAt), NOT a
+    // message id, so a send-delayed outbound (sentAt stamped at flush, up to 5 min
+    // late) is never summarized-past while still reserved. The summarizable prefix
+    // ends at the last FINALIZED turn before any pending reserved send. Null before
+    // the first summary is generated.
+    summarizedThroughSentAt: ts("summarizedThroughSentAt"),
+    // The specific Message row at that high-water mark, for audit/debug only (NOT
+    // the cursor — the cursor is the timestamp above). Null before first summary.
+    summarizedThroughMessageId: text("summarizedThroughMessageId").references(
+      () => messages.id,
+    ),
+    // The summarizer prompt/version stamp → observability `summaryVersion` (§5.3).
+    version: text("version"),
+    // Best-effort, for the debug token-savings proxy (§5.3). Not authoritative.
+    estimatedInputTokensSaved: integer("estimatedInputTokensSaved"),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    // One summary per instance. Mirrors migration
+    // 20260729120000_plu112_conversation_summary.
+    uniqueIndex("ConversationSummary_instanceId_key").on(table.instanceId),
+  ],
+);
+
 // HARD-O1: one row per LLM call the agent service made on behalf of a workflow
 // instance — the durable token/latency/cost telemetry the in-process agent ring
 // buffer cannot provide. Rows are written best-effort by the observability sink
@@ -1192,6 +1236,9 @@ export const insertConversationObligationSchema = createInsertSchema(
 export const insertCampaignCreatorMemorySchema = createInsertSchema(
   campaignCreatorMemory,
 ).omit({ id: true, createdAt: true, updatedAt: true });
+export const insertConversationSummarySchema = createInsertSchema(
+  conversationSummaries,
+).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertPartnershipSchema = createInsertSchema(partnerships).omit({
   id: true,
   createdAt: true,
@@ -1238,6 +1285,9 @@ export type ConversationObligation = typeof conversationObligations.$inferSelect
 export type CampaignCreatorMemory = typeof campaignCreatorMemory.$inferSelect;
 export type CampaignCreatorMemoryInsert =
   typeof campaignCreatorMemory.$inferInsert;
+export type ConversationSummary = typeof conversationSummaries.$inferSelect;
+export type ConversationSummaryInsert =
+  typeof conversationSummaries.$inferInsert;
 export type Partnership = typeof partnerships.$inferSelect;
 export type Click = typeof clicks.$inferSelect;
 export type Conversion = typeof conversions.$inferSelect;
@@ -1266,6 +1316,9 @@ export type InsertConversationObligation = z.infer<
 >;
 export type InsertCampaignCreatorMemory = z.infer<
   typeof insertCampaignCreatorMemorySchema
+>;
+export type InsertConversationSummary = z.infer<
+  typeof insertConversationSummarySchema
 >;
 export type InsertPartnership = z.infer<typeof insertPartnershipSchema>;
 export type InsertClick = z.infer<typeof insertClickSchema>;
