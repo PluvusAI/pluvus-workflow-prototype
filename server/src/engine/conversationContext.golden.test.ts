@@ -635,4 +635,88 @@ test("toDraftContext DOES carry creatorMemory when the loader returned a row (dr
   );
 });
 
+// ---------------------------------------------------------------------------
+// PLU-112 §5.8 — the ON-path snapshot (the *new* request shape, flag ON).
+//
+// The OFF gate above proves "dark = today". This proves the ON contract can't
+// silently drift: with CONVERSATION_SUMMARY_ENABLED on + a valid summary + a long
+// transcript, the negotiate request MUST carry `conversationSummary` and a WINDOWED
+// `conversationHistory` (newest 8), and that ON shape MUST differ from the OFF shape.
+// ---------------------------------------------------------------------------
+
+console.log("\nGOLDEN — PLU-112 §5.8 ON-path snapshot (windowed request shape)\n");
+
+function longTranscriptMessages(count: number): Message[] {
+  const out: Message[] = [];
+  for (let i = 0; i < count; i++) {
+    const t = new Date(2026, 0, 1, 0, 0, 10 + i);
+    if (i % 2 === 0) {
+      out.push(msg({ direction: "INBOUND", body: `creator line ${i}`, externalMessageId: `on-${i}`, receivedAt: t }));
+    } else {
+      out.push(msg({ direction: "OUTBOUND", body: `our line ${i}`, idempotencyKey: `negotiation:counter_offer:${INSTANCE_ID}:${i}`, sentAt: t }));
+    }
+  }
+  return out;
+}
+
+test("flag ON + valid summary + long transcript → request carries conversationSummary + windowed history; ON ≠ OFF", () => {
+  const common = {
+    purpose: "NEGOTIATION_DECISION" as const,
+    instance: inst(), creator: creator(), campaign: null as Campaign | null, node: NODE, nodeGraph: NODE_GRAPH,
+    messages: longTranscriptMessages(20), events: events(), obligationRows: obligations(),
+    resolvedBrief: resolvedBrief(),
+  };
+
+  // Mirror the executor's fold (§5.8): the summary lives on the projection wrapper
+  // (DecisionContext.conversationSummary), and the executor folds it onto the
+  // PriorNegotiationContext before calling buildNegotiationRequest.
+  const foldSummary = (dc: ReturnType<typeof toDecisionContext>) => ({
+    ...dc.decisionHistory,
+    ...(dc.conversationSummary ? { conversationSummary: dc.conversationSummary } : {}),
+  });
+
+  // OFF: no windowing, full transcript, no summary key.
+  const offReq = withFlags({}, () => {
+    const ctx = assembleContext({ ...common, conversationSummary: summaryFixture() });
+    const dc = toDecisionContext(ctx);
+    return buildNegotiationRequest(ROUND, mergeCampaignFallback(NODE.config, null), dc.creatorReply, foldSummary(dc)) as Record<string, unknown>;
+  });
+  assert.ok(!("conversationSummary" in offReq), "OFF: no summary on the request");
+  const offHist = offReq["conversationHistory"] as unknown[];
+  assert.ok(offHist.length > 8, "OFF: the full (un-windowed) transcript rides");
+
+  // ON: windowed to 8 + the summary threaded.
+  const onReq = withFlags({ CONVERSATION_SUMMARY_ENABLED: true }, () => {
+    const ctx = assembleContext({ ...common, conversationSummary: summaryFixture() });
+    const dc = toDecisionContext(ctx);
+    return buildNegotiationRequest(ROUND, mergeCampaignFallback(NODE.config, null), dc.creatorReply, foldSummary(dc)) as Record<string, unknown>;
+  });
+  assert.ok("conversationSummary" in onReq, "ON: the summary IS on the request (the new wire field)");
+  assert.equal((onReq["conversationSummary"] as { text: string }).text, summaryFixture().text);
+  const onHist = onReq["conversationHistory"] as unknown[];
+  assert.equal(onHist.length, 8, "ON: the transcript is windowed to the newest 8 turns");
+
+  // The ON shape MUST differ from OFF (proves the flag actually changes the wire).
+  assert.notEqual(canonical(onReq), canonical(offReq), "ON request shape must differ from OFF");
+});
+
+test("flag ON but NO summary → request is byte-identical to OFF (§5.6 fallback, no drift)", () => {
+  const common = {
+    purpose: "NEGOTIATION_DECISION" as const,
+    instance: inst(), creator: creator(), campaign: null as Campaign | null, node: NODE, nodeGraph: NODE_GRAPH,
+    messages: longTranscriptMessages(20), events: events(), obligationRows: obligations(),
+    resolvedBrief: resolvedBrief(),
+  };
+  const mk = (flags: FlagSet) => withFlags(flags, () => {
+    const ctx = assembleContext({ ...common }); // NO conversationSummary
+    const dc = toDecisionContext(ctx);
+    return buildNegotiationRequest(ROUND, mergeCampaignFallback(NODE.config, null), dc.creatorReply, dc.decisionHistory);
+  });
+  assert.equal(
+    canonical(mk({ CONVERSATION_SUMMARY_ENABLED: true })),
+    canonical(mk({})),
+    "flag ON with no summary must be byte-identical to OFF (no window without a valid summary)",
+  );
+});
+
 console.log(`\n${n} passed\n`);
