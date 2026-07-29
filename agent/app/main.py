@@ -11,6 +11,7 @@ from app.routes.classify import router as classify_router
 from app.routes.negotiate import router as negotiate_router
 from app.routes.negotiate import warn_knowledge_flag_dependency
 from app.routes.outreach_template import router as outreach_template_router
+from app.routes.summarize import router as summarize_router
 from app.security import require_api_key
 
 
@@ -55,3 +56,4 @@ def metrics() -> dict:
 app.include_router(classify_router)
 app.include_router(negotiate_router)
 app.include_router(outreach_template_router)
+app.include_router(summarize_router)
