@@ -57,6 +57,13 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   // gets exactly the campaign they would have got before.
   const [postAcceptanceMode, setPostAcceptanceMode] =
     useState<PostAcceptanceMode>("local_payment");
+  const [dailyInitialOutreachLimit, setDailyInitialOutreachLimit] = useState("30");
+  const [outreachPacingMinMinutes, setOutreachPacingMinMinutes] = useState("5");
+  const [outreachPacingMaxMinutes, setOutreachPacingMaxMinutes] = useState("10");
+  const [negotiationReplyPacingMinMinutes, setNegotiationReplyPacingMinMinutes] =
+    useState("1");
+  const [negotiationReplyPacingMaxMinutes, setNegotiationReplyPacingMaxMinutes] =
+    useState("5");
 
   // Step 2 selection
   const [selectedTemplate, setSelectedTemplate] = useState<TemplateKey | null>(null);
@@ -75,6 +82,11 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   const targetUrlId = useId();
   const hiddenParamKeyId = useId();
   const postAcceptId = useId();
+  const dailyLimitId = useId();
+  const outreachMinId = useId();
+  const outreachMaxId = useId();
+  const negotiationMinId = useId();
+  const negotiationMaxId = useId();
 
   const notifyEmailInvalid =
     !!notifyEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(notifyEmail.trim());
@@ -100,6 +112,27 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
       setError("Product URL must be a valid URL (e.g. https://example.com/shop)");
       return;
     }
+    const daily = Number(dailyInitialOutreachLimit);
+    const outreachMin = Number(outreachPacingMinMinutes);
+    const outreachMax = Number(outreachPacingMaxMinutes);
+    const negotiationMin = Number(negotiationReplyPacingMinMinutes);
+    const negotiationMax = Number(negotiationReplyPacingMaxMinutes);
+    if (!Number.isInteger(daily) || daily < 1 || daily > 1000) {
+      setError("Maximum emails per day must be a whole number between 1 and 1000");
+      return;
+    }
+    if (
+      [outreachMin, outreachMax, negotiationMin, negotiationMax].some(
+        (value) => !Number.isInteger(value) || value < 1 || value > 60,
+      )
+    ) {
+      setError("Email pacing values must be whole minutes between 1 and 60");
+      return;
+    }
+    if (outreachMin > outreachMax || negotiationMin > negotiationMax) {
+      setError("The minimum email delay cannot exceed the maximum delay");
+      return;
+    }
     setError(null);
     setWorkflowName(`${name.trim()} Outreach`);
     setStep(2);
@@ -121,6 +154,11 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
       const campaignData: Parameters<typeof createCampaign>[0] = {
         name: name.trim(),
         brand: brand.trim(),
+        dailyInitialOutreachLimit: Number(dailyInitialOutreachLimit),
+        outreachPacingMinMinutes: Number(outreachPacingMinMinutes),
+        outreachPacingMaxMinutes: Number(outreachPacingMaxMinutes),
+        negotiationReplyPacingMinMinutes: Number(negotiationReplyPacingMinMinutes),
+        negotiationReplyPacingMaxMinutes: Number(negotiationReplyPacingMaxMinutes),
       };
       if (notifyEmail.trim()) campaignData.notifyEmail = notifyEmail.trim();
       if (brandDescription.trim()) campaignData.brandDescription = brandDescription.trim();
@@ -319,6 +357,97 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
                 <option value="operator_handoff">Send to operator for onboarding</option>
               </Select>
             </FormField>
+            <div
+              style={{
+                paddingTop: 4,
+                borderTop: `1px solid ${colors.border}`,
+                display: "flex",
+                flexDirection: "column",
+                gap: 14,
+              }}
+            >
+              <div>
+                <div style={{ color: colors.text, fontWeight: font.weight.semibold }}>
+                  Sending settings
+                </div>
+                <div style={{ color: colors.textMuted, fontSize: font.size.sm, marginTop: 3 }}>
+                  Daily limits reset at 00:00 UTC. Queued outreach resumes at the normal pace.
+                </div>
+              </div>
+              <FormField
+                label="Maximum emails per day"
+                htmlFor={dailyLimitId}
+                hint="Applies to initial outreach only. Replies and scheduled follow-ups remain timely."
+              >
+                <Input
+                  id={dailyLimitId}
+                  type="number"
+                  min={1}
+                  max={1000}
+                  step={1}
+                  value={dailyInitialOutreachLimit}
+                  onChange={(e) => setDailyInitialOutreachLimit(e.target.value)}
+                />
+              </FormField>
+              <FormField
+                label="Delay between outreach emails"
+                hint="A random delay in this range is applied after every initial outreach."
+              >
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <Input
+                    id={outreachMinId}
+                    aria-label="Minimum outreach delay in minutes"
+                    type="number"
+                    min={1}
+                    max={60}
+                    step={1}
+                    value={outreachPacingMinMinutes}
+                    onChange={(e) => setOutreachPacingMinMinutes(e.target.value)}
+                    placeholder="Min minutes"
+                  />
+                  <Input
+                    id={outreachMaxId}
+                    aria-label="Maximum outreach delay in minutes"
+                    type="number"
+                    min={1}
+                    max={60}
+                    step={1}
+                    value={outreachPacingMaxMinutes}
+                    onChange={(e) => setOutreachPacingMaxMinutes(e.target.value)}
+                    placeholder="Max minutes"
+                  />
+                </div>
+              </FormField>
+              <FormField
+                label="Delay between negotiation replies"
+                hint="Randomized reply pacing keeps automated responses from arriving instantly."
+              >
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                  <Input
+                    id={negotiationMinId}
+                    aria-label="Minimum negotiation reply delay in minutes"
+                    type="number"
+                    min={1}
+                    max={60}
+                    step={1}
+                    value={negotiationReplyPacingMinMinutes}
+                    onChange={(e) => setNegotiationReplyPacingMinMinutes(e.target.value)}
+                    placeholder="Min minutes"
+                  />
+                  <Input
+                    id={negotiationMaxId}
+                    aria-label="Maximum negotiation reply delay in minutes"
+                    type="number"
+                    min={1}
+                    max={60}
+                    step={1}
+                    value={negotiationReplyPacingMaxMinutes}
+                    onChange={(e) => setNegotiationReplyPacingMaxMinutes(e.target.value)}
+                    placeholder="Max minutes"
+                  />
+                </div>
+              </FormField>
+            </div>
             <FormField label="Objective" htmlFor={objId}>
               <Input
                 id={objId}

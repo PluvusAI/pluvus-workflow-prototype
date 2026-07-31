@@ -8,7 +8,11 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { randomSendDelayMs, type SendDelayConfig } from "./sendDelay.js";
+import {
+  negotiationReplyDelayMs,
+  randomSendDelayMs,
+  type SendDelayConfig,
+} from "./sendDelay.js";
 
 function cfg(over: Partial<SendDelayConfig> = {}): SendDelayConfig {
   return {
@@ -62,4 +66,38 @@ test("randomSendDelayMs: never returns a fractional or NaN value", () => {
     assert.ok(Number.isInteger(d), `non-integer draw ${d}`);
     assert.ok(!Number.isNaN(d));
   }
+});
+
+test("negotiationReplyDelayMs: campaign minute window overrides global config", () => {
+  const campaign = {
+    negotiationReplyPacingMinMinutes: 1,
+    negotiationReplyPacingMaxMinutes: 5,
+  };
+  assert.equal(negotiationReplyDelayMs(campaign, cfg(), () => 0), 60_000);
+  assert.equal(
+    negotiationReplyDelayMs(campaign, cfg(), () => 1 - Number.EPSILON),
+    300_000,
+  );
+});
+
+test("negotiationReplyDelayMs: fixed campaign window is honored", () => {
+  assert.equal(
+    negotiationReplyDelayMs(
+      { negotiationReplyPacingMinMinutes: 4, negotiationReplyPacingMaxMinutes: 4 },
+      cfg(),
+    ),
+    240_000,
+  );
+});
+
+test("negotiationReplyDelayMs: legacy null campaign retains global delay", () => {
+  const legacy = {
+    negotiationReplyPacingMinMinutes: null,
+    negotiationReplyPacingMaxMinutes: null,
+  };
+  assert.equal(
+    negotiationReplyDelayMs(legacy, cfg({ minMs: 42_000, maxMs: 43_000 }), () => 0),
+    42_000,
+  );
+  assert.equal(negotiationReplyDelayMs(legacy, cfg({ enabled: false })), 0);
 });

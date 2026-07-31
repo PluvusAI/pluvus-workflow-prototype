@@ -28,6 +28,7 @@ type Icon = ComponentType<LucideProps>;
 
 const MAP: Record<InstanceState, Icon> = {
   ENROLLED: UserPlus,
+  OUTREACH_QUEUED: Clock,
   OUTREACH_SENT: Mail,
   AWAITING_REPLY: Clock,
   FOLLOWED_UP: Bell,

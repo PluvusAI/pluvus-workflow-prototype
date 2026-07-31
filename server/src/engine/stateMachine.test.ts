@@ -20,6 +20,16 @@ function test(name: string, fn: () => void): void {
 
 console.log("\nstate machine — CRITICAL-6 accepting edges\n");
 
+test("initial outreach parks queued and advances only after delivery", () => {
+  assert.doesNotThrow(() => assertTransition("ENROLLED", "OUTREACH_QUEUED"));
+  assert.doesNotThrow(() => assertTransition("OUTREACH_QUEUED", "OUTREACH_SENT"));
+  assert.throws(
+    () => assertTransition("OUTREACH_QUEUED", "AWAITING_REPLY"),
+    InvalidTransitionError,
+  );
+  assert.equal(isTerminal("OUTREACH_QUEUED"), false);
+});
+
 test("OUTREACH_SENT accepts a reply (→ REPLY_RECEIVED)", () => {
   // Must not throw — a reply that beats the scheduler's AWAITING_REPLY transition
   // is buffered, not dropped.

@@ -14,6 +14,7 @@ interface Props {
 
 const ALL_STATES: InstanceState[] = [
   "ENROLLED",
+  "OUTREACH_QUEUED",
   "OUTREACH_SENT",
   "AWAITING_REPLY",
   "FOLLOWED_UP",

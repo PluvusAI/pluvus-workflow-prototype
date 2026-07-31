@@ -151,13 +151,11 @@ export function configChips(node: DraftNode): string[] {
   switch (node.type) {
     case "INITIAL_OUTREACH": {
       const chips: string[] = [];
-      const delay = cfg["delaySeconds"] as number | undefined;
       // Lead with the mode so the canvas shows at a glance whether the first
       // email is operator-written or AI-drafted. Absent = legacy AI default.
       chips.push(cfg["outreachMode"] === "manual" ? "manual" : "AI");
       if (cfg["subjectTemplate"]) chips.push("subject");
       if (cfg["bodyTemplate"]) chips.push("body");
-      if (delay !== undefined) chips.push(delay === 0 ? "no delay" : `delay ${delay}s`);
       return chips;
     }
     case "FOLLOW_UP": {

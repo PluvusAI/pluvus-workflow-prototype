@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull, gt, lt, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, gt, lt, or, sql } from "drizzle-orm";
 import { db } from "./drizzle.js";
 import { messages, type Message, type MessageInsert } from "./schema.js";
 import {
@@ -151,11 +151,13 @@ export async function listMessagesByInstance(instanceId: string): Promise<Messag
 export async function listStrandedOutboundReservations(args: {
   now: Date;
   lowerBoundMs: number;
+  scheduleGraceMs: number;
   maxAgeMs: number;
   maxRedrives: number;
   limit?: number;
 }): Promise<Message[]> {
   const lowerBound = new Date(args.now.getTime() - args.lowerBoundMs);
+  const scheduledCutoff = new Date(args.now.getTime() - args.scheduleGraceMs);
   const upperBound = new Date(args.now.getTime() - args.maxAgeMs);
   const q = db
     .select()
@@ -164,7 +166,18 @@ export async function listStrandedOutboundReservations(args: {
       and(
         eq(messages.direction, "OUTBOUND"),
         isNull(messages.externalMessageId),
-        lt(messages.createdAt, lowerBound),
+        or(
+          // New reservations persist their intentional due time. Recover only
+          // once that due time is overdue, so a long quota deferral is never
+          // mistaken for a lost job.
+          and(
+            isNotNull(messages.scheduledFor),
+            lt(messages.scheduledFor, scheduledCutoff),
+          ),
+          // Legacy rows have no due time; retain the original conservative
+          // max-window + grace age rule.
+          and(isNull(messages.scheduledFor), lt(messages.createdAt, lowerBound)),
+        ),
         gt(messages.createdAt, upperBound),
         lt(messages.redriveCount, args.maxRedrives),
       ),

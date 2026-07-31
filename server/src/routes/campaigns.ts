@@ -14,6 +14,10 @@ import {
 } from "../db/workflows.js";
 import { getTemplate } from "../templates/index.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
+import {
+  validateCreateSendingSettings,
+  validatePatchSendingSettings,
+} from "../validation/campaignSendingSettings.js";
 
 const router = Router();
 
@@ -35,6 +39,11 @@ router.get("/", async (_req: Request, res: Response) => {
         rewardDescription: c.rewardDescription,
         shipsPhysicalProduct: c.shipsPhysicalProduct,
         postAcceptanceMode: c.postAcceptanceMode,
+        dailyInitialOutreachLimit: c.dailyInitialOutreachLimit,
+        outreachPacingMinMinutes: c.outreachPacingMinMinutes,
+        outreachPacingMaxMinutes: c.outreachPacingMaxMinutes,
+        negotiationReplyPacingMinMinutes: c.negotiationReplyPacingMinMinutes,
+        negotiationReplyPacingMaxMinutes: c.negotiationReplyPacingMaxMinutes,
         createdAt: c.createdAt.toISOString(),
         updatedAt: c.updatedAt.toISOString(),
         workflowCount: c._count.workflows,
@@ -137,6 +146,12 @@ router.post("/", async (req: Request, res: Response) => {
     return;
   }
 
+  const sendingSettings = validateCreateSendingSettings(req.body as Record<string, unknown>);
+  if (!sendingSettings.valid) {
+    res.status(400).json({ error: sendingSettings.error });
+    return;
+  }
+
   try {
     const campaign = await createCampaign({
       name: name.trim(),
@@ -165,6 +180,7 @@ router.post("/", async (req: Request, res: Response) => {
       // Omitted → the column default (local_payment) applies, so a client that
       // predates this field creates a campaign that behaves exactly as before.
       ...(isPostAcceptanceMode(postAcceptanceMode) ? { postAcceptanceMode } : {}),
+      ...sendingSettings.value,
     });
     res.status(201).json({
       id: campaign.id,
@@ -185,6 +201,11 @@ router.post("/", async (req: Request, res: Response) => {
       targetUrl: campaign.targetUrl,
       hiddenParamKey: campaign.hiddenParamKey,
       postAcceptanceMode: campaign.postAcceptanceMode,
+      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       createdAt: campaign.createdAt.toISOString(),
     });
   } catch (err) {
@@ -214,6 +235,11 @@ router.get("/:id", async (req: Request, res: Response) => {
       rewardDescription: campaign.rewardDescription,
       shipsPhysicalProduct: campaign.shipsPhysicalProduct,
       postAcceptanceMode: campaign.postAcceptanceMode,
+      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
       workflows: campaign.workflows.map((w) => ({
@@ -328,6 +354,15 @@ router.patch("/:id", async (req: Request, res: Response) => {
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
 
+  const sendingSettings = validatePatchSendingSettings(
+    req.body as Record<string, unknown>,
+  );
+  if (!sendingSettings.valid) {
+    res.status(400).json({ error: sendingSettings.error });
+    return;
+  }
+  Object.assign(patch, sendingSettings.value);
+
   if (notifyEmail !== undefined) {
     const trimmed = typeof notifyEmail === "string" ? notifyEmail.trim() : "";
     if (trimmed && !isEmailish(trimmed)) {
@@ -390,6 +425,11 @@ router.patch("/:id", async (req: Request, res: Response) => {
       rewardDescription: campaign.rewardDescription,
       shipsPhysicalProduct: campaign.shipsPhysicalProduct,
       postAcceptanceMode: campaign.postAcceptanceMode,
+      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       updatedAt: campaign.updatedAt.toISOString(),
     });
   } catch (err) {

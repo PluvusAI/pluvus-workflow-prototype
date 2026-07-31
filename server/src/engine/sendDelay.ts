@@ -1,3 +1,5 @@
+import type { Campaign } from "../db/schema.js";
+
 // ---------------------------------------------------------------------------
 // Randomized send delay (Randomized Send Delay — §4.5, §5)
 // ---------------------------------------------------------------------------
@@ -114,8 +116,41 @@ export const sendDelayConfig: SendDelayConfig = resolveConfig();
  * `Math.random()` is intentional — this is jitter to break timing regularity,
  * not a security primitive.
  */
-export function randomSendDelayMs(cfg: SendDelayConfig = sendDelayConfig): number {
+export function randomSendDelayMs(
+  cfg: SendDelayConfig = sendDelayConfig,
+  random: () => number = Math.random,
+): number {
   if (!cfg.enabled || cfg.maxMs <= cfg.minMs) return 0;
   // Uniform inclusive over [min, max].
-  return cfg.minMs + Math.floor(Math.random() * (cfg.maxMs - cfg.minMs + 1));
+  return cfg.minMs + Math.floor(random() * (cfg.maxMs - cfg.minMs + 1));
+}
+
+/**
+ * Resolve the negotiation-reply delay for a campaign. New/edited campaigns use
+ * their persisted minute window; legacy campaigns with null settings retain
+ * the existing process-wide SEND_DELAY_* behaviour exactly.
+ */
+export function negotiationReplyDelayMs(
+  campaign: Pick<
+    Campaign,
+    "negotiationReplyPacingMinMinutes" | "negotiationReplyPacingMaxMinutes"
+  > | null | undefined,
+  legacyConfig: SendDelayConfig = sendDelayConfig,
+  random: () => number = Math.random,
+): number {
+  const min = campaign?.negotiationReplyPacingMinMinutes;
+  const max = campaign?.negotiationReplyPacingMaxMinutes;
+  if (
+    min === null || min === undefined ||
+    max === null || max === undefined ||
+    !Number.isInteger(min) || !Number.isInteger(max) ||
+    min < 1 || max > 60 || min > max
+  ) {
+    return randomSendDelayMs(legacyConfig, random);
+  }
+
+  const minMs = min * 60_000;
+  const maxMs = max * 60_000;
+  if (maxMs <= minMs) return minMs;
+  return minMs + Math.floor(random() * (maxMs - minMs + 1));
 }

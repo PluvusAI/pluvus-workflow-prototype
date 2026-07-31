@@ -253,6 +253,13 @@ router.get("/:id", async (req: Request, res: Response) => {
             // PLU-70: the enroll tab shows this as the pre-selected default and
             // lets the operator override it for the batch they're about to enroll.
             postAcceptanceMode: found.campaign.postAcceptanceMode,
+            dailyInitialOutreachLimit: found.campaign.dailyInitialOutreachLimit,
+            outreachPacingMinMinutes: found.campaign.outreachPacingMinMinutes,
+            outreachPacingMaxMinutes: found.campaign.outreachPacingMaxMinutes,
+            negotiationReplyPacingMinMinutes:
+              found.campaign.negotiationReplyPacingMinMinutes,
+            negotiationReplyPacingMaxMinutes:
+              found.campaign.negotiationReplyPacingMaxMinutes,
           }
         : null,
       draftNodes: wf.draftNodes ?? [],

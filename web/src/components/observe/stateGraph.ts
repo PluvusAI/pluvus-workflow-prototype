@@ -22,6 +22,7 @@ export interface StateEdge {
 // to give ELK a stable spine.
 export const PRIMARY_PATH: InstanceState[] = [
   "ENROLLED",
+  "OUTREACH_QUEUED",
   "OUTREACH_SENT",
   "AWAITING_REPLY",
   "REPLY_RECEIVED",
@@ -41,6 +42,9 @@ function isPrimaryEdge(from: InstanceState, to: InstanceState): boolean {
 // The meaningful engine transitions (mirrors stateMachine.ts). Classification is
 // derived: self-loop → loop; on the primary spine → primary; else → branch.
 const RAW_EDGES: Array<[InstanceState, InstanceState]> = [
+  ["ENROLLED", "OUTREACH_QUEUED"],
+  ["OUTREACH_QUEUED", "OUTREACH_SENT"],
+  // Legacy/retry compatibility for campaigns launched before queued outreach.
   ["ENROLLED", "OUTREACH_SENT"],
   ["OUTREACH_SENT", "AWAITING_REPLY"],
   ["AWAITING_REPLY", "FOLLOWED_UP"],

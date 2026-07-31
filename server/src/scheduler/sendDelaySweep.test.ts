@@ -19,6 +19,7 @@ import {
   sweepStrandedSends,
   committingEventType,
   BRAND_REJECT_CLOSE_PREFIX,
+  INITIAL_OUTREACH_PREFIX,
   type SendDelaySweepDeps,
 } from "./sendDelaySweep.js";
 import type { Message } from "../db/schema.js";
@@ -203,6 +204,11 @@ test("committingEventType: a negotiation reservation maps to NEGOTIATION_TURN", 
   assert.equal(committingEventType(negotiation), "NEGOTIATION_TURN");
   // A null key (defensive) also defaults to the negotiation event.
   assert.equal(committingEventType(reservation({ idempotencyKey: null })), "NEGOTIATION_TURN");
+});
+
+test("committingEventType: initial outreach maps to OUTREACH_DRAFTED", () => {
+  const outreach = reservation({ idempotencyKey: `${INITIAL_OUTREACH_PREFIX}i1` });
+  assert.equal(committingEventType(outreach), "OUTREACH_DRAFTED");
 });
 
 test("orphan guard: a brand-reject close reservation is re-driven when its commit event is queried", async () => {

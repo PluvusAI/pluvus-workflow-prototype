@@ -25,6 +25,7 @@ import type {
 
 export const WORKFLOW_STATE_ORDER: InstanceState[] = [
   "ENROLLED",
+  "OUTREACH_QUEUED",
   "OUTREACH_SENT",
   "AWAITING_REPLY",
   "FOLLOWED_UP",
@@ -66,6 +67,7 @@ export const TERMINAL_STATES: InstanceState[] = [
 // CONTENT_LINKS_PENDING likewise waits on a creator action (the content-links
 // reply), so it is a waiting bucket too.
 export const WAITING_STATES: InstanceState[] = [
+  "OUTREACH_QUEUED",
   "AWAITING_REPLY",
   "FOLLOWED_UP",
   "REWARD_PENDING",

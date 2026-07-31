@@ -107,6 +107,11 @@ export function createCampaign(data: {
   targetUrl?: string;
   hiddenParamKey?: string;
   postAcceptanceMode?: PostAcceptanceMode;
+  dailyInitialOutreachLimit?: number;
+  outreachPacingMinMinutes?: number;
+  outreachPacingMaxMinutes?: number;
+  negotiationReplyPacingMinMinutes?: number;
+  negotiationReplyPacingMaxMinutes?: number;
 }) {
   return postJson<{ id: string; name: string }>("/api/campaigns", data);
 }
@@ -123,9 +128,21 @@ export function updateCampaign(
     rewardDescription?: string | null;
     shipsPhysicalProduct?: boolean;
     postAcceptanceMode?: PostAcceptanceMode;
+    dailyInitialOutreachLimit?: number;
+    outreachPacingMinMinutes?: number;
+    outreachPacingMaxMinutes?: number;
+    negotiationReplyPacingMinMinutes?: number;
+    negotiationReplyPacingMaxMinutes?: number;
   },
 ) {
-  return apiFetch<{ id: string; notifyEmail: string | null }>(`/api/campaigns/${id}`, {
+  return apiFetch<{
+    id: string;
+    dailyInitialOutreachLimit: number | null;
+    outreachPacingMinMinutes: number | null;
+    outreachPacingMaxMinutes: number | null;
+    negotiationReplyPacingMinMinutes: number | null;
+    negotiationReplyPacingMaxMinutes: number | null;
+  }>(`/api/campaigns/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),

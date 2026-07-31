@@ -6,6 +6,7 @@
 
 export type InstanceState =
   | "ENROLLED"
+  | "OUTREACH_QUEUED"
   | "OUTREACH_SENT"
   | "AWAITING_REPLY"
   | "FOLLOWED_UP"

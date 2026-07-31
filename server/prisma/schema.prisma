@@ -30,6 +30,7 @@ datasource db {
 /// Source of truth: source-of-truth.md §6
 enum InstanceState {
   ENROLLED
+  OUTREACH_QUEUED
   OUTREACH_SENT
   AWAITING_REPLY
   FOLLOWED_UP
@@ -293,10 +294,37 @@ model Campaign {
   /// enrollments and can never alter an already-running execution.
   postAcceptanceMode PostAcceptanceMode @default(local_payment)
 
+  /// PLU-122. NULL is the legacy behavior: no daily initial-outreach cap.
+  /// New campaigns receive explicit API defaults rather than a DB default, so
+  /// applying the migration cannot change existing campaigns.
+  dailyInitialOutreachLimit            Int?
+  outreachPacingMinMinutes             Int?
+  outreachPacingMaxMinutes             Int?
+  negotiationReplyPacingMinMinutes     Int?
+  negotiationReplyPacingMaxMinutes     Int?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  workflows Workflow[]
+  workflows       Workflow[]
+  outreachDays    CampaignOutreachDay[]
+}
+
+/// PLU-122: one UTC calendar-day counter/pacing cursor per campaign. This is
+/// quota state only; the Message row remains the durable outbox and BullMQ's
+/// delayed-send queue remains the only delivery scheduler.
+model CampaignOutreachDay {
+  id             String   @id @default(cuid())
+  campaignId     String
+  dayStart       DateTime
+  startedCount   Int      @default(0)
+  nextEligibleAt DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, dayStart])
 }
 
 /// A campaign definition. The logical container for a sequence of nodes.
@@ -569,6 +597,12 @@ model Message {
   /// that (or SEND_DELAY_MAX_SWEEP_AGE_MS) it is abandoned for manual inspection
   /// instead of re-enqueued forever. 0 for every non-swept / inbound row.
   redriveCount       Int              @default(0)
+  /// Persisted BullMQ due time. Recovery never promotes an intentionally
+  /// deferred send before this instant.
+  scheduledFor       DateTime?
+  /// UTC day whose initial-outreach capacity this message atomically claimed.
+  /// NULL until claimed; retries reuse a non-NULL claim without incrementing.
+  initialOutreachQuotaDay DateTime?
   sentAt             DateTime?
   receivedAt         DateTime?
   /// When an INBOUND reply finished PROCESSING (CRITICAL-6). Set only after the

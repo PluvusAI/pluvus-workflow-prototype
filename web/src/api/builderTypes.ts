@@ -29,7 +29,6 @@ export interface InitialOutreachConfig {
   outreachMode?: "manual" | "ai";
   subjectTemplate: string;
   bodyTemplate: string;
-  delaySeconds: number;
 }
 
 export interface FollowUpConfig {
@@ -159,6 +158,12 @@ export interface CampaignListItem {
   rewardDescription: string | null;
   /** When true, the payment form also collects a shipping address. */
   shipsPhysicalProduct: boolean;
+  postAcceptanceMode: PostAcceptanceMode;
+  dailyInitialOutreachLimit: number | null;
+  outreachPacingMinMinutes: number | null;
+  outreachPacingMaxMinutes: number | null;
+  negotiationReplyPacingMinMinutes: number | null;
+  negotiationReplyPacingMaxMinutes: number | null;
   createdAt: string;
   updatedAt: string;
   workflowCount: number;
@@ -187,6 +192,12 @@ export interface CampaignDetail {
   rewardDescription: string | null;
   /** When true, the payment form also collects a shipping address. */
   shipsPhysicalProduct: boolean;
+  postAcceptanceMode: PostAcceptanceMode;
+  dailyInitialOutreachLimit: number | null;
+  outreachPacingMinMinutes: number | null;
+  outreachPacingMaxMinutes: number | null;
+  negotiationReplyPacingMinMinutes: number | null;
+  negotiationReplyPacingMaxMinutes: number | null;
   createdAt: string;
   updatedAt: string;
   workflows: CampaignWorkflowItem[];
@@ -210,6 +221,11 @@ export interface WorkflowCampaign {
   brand: string;
   /** The campaign default the enroll tab pre-selects (and lets you override). */
   postAcceptanceMode: PostAcceptanceMode;
+  dailyInitialOutreachLimit: number | null;
+  outreachPacingMinMinutes: number | null;
+  outreachPacingMaxMinutes: number | null;
+  negotiationReplyPacingMinMinutes: number | null;
+  negotiationReplyPacingMaxMinutes: number | null;
 }
 
 export interface WorkflowLatestVersion {

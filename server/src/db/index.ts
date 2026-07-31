@@ -5,6 +5,7 @@ export * from "./workflows.js";
 export * from "./creators.js";
 export * from "./instances.js";
 export * from "./messages.js";
+export * from "./outboundPacing.js";
 export * from "./events.js";
 export * from "./deadLetterJobs.js";
 export * from "./brandNotifications.js";
