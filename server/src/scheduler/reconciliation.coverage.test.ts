@@ -49,6 +49,12 @@ const WAITING_STATES: InstanceState[] = [
   // NOT be swept (re-enqueuing has no reply to process → spam, not recovery).
   "CONTENT_LINKS_PENDING",
   "NEEDS_DEAL_FINALIZATION",
+  // Brand-approval gate: AWAITING_BRAND_APPROVAL is parked on the BRAND clicking an
+  // approve/reject magic link, exactly as PAYMENT_PENDING parks on the payout form.
+  // There is no queued work to recover, so sweeping it would re-run
+  // executeBrandApproval every tick forever. ACCEPTED (already swept) covers the
+  // real strand risk: a crash between the accept commit and the gate enqueue.
+  "AWAITING_BRAND_APPROVAL",
 ];
 
 test("H8: RECONCILE_STATES includes NEGOTIATING and REPLY_RECEIVED (the flagged pair)", () => {

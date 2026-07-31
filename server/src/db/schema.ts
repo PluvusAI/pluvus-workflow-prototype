@@ -117,6 +117,10 @@ export const instanceStateEnum = pgEnum("InstanceState", [
   // VALUE appends to the DB type — this array must mirror the DB's member order.
   "NEEDS_DEAL_FINALIZATION",
   "HANDOFF_COMPLETE",
+  // Brand-approval gate: a local_payment deal that a creator ACCEPTED is held
+  // here until the BRAND approves (via magic link) before the content brief +
+  // payout link go out. Appended to mirror the DB's ALTER TYPE ADD VALUE order.
+  "AWAITING_BRAND_APPROVAL",
 ]);
 
 // DB member order differs from schema.prisma's declaration order for the
@@ -187,6 +191,10 @@ export const eventTypeEnum = pgEnum("EventType", [
   "DEAL_HANDOFF_REQUESTED",
   "DEAL_HANDOFF_REPLY",
   "DEAL_HANDOFF_COMPLETED",
+  // Brand-approval gate. Appended to mirror the DB's ALTER TYPE ADD VALUE order.
+  "BRAND_APPROVAL_REQUESTED",
+  "BRAND_APPROVED",
+  "BRAND_REJECTED",
 ]);
 
 // PLU-70: what happens after a negotiation is accepted. local_payment is the
@@ -199,6 +207,21 @@ export const postAcceptanceModeEnum = pgEnum("PostAcceptanceMode", [
 export const dealHandoffStatusEnum = pgEnum("DealHandoffStatus", [
   "AWAITING_FINALIZATION",
   "COMPLETED",
+]);
+
+// Brand-approval gate: lifecycle of the brand's Approve/Reject decision on a
+// creator the AI closed. AWAITING_APPROVAL until the brand clicks a magic link;
+// PROCESSING is a short-lived intermediate claim held ONLY while the workflow
+// action (content-brief send / halt to manual review) runs, so the decision is
+// finalized (APPROVED / REJECTED) exactly once, and STRICTLY AFTER that action
+// succeeds. A PROCESSING row whose action failed reverts to AWAITING_APPROVAL so
+// the brand can retry the same link instead of being told "already actioned"
+// while the execution is still parked (PLU-118, Calvin review §2).
+export const brandApprovalStatusEnum = pgEnum("BrandApprovalStatus", [
+  "AWAITING_APPROVAL",
+  "PROCESSING",
+  "APPROVED",
+  "REJECTED",
 ]);
 
 // PLU-111: Conversation Obligations. A DIFFERENT concept from the payout-ledger
@@ -308,6 +331,8 @@ export type PartnershipStatus = (typeof partnershipStatusEnum.enumValues)[number
 export type ObligationStatus = (typeof obligationStatusEnum.enumValues)[number];
 export type PayoutStatus = (typeof payoutStatusEnum.enumValues)[number];
 export type PayoutType = (typeof payoutTypeEnum.enumValues)[number];
+export type BrandApprovalStatus =
+  (typeof brandApprovalStatusEnum.enumValues)[number];
 // PLU-111 — conversation obligations (distinct from the payout ObligationStatus).
 export type ObligationType = (typeof obligationTypeEnum.enumValues)[number];
 export type ConversationObligationStatus =
@@ -720,6 +745,71 @@ export const dealHandoffs = pgTable(
   ],
 );
 
+// Brand-approval gate: the snapshot the BRAND sees when asked to approve a
+// creator the AI closed, plus the magic-link token + their decision. Modeled on
+// DealHandoff (same denormalized agreed-terms snapshot) with the Payout token
+// pattern bolted on: the DB stores ONLY the sha256 hash of the approve/reject
+// token (approveTokenHash) — the raw token lives solely in the brand's email, so
+// a DB dump cannot forge an approval. UNIQUE instanceId is the idempotency guard:
+// a retried send re-inserts, hits the constraint, and reuses the existing row +
+// token (so the emailed links stay valid across retries).
+export const brandApprovals = pgTable(
+  "BrandApproval",
+  {
+    id: cuidId("id"),
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+    creatorName: text("creatorName").notNull(),
+    creatorEmail: text("creatorEmail").notNull(),
+    campaignName: text("campaignName"),
+    // The brand's DISPLAY name (resolveBrandName: node config → campaign.brand),
+    // distinct from the campaign name. The hosted approval page headed itself with
+    // campaignName, which could show the wrong brand (PLU-118, Calvin review). We
+    // persist the resolved brand name so the page can head with the real brand and
+    // still say "…for {campaignName}". Nullable: rows written before this column
+    // fall back to campaignName at read time (legacy-safe).
+    brandName: text("brandName"),
+    // Null for commission-only deals. Present on fee deals — the brand email
+    // states this figure, so the executor escalates rather than snapshotting a
+    // fabricated fee (CRITICAL-3 parity with the merged Content Brief email).
+    // NOTE (PLU-118): fixedFee/commissionRate are DISPLAY-ONLY snapshots — the
+    // brand email + hosted page render them, nothing does arithmetic on them, and
+    // the authoritative money lives in the payout ledger (Obligation/Payout).
+    // doublePrecision matches the proto-wide convention for these display figures
+    // (Campaign.*, DealHandoff.*); switching this one table to minor-units would
+    // diverge from every sibling snapshot without any correctness gain here.
+    fixedFee: doublePrecision("fixedFee"),
+    commissionRate: doublePrecision("commissionRate"),
+    negotiationFloor: doublePrecision("negotiationFloor"),
+    negotiationCeiling: doublePrecision("negotiationCeiling"),
+    deliverables: text("deliverables"),
+    timeline: text("timeline"),
+    paymentTerms: text("paymentTerms"),
+    rewardDescription: text("rewardDescription"),
+    // Platform/handle for the "creator profile" block in the brand email.
+    creatorHandle: text("creatorHandle"),
+    creatorPlatform: text("creatorPlatform"),
+    threadId: text("threadId"),
+    acceptedAt: ts("acceptedAt").notNull(),
+    // Magic-link token: only the hash is stored (Payout pattern). Expiry gates a
+    // leaked/forwarded link; a null expiry never expires (grandfathered).
+    approveTokenHash: text("approveTokenHash").notNull(),
+    tokenExpiresAt: ts("tokenExpiresAt"),
+    status: brandApprovalStatusEnum("status").notNull().default("AWAITING_APPROVAL"),
+    // Audit trail of the decision — who/when, and from where.
+    decidedAt: ts("decidedAt"),
+    decidedIp: text("decidedIp"),
+    decidedUserAgent: text("decidedUserAgent"),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    uniqueIndex("BrandApproval_instanceId_key").on(table.instanceId),
+    index("BrandApproval_status_idx").on(table.status),
+  ],
+);
+
 // PLU-111: durable conversation obligations. ONLY-lifecycle data — status +
 // pointers back into the canonical Message rows + the original wording (audit).
 // NOT a second copy of the conversation (the transcript stays sourced from
@@ -1054,6 +1144,7 @@ export type DeadLetterJob = typeof deadLetterJobs.$inferSelect;
 export type BrandNotification = typeof brandNotifications.$inferSelect;
 export type PaymentInfo = typeof paymentInfo.$inferSelect;
 export type DealHandoff = typeof dealHandoffs.$inferSelect;
+export type BrandApproval = typeof brandApprovals.$inferSelect;
 export type ConversationObligation = typeof conversationObligations.$inferSelect;
 export type Partnership = typeof partnerships.$inferSelect;
 export type Click = typeof clicks.$inferSelect;
@@ -1103,6 +1194,7 @@ export type DeadLetterJobInsert = typeof deadLetterJobs.$inferInsert;
 export type BrandNotificationInsert = typeof brandNotifications.$inferInsert;
 export type PaymentInfoInsert = typeof paymentInfo.$inferInsert;
 export type DealHandoffInsert = typeof dealHandoffs.$inferInsert;
+export type BrandApprovalInsert = typeof brandApprovals.$inferInsert;
 export type ConversationObligationInsert = typeof conversationObligations.$inferInsert;
 export type PartnershipInsert = typeof partnerships.$inferInsert;
 export type ClickInsert = typeof clicks.$inferInsert;

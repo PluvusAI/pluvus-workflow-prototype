@@ -9,6 +9,7 @@ import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import {
   computeOpenQuestions,
   buildOpenObligations,
+  buildStructuredObligations,
   buildQuestionObligationPlan,
   type QuestionObligationPlanItem,
   computeChangedFields,

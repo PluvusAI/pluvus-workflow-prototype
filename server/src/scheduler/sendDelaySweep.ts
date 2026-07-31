@@ -30,7 +30,13 @@ import { logTrace } from "../observability/logger.js";
 //     Flushing it would COMPLETE a send the rollback meant to prevent. Under
 //     enqueue-after-commit (option A) a rolled-back turn appends NO
 //     NEGOTIATION_TURN event, so we require a committed NEGOTIATION_TURN event at
-//     or after the row's createdAt before re-driving.
+//     or after the row's createdAt before re-driving. The guard is RESERVATION-TYPE
+//     AWARE (PLU-118, Calvin review §2): a brand-reject close email
+//     (idempotencyKey `brand-reject-close:*`) is reserved by the reject path, which
+//     appends BRAND_REJECTED — never NEGOTIATION_TURN — so for those rows the guard
+//     looks for a committed BRAND_REJECTED instead. Without this, a genuinely
+//     committed reject whose delayed enqueue was lost would be permanently mistaken
+//     for an orphan and its close email dropped.
 //
 // Exactly-once is preserved by the per-send lock + post-lock NULL re-check in
 // flushOutbound (§4.2a), NOT by the jobId — so the re-drive MUST use a DISTINCT
@@ -61,15 +67,32 @@ export interface SendDelaySweepDeps {
     delayMs?: number,
     jobId?: string,
   ): Promise<void>;
-  /** Returns true when the reservation's owning negotiation turn COMMITTED — i.e.
-   *  a NEGOTIATION_TURN event exists for the instance at/after the row's reserve
-   *  time (minus skew). A rolled-back turn has none → orphan → skip. */
-  turnCommitted(instanceId: string, reservedAt: Date): Promise<boolean>;
+  /** Returns true when the reservation's owning action COMMITTED — i.e. the
+   *  committing event for THIS reservation type exists for the instance at/after
+   *  the row's reserve time (minus skew). A rolled-back action has none → orphan →
+   *  skip. The row is passed (not just instanceId) so the guard can pick the right
+   *  committing event by the reservation's idempotencyKey (PLU-118 §2). */
+  turnCommitted(row: Message, reservedAt: Date): Promise<boolean>;
   now(): Date;
 }
 
-async function defaultTurnCommitted(instanceId: string, reservedAt: Date): Promise<boolean> {
-  const events = await listEventsByInstance(instanceId, { type: "NEGOTIATION_TURN" });
+// The idempotencyKey prefix for the brand-reject creator close email. Kept in sync
+// with brandRejectCloseKey() in brandRejectEmail.ts (`brand-reject-close:<id>`).
+export const BRAND_REJECT_CLOSE_PREFIX = "brand-reject-close:";
+
+// Map a reservation to the event type whose committed presence proves its owning
+// action committed. Default is NEGOTIATION_TURN (AI negotiation replies, the
+// overwhelming majority of delayed sends); a brand-reject close email is committed
+// by the reject transition's BRAND_REJECTED event instead. Exported for unit tests.
+export function committingEventType(row: Message): "NEGOTIATION_TURN" | "BRAND_REJECTED" {
+  if (row.idempotencyKey?.startsWith(BRAND_REJECT_CLOSE_PREFIX)) return "BRAND_REJECTED";
+  return "NEGOTIATION_TURN";
+}
+
+async function defaultTurnCommitted(row: Message, reservedAt: Date): Promise<boolean> {
+  const events = await listEventsByInstance(row.instanceId, {
+    type: committingEventType(row),
+  });
   const floor = reservedAt.getTime() - ORPHAN_GUARD_SKEW_MS;
   return events.some((e) => e.occurredAt.getTime() >= floor);
 }
@@ -130,7 +153,7 @@ export async function sweepStrandedSends(
     // flushing it would complete a send the rollback meant to prevent.
     let committed: boolean;
     try {
-      committed = await deps.turnCommitted(row.instanceId, row.createdAt);
+      committed = await deps.turnCommitted(row, row.createdAt);
     } catch (err) {
       console.error(
         `[scheduler/send-delay-sweep] orphan-guard check failed for ${row.id}:`,

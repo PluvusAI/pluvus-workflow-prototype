@@ -37,7 +37,8 @@ The platform is a three-service monorepo:
 16. [Extensibility](#extensibility)
 17. [Current Status](#current-status)
 18. [Getting Started](#getting-started)
-19. [Conclusion](#conclusion)
+19. [Desktop Notifications (Claude Code hooks)](#desktop-notifications-claude-code-hooks)
+20. [Conclusion](#conclusion)
 
 ---
 
@@ -877,6 +878,89 @@ docker compose --profile app up --scale worker=3
 | `NEGOTIATION_STRATEGY` | `rules` / `llm` | Deterministic vs model-driven negotiation |
 | `PROCESS_ROLE` | `api` / `worker` / `scheduler` / `all` | Process topology (run exactly one `scheduler`; leader-locked so extras are inert) |
 | `AGENT_ENV` | unset / `production` | When deployed + `AGENT_API_KEY` unset, agent auth fails closed |
+
+---
+
+# Desktop Notifications (Claude Code hooks)
+
+This repo ships a small, local-only notification system so that when a Claude Code
+session finishes work or pauses for input, you get a **native Windows toast
+notification** (Action Center) plus the standard Windows notification sound —
+handy when you step away from the machine mid-run. It uses no external services
+(no Discord/Slack/ntfy/Telegram) and no third-party PowerShell modules.
+
+## What was added
+
+| File | Purpose |
+|---|---|
+| `.claude/settings.json` | Claude Code hook configuration — maps hook events to the notifier. |
+| `.claude/hooks/notify.ps1` | The single, reusable notifier. Shows a native WinRT toast + plays the notification sound. |
+
+## How it works
+
+Claude Code fires **hooks** at lifecycle points. Two are wired here:
+
+| Hook event | When it fires | Command |
+|---|---|---|
+| `Stop` | Claude finishes a turn / a task completes | `notify.ps1 stop` → **"Implementation complete."** |
+| `Notification` (`permission_prompt`) | Claude is waiting for you to approve a tool/permission | `notify.ps1 waiting` → **"Waiting for your input."** |
+| `Notification` (`idle_prompt`) | Claude has finished and is idle, waiting for your next prompt | `notify.ps1 waiting` → **"Waiting for your input."** |
+
+All three routes call the **same** script with a different argument, so there is no
+duplicated notification logic. The script (`notify.ps1`) takes one event key
+(`stop` or `waiting`), looks up the title/message in an `$Events` table, and shows a
+native toast via the built-in WinRT `ToastNotificationManager` API. The toast is
+non-blocking (it lands in the Action Center like any other Windows notification —
+**not** a modal message box) and includes `ms-winsoundevent:Notification.Default`
+so the normal Windows notification sound plays.
+
+Notifications are strictly best-effort: `notify.ps1` never throws and always exits
+`0`, so a notification problem can never block or fail a Claude Code turn. If the
+WinRT toast API is unavailable (e.g. older Windows), it falls back to an audible
+system beep and appends one line to `.claude/hooks/notify.error.log`.
+
+The hook commands use `%CLAUDE_PROJECT_DIR%` (substituted by Claude Code) so the
+path resolves regardless of the current working directory, and run with
+`-NoProfile -ExecutionPolicy Bypass` for a clean, policy-independent invocation.
+
+> Note: `.claude/` is matched by a `**/.claude` rule in `.gitignore`, so these two
+> files were added with `git add -f` (the same convention the repo already uses for
+> its tracked `.claude/docs` and `.claude/skills` files).
+
+## How to test it
+
+Run the notifier directly (this is exactly how the hook invokes it):
+
+```powershell
+# "Implementation complete." toast
+powershell -NoProfile -ExecutionPolicy Bypass -File .claude\hooks\notify.ps1 stop
+
+# "Waiting for your input." toast
+powershell -NoProfile -ExecutionPolicy Bypass -File .claude\hooks\notify.ps1 waiting
+```
+
+You should see a **Claude Code** toast appear (and hear the notification sound) for
+each. To test the wiring inside Claude Code itself: start a session, ask for a small
+change and let it finish → you get the *complete* toast; trigger a permission prompt
+(e.g. a command that needs approval) → you get the *waiting* toast.
+
+If a toast does not appear, check that Windows **Focus Assist / Do Not Disturb** is
+off and that notifications are enabled for **Windows PowerShell** in
+*Settings → System → Notifications*, then look for `.claude/hooks/notify.error.log`.
+
+## How to customize
+
+- **Change the text:** edit the `$Events` table at the top of
+  `.claude/hooks/notify.ps1` — e.g. change the `stop` message to `'Done ✅'`.
+- **Change the sound:** edit `$SoundEvent` in `notify.ps1`. Use any
+  `ms-winsoundevent:*` token (`Notification.IM`, `Notification.Reminder`, …), or set
+  it to `'silent'` for a soundless toast.
+- **Add a new event:** add a row to `$Events` (e.g.
+  `'review' = @{ Title = 'Claude Code'; Message = 'Review requested.' }`), then add a
+  hook entry in `.claude/settings.json` that calls
+  `notify.ps1 review` for the relevant Claude Code event. The design is intentionally
+  extensible — any future hook event (e.g. `SubagentStop`) is a one-line table entry
+  plus one settings block, with no change to the notification logic.
 
 ---
 
