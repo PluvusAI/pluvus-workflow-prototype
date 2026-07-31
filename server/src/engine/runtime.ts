@@ -440,10 +440,18 @@ export class WorkflowRuntime {
   ): Promise<void> {
     const existing = await findMessageByExternalId(externalMessageId);
     if (existing) return; // already persisted by a prior (crashed) attempt
+    // PLU-121: attribute the inbound row to the mailbox this run is pinned to.
+    // A reply arrives on the same account the outreach was sent from (thread
+    // continuity), so the run's pinned account IS the receiving mailbox — stamping
+    // it here gives each account its own inbox view without threading the id
+    // through every reply handler. Best-effort: a missing pin leaves it null
+    // (caller-supplied emailAccountId in `data`, if any, still wins).
+    const instance = await findInstanceById(instanceId);
     await createMessage({
       instanceId,
       direction: "INBOUND",
       externalMessageId,
+      ...(instance?.emailAccountId ? { emailAccountId: instance.emailAccountId } : {}),
       ...data,
     });
   }

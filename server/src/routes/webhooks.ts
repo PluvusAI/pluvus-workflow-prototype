@@ -7,6 +7,7 @@ import {
   SeenDeliveryIds,
 } from "../providers/nylas/replayGuard.js";
 import { findMessagesByThreadId } from "../db/index.js";
+import { findEmailAccountByGrantId } from "../db/emailAccounts.js";
 import { enqueueInboundEmail } from "../workers/queues.js";
 
 // ---------------------------------------------------------------------------
@@ -84,6 +85,30 @@ function extractInboundMessage(payload: unknown): InboundMessage | null {
     body: pick<string>(msg, "body", "snippet") ?? "",
     senderEmail: extractFromEmail(msg),
   };
+}
+
+// PLU-121 (multi-mailbox): pull the Nylas GRANT id an event belongs to. In v3 the
+// grant id sits on the notification envelope (`data.grant_id`) and is echoed on the
+// message object; tolerate both shapes + snake/camel case. Undefined when the
+// payload carries none (older single-grant deliveries) → the handler falls back to
+// an unscoped correlation, exactly as before multi-mailbox.
+function extractGrantId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const data = (payload as Record<string, unknown>)["data"];
+  if (data && typeof data === "object") {
+    const onData = pick<string>(data as Record<string, unknown>, "grant_id", "grantId");
+    if (onData) return onData;
+    const object = (data as Record<string, unknown>)["object"];
+    if (object && typeof object === "object") {
+      const onObject = pick<string>(
+        object as Record<string, unknown>,
+        "grant_id",
+        "grantId",
+      );
+      if (onObject) return onObject;
+    }
+  }
+  return undefined;
 }
 
 // The From: address in a Nylas message is `from: [{ email, name }]` (or, on some
@@ -189,7 +214,35 @@ router.post("/nylas", async (req: Request, res: Response) => {
     return;
   }
 
-  const threadMessages = await findMessagesByThreadId(inbound.threadId);
+  // PLU-121 (multi-mailbox): resolve WHICH connected account this event is for
+  // from its grant id, and scope the thread correlation to that account. Nylas
+  // thread ids are unique only within a grant, so once several grants are
+  // connected an unscoped match could attach grant A's reply to grant B's thread
+  // (cross-account leakage). Behavior when the grant is absent/unregistered, or
+  // when only the single seeded account exists, degrades to the previous unscoped
+  // correlation so single-mailbox deployments are unaffected.
+  const grantId = extractGrantId(payload);
+  const account = grantId ? await findEmailAccountByGrantId(grantId) : null;
+  if (account && account.status !== "active") {
+    // A disabled/revoked account must not drive any workflow — drop, ack. Other
+    // accounts are unaffected (per-account isolation).
+    console.log(
+      `[webhook/nylas] dropping event for ${account.status} account ${account.id} ` +
+        `(grant ${grantId})`,
+    );
+    res.status(200).json({ status: "ignored", reason: "account not active" });
+    return;
+  }
+
+  // Prefer an account-scoped correlation; fall back to unscoped only when the
+  // scoped lookup finds nothing (legacy rows with no emailAccountId, or an event
+  // whose grant we couldn't resolve) so a mid-rollout thread still correlates.
+  let threadMessages = account
+    ? await findMessagesByThreadId(inbound.threadId, account.id)
+    : await findMessagesByThreadId(inbound.threadId);
+  if (account && threadMessages.length === 0) {
+    threadMessages = await findMessagesByThreadId(inbound.threadId);
+  }
   if (threadMessages.length === 0) {
     // A reply to a thread we never sent (or not ours). Drop, ack.
     console.log(

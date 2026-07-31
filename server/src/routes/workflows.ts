@@ -16,6 +16,7 @@ import {
 } from "../db/instances.js";
 import { listCreators } from "../db/creators.js";
 import { findCampaignById } from "../db/campaigns.js";
+import { resolveAccountForCampaign } from "../db/emailAccounts.js";
 import { db } from "../db/drizzle.js";
 import { isForeignKeyViolation, isUniqueViolation } from "../db/errors.js";
 import {
@@ -703,6 +704,10 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
       return;
     }
 
+    // Fetch the campaign ONCE for this batch — it drives both the post-acceptance
+    // mode default and (PLU-121) the connected mailbox these runs are pinned to.
+    const campaign = wf.campaignId ? await findCampaignById(wf.campaignId) : null;
+
     // Resolve the effective mode ONCE for this batch:
     //   explicit override → the campaign's default → local_payment.
     // Stamping it onto each instance is what locks it: editing the campaign
@@ -711,12 +716,16 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
     let effectiveMode: "local_payment" | "operator_handoff" = "local_payment";
     if (postAcceptanceMode === "local_payment" || postAcceptanceMode === "operator_handoff") {
       effectiveMode = postAcceptanceMode;
-    } else if (wf.campaignId) {
-      const campaign = await findCampaignById(wf.campaignId);
-      if (campaign?.postAcceptanceMode === "operator_handoff") {
-        effectiveMode = "operator_handoff";
-      }
+    } else if (campaign?.postAcceptanceMode === "operator_handoff") {
+      effectiveMode = "operator_handoff";
     }
+
+    // PLU-121: resolve the mailbox to PIN for this batch — the campaign's chosen
+    // account, else the default account, else null (no accounts configured yet →
+    // the send path falls back to the env grant, exactly as before multi-mailbox).
+    // Stamping it once at enrollment is what keeps every message of a run — and its
+    // replies — on the same mailbox even if the campaign default is later changed.
+    const pinnedAccount = await resolveAccountForCampaign(campaign?.emailAccountId);
 
     let enrolled = 0;
     let skipped = 0;
@@ -727,6 +736,7 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
           creatorId,
           workflowVersionId: latestVersion.id,
           postAcceptanceMode: effectiveMode,
+          ...(pinnedAccount ? { emailAccountId: pinnedAccount.id } : {}),
         });
         enrolled++;
       } catch (err) {

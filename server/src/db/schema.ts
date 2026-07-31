@@ -342,6 +342,36 @@ export type ConversationObligationStatus =
 // Definition models
 // ---------------------------------------------------------------------------
 
+// PLU-121: a connected email account — one Nylas grant = one mailbox. Stores only
+// the opaque grant id + address (never raw credentials). See schema.prisma for the
+// full rationale. Declared BEFORE the tables that reference it (campaigns,
+// executionInstances, messages) so every foreign-key thunk resolves a value that
+// is already initialized.
+export const connectedEmailAccounts = pgTable(
+  "ConnectedEmailAccount",
+  {
+    id: cuidId("id"),
+    nylasGrantId: text("nylasGrantId").notNull(),
+    emailAddress: text("emailAddress").notNull(),
+    displayName: text("displayName"),
+    provider: text("provider").notNull().default("nylas"),
+    // active | disabled | revoked.
+    status: text("status").notNull().default("active"),
+    isDefault: boolean("isDefault").notNull().default(false),
+    webhookSecret: text("webhookSecret"),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    uniqueIndex("ConnectedEmailAccount_nylasGrantId_key").on(table.nylasGrantId),
+    index("ConnectedEmailAccount_status_idx").on(table.status),
+    // At most one default account (partial unique over the default rows).
+    uniqueIndex("ConnectedEmailAccount_isDefault_key")
+      .on(table.isDefault)
+      .where(sql`${table.isDefault} = true`),
+  ],
+);
+
 export const campaigns = pgTable("Campaign", {
   id: cuidId("id"),
   name: text("name").notNull(),
@@ -365,6 +395,13 @@ export const campaigns = pgTable("Campaign", {
   postAcceptanceMode: postAcceptanceModeEnum("postAcceptanceMode")
     .notNull()
     .default("local_payment"),
+  // PLU-121: the brand's DEFAULT sending mailbox. Enrollment stamps the effective
+  // account onto each ExecutionInstance, so editing this reaches only FUTURE
+  // enrollments. Nullable — pre-multi-mailbox campaigns fall back to the default
+  // ConnectedEmailAccount at enrollment.
+  emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
+    onDelete: "set null",
+  }),
   createdAt: tsNow("createdAt"),
   updatedAt: tsUpdatedAt("updatedAt"),
 });
@@ -521,6 +558,12 @@ export const executionInstances = pgTable(
     postAcceptanceMode: postAcceptanceModeEnum("postAcceptanceMode")
       .notNull()
       .default("local_payment"),
+    // PLU-121: the connected mailbox this run is PINNED to. Stamped once at
+    // enrollment and never rewritten — reading it here keeps a whole conversation
+    // on one mailbox. Nullable; backfilled to the default account by the migration.
+    emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
+      onDelete: "set null",
+    }),
     dueAt: ts("dueAt"),
     enrolledAt: tsNow("enrolledAt"),
     completedAt: ts("completedAt"),
@@ -565,6 +608,12 @@ export const messages = pgTable(
     sentAt: ts("sentAt"),
     receivedAt: ts("receivedAt"),
     processedAt: ts("processedAt"),
+    // PLU-121: which connected mailbox this message was sent from / received on.
+    // Stamped at send finalize (OUTBOUND) and from the run's pinned account
+    // (INBOUND). Nullable; backfilled to the default account by the migration.
+    emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
+      onDelete: "set null",
+    }),
     createdAt: tsNow("createdAt"),
   },
   (table) => [
@@ -572,6 +621,7 @@ export const messages = pgTable(
     uniqueIndex("Message_idempotencyKey_key").on(table.idempotencyKey),
     index("Message_threadId_idx").on(table.threadId),
     index("Message_instanceId_idx").on(table.instanceId),
+    index("Message_emailAccountId_idx").on(table.emailAccountId),
   ],
 );
 
@@ -1054,6 +1104,9 @@ export const insertWorkflowSchema = createInsertSchema(workflows).omit({
   createdAt: true,
   updatedAt: true,
 });
+export const insertConnectedEmailAccountSchema = createInsertSchema(
+  connectedEmailAccounts,
+).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertWorkflowVersionSchema = createInsertSchema(
   workflowVersions,
 ).omit({ id: true, createdAt: true, publishedAt: true });
@@ -1131,6 +1184,7 @@ export const insertPayoutSchema = createInsertSchema(payouts).omit({
 // ---------------------------------------------------------------------------
 
 export type Campaign = typeof campaigns.$inferSelect;
+export type ConnectedEmailAccount = typeof connectedEmailAccounts.$inferSelect;
 export type Workflow = typeof workflows.$inferSelect;
 export type WorkflowVersion = typeof workflowVersions.$inferSelect;
 export type Creator = typeof creators.$inferSelect;
@@ -1181,6 +1235,10 @@ export type InsertPayout = z.infer<typeof insertPayoutSchema>;
 // Raw insert types (what db.insert(...).values() accepts, ids/timestamps
 // optional because of the $defaultFn/default declarations above).
 export type CampaignInsert = typeof campaigns.$inferInsert;
+export type ConnectedEmailAccountInsert = typeof connectedEmailAccounts.$inferInsert;
+export type InsertConnectedEmailAccount = z.infer<
+  typeof insertConnectedEmailAccountSchema
+>;
 export type WorkflowInsert = typeof workflows.$inferInsert;
 export type WorkflowVersionInsert = typeof workflowVersions.$inferInsert;
 export type CreatorInsert = typeof creators.$inferInsert;
