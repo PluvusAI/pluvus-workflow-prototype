@@ -118,11 +118,22 @@ give an *unsupported automated answer*.
 **The gate (`conflictAffectsCreatorCommitment`) requires ALL of:**
 1. the conflicting field is a creator-commitment field (`usageRights` / `exclusivity`
    / `paymentTerms` / `attributionWindow`);
-2. the creator **asked about that field this turn** (`creatorQuestions` /
-   `pushedFixedTerms`, matched via `detectObligationCategory`) **OR** has a
-   non-terminal open obligation on it;
+2. the creator **asked about that exact field this turn** — matched
+   **field-specifically** via `CONFLICT_FIELD_PATTERNS` (each field has its own
+   pattern, so a usage-rights ask does **not** match an exclusivity-only conflict)
+   **OR** has a non-terminal open obligation whose coarse category unambiguously maps
+   to that field (see the fallback note below);
 3. the agent did **not** already escalate (`outcome !== "escalate"` — defer to the
    topic gate's reason, never race it).
+
+> **Field-specific matching (review §5).** Earlier, `usageRights` and `exclusivity`
+> shared the coarse `usage_rights` bucket, so an ask about one could escalate a
+> conflict on the other. This-turn matching now uses each field's own pattern.
+> **Open obligations** from prior rounds carry only the coarse category (they can't
+> tell the two apart), so they are a **conservative fallback**: a coarse open
+> obligation in a *shared* category (`usage_rights`) does **not** back-fill either
+> sibling — only an unambiguous category (e.g. `payment`) does. A this-turn
+> field-specific ask always matches.
 
 **Why the gate matters:** a brief-vs-campaign conflict exists on *every* turn from
 round 0, independent of the creator. Escalating on conflict-*existence* alone would
@@ -134,13 +145,56 @@ fires automatically (`eventPayload.reason`), and the open obligations move to
 `ESCALATED` (`escalateAfterWrite`). The escalation is a **terminal** MANUAL_REVIEW,
 so the negotiation executor never runs again — no escalation loop.
 
-> **`attributionWindow`** has no keyword category (`detectObligationCategory` can't
-> emit it), so a conflict on it never matches a creator question — conservative by
-> design (a false-negative reverts to today's silence).
+> **`attributionWindow`** now has its **own** field-specific pattern (review §5), so a
+> conflict on it escalates when the creator actually asks about the attribution /
+> conversion window. It still has no *coarse* obligation category
+> (`detectObligationCategory` emits none), so an old open obligation can't back-fill
+> it — only a this-turn ask matches. Previously it was detected but structurally
+> unable to escalate at all.
+
+### 4.1 Recovery — active vs cleared conflicts (review §6)
+
+Conflicts are surfaced from the event log across all turns, but each carries a
+**status**:
+
+- **`active`** — still present in the **most recent turn whose brief was
+  re-resolved** (the latest "knowledge round").
+- **`cleared`** — present in an earlier round but **absent from that latest
+  re-resolution** (the source was corrected).
+
+So the operator panel distinguishes a *historical* conflict, a *currently active*
+one, and a *since-corrected* one. `briefAvailability` is already latest-wins; the
+conflict list previously unioned every conflict ever seen, which made a fixed
+conflict read as though it were still live. A plain negotiation turn with **no**
+knowledge block is **not** treated as a re-resolution, so it never falsely clears a
+standing conflict. Recovery is **per-field** — one field can clear while another
+stays active. When no round is known (older instances), a conflict stays `active`
+(conservative — never hide a possibly-live conflict).
 
 ---
 
-## 5. Flags
+## 5. Supported conflict scope (review §7)
+
+The material-conflict detector + escalation currently covers a **subset** of the
+fields the Linear issue lists. This is intentional for v1; the rest is deferred.
+
+| Field | Detected? | Can escalate? | Notes |
+|---|---|---|---|
+| `paymentTerms` | ✅ | ✅ | coarse category `payment` (unambiguous → open-obligation fallback works). |
+| `usageRights` | ✅ | ✅ | field-specific this-turn match; shared coarse bucket → no cross-trigger. |
+| `exclusivity` | ✅ | ✅ | field-specific this-turn match. |
+| `attributionWindow` | ✅ | ✅ | this-turn ask only (no coarse category for open-obligation fallback). |
+| `deliverables` | ❌ | ❌ | **deferred** — not in `_CONFLICT_KEYS` / `detectBriefConflicts`. |
+| `deadline` / `timeline` | ❌ | ❌ | **deferred**. |
+| `commission` / `fixedFee` | ❌ | ❌ | **deferred** (fee is special-cased out of the resolver entirely — see §2). |
+
+Deferred fields are still resolved by the precedence table (§2); they are simply not
+part of the brief-vs-Campaign **conflict** detection/escalation yet. Widening the
+detector is a separate, golden-tested change.
+
+---
+
+## 6. Flags
 
 | Flag | Side | Default | Gates |
 |---|---|---|---|
@@ -163,7 +217,7 @@ The precedence-resolver migration and the availability projection are **not flag
 
 ---
 
-## 6. What this does NOT touch
+## 7. What this does NOT touch
 
 - No dollar figure moves — `fixedFee` still comes only from `resolveAgreedFee` or
   escalates; conflict detection *reports* a money disagreement, never changes a fee.
@@ -176,14 +230,15 @@ The precedence-resolver migration and the availability projection are **not flag
 
 ---
 
-## 7. Where it lives
+## 8. Where it lives
 
 | Concern | File |
 |---|---|
 | The resolver + `PRECEDENCE_BY_CATEGORY` | `server/src/engine/knowledgePrecedence.ts` |
 | Executor migration (3 call sites) | `operatorHandoff.ts` / `rewardSetup.ts` / `contentBrief.ts` |
 | Brief availability projection | `server/src/engine/executors/briefKnowledge.ts` (`deriveBriefAvailability`) |
-| Conflict gate + escalate helper | `server/src/engine/executors/negotiation.ts` (`conflictAffectsCreatorCommitment`, `escalateMaterialConflict`) |
+| Parser-version cache (review §3) | `briefKnowledge.ts` (`expectedParserVersion`, env `BRIEF_PARSER_VERSION`) |
+| Conflict gate + escalate helper | `server/src/engine/executors/negotiation.ts` (`conflictAffectsCreatorCommitment`, `CONFLICT_FIELD_PATTERNS`, `escalateMaterialConflict`) |
 | Reason labels (two maps — keep in sync) | `routes/manualQueue.ts` + `notifications/escalation.ts` |
-| Observability DTO / mapper / panel | `observability/dto.ts` (`KnowledgeDTO`), `repository.ts` (`mapKnowledge`), `web/src/components/KnowledgePanel.tsx` |
-| Tests | `knowledgePrecedence.test.ts`, `finalizedTermsPrecedence.golden.test.ts`, `briefKnowledge.availability.test.ts`, `knowledgeMapper.test.ts`, `materialConflictEscalation.test.ts`, `reasonLabelParity.test.ts` |
+| Observability DTO / mapper / panel | `observability/dto.ts` (`KnowledgeDTO`, conflict `status`), `repository.ts` (`mapKnowledge`), `web/src/components/KnowledgePanel.tsx` |
+| Tests | `knowledgePrecedence.test.ts`, `finalizedTermsPrecedence.golden.test.ts`, `briefKnowledge.availability.test.ts`, `briefKnowledge.cache.test.ts`, `knowledgeMapper.test.ts`, `materialConflictEscalation.test.ts`, `reasonLabelParity.test.ts` |

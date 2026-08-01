@@ -28,8 +28,11 @@ import { agentBaseUrl, agentPostJson } from "../../adapters/agentServiceClient.j
 // not the NEGOTIATION node, so we resolve it from the whole node graph.
 //
 // The file content is immutable per reference (uploads get a fresh random name),
-// so parsed results are cached in-process keyed by `${ref}::${PARSER_VERSION}`
-// (invariant #3) — a parser bump misses every stale entry. Only ok/empty results
+// so parsed results are cached in-process keyed by `${ref}::${parserVersion}`
+// (invariant #3). The READ keys on the server's EXPECTED version
+// (expectedParserVersion(), env BRIEF_PARSER_VERSION) — known before the parse — so
+// bumping the parser genuinely misses every stale entry (PLU-82 review §3). Only
+// ok/empty results
 // are cached; a parse_failed is NOT cached (fixes BUG-E8: a transient agent
 // timeout no longer poisons the campaign's brief until process restart, §4.4).
 // Any failure (no brief, unreadable file, agent error) degrades to an empty flat
@@ -92,6 +95,19 @@ export interface CampaignKnowledgeFields {
 // ref simply isn't cached.
 const _cache = new Map<string, ResolvedBrief>();
 const _CACHE_MAX = 256;
+
+// PLU-82 review §3 (Calvin): the server's EXPECTED parser version. The read path
+// keys the cache on THIS (known before the parse) rather than scanning for any
+// entry whose key starts with the ref — so bumping the parser (deploy a new agent,
+// set BRIEF_PARSER_VERSION to match) genuinely invalidates every stale entry
+// instead of silently reusing a version-A result under a version-B parser. Default
+// tracks the agent's current PARSER_VERSION (agent/app/brief.py); override via env
+// during a mixed-version rollout. Read lazily so a test can set the env per-case.
+const _DEFAULT_PARSER_VERSION = "brief-parser-v1.1";
+export function expectedParserVersion(): string {
+  const raw = process.env["BRIEF_PARSER_VERSION"];
+  return typeof raw === "string" && raw.trim() ? raw.trim() : _DEFAULT_PARSER_VERSION;
+}
 
 function cacheKey(ref: string, parserVersion: string): string {
   return `${ref}::${parserVersion}`;
@@ -246,29 +262,43 @@ export function projectSections(
  * provided AND the parse produced sections, material conflicts are detected (§4.5).
  * When absent (or the flag is off / no sections), the conflict pass is skipped.
  */
+// The two I/O boundaries the resolver crosses, injectable so a unit test can drive
+// deterministic parses (and count how many times the parser was actually called)
+// without mocking modules or standing up the agent. Defaults ARE the real calls,
+// so the production call site (negotiation.ts) is byte-identical.
+export interface BriefResolveDeps {
+  readFile: (ref: string) => Promise<Buffer>;
+  parse: (pdfBase64: string) => Promise<Record<string, unknown>>;
+}
+const _realDeps: BriefResolveDeps = {
+  readFile: (ref) => readStoredFile(ref),
+  parse: (pdfBase64) => agentPostJson(agentBaseUrl(), "/parse-brief", { pdfBase64 }),
+};
+
 export async function resolveBriefKnowledge(
   nodeGraph: NodeSnapshot[],
   campaignFields?: CampaignKnowledgeFields,
+  deps: BriefResolveDeps = _realDeps,
 ): Promise<ResolvedBrief> {
   const ref = briefRefFromGraph(nodeGraph);
   if (!ref) return { flatText: "", status: "no_brief" };
 
-  // The parser version is reported by the agent, so we can't form the cache key
-  // until after a parse. To still hit the cache on repeat turns without a network
-  // round-trip, we scan for any cached entry whose key starts with this ref — the
-  // working set is one brief per campaign, so this is at most a handful of keys.
-  for (const [key, value] of _cache) {
-    if (key.startsWith(`${ref}::`)) {
-      return withConflicts(value, campaignFields);
-    }
+  // PLU-82 review §3 (Calvin): key the read on the EXPECTED parser version, which
+  // we know before the parse. A stale entry cached under a DIFFERENT version (an
+  // older parser, or a mixed-deploy peer) no longer matches, so bumping
+  // BRIEF_PARSER_VERSION forces a re-parse instead of reusing a version-A result.
+  // (The prior `startsWith(`${ref}::`)` scan returned the first match regardless of
+  // version — the invalidation bug.) The working set is one brief per campaign, so
+  // the direct Map.get is also strictly cheaper than the scan it replaces.
+  const hit = cacheGet(cacheKey(ref, expectedParserVersion()));
+  if (hit) {
+    return withConflicts(hit, campaignFields);
   }
 
   let resolved: ResolvedBrief;
   try {
-    const bytes = await readStoredFile(ref);
-    const data = await agentPostJson(agentBaseUrl(), "/parse-brief", {
-      pdfBase64: bytes.toString("base64"),
-    });
+    const bytes = await deps.readFile(ref);
+    const data = await deps.parse(bytes.toString("base64"));
     const flatText = typeof data["text"] === "string" ? data["text"] : "";
     const status = normalizeStatus(data["status"]);
     const parserVersion =
@@ -286,7 +316,11 @@ export async function resolveBriefKnowledge(
 
     // Cache only ok/empty (invariant / §4.4): a parse_failed must NOT be cached so
     // a transient agent timeout is retried next turn instead of poisoning the
-    // brief until process restart (fixes BUG-E8).
+    // brief until process restart (fixes BUG-E8). Keyed on the version the agent
+    // RETURNED (provenance-accurate). The read path keys on expectedParserVersion();
+    // when they match (the normal case) the next turn hits, and when they DON'T (a
+    // stale entry from an older parser) the read misses and re-parses — which is the
+    // correct behavior for PLU-82 review §3, not a cache we want to serve.
     if (status === "ok" || status === "empty") {
       cacheSet(cacheKey(ref, parserVersion), resolved);
     }
@@ -367,6 +401,8 @@ export interface BriefKnowledgeResult {
  *   parse_failed  → PARSE_FAILED (error set)
  *   empty         → PARSE_FAILED — present-but-unreadable ≠ absent (a scanned/
  *                   image PDF that parsed to no text must never read as "no brief")
+ *   ok + no usable content (blank text, no sections) → PARSE_FAILED (review §4:
+ *                   a missing/defaulted "ok" status must not read as AVAILABLE)
  *   ok + all expected sections present → AVAILABLE
  *   ok + ≥1 expected section absent    → PARTIAL
  */
@@ -389,6 +425,22 @@ export function deriveBriefAvailability(
       return { status: "PARSE_FAILED", error: "empty extraction (no readable text)", ...refPart };
     case "ok": {
       const sections = resolved.sections ?? {};
+      // PLU-82 review §4 (Calvin): AVAILABLE must require actual usable content.
+      // normalizeStatus defaults a MISSING/unknown agent status to "ok" (an old
+      // agent that returns only flat text is a real parse) — but "ok" + blank
+      // flatText + no usable sections is a malformed/blank response, not a
+      // successful availability result. Treat it as PARSE_FAILED so a brief-
+      // dependent question can honestly defer instead of trusting empty content.
+      const hasUsableSection = Object.values(sections).some(
+        (s) => s && typeof s.text === "string" && s.text.trim(),
+      );
+      if (!resolved.flatText.trim() && !hasUsableSection) {
+        return {
+          status: "PARSE_FAILED",
+          error: "ok status but no usable content (blank text, no sections)",
+          ...refPart,
+        };
+      }
       const missing = expectedSections.filter((k) => {
         const s = sections[k];
         return !s || typeof s.text !== "string" || !s.text.trim();

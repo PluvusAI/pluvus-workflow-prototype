@@ -118,10 +118,24 @@ test("a blank fileReference is omitted", () => {
   assert.equal(r.fileReference, undefined);
 });
 
-test("AVAILABLE omits text when flatText is blank (no empty-string noise)", () => {
-  const r = deriveBriefAvailability({ flatText: "   ", status: "ok" }, []);
+test("AVAILABLE omits text when flatText is present but a section carries it", () => {
+  // Usable content via a section (not flatText) → AVAILABLE, but text is omitted
+  // because flatText itself is blank (no empty-string noise on the payload).
+  const r = deriveBriefAvailability(
+    { flatText: "   ", status: "ok", sections: { usageRights: section("6mo") } },
+    [],
+  );
   assert.equal(r.status, "AVAILABLE");
   assert.equal(r.text, undefined);
+});
+
+test("§4 (Calvin) — ok + blank flatText + NO usable sections → PARSE_FAILED, not AVAILABLE", () => {
+  // normalizeStatus defaults a missing agent status to "ok"; a blank/malformed
+  // response must NOT read as available knowledge.
+  const r = deriveBriefAvailability({ flatText: "   ", status: "ok" }, []);
+  assert.equal(r.status, "PARSE_FAILED");
+  assert.notEqual(r.status, "AVAILABLE");
+  assert.ok(r.error && /no usable content/i.test(r.error));
 });
 
 console.log("\npurity — the input ResolvedBrief is not mutated\n");

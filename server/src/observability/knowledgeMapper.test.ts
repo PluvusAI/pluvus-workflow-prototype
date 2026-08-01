@@ -196,6 +196,85 @@ test("a NON-material-conflict escalation with top-level conflicts is NOT harvest
   assert.equal(mapKnowledge(events), undefined);
 });
 
+console.log("\nconflicts — active vs cleared (review §6, recovery recording)\n");
+
+const netConflict = {
+  section: "paymentTerms",
+  campaignField: "paymentTerms",
+  campaignValue: "Net 30",
+  briefExcerpt: "Net 60",
+  reason: "net-days mismatch (30 vs 60)",
+};
+
+test("a conflict still present in the LATEST knowledge round is ACTIVE", () => {
+  const events = [
+    ev("NEGOTIATION_TURN", { round: 0, knowledge: { conflicts: [netConflict] } }),
+    ev("NEGOTIATION_TURN", { round: 1, knowledge: { conflicts: [netConflict] } }),
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts.length, 1);
+  assert.equal(k.conflicts[0]!.status, "active");
+  assert.equal(k.conflicts[0]!.round, 0, "firstRound kept");
+  assert.equal(k.conflicts[0]!.lastRound, 1, "lastRound advances on re-sighting");
+});
+
+test("a conflict ABSENT from a later re-resolution reads as CLEARED, not active (§6)", () => {
+  // Round 1 conflicts; round 2 re-resolves the brief (knowledge block present) with
+  // NO conflicts — the source was corrected. The earlier conflict must demote.
+  const events = [
+    ev("NEGOTIATION_TURN", {
+      round: 1,
+      knowledge: {
+        briefAvailability: { status: "PARTIAL", error: null, missingSections: [] },
+        conflicts: [netConflict],
+      },
+    }),
+    ev("NEGOTIATION_TURN", {
+      round: 2,
+      knowledge: {
+        // brief now clean — availability AVAILABLE, no conflicts array.
+        briefAvailability: { status: "AVAILABLE", error: null, missingSections: [] },
+      },
+    }),
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts.length, 1);
+  assert.equal(k.conflicts[0]!.status, "cleared", "corrected conflict must not read as live");
+  assert.equal(k.conflicts[0]!.lastRound, 1);
+  assert.equal(k.briefAvailability?.status, "AVAILABLE");
+});
+
+test("a later turn WITHOUT a knowledge block does not clear a standing conflict", () => {
+  // A plain counter turn (no re-resolution) must not be treated as a clean
+  // knowledge round — the conflict stays active.
+  const events = [
+    ev("NEGOTIATION_TURN", { round: 1, knowledge: { conflicts: [netConflict] } }),
+    ev("NEGOTIATION_TURN", { outcome: "counter", round: 2 }), // no knowledge block
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts[0]!.status, "active", "a non-knowledge turn is not a recovery signal");
+});
+
+test("conflicts with null rounds stay ACTIVE (can't prove recovery — conservative)", () => {
+  const events = [
+    ev("NEGOTIATION_TURN", { knowledge: { conflicts: [netConflict] } }), // no round
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts[0]!.status, "active");
+});
+
+test("recovery is per-field: one field clears while another stays active", () => {
+  const usage = { section: "usageRights", campaignField: "usageRights", campaignValue: "90d", briefExcerpt: "180d", reason: "duration mismatch" };
+  const events = [
+    ev("NEGOTIATION_TURN", { round: 1, knowledge: { conflicts: [netConflict, usage] } }),
+    ev("NEGOTIATION_TURN", { round: 2, knowledge: { conflicts: [usage] } }), // payment fixed, usage remains
+  ];
+  const k = mapKnowledge(events)!;
+  const byField = Object.fromEntries(k.conflicts.map((c) => [c.campaignField, c.status]));
+  assert.equal(byField["paymentTerms"], "cleared");
+  assert.equal(byField["usageRights"], "active");
+});
+
 console.log("\nresolvedSources — from post-acceptance event payloads\n");
 
 for (const t of ["DEAL_HANDOFF_REQUESTED", "REWARD_SETUP_SENT", "PAYMENT_INFO_SENT"] as const) {

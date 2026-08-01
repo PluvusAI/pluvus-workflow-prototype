@@ -487,20 +487,57 @@ function detectObligationCategory(question: string): string | undefined {
   return undefined;
 }
 
-// PLU-82 §4.5: the four authoritative conflict fields, mapped to the obligation
-// CATEGORY detectObligationCategory emits for a creator question about that field.
-// A creator asking about `paymentTerms` produces a `payment`-category question /
-// obligation; usageRights/exclusivity produce `usage_rights`. attributionWindow
-// has no keyword pattern (detectObligationCategory can't emit it), so a conflict on
-// it never matches a creator question here — conservative by design (§8; a
-// false-negative reverts to today's silence, a false-positive dumps a deal to
-// MANUAL_REVIEW, so we bias hard toward the former).
+// PLU-82 §4.5: the four authoritative conflict fields, mapped to the COARSE
+// obligation category detectObligationCategory emits. This is the FALLBACK axis:
+// an open obligation from a prior round only carries the coarse category (it was
+// stored via detectObligationCategory), so usageRights and exclusivity are
+// indistinguishable there and share `usage_rights`. This-turn matching uses the
+// field-specific detector below instead — see conflictAffectsCreatorCommitment.
 const CONFLICT_FIELD_TO_CATEGORY: Record<string, string | undefined> = {
   usageRights: "usage_rights",
   exclusivity: "usage_rights",
   paymentTerms: "payment",
+  // review §5 (Calvin): attributionWindow is now a first-class conflict field — it
+  // has its own field-specific pattern below, and the coarse category axis is left
+  // undefined only because detectObligationCategory has no attribution keyword (so
+  // an OLD open obligation can't back-fill it; a this-turn ask still matches).
   attributionWindow: undefined,
 };
+
+// review §5 (Calvin): FIELD-SPECIFIC detection for the conflict keys, so a creator
+// asking about usage rights does NOT match an exclusivity-only conflict (the two
+// used to share the coarse `usage_rights` bucket and cross-triggered). Each pattern
+// matches the ONE field; a question is tested against the field of the conflict at
+// hand. attributionWindow gets its own pattern here (Calvin: it was detected but
+// unable to escalate — now it can, when the creator actually asks about it).
+const CONFLICT_FIELD_PATTERNS: Record<string, RegExp> = {
+  usageRights: /\busage rights?\b|\busage of\b|\blicens|\bwhitelist|\bwhitelabel|\bpaid ads?\b|\bboost(?:ing|ed)?\b/i,
+  exclusivity: /\bexclusiv|\bnon-?compete\b|\bcompeting brands?\b|\bcategory exclusiv/i,
+  paymentTerms: /\bpay(?:ment|out)?\b|\binvoice\b|\bnet ?\d+\b|\bwhen.*paid\b|\bpaypal\b|\bbank\b|\bterms of payment\b/i,
+  attributionWindow:
+    /\battribution window\b|\battribution period\b|\bcookie window\b|\bconversion window\b|\btracking window\b|\battribution\b/i,
+};
+
+/** True when the creator text is specifically ABOUT `field` (not a sibling that
+ *  merely shares a coarse category). Used for this-turn matching in §4.5. */
+function questionMentionsField(field: string, texts: string[]): boolean {
+  const re = CONFLICT_FIELD_PATTERNS[field];
+  if (!re) return false;
+  return texts.some((t) => re.test(t));
+}
+
+/** True when more than one conflict field maps to `coarse` (e.g. usageRights +
+ *  exclusivity → usage_rights). A coarse-only open obligation in a SHARED category
+ *  is ambiguous — it cannot tell which sibling the creator meant — so we do NOT let
+ *  it back-fill either field (conservative; a this-turn field-specific ask still
+ *  matches). Computed from CONFLICT_FIELD_TO_CATEGORY so it stays in sync. */
+function coarseCategoryIsShared(coarse: string): boolean {
+  let count = 0;
+  for (const cat of Object.values(CONFLICT_FIELD_TO_CATEGORY)) {
+    if (cat === coarse) count += 1;
+  }
+  return count > 1;
+}
 
 /**
  * PLU-82 §4.5 / invariant #7 — the gate that stops false-positive escalation. A
@@ -525,18 +562,24 @@ export function conflictAffectsCreatorCommitment(
 ): string[] {
   if (!conflicts.length) return [];
 
-  // The categories the creator surfaced THIS turn (from their questions + pushed
-  // terms), plus the categories of any non-terminal open obligation (a field asked
-  // about in an earlier round but silent this turn still counts — §8-g). All rows
-  // from listOpenObligationsByInstance are already non-terminal, so their presence
-  // is sufficient (no status re-check needed).
-  const surfacedCategories = new Set<string>();
-  for (const q of [...(creatorQuestions ?? []), ...(pushedFixedTerms ?? [])]) {
-    const cat = detectObligationCategory(q);
-    if (cat) surfacedCategories.add(cat);
-  }
+  // review §5 (Calvin): match FIELD-SPECIFICALLY, not through a shared coarse
+  // bucket. Two axes:
+  //
+  //   (1) THIS-TURN text (creator questions + pushed terms) — matched by the
+  //       field's OWN pattern (CONFLICT_FIELD_PATTERNS), so an ask about usage
+  //       rights matches ONLY a usageRights conflict, never an exclusivity-only
+  //       one. attributionWindow now matches here too.
+  //
+  //   (2) OPEN OBLIGATIONS from prior rounds — these carry only the COARSE category
+  //       (they were stored via detectObligationCategory, which cannot tell
+  //       usageRights from exclusivity). Used as a CONSERVATIVE FALLBACK: a
+  //       coarse-category open obligation re-surfaces a field only when the field
+  //       has no less-ambiguous signal. This is the "conservative fallback is fine
+  //       when genuinely ambiguous" case Calvin called out.
+  const thisTurnText = [...(creatorQuestions ?? []), ...(pushedFixedTerms ?? [])];
+  const openCoarseCategories = new Set<string>();
   for (const o of openObligations) {
-    if (o.category) surfacedCategories.add(o.category);
+    if (o.category) openCoarseCategories.add(o.category);
   }
 
   const matched: string[] = [];
@@ -544,11 +587,26 @@ export function conflictAffectsCreatorCommitment(
   for (const c of conflicts) {
     const field = c.campaignField;
     // (a) the field must be one of the four creator-commitment conflict keys.
-    const category = CONFLICT_FIELD_TO_CATEGORY[field];
     if (!(field in CONFLICT_FIELD_TO_CATEGORY)) continue;
-    // (b) the creator asked about that field's category this turn OR has an open
-    //     obligation in it. attributionWindow (category undefined) can never match.
-    if (category && surfacedCategories.has(category) && !seen.has(field)) {
+    if (seen.has(field)) continue;
+
+    // (b) FIELD-SPECIFIC this-turn match — the strong signal.
+    const askedThisTurn = questionMentionsField(field, thisTurnText);
+
+    // (c) FALLBACK: a prior open obligation in this field's coarse category. Only
+    //     applied when this-turn text did not already resolve the field, and only
+    //     for fields whose coarse category is unambiguous OR where no sibling field
+    //     shares the category (so exclusivity/usageRights don't cross-trigger off a
+    //     coarse open obligation alone — that stays conservative-silent unless a
+    //     this-turn ask names the field).
+    const coarse = CONFLICT_FIELD_TO_CATEGORY[field];
+    const fallbackMatch =
+      !askedThisTurn &&
+      coarse !== undefined &&
+      openCoarseCategories.has(coarse) &&
+      !coarseCategoryIsShared(coarse);
+
+    if (askedThisTurn || fallbackMatch) {
       seen.add(field);
       matched.push(field);
     }

@@ -22,7 +22,7 @@
 
 import assert from "node:assert/strict";
 import { firstString, firstNumber } from "./agreedFee.js";
-import { resolveKnowledgeField } from "../knowledgePrecedence.js";
+import { resolveKnowledgeField, PRECEDENCE_BY_CATEGORY } from "../knowledgePrecedence.js";
 
 let n = 0;
 function test(name: string, fn: () => void): void {
@@ -207,6 +207,54 @@ test("2-tier: a campaign value is NEVER consulted (byte-identical to the no-camp
   const got = new2tier(undefined, undefined);
   assert.equal(got.value, undefined);
   assert.equal(got.source, null);
+});
+
+// ---------------------------------------------------------------------------
+// review §2 (Calvin): PIN the exact field-by-field precedence policy as a literal
+// table, so approving PLU-82 means intentionally approving THIS order — not
+// assuming the issue's proposed hierarchy was implemented unchanged. Any drift in
+// PRECEDENCE_BY_CATEGORY (a reordered tier, an added/removed slot, the paymentTerms
+// NS-skip silently "fixed") fails HERE, loudly, against the documented table in
+// readme_docs/KNOWLEDGE_PRECEDENCE.md §2.
+// ---------------------------------------------------------------------------
+console.log("\nreview §2 — the precedence table is pinned exactly\n");
+
+const EXPECTED_PRECEDENCE: Record<string, string[]> = {
+  // Finalized-terms family.
+  commissionRate: ["operator_override", "workflow_config", "negotiation_state"],
+  deliverables: ["operator_override", "workflow_config", "negotiation_state", "campaign_default"],
+  timeline: ["operator_override", "workflow_config", "negotiation_state", "campaign_default"],
+  rewardDescription: ["operator_override", "workflow_config", "negotiation_state", "campaign_default"],
+  // paymentTerms deliberately SKIPS negotiation_state (the preserved quirk, §2.1).
+  paymentTerms: ["operator_override", "workflow_config", "campaign_default"],
+  // General-knowledge family (brief is a conflict challenger, never a slot).
+  usageRights: ["operator_override", "workflow_config", "campaign_default"],
+  exclusivity: ["operator_override", "workflow_config", "campaign_default"],
+  attributionWindow: ["operator_override", "workflow_config", "campaign_default"],
+};
+
+test("PRECEDENCE_BY_CATEGORY matches the documented table byte-for-byte (order included)", () => {
+  assert.deepEqual(
+    PRECEDENCE_BY_CATEGORY as unknown as Record<string, string[]>,
+    EXPECTED_PRECEDENCE,
+    "the precedence policy drifted from the approved KNOWLEDGE_PRECEDENCE.md §2 table",
+  );
+});
+
+test("every finalized-terms category leads with operator_override (the fixed PLU-113 seam)", () => {
+  for (const [cat, order] of Object.entries(EXPECTED_PRECEDENCE)) {
+    assert.equal(order[0], "operator_override", `${cat} must lead with operator_override`);
+  }
+});
+
+test("paymentTerms is the ONLY category that omits negotiation_state (the preserved inconsistency)", () => {
+  const omitsNS = Object.entries(EXPECTED_PRECEDENCE)
+    .filter(([, order]) => !order.includes("negotiation_state"))
+    .map(([cat]) => cat)
+    .sort();
+  // usageRights/exclusivity/attributionWindow are general-knowledge (never had NS);
+  // among the FINALIZED-TERMS family, paymentTerms is the sole NS-skipper.
+  assert.deepEqual(omitsNS, ["attributionWindow", "exclusivity", "paymentTerms", "usageRights"]);
 });
 
 console.log(`\n${n} passed\n`);

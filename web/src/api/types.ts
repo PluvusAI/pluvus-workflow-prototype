@@ -184,6 +184,10 @@ export interface KnowledgeConflictDTO {
   pageStart?: number;
   reason: string;
   round: number | null;
+  // review §6: last round the conflict was reported + active/cleared, so the panel
+  // can distinguish a live conflict from one a later re-resolution corrected.
+  lastRound: number | null;
+  status: "active" | "cleared";
 }
 
 export interface BriefAvailabilityDTO {

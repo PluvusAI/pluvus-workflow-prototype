@@ -60,6 +60,10 @@ export function KnowledgePanel({ knowledge }: { knowledge: KnowledgeDTO | undefi
 
   const { briefAvailability, conflicts, resolvedSources } = knowledge;
   const sourceEntries = Object.entries(resolvedSources);
+  // review §6: active conflicts are still live; cleared ones were corrected by a
+  // later re-resolution and are shown demoted, not as active failures.
+  const activeConflicts = conflicts.filter((c) => c.status !== "cleared");
+  const clearedConflicts = conflicts.filter((c) => c.status === "cleared");
 
   return (
     <div>
@@ -116,13 +120,19 @@ export function KnowledgePanel({ knowledge }: { knowledge: KnowledgeDTO | undefi
         <Empty>No brief availability recorded (no negotiation turn yet).</Empty>
       )}
 
-      {/* 2. Material conflicts */}
+      {/* 2. Material conflicts. review §6: split active vs cleared so a conflict a
+          later re-resolution corrected no longer reads as live. Active first. */}
       <div style={{ height: 14 }} />
-      <SubHeading>Material conflicts ({conflicts.length})</SubHeading>
+      <SubHeading>
+        Material conflicts ({activeConflicts.length} active
+        {clearedConflicts.length > 0 ? `, ${clearedConflicts.length} cleared` : ""})
+      </SubHeading>
       {conflicts.length === 0 ? (
         <Empty>No material brief-vs-Campaign conflicts detected.</Empty>
       ) : (
-        conflicts.map((c, i) => <ConflictRow key={`${c.campaignField}-${c.reason}-${i}`} conflict={c} />)
+        [...activeConflicts, ...clearedConflicts].map((c, i) => (
+          <ConflictRow key={`${c.campaignField}-${c.reason}-${i}`} conflict={c} />
+        ))
       )}
 
       {/* 3. Selected sources */}
@@ -181,6 +191,7 @@ function SubHeading({ children }: { children: React.ReactNode }) {
 
 function ConflictRow({ conflict }: { conflict: KnowledgeConflictDTO }) {
   const c = conflict;
+  const cleared = c.status === "cleared";
   return (
     <div
       style={{
@@ -189,6 +200,9 @@ function ConflictRow({ conflict }: { conflict: KnowledgeConflictDTO }) {
         padding: "10px 12px",
         marginBottom: 8,
         background: colors.panelAlt,
+        // review §6: a corrected conflict is demoted (dimmed) so it reads as
+        // history, not a live failure the operator must act on.
+        opacity: cleared ? 0.55 : 1,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
@@ -197,19 +211,22 @@ function ConflictRow({ conflict }: { conflict: KnowledgeConflictDTO }) {
           style={{
             fontSize: 10,
             fontWeight: font.weight.semibold,
-            color: colors.warning,
-            border: `1px solid ${colors.warning}`,
+            color: cleared ? colors.textDim : colors.warning,
+            border: `1px solid ${cleared ? colors.textDim : colors.warning}`,
             borderRadius: 4,
             padding: "1px 6px",
           }}
         >
-          conflict
+          {cleared ? "cleared" : "conflict"}
         </span>
         {c.pageStart !== undefined && (
           <span style={{ fontSize: 10, color: colors.textDim }}>· p{c.pageStart}</span>
         )}
         {c.round !== null && (
           <span style={{ fontSize: 10, color: colors.textDim }}>· round {c.round}</span>
+        )}
+        {cleared && c.lastRound !== null && c.lastRound !== c.round && (
+          <span style={{ fontSize: 10, color: colors.textDim }}>· last seen round {c.lastRound}</span>
         )}
       </div>
 

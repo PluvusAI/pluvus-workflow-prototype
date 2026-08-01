@@ -120,22 +120,96 @@ test("pushedFixedTerms also surface a category", () => {
   assert.deepEqual(matched, ["paymentTerms"]);
 });
 
-test("attributionWindow conflict never matches (no keyword category — conservative §8)", () => {
-  const attrConflict: BriefFieldConflict = {
-    section: "attributionWindow",
-    campaignField: "attributionWindow",
-    campaignValue: "30 days",
-    briefExcerpt: "60 day attribution",
-    reason: "duration mismatch",
-  };
-  // Even with a payment-ish question, attributionWindow has no category mapping.
+const attrConflict: BriefFieldConflict = {
+  section: "attributionWindow",
+  campaignField: "attributionWindow",
+  campaignValue: "30 days",
+  briefExcerpt: "60 day attribution",
+  reason: "duration mismatch",
+};
+const exclusivityConflict: BriefFieldConflict = {
+  section: "exclusivity",
+  campaignField: "exclusivity",
+  campaignValue: "none",
+  briefExcerpt: "no competing brands for 90 days",
+  reason: "exclusivity mismatch",
+};
+
+test("review §5: attributionWindow conflict + an attribution question → matched (was unreachable before)", () => {
   const matched = conflictAffectsCreatorCommitment(
     [attrConflict],
-    ["when do I get paid and what's the attribution?"],
+    ["what's the attribution window on the referral link?"],
+    undefined,
+    [],
+  );
+  assert.deepEqual(matched, ["attributionWindow"]);
+});
+
+test("attributionWindow conflict + an UNRELATED question → [] (still gated on the ask)", () => {
+  const matched = conflictAffectsCreatorCommitment(
+    [attrConflict],
+    ["how many reels do you need?"],
     undefined,
     [],
   );
   assert.deepEqual(matched, []);
+});
+
+test("review §5: a USAGE-RIGHTS ask does NOT match an EXCLUSIVITY-only conflict (no cross-trigger)", () => {
+  // The exact scenario Calvin flagged: creator asks about usage rights, only
+  // exclusivity is conflicted. The old shared `usage_rights` bucket cross-fired;
+  // field-specific matching must NOT escalate here.
+  const matched = conflictAffectsCreatorCommitment(
+    [exclusivityConflict],
+    ["what are the usage rights / licensing terms?"],
+    undefined,
+    [],
+  );
+  assert.deepEqual(matched, []);
+});
+
+test("review §5: an EXCLUSIVITY ask matches an exclusivity conflict (and not a usage-only one)", () => {
+  const matchedExcl = conflictAffectsCreatorCommitment(
+    [exclusivityConflict],
+    ["am I allowed to work with competing brands?"],
+    undefined,
+    [],
+  );
+  assert.deepEqual(matchedExcl, ["exclusivity"]);
+
+  // The mirror: a usage-rights ask matches usageRights, not exclusivity.
+  const matchedUsage = conflictAffectsCreatorCommitment(
+    [usageConflict, exclusivityConflict],
+    ["what are the usage rights?"],
+    undefined,
+    [],
+  );
+  assert.deepEqual(matchedUsage, ["usageRights"]);
+});
+
+test("review §5: a coarse-only open obligation in the SHARED usage_rights bucket does NOT back-fill (ambiguous)", () => {
+  // An old open obligation carries only the coarse category "usage_rights" — it
+  // can't tell usageRights from exclusivity — so with NO this-turn ask, neither
+  // sibling escalates (conservative fallback).
+  const matched = conflictAffectsCreatorCommitment(
+    [usageConflict, exclusivityConflict],
+    [], // silent this turn
+    undefined,
+    [{ category: "usage_rights" }],
+  );
+  assert.deepEqual(matched, []);
+});
+
+test("payment open obligation (unshared category) STILL back-fills — the round-2 clause survives §5", () => {
+  // payment maps to exactly one field, so a coarse open obligation is unambiguous
+  // and the prior-round re-surfacing behavior is preserved.
+  const matched = conflictAffectsCreatorCommitment(
+    [paymentConflict],
+    [],
+    undefined,
+    [{ category: "payment" }],
+  );
+  assert.deepEqual(matched, ["paymentTerms"]);
 });
 
 test("empty conflicts → [] (fast path)", () => {
