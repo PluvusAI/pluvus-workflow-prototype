@@ -306,6 +306,8 @@ function builder(inputsRows: {
     events: inputsRows.evs,
     obligationRows: inputsRows.obs,
     resolvedBrief: inputsRows.brief,
+    // §6.2 — the shell merges once and threads it in; mirror that here.
+    mergedConfig: mergeCampaignFallback(NODE.config, inputsRows.campaign),
   };
   const ctx = assembleContext(inputs);
   const decision = toDecisionContext(ctx);
@@ -441,6 +443,7 @@ test("negotiate + draft byte-identical when a campaign fills gaps", () => {
       purpose: "NEGOTIATION_DECISION",
       instance: inst(), creator: creator(), campaign, node: sparseNode, nodeGraph: [sparseNode, CONTENT_BRIEF_NODE],
       messages: r.msgs, events: r.evs, obligationRows: r.obs, resolvedBrief: r.brief,
+      mergedConfig: mergeCampaignFallback(sparseNode.config, campaign),
     });
     const oReq = buildNegotiationRequest(ROUND, config, creatorReply, oracleNeg);
     const bReq = buildNegotiationRequest(ROUND, config, ctx.creatorReply, toDecisionContext(ctx).decisionHistory);
@@ -465,6 +468,7 @@ test("flags-off negotiate request has NO campaignContext/conversationHistory/ope
       purpose: "NEGOTIATION_DECISION",
       instance: inst(), creator: creator(), campaign: null, node: NODE, nodeGraph: NODE_GRAPH,
       messages: r.msgs, events: r.evs, obligationRows: r.obs, resolvedBrief: r.brief,
+      mergedConfig: mergeCampaignFallback(NODE.config, null),
     });
     const neg = toDecisionContext(ctx).decisionHistory;
     // The knowledge campaignContext still carries flat FIELDS (config has them) — but
@@ -492,6 +496,7 @@ test("a truly bare config (no knowledge fields) → negotiate request has NO cam
       purpose: "NEGOTIATION_DECISION",
       instance: inst(), creator: creator(), campaign: null, node: bareNode, nodeGraph: [bareNode],
       messages: [cleanInbound], events: [], obligationRows: [], resolvedBrief: { flatText: "", status: "no_brief" },
+      mergedConfig: mergeCampaignFallback(bareNode.config, null),
     });
     const neg = toDecisionContext(ctx).decisionHistory;
     assert.ok(!("campaignContext" in neg), "empty knowledge → no campaignContext (omit-when-empty §5.7)");

@@ -114,6 +114,32 @@ async function reserveAiReply(
   };
 }
 
+// PLU-81 §6.1 (Calvin review #3): fold the two sanitized observability records
+// (PLU-82 `knowledge`, PLU-81 `context`) onto a post-build NodeResult's
+// NEGOTIATION_TURN eventPayload. Pure + exported so the fold contract is
+// unit-testable without driving the full DB-backed executor: every post-build
+// outcome — success AND failure/escalation — carries the records, so mapContext/
+// mapKnowledge populate the operator panels on the exact latest turn.
+//
+// The records are DISTINCT keys and an already-present one is never overwritten
+// (defensive), and the whole eventPayload is never replaced (§10 risk table). A
+// result with no eventPayload is returned untouched.
+export function foldObservabilityRecords<T extends NodeResult>(
+  result: T,
+  knowledgeRecord: Record<string, unknown>,
+  contextRecord: Record<string, unknown>,
+): T {
+  if (!result.eventPayload) return result;
+  return {
+    ...result,
+    eventPayload: {
+      ...knowledgeRecord,
+      ...contextRecord,
+      ...result.eventPayload,
+    },
+  };
+}
+
 // Build the MANUAL_REVIEW NodeResult emitted when AI copy generation for an
 // OFFER turn (present_offer / accept / counter) fails after retries. These turns
 // PRESENT concrete terms (fee, commission, deliverables) and must read as a
@@ -859,6 +885,24 @@ export async function executeNegotiation(
   // adds debug keys, so a real DEAL's money path is byte-identical.
   const contextRecord = { context: buildContextRecord(cc) };
 
+  // PLU-81 §6.1 (Calvin review #3): stamp BOTH observability records onto EVERY
+  // post-build NodeResult, so the Context (and Knowledge) panel is populated on the
+  // exact turns an operator most needs them — the failure/escalation outcomes, not
+  // just the five success arms. Previously the two records were spread by hand onto
+  // the success returns only, so an instance whose LATEST turn was a draft-failure,
+  // an output-guard block, a material-conflict escalation, an over-ceiling escalate,
+  // a secondary max-rounds reject, or the exhaustiveness default showed a stale/empty
+  // Context panel (mapContext reads the latest NEGOTIATION_TURN event). One decorator
+  // makes it impossible to forget.
+  //
+  // Every post-build return targets a NEGOTIATION_TURN event with an eventPayload
+  // (draftUnavailable / blockedByGuard / escalateOverCeiling / escalateMaterialConflict
+  // / maxRoundsReject all set one, as do the success arms), so we fold onto that
+  // payload. Delegates to the pure, exported foldObservabilityRecords so the closure
+  // just supplies THIS turn's two records; the merge contract is unit-tested there.
+  const withContextRecord = <T extends NodeResult>(result: T): T =>
+    foldObservabilityRecords(result, knowledgeRecord, contextRecord);
+
   // PLU-111: the durable obligation ledger (loaded by the builder) supersedes the
   // event-diff as the source of "what creator questions are still open". This is a
   // POST-decision read (§5.6): it mixes THIS turn's creatorQuestions, so it stays in
@@ -981,7 +1025,8 @@ export async function executeNegotiation(
       openObligationRows,
     );
     if (matchedFields.length) {
-      return {
+      // §6.1: an escalation is exactly a turn the operator needs the Context panel for.
+      return withContextRecord({
         ...escalateMaterialConflict({
           round: instance.negotiationRound,
           message: creatorReply,
@@ -996,7 +1041,7 @@ export async function executeNegotiation(
           ...buildObligationWrites(undefined),
           escalateAfterWrite: true,
         },
-      };
+      });
     }
   }
 
@@ -1040,7 +1085,7 @@ export async function executeNegotiation(
       if (aiDraft === null && agent.generatesDraftCopy) {
         // PLU-111: record this turn's questions (open, unresolved) but attach NO
         // resolution link — a failed draft must not mark a question answered.
-        return { ...draftUnavailable(instance.negotiationRound, "present_offer"), obligationWrites: buildObligationWrites(undefined) };
+        return withContextRecord({ ...draftUnavailable(instance.negotiationRound, "present_offer"), obligationWrites: buildObligationWrites(undefined) });
       }
       const body = aiDraft?.body ?? message;
       const draft = aiDraft ?? await email.draft(creator, body, config);
@@ -1053,7 +1098,7 @@ export async function executeNegotiation(
         guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
-        return { ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) };
+        return withContextRecord({ ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
       }
 
       // Idempotent send keyed on (instance, present, round, inbound message id).
@@ -1072,7 +1117,9 @@ export async function executeNegotiation(
       // Back to AWAITING_REPLY at the SAME node. The round is unchanged on a
       // "free" present turn; past the MED-W3 cap it advances so the loop is
       // bounded by max-rounds.
-      return {
+      // §6.1: the knowledge + context records are stamped by withContextRecord
+      // (uniform with every other post-build return) instead of a manual spread.
+      return withContextRecord({
         nextState: "AWAITING_REPLY",
         nextNodeId: node.id,
         ...(presentConsumesRound ? { negotiationRound: presentRound } : {}),
@@ -1096,12 +1143,8 @@ export async function executeNegotiation(
           ...(presentConsumesRound
             ? { consumedRound: true, consecutivePresentOffers: trailingPresents + 1 }
             : {}),
-          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
-          ...knowledgeRecord,
-          // PLU-81 §7.2: fold the sanitized context observability record too.
-          ...contextRecord,
         },
-      };
+      });
     }
 
     case "accept": {
@@ -1113,7 +1156,8 @@ export async function executeNegotiation(
       // agreed rate is persisted on the NEGOTIATION_TURN payload so resolveAgreedFee
       // can recover it as the finalized offer.
       if (hasPostAcceptEmailNode) {
-        return {
+        // §6.1: records stamped uniformly by withContextRecord.
+        return withContextRecord({
           nextState: "ACCEPTED",
           nextNodeId: null,
           completedAt: new Date(),
@@ -1129,12 +1173,8 @@ export async function executeNegotiation(
             round: instance.negotiationRound,
             message,
             ...(proposedRate !== undefined ? { rate: proposedRate } : {}),
-            // PLU-82 §4.6: fold the knowledge observability record onto this turn.
-            ...knowledgeRecord,
-            // PLU-81 §7.2: fold the sanitized context observability record too.
-            ...contextRecord,
           },
-        };
+        });
       }
 
       // An ACCEPT now always carries a real agreed rate (the agent only
@@ -1169,7 +1209,7 @@ export async function executeNegotiation(
       // REAL AI generator returns null (retries exhausted), escalate to a human.
       // (Mock null → keep the template fallback so harnesses still close deals.)
       if (aiDraft === null && agent.generatesDraftCopy) {
-        return { ...draftUnavailable(instance.negotiationRound, purpose), obligationWrites: buildObligationWrites(undefined) };
+        return withContextRecord({ ...draftUnavailable(instance.negotiationRound, purpose), obligationWrites: buildObligationWrites(undefined) });
       }
       const body = aiDraft?.body ?? message;
 
@@ -1184,7 +1224,7 @@ export async function executeNegotiation(
         guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
-        return { ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) };
+        return withContextRecord({ ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
       }
 
       // FIX-11 + §4.1: reserve the acceptance/onboarding email keyed on
@@ -1195,7 +1235,8 @@ export async function executeNegotiation(
         `negotiation:acceptance:${instance.id}:${instance.negotiationRound}`,
       );
 
-      return {
+      // §6.1: records stamped uniformly by withContextRecord.
+      return withContextRecord({
         nextState: "ACCEPTED",
         nextNodeId: null,
         completedAt: new Date(),
@@ -1213,16 +1254,13 @@ export async function executeNegotiation(
           ...(proposedRate !== undefined ? { rate: proposedRate } : {}),
           // §9: drawn delay, *scheduled* not *sent*.
           sendScheduledInMs: accept.sendScheduledInMs,
-          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
-          ...knowledgeRecord,
-          // PLU-81 §7.2: fold the sanitized context observability record too.
-          ...contextRecord,
         },
-      };
+      });
     }
 
     case "reject": {
-      return {
+      // §6.1: records stamped uniformly by withContextRecord.
+      return withContextRecord({
         nextState: "REJECTED",
         nextNodeId: null,
         completedAt: new Date(),
@@ -1231,12 +1269,8 @@ export async function executeNegotiation(
           outcome,
           round: instance.negotiationRound,
           message,
-          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
-          ...knowledgeRecord,
-          // PLU-81 §7.2: fold the sanitized context observability record too.
-          ...contextRecord,
         },
-      };
+      });
     }
 
     case "escalate": {
@@ -1257,13 +1291,14 @@ export async function executeNegotiation(
       // obligation for this instance to ESCALATED (non-terminal) — nothing is
       // lost, they stay in the AI context and are visible to the operator. No
       // send happens on an escalate, so there's no resolution link.
-      return {
+      // §6.1: an escalate is a turn the operator needs the Context panel for.
+      return withContextRecord({
         ...escalateResult,
         obligationWrites: {
           ...buildObligationWrites(undefined),
           escalateAfterWrite: true,
         },
-      };
+      });
     }
 
     case "counter": {
@@ -1288,7 +1323,8 @@ export async function executeNegotiation(
         // PLU-111: record this turn's questions (open). The courteous close email
         // is a REJECT — it does NOT answer questions — so no resolution link. They
         // remain visible to a human even though the run auto-closes.
-        return { ...rejectResult, obligationWrites: buildObligationWrites(undefined) };
+        // §6.1: records stamped uniformly by withContextRecord.
+        return withContextRecord({ ...rejectResult, obligationWrites: buildObligationWrites(undefined) });
       }
 
       // Try AI-generated counter copy; fall back to agent-provided message.
@@ -1326,7 +1362,7 @@ export async function executeNegotiation(
       // on a successful send below), so a human picks up at the same point.
       // (Mock null → keep the template fallback so mock-mode counters still send.)
       if (aiDraft === null && agent.generatesDraftCopy) {
-        return { ...draftUnavailable(newRound, "counter_offer"), obligationWrites: buildObligationWrites(undefined) };
+        return withContextRecord({ ...draftUnavailable(newRound, "counter_offer"), obligationWrites: buildObligationWrites(undefined) });
       }
       const body = aiDraft?.body ?? message;
 
@@ -1342,7 +1378,7 @@ export async function executeNegotiation(
         guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
-        return { ...blockedByGuard(newRound, guard.hits), obligationWrites: buildObligationWrites(undefined) };
+        return withContextRecord({ ...blockedByGuard(newRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
       }
 
       // FIX-11 + §4.1: reserve the counter email keyed on (instance,
@@ -1353,7 +1389,8 @@ export async function executeNegotiation(
         `negotiation:counter_offer:${instance.id}:${newRound}`,
       );
 
-      return {
+      // §6.1: records stamped uniformly by withContextRecord.
+      return withContextRecord({
         nextState: "AWAITING_REPLY",
         nextNodeId: node.id,
         negotiationRound: newRound,
@@ -1374,12 +1411,8 @@ export async function executeNegotiation(
           // HARD-N2: persist this turn's creator questions for the answered-
           // questions ledger on any subsequent turn.
           ...(creatorQuestions?.length ? { creatorQuestions } : {}),
-          // PLU-82 §4.6: fold the knowledge observability record onto this turn.
-          ...knowledgeRecord,
-          // PLU-81 §7.2: fold the sanitized context observability record too.
-          ...contextRecord,
         },
-      };
+      });
     }
     default: {
       // H7: exhaustiveness backstop on a MONEY path. `outcome` is typed as the
@@ -1392,11 +1425,13 @@ export async function executeNegotiation(
       // Mirrors mapNegotiationResponse's own default arm. The `String(outcome)`
       // read of the `never`-typed value is what keeps the exhaustiveness check
       // live without a throwaway assignment.
-      return escalateOverCeiling({
+      // §6.1: even the exhaustiveness backstop carries the records so the panel is
+      // populated on this (rare) escalation turn too.
+      return withContextRecord(escalateOverCeiling({
         round: instance.negotiationRound,
         message: `Unrecognized negotiation outcome "${String(outcome as never)}" — routed to a human.`,
         creatorRate: creatorRequestedRate,
-      });
+      }));
     }
   }
 }

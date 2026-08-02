@@ -26,6 +26,7 @@ import type { Campaign, ConversationObligation, Creator, Event, ExecutionInstanc
 import type { NodeSnapshot } from "./types.js";
 import type { ResolvedBrief } from "./executors/briefKnowledge.js";
 import { BAND_CONTEXT_KEYS } from "./providerFactory.js";
+import { mergeCampaignFallback } from "./campaignContext.js";
 import {
   assembleContext,
   toDecisionContext,
@@ -172,7 +173,7 @@ function baseInputs(overrides: Partial<AssembleInputs> = {}): AssembleInputs {
   ];
   const resolvedBrief: ResolvedBrief = { flatText: "Brief: usage is 90 days.", status: "ok" };
 
-  return {
+  const built: AssembleInputs = {
     purpose: "NEGOTIATION_DECISION",
     instance: inst(),
     creator: creator(),
@@ -183,8 +184,17 @@ function baseInputs(overrides: Partial<AssembleInputs> = {}): AssembleInputs {
     events,
     obligationRows: [],
     resolvedBrief,
+    // §6.2 — the shell now merges once and threads mergedConfig in. Placeholder here;
+    // recomputed from the FINAL (post-override) node/campaign below so a test that
+    // overrides `node` still gets a matching merged config, exactly as the shell would.
+    mergedConfig: {},
     ...overrides,
   };
+  // Derive mergedConfig from the resolved node/campaign unless a test supplied its own.
+  if (!("mergedConfig" in overrides)) {
+    built.mergedConfig = mergeCampaignFallback(built.node.config, built.campaign);
+  }
+  return built;
 }
 
 // ---------------------------------------------------------------------------
