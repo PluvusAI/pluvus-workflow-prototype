@@ -76,6 +76,9 @@ export function toDecisionContext(ctx: AssembledContext): DecisionContext {
     ...(Object.keys(ctx.knowledgeContext).length
       ? { campaignContext: ctx.knowledgeContext }
       : {}),
+    // PLU-113: durable creator memory as sanitized DATA (attached ONLY when present
+    // — flag off / empty ⇒ omitted, so the /negotiate prompt is byte-identical).
+    ...(ctx.creatorMemory ? { creatorMemory: ctx.creatorMemory } : {}),
   };
   const debug = buildDebug(ctx, decisionHistory, [
     ...(ctx.campaignConstraints.bandPresent ? ["band:present"] : []),
@@ -116,6 +119,10 @@ export function toDraftContext(ctx: AssembledContext): DraftContext {
     ...(ctx.structuredObligations.length
       ? { structuredObligations: ctx.structuredObligations }
       : {}),
+    // PLU-113: creator memory as a draftConfig key so it survives the band strip and
+    // reaches DraftRequest.campaignContext.creatorMemory (the agent renders it there).
+    // Attached only when present → draft prompt byte-identical when off.
+    ...(ctx.creatorMemory ? { creatorMemory: ctx.creatorMemory } : {}),
   };
   // The draft projection is band-stripped and does not receive the per-branch
   // dealDescription extras assembled later by the executor. Neither can be

@@ -244,6 +244,36 @@ export const convObligationStatusEnum = pgEnum("ConversationObligationStatus", [
   "NO_LONGER_RELEVANT",
 ]);
 
+// PLU-113 — campaign-scoped creator memory. MemoryFactKey members MUST stay
+// byte-identical to MEMORY_KEY_METADATA in engine/memoryKeys.ts (the single source
+// of truth — Calvin review #7); the migration lists the same members.
+export const memoryFactKeyEnum = pgEnum("MemoryFactKey", [
+  "REQUESTED_RATE",
+  "MINIMUM_RATE",
+  "AVAILABILITY",
+  "LOGISTICS_CONSTRAINT",
+  "OBJECTION",
+  "DELIVERABLE_PREFERENCE",
+  "COMPENSATION_PREFERENCE",
+  "MANAGER_INVOLVED",
+  "MANAGER_CONTACT",
+]);
+// A live fact is ACTIVE, or CONFLICTED when a material change arrived and an
+// operator has not yet reconciled it (both values are visible; the newer is the
+// live head — Calvin review, "conflicting facts are not silently overwritten").
+export const memoryFactStatusEnum = pgEnum("MemoryFactStatus", [
+  "ACTIVE",
+  "CONFLICTED",
+  "SUPERSEDED",
+  "REMOVED",
+]);
+// A memory revision's author: extracted from a creator inbound, or entered/edited
+// by an operator (Calvin review #5 — operator provenance is unambiguous).
+export const memoryRevisionSourceEnum = pgEnum("MemoryRevisionSource", [
+  "creator",
+  "operator",
+]);
+
 export const workflowStatusEnum = pgEnum("WorkflowStatus", [
   "DRAFT",
   "PUBLISHED",
@@ -340,6 +370,13 @@ export type BrandApprovalStatus =
 export type ObligationType = (typeof obligationTypeEnum.enumValues)[number];
 export type ConversationObligationStatus =
   (typeof convObligationStatusEnum.enumValues)[number];
+
+// PLU-113 — creator memory. MemoryFactKey is re-exported from the shared metadata
+// module (engine/memoryKeys.ts) as the single source of truth; the pgEnum members
+// mirror it. The status + revision-source types derive from their pgEnums.
+export type MemoryFactStatus = (typeof memoryFactStatusEnum.enumValues)[number];
+export type MemoryRevisionSource =
+  (typeof memoryRevisionSourceEnum.enumValues)[number];
 
 // ---------------------------------------------------------------------------
 // Definition models
@@ -964,6 +1001,136 @@ export const conversationObligations = pgTable(
   ],
 );
 
+// PLU-113: campaign-scoped creator memory — durable creator facts, keyed on the
+// ExecutionInstance (NEVER the Creator: the same creator can have different terms
+// across campaigns — issue "Goal"). This table is the LIVE HEAD: one row per fact,
+// holding its current value. Every value the fact ever held (including the one it
+// holds now) is an immutable row in CampaignCreatorMemoryRevision, so no earlier
+// value is ever lost ($400 → $600 → $800 keeps all three — Calvin review #4). The
+// head is NOT a second copy of the conversation; provenance is a pointer back to
+// the source Message via the current revision.
+export const campaignCreatorMemory = pgTable(
+  "CampaignCreatorMemory",
+  {
+    id: cuidId("id"),
+    // Campaign-scoped — NEVER the Creator (no cross-campaign leak; issue "Goal").
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+    key: memoryFactKeyEnum("key").notNull(),
+    status: memoryFactStatusEnum("status").notNull().default("ACTIVE"),
+    // Current canonical value as text (numbers stringified). Mirrors the latest
+    // revision's value; kept denormalized on the head so the live read is a single
+    // indexed scan with no per-fact revision join.
+    value: text("value").notNull(),
+    // Numeric mirror for numeric keys (null otherwise). Recalculated whenever the
+    // head value changes — including an operator edit (Calvin review #5).
+    valueNumber: doublePrecision("valueNumber"),
+    // Dedup/live-index key: normalize(value) for list keys; a per-key sentinel for
+    // singleton keys so the partial-unique live index collapses to one row per
+    // (instance, key). Derived by memoryDedupKey — one code path.
+    normalizedValue: text("normalizedValue").notNull(),
+    // Optional light bucket for objections (reuse topic-gate categories).
+    category: text("category"),
+    // The current revision this head reflects (its source/evidence/confidence).
+    currentRevisionId: text("currentRevisionId"),
+    // Conflict pair (Calvin review — "conflicting facts are not silently
+    // overwritten"): when a singleton materially changes we set status=CONFLICTED
+    // and keep the immediately-prior value + its source here so the model sees
+    // "was X, now Y". The FULL history is in the revisions table.
+    conflictValue: text("conflictValue"),
+    conflictSourceMessageId: text("conflictSourceMessageId").references(
+      () => messages.id,
+    ),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    index("CampaignCreatorMemory_instanceId_status_idx").on(
+      table.instanceId,
+      table.status,
+    ),
+    // At most one LIVE (ACTIVE/CONFLICTED) row per (instance, key, normalizedValue).
+    // Singletons collapse via the sentinel; list keys allow one row per distinct
+    // value. Partial so SUPERSEDED/REMOVED heads accumulate as history. Mirrors
+    // migration 20260803000000_plu113_campaign_creator_memory.
+    uniqueIndex("CampaignCreatorMemory_live_key")
+      .on(table.instanceId, table.key, table.normalizedValue)
+      .where(sql`${table.status} IN ('ACTIVE', 'CONFLICTED')`),
+  ],
+);
+
+// PLU-113: the immutable revision log for a memory fact (Calvin review #4). Every
+// value a fact ever held is one append-only row here — never updated, never
+// deleted — so an operator retains the complete audit trail (each prior value +
+// its source message + evidence) even after many changes. The AI only reads the
+// live head; this table exists for provenance and operator review.
+export const campaignCreatorMemoryRevision = pgTable(
+  "CampaignCreatorMemoryRevision",
+  {
+    id: cuidId("id"),
+    memoryId: text("memoryId")
+      .notNull()
+      .references(() => campaignCreatorMemory.id),
+    value: text("value").notNull(),
+    valueNumber: doublePrecision("valueNumber"),
+    // Who authored this value (Calvin review #5). A 'creator' revision carries the
+    // sourceMessageId + evidenceText it was extracted from; an 'operator' revision
+    // has NO sourceMessageId (the edit did not come from a creator message) and an
+    // optional note instead of evidence.
+    source: memoryRevisionSourceEnum("source").notNull(),
+    // The inbound Message this value was extracted from (creator revisions only;
+    // null for operator edits — Calvin review #5).
+    sourceMessageId: text("sourceMessageId").references(() => messages.id),
+    // The verbatim creator phrase that supports this value (Calvin review #3 +
+    // #8). Server-verified to appear in the normalized creator reply before the
+    // revision is written; null for operator edits.
+    evidenceText: text("evidenceText"),
+    // Extraction confidence 0..1 (creator revisions); 1.0 for operator entries.
+    confidence: doublePrecision("confidence").notNull().default(0),
+    // Operator note on a correction (operator revisions only).
+    note: text("note"),
+    createdAt: tsNow("createdAt"),
+  },
+  (table) => [
+    index("CampaignCreatorMemoryRevision_memoryId_idx").on(table.memoryId),
+  ],
+);
+
+// PLU-113: a durable record of a memory write plan that FAILED to apply (Calvin
+// review #6). Persisting the reply must never be blocked by a memory-write error,
+// but the failure must not vanish into stdout either: the plan is captured here so
+// it is operator-visible and a sweep can retry it. Reuses DeadLetterStatus:
+// PENDING → REDRIVEN (a retry succeeded) | DISCARDED (an operator dismissed it).
+// Written from OUTSIDE the failed transaction, so a rolled-back memory tx still
+// leaves a recoverable trace.
+export const failedMemoryWrite = pgTable(
+  "FailedMemoryWrite",
+  {
+    id: cuidId("id"),
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+    // The serialized MemoryWritePlanItem[] that failed — enough to replay.
+    plan: jsonb("plan").notNull().$type<JsonValue>(),
+    // The source inbound message id the plan's creator facts came from.
+    sourceMessageId: text("sourceMessageId").references(() => messages.id),
+    error: text("error").notNull(),
+    // PENDING until a retry succeeds or an operator dismisses it.
+    status: deadLetterStatusEnum("status").notNull().default("PENDING"),
+    attempts: integer("attempts").notNull().default(0),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+    resolvedAt: ts("resolvedAt"),
+  },
+  (table) => [
+    index("FailedMemoryWrite_instanceId_status_idx").on(
+      table.instanceId,
+      table.status,
+    ),
+  ],
+);
+
 // HARD-O1: one row per LLM call the agent service made on behalf of a workflow
 // instance — the durable token/latency/cost telemetry the in-process agent ring
 // buffer cannot provide. Rows are written best-effort by the observability sink
@@ -1210,6 +1377,15 @@ export const insertDealHandoffSchema = createInsertSchema(dealHandoffs).omit({
 export const insertConversationObligationSchema = createInsertSchema(
   conversationObligations,
 ).omit({ id: true, createdAt: true, updatedAt: true });
+export const insertCampaignCreatorMemorySchema = createInsertSchema(
+  campaignCreatorMemory,
+).omit({ id: true, createdAt: true, updatedAt: true });
+export const insertCampaignCreatorMemoryRevisionSchema = createInsertSchema(
+  campaignCreatorMemoryRevision,
+).omit({ id: true, createdAt: true });
+export const insertFailedMemoryWriteSchema = createInsertSchema(
+  failedMemoryWrite,
+).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertPartnershipSchema = createInsertSchema(partnerships).omit({
   id: true,
   createdAt: true,
@@ -1255,6 +1431,10 @@ export type PaymentInfo = typeof paymentInfo.$inferSelect;
 export type DealHandoff = typeof dealHandoffs.$inferSelect;
 export type BrandApproval = typeof brandApprovals.$inferSelect;
 export type ConversationObligation = typeof conversationObligations.$inferSelect;
+export type CampaignCreatorMemory = typeof campaignCreatorMemory.$inferSelect;
+export type CampaignCreatorMemoryRevision =
+  typeof campaignCreatorMemoryRevision.$inferSelect;
+export type FailedMemoryWrite = typeof failedMemoryWrite.$inferSelect;
 export type Partnership = typeof partnerships.$inferSelect;
 export type Click = typeof clicks.$inferSelect;
 export type Conversion = typeof conversions.$inferSelect;
@@ -1310,6 +1490,10 @@ export type PaymentInfoInsert = typeof paymentInfo.$inferInsert;
 export type DealHandoffInsert = typeof dealHandoffs.$inferInsert;
 export type BrandApprovalInsert = typeof brandApprovals.$inferInsert;
 export type ConversationObligationInsert = typeof conversationObligations.$inferInsert;
+export type CampaignCreatorMemoryInsert = typeof campaignCreatorMemory.$inferInsert;
+export type CampaignCreatorMemoryRevisionInsert =
+  typeof campaignCreatorMemoryRevision.$inferInsert;
+export type FailedMemoryWriteInsert = typeof failedMemoryWrite.$inferInsert;
 export type PartnershipInsert = typeof partnerships.$inferInsert;
 export type ClickInsert = typeof clicks.$inferInsert;
 export type ConversionInsert = typeof conversions.$inferInsert;
