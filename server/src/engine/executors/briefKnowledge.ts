@@ -28,11 +28,11 @@ import { agentBaseUrl, agentPostJson } from "../../adapters/agentServiceClient.j
 // not the NEGOTIATION node, so we resolve it from the whole node graph.
 //
 // The file content is immutable per reference (uploads get a fresh random name),
-// so parsed results are cached in-process keyed by `${ref}::${parserVersion}`
-// (invariant #3). The READ keys on the server's EXPECTED version
-// (expectedParserVersion(), env BRIEF_PARSER_VERSION) — known before the parse — so
-// bumping the parser genuinely misses every stale entry (PLU-82 review §3). Only
-// ok/empty results
+// so parsed results are cached in-process keyed by
+// `${ref}::${parserVersion}::${parseMode}` (invariant #3). The READ keys on the
+// server's EXPECTED version + requested mode — both known before the parse — so
+// bumping the parser or toggling structured parsing genuinely misses every stale
+// entry (PLU-82 review §3). Only ok/empty results
 // are cached; a parse_failed is NOT cached (fixes BUG-E8: a transient agent
 // timeout no longer poisons the campaign's brief until process restart, §4.4).
 // Any failure (no brief, unreadable file, agent error) degrades to an empty flat
@@ -42,6 +42,7 @@ import { agentBaseUrl, agentPostJson } from "../../adapters/agentServiceClient.j
 // PLU-114's SectionKey uses where they overlap, so ResolvedBrief.sections projects
 // directly into AvailableSections.brief.
 export type BriefParseStatus = "ok" | "empty" | "parse_failed";
+export type BriefParseMode = "flat" | "structured";
 
 export interface CampaignBriefSection {
   type: string; // canonical key, e.g. "usageRights"
@@ -69,6 +70,11 @@ export interface ResolvedBrief {
   // no_brief is a resolver-level status (the parser is never called); ok/empty/
   // parse_failed come from the agent. invariant #2.
   status: BriefParseStatus | "no_brief";
+  // The capability the agent actually used. Optional only for resolver-level
+  // no_brief results and legacy/test values created before the additive wire
+  // field existed. A successful legacy response with sections infers structured;
+  // otherwise it safely infers flat.
+  parseMode?: BriefParseMode;
   // → AvailableSections.brief (PLU-114). Absent when the flag is off / no sections.
   sections?: Partial<Record<string, CampaignBriefSection>>;
   // Material Campaign-field conflicts (§4.5). Absent/empty on no conflict.
@@ -88,11 +94,9 @@ export interface CampaignKnowledgeFields {
   attributionWindow?: string | undefined;
 }
 
-// PLU-107 invariant #3: the cache key stamps the parser version so a parser bump
-// self-invalidates. The version is reported by the agent per parse; we key the
-// cache on the version the agent RETURNED (so a mixed-version deploy caches each
-// under its own key). Until a successful parse tells us the version, an unknown
-// ref simply isn't cached.
+// PLU-107 invariant #3: the cache key stamps parser version + actual parse mode,
+// so a parser bump or capability toggle self-invalidates. Both are reported by
+// the agent per parse; mixed-version/mode deploys cache each result separately.
 const _cache = new Map<string, ResolvedBrief>();
 const _CACHE_MAX = 256;
 
@@ -109,8 +113,16 @@ export function expectedParserVersion(): string {
   return typeof raw === "string" && raw.trim() ? raw.trim() : _DEFAULT_PARSER_VERSION;
 }
 
-function cacheKey(ref: string, parserVersion: string): string {
-  return `${ref}::${parserVersion}`;
+/** The parse capability the server requests from /parse-brief. Read lazily so
+ * tests and rolling deploys can change the flag without restarting this module. */
+export function expectedBriefParseMode(): BriefParseMode {
+  return process.env["STRUCTURED_BRIEF_PARSING_ENABLED"]?.trim().toLowerCase() === "true"
+    ? "structured"
+    : "flat";
+}
+
+function cacheKey(ref: string, parserVersion: string, parseMode: BriefParseMode): string {
+  return `${ref}::${parserVersion}::${parseMode}`;
 }
 
 function cacheGet(key: string): ResolvedBrief | undefined {
@@ -127,7 +139,7 @@ function cacheSet(key: string, value: ResolvedBrief): void {
 }
 
 /** The CONTENT_BRIEF node's brief file reference, if the graph has one. */
-function briefRefFromGraph(nodeGraph: NodeSnapshot[]): string | undefined {
+export function briefRefFromGraph(nodeGraph: NodeSnapshot[]): string | undefined {
   const node = nodeGraph.find((n) => n.type === "CONTENT_BRIEF");
   const ref = node?.config?.["briefFileRef"];
   return typeof ref === "string" && ref.trim() ? ref.trim() : undefined;
@@ -204,11 +216,9 @@ export function detectBriefConflicts(
       // Term-presence conflict: the Campaign says non-exclusive but the brief
       // asserts an exclusive clause (or vice versa). Only the clear opposite-stance
       // case is flagged.
-      const cNonExcl = /\bnon[- ]?exclusiv/i.test(campaignValue);
-      const bExcl = /\bexclusiv/i.test(briefText) && !/\bnon[- ]?exclusiv/i.test(briefText);
-      const cExcl = /\bexclusiv/i.test(campaignValue) && !cNonExcl;
-      const bNonExcl = /\bnon[- ]?exclusiv/i.test(briefText);
-      if ((cNonExcl && bExcl) || (cExcl && bNonExcl)) {
+      const campaignStance = exclusivityStance(campaignValue);
+      const briefStance = exclusivityStance(briefText);
+      if (campaignStance && briefStance && campaignStance !== briefStance) {
         conflicts.push({
           ...base,
           reason: "exclusivity stance mismatch (campaign vs brief disagree on exclusivity)",
@@ -218,6 +228,16 @@ export function detectBriefConflicts(
     }
   }
   return conflicts;
+}
+
+/** Recognize only explicit exclusivity stances. Negation must be checked before
+ * the generic `exclusive|exclusivity` token or phrases such as "not exclusive"
+ * are accidentally classified as positive exclusivity. */
+function exclusivityStance(text: string): "exclusive" | "non_exclusive" | null {
+  const nonExclusive =
+    /\b(?:non[-\s]?exclusiv(?:e|ity)|not\s+(?:an?\s+)?exclusive|no\s+(?:category\s+)?exclusivity|without\s+(?:(?:any|category)\s+|any\s+category\s+)?exclusivity)\b/i;
+  if (nonExclusive.test(text)) return "non_exclusive";
+  return /\bexclusiv(?:e|ity)\b/i.test(text) ? "exclusive" : null;
 }
 
 /** Coerce an agent /parse-brief section-map payload into typed CampaignBriefSection
@@ -264,15 +284,16 @@ export function projectSections(
  */
 // The two I/O boundaries the resolver crosses, injectable so a unit test can drive
 // deterministic parses (and count how many times the parser was actually called)
-// without mocking modules or standing up the agent. Defaults ARE the real calls,
-// so the production call site (negotiation.ts) is byte-identical.
+// without mocking modules or standing up the agent. Defaults ARE the real calls;
+// the negotiation executor needs no transport-specific branching.
 export interface BriefResolveDeps {
   readFile: (ref: string) => Promise<Buffer>;
-  parse: (pdfBase64: string) => Promise<Record<string, unknown>>;
+  parse: (pdfBase64: string, parseMode: BriefParseMode) => Promise<Record<string, unknown>>;
 }
 const _realDeps: BriefResolveDeps = {
   readFile: (ref) => readStoredFile(ref),
-  parse: (pdfBase64) => agentPostJson(agentBaseUrl(), "/parse-brief", { pdfBase64 }),
+  parse: (pdfBase64, parseMode) =>
+    agentPostJson(agentBaseUrl(), "/parse-brief", { pdfBase64, parseMode }),
 };
 
 export async function resolveBriefKnowledge(
@@ -282,15 +303,16 @@ export async function resolveBriefKnowledge(
 ): Promise<ResolvedBrief> {
   const ref = briefRefFromGraph(nodeGraph);
   if (!ref) return { flatText: "", status: "no_brief" };
+  const requestedParseMode = expectedBriefParseMode();
 
-  // PLU-82 review §3 (Calvin): key the read on the EXPECTED parser version, which
-  // we know before the parse. A stale entry cached under a DIFFERENT version (an
-  // older parser, or a mixed-deploy peer) no longer matches, so bumping
-  // BRIEF_PARSER_VERSION forces a re-parse instead of reusing a version-A result.
+  // PLU-82 review §3 (Calvin): key the read on the EXPECTED parser version and
+  // requested mode, which we know before the parse. A stale entry produced by a
+  // different version or capability no longer matches, so a bump/toggle forces a
+  // re-parse instead of reusing incompatible content.
   // (The prior `startsWith(`${ref}::`)` scan returned the first match regardless of
   // version — the invalidation bug.) The working set is one brief per campaign, so
   // the direct Map.get is also strictly cheaper than the scan it replaces.
-  const hit = cacheGet(cacheKey(ref, expectedParserVersion()));
+  const hit = cacheGet(cacheKey(ref, expectedParserVersion(), requestedParseMode));
   if (hit) {
     return withConflicts(hit, campaignFields);
   }
@@ -298,17 +320,27 @@ export async function resolveBriefKnowledge(
   let resolved: ResolvedBrief;
   try {
     const bytes = await deps.readFile(ref);
-    const data = await deps.parse(bytes.toString("base64"));
+    const data = await deps.parse(bytes.toString("base64"), requestedParseMode);
     const flatText = typeof data["text"] === "string" ? data["text"] : "";
-    const status = normalizeStatus(data["status"]);
+    const reportedStatus = normalizeStatus(data["status"]);
     const parserVersion =
       typeof data["parserVersion"] === "string" && data["parserVersion"].trim()
         ? (data["parserVersion"] as string)
         : "unknown";
     const sections = projectSections(data["sections"], ref, parserVersion);
+    const parseMode = normalizeParseMode(data["parseMode"], data["sections"]);
+    // Legacy text-only agents may omit `status`, which normalizeStatus treats as
+    // ok for backward compatibility. A completely blank response, however, is
+    // malformed rather than a successful parse. Promote it to parse_failed here
+    // (before caching), so a transient bad response is retried on the next turn.
+    const status =
+      reportedStatus === "ok" && !flatText.trim() && !sections
+        ? "parse_failed"
+        : reportedStatus;
     resolved = {
       flatText,
       status,
+      parseMode,
       ...(sections ? { sections } : {}),
       ...(typeof data["tierUsed"] === "string" ? { tierUsed: data["tierUsed"] as string } : {}),
       ...(typeof data["pageCount"] === "number" ? { pageCount: data["pageCount"] as number } : {}),
@@ -316,13 +348,12 @@ export async function resolveBriefKnowledge(
 
     // Cache only ok/empty (invariant / §4.4): a parse_failed must NOT be cached so
     // a transient agent timeout is retried next turn instead of poisoning the
-    // brief until process restart (fixes BUG-E8). Keyed on the version the agent
-    // RETURNED (provenance-accurate). The read path keys on expectedParserVersion();
-    // when they match (the normal case) the next turn hits, and when they DON'T (a
-    // stale entry from an older parser) the read misses and re-parses — which is the
-    // correct behavior for PLU-82 review §3, not a cache we want to serve.
+    // brief until process restart (fixes BUG-E8). Keyed on the version + mode the
+    // agent RETURNED (provenance-accurate). The read path uses the expected version
+    // + requested mode; when either differs, it misses and re-parses. This also
+    // makes rolling deploys safe when an old agent ignores the additive request.
     if (status === "ok" || status === "empty") {
-      cacheSet(cacheKey(ref, parserVersion), resolved);
+      cacheSet(cacheKey(ref, parserVersion, parseMode), resolved);
     }
   } catch (err) {
     // Unreadable file, agent down/breaker-open, malformed response — all degrade
@@ -334,7 +365,7 @@ export async function resolveBriefKnowledge(
         err instanceof Error ? err.message : String(err)
       }`,
     );
-    resolved = { flatText: "", status: "parse_failed" };
+    resolved = { flatText: "", status: "parse_failed", parseMode: requestedParseMode };
   }
 
   return withConflicts(resolved, campaignFields);
@@ -358,6 +389,16 @@ export function normalizeStatus(raw: unknown): BriefParseStatus {
   return raw === "empty" || raw === "parse_failed" ? raw : "ok";
 }
 
+/** Normalize the additive parse-mode response field. Legacy agents did not send
+ * it: a section-map proves structured parsing; a text-only response is treated as
+ * flat so a successful legacy parse never becomes a false PARTIAL result. */
+export function normalizeParseMode(raw: unknown, rawSections?: unknown): BriefParseMode {
+  if (raw === "structured" || raw === "flat") return raw;
+  return rawSections !== null && typeof rawSections === "object" && !Array.isArray(rawSections)
+    ? "structured"
+    : "flat";
+}
+
 // ---------------------------------------------------------------------------
 // PLU-82 §4.4: explicit brief AVAILABILITY (the issue's four-state result)
 // ---------------------------------------------------------------------------
@@ -377,7 +418,8 @@ export interface BriefKnowledgeResult {
   status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
   /** The immutable upload ref, when a brief is configured on the graph. */
   fileReference?: string;
-  /** ResolvedBrief.flatText, when present (non-empty). */
+  /** ResolvedBrief.flatText, when present (non-empty). Internal projection only;
+   * buildKnowledgeRecord deliberately strips it from persisted observability. */
   text?: string;
   /** A short reason on PARSE_FAILED (which underlying status produced it). */
   error?: string;
@@ -403,8 +445,9 @@ export interface BriefKnowledgeResult {
  *                   image PDF that parsed to no text must never read as "no brief")
  *   ok + no usable content (blank text, no sections) → PARSE_FAILED (review §4:
  *                   a missing/defaulted "ok" status must not read as AVAILABLE)
- *   ok + all expected sections present → AVAILABLE
- *   ok + ≥1 expected section absent    → PARTIAL
+ *   ok + flat parse + usable text       → AVAILABLE (sections were not attempted)
+ *   ok + structured + all expected sections present → AVAILABLE
+ *   ok + structured + ≥1 expected section absent    → PARTIAL
  */
 export function deriveBriefAvailability(
   resolved: ResolvedBrief,
@@ -441,11 +484,19 @@ export function deriveBriefAvailability(
           ...refPart,
         };
       }
+      // In flat mode there is no section-level capability, so absent section keys
+      // do not mean a partial parse. The extracted flat text is the complete
+      // output for that mode. Legacy text-only responses infer flat above/by
+      // absence here, preserving backward compatibility.
+      const parseMode = resolved.parseMode ?? (resolved.sections ? "structured" : "flat");
+      const textPart = resolved.flatText.trim() ? { text: resolved.flatText } : {};
+      if (parseMode === "flat") {
+        return { status: "AVAILABLE", ...textPart, ...refPart };
+      }
       const missing = expectedSections.filter((k) => {
         const s = sections[k];
         return !s || typeof s.text !== "string" || !s.text.trim();
       });
-      const textPart = resolved.flatText.trim() ? { text: resolved.flatText } : {};
       if (missing.length === 0) {
         return { status: "AVAILABLE", ...textPart, ...refPart };
       }

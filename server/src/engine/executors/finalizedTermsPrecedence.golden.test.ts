@@ -209,6 +209,24 @@ test("2-tier: a campaign value is NEVER consulted (byte-identical to the no-camp
   assert.equal(got.source, null);
 });
 
+console.log("\ncontentBrief — rewardDescription (trimmed workflow config only)\n");
+
+function oldContentBriefString(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+for (const raw of ["  creator receives shoes  ", "", S.ws, undefined, S.num]) {
+  test(`rewardDescription preserves legacy trim semantics [${JSON.stringify(raw)}]`, () => {
+    const resolved = resolveKnowledgeField("rewardDescription", { workflowConfig: raw });
+    const rendered = typeof resolved.value === "string" ? resolved.value.trim() : "";
+    assert.equal(rendered, oldContentBriefString(raw));
+    assert.equal(
+      resolved.source,
+      oldContentBriefString(raw) ? "workflow_config" : null,
+    );
+  });
+}
+
 // ---------------------------------------------------------------------------
 // review §2 (Calvin): PIN the exact field-by-field precedence policy as a literal
 // table, so approving PLU-82 means intentionally approving THIS order — not

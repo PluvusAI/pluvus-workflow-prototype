@@ -33,8 +33,8 @@ debug context" requirement.
 |---|---|---|
 | `confirmed_agreement` | `confirmedAgreement` | A real confirmed creator agreement (e.g. `resolveAgreedFee` for the fee). |
 | `operator_override` | `operatorOverride` | **PLU-113 seam — no producer on this branch; always `undefined`.** Position fixed + unit-proven so a future feature lights up with no resolver change. |
-| `negotiation_state` | `negotiationState` | The NEGOTIATION node's config. |
 | `workflow_config` | `workflowConfig` | THIS node's published config (`node.config`) — "node config wins". |
+| `negotiation_state` | `negotiationState` | The NEGOTIATION node's config. |
 | `campaign_default` | `campaignDefault` | The `campaign.*` column. |
 
 > The brief is **not** a slot. It is a **conflict challenger, never a resolution
@@ -92,20 +92,23 @@ golden-tested** change — out of scope for v1. The golden per-executor tests
 `ResolvedBrief.status` (PLU-107) + which *expected* sections are present into the
 issue's four-state result. **Missing ≠ failed ≠ absent.**
 
-| `ResolvedBrief.status` | + section presence | `BriefKnowledgeResult.status` |
+| `ResolvedBrief.status` | parse capability + content | `BriefKnowledgeResult.status` |
 |---|---|---|
 | `no_brief` (no ref on the graph) | — | **`NO_BRIEF`** |
 | `parse_failed` (unreadable / agent down) | — | **`PARSE_FAILED`** (error set) |
 | `empty` (parsed, no extractable text — scanned/image PDF) | — | **`PARSE_FAILED`** — present-but-unreadable ≠ absent |
-| `ok` | every *expected* section present | **`AVAILABLE`** |
-| `ok` | ≥1 *expected* section absent | **`PARTIAL`** (lists the missing keys) |
+| `ok` | no usable flat text or section content | **`PARSE_FAILED`** |
+| `ok` | `flat` mode + readable text | **`AVAILABLE`** — sections were not attempted |
+| `ok` | `structured` mode + every *expected* section present | **`AVAILABLE`** |
+| `ok` | `structured` mode + ≥1 *expected* section absent | **`PARTIAL`** (lists the missing keys) |
 
 - **`expectedSections` = the campaign's declared fields ∩ the four conflict keys**,
   NOT all possible keys — otherwise every brief is `PARTIAL` forever.
-- This is a **pure projection** — no parser change, no cache change (`empty` stays
-  cached, `parse_failed` stays uncached — the BUG-E8 fix), and it **gates no prompt
-  in v1**. It is an observability label surfaced in the inspector's Knowledge panel;
-  the agent already owns honest-defer.
+- The availability mapping itself is a **pure projection** and **gates no prompt in
+  v1**. Parse capability is selected earlier by the resolver and is part of the
+  cache identity (`empty` stays cached; `parse_failed` stays uncached — the BUG-E8
+  fix). The result is surfaced in the inspector's Knowledge panel; the agent still
+  owns honest-defer.
 
 ---
 
@@ -157,19 +160,23 @@ so the negotiation executor never runs again — no escalation loop.
 Conflicts are surfaced from the event log across all turns, but each carries a
 **status**:
 
-- **`active`** — still present in the **most recent turn whose brief was
-  re-resolved** (the latest "knowledge round").
-- **`cleared`** — present in an earlier round but **absent from that latest
-  re-resolution** (the source was corrected).
+- **`active`** — still present in the **most recent chronological knowledge
+  snapshot**.
+- **`cleared`** — present in an earlier snapshot but **absent from the latest
+  snapshot** (the source was corrected).
 
 So the operator panel distinguishes a *historical* conflict, a *currently active*
 one, and a *since-corrected* one. `briefAvailability` is already latest-wins; the
 conflict list previously unioned every conflict ever seen, which made a fixed
-conflict read as though it were still live. A plain negotiation turn with **no**
+conflict read as though it were still live. Sequence, not negotiation-round number,
+determines liveness: a later clean `present_offer` snapshot clears an earlier
+conflict even when both events share a round, and the same applies to legacy
+null-round events. Round remains display metadata only. A plain event with **no**
 knowledge block is **not** treated as a re-resolution, so it never falsely clears a
 standing conflict. Recovery is **per-field** — one field can clear while another
-stays active. When no round is known (older instances), a conflict stays `active`
-(conservative — never hide a possibly-live conflict).
+stays active. Every committed negotiation turn that actually resolved the brief
+persists a compact snapshot, including `AVAILABLE` with `conflicts: []`, so healthy
+recovery is explicit.
 
 ---
 
@@ -199,19 +206,33 @@ detector is a separate, golden-tested change.
 | Flag | Side | Default | Gates |
 |---|---|---|---|
 | `MATERIAL_CONFLICT_ESCALATION_ENABLED` | server | **OFF** | ONLY the escalation *decision* (§4). Detection + observability ship unconditionally. |
-| `STRUCTURED_BRIEF_PARSING_ENABLED` | agent | OFF | Whether the brief parses to structured `sections` — a **hidden dependency**: no sections → no conflicts → escalation inert regardless of the flag above. |
+| `STRUCTURED_BRIEF_PARSING_ENABLED` | server request / agent legacy fallback | OFF | Whether the brief parses to structured `sections`. The server sends explicit `parseMode`; the agent flag remains fallback for old/direct callers. No sections → no conflicts → escalation inert regardless of the flag above. |
 | `KNOWLEDGE_RETRIEVAL_ENABLED` / `BRIEF_INTO_NEGOTIATE` | server | OFF | Brief *text into the prompt* — **orthogonal** to the escalation flag. |
 
 ### Flag matrix (what fires)
 
 | `STRUCTURED_BRIEF_PARSING_ENABLED` | `MATERIAL_CONFLICT_ESCALATION_ENABLED` | Behavior |
 |---|---|---|
-| OFF | any | no sections → no conflicts → **no escalation**; availability = `NO_BRIEF` / `PARSE_FAILED` (never `PARTIAL`, no sections) |
+| OFF | any | flat parse → no conflicts → **no escalation**; readable flat text is `AVAILABLE` (`NO_BRIEF` / `PARSE_FAILED` still describe absent/unreadable files; never `PARTIAL`) |
 | ON | OFF | conflicts detected + **surfaced in observability**; **no escalation** (`console.warn` + Knowledge panel) |
 | ON | ON | conflicts detected + surfaced + **escalate to MANUAL_REVIEW** when the §4 gate fires |
 
-The precedence-resolver migration and the availability projection are **not flagged**
-— they are pure refactors/projections that are byte-identical to today.
+The precedence-resolver migration and the availability projection are **not flagged**.
+They do not change prompt content or deal decisions.
+
+`/parse-brief` reports `parseMode: flat | structured`, and the server includes that
+mode in the cache key. A flag toggle therefore cannot reuse a result produced by
+the other capability. Responses from an older agent that omit `parseMode` remain
+compatible: a section map proves structured mode; otherwise a successful text-only
+response is treated as flat and therefore does not become a false `PARTIAL`.
+
+Rolling deploys are safe in both directions. A new server's additive `parseMode`
+request is ignored by an old agent, and its legacy response is inferred as above;
+an old server omits the field, so a new agent falls back to its environment flag.
+If an old agent does not honor a requested mode, its result is cached only under
+the mode it actually produced, so the requested-mode read keeps missing until the
+matching agent version is live. Keep the shared flag equal in both environments
+during the rollout to avoid needless re-parses.
 
 **Flags OFF ⇒ byte-identical to today on every prompt and every real deal.**
 

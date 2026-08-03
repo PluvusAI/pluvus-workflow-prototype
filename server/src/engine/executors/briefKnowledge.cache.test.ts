@@ -1,13 +1,13 @@
 /**
- * PLU-82 review §3 (Calvin) — parser-version cache invalidation.
+ * PLU-82 review §3 (Calvin) — parser-version + parse-mode cache invalidation.
  * Run with:
  *   node --import tsx --test src/engine/executors/briefKnowledge.cache.test.ts
  *
  * Regression target: the read path used to scan for ANY cached entry whose key
  * began with the file ref (`${ref}::…`) and return the first match, so a result
  * cached under parser version A kept being served after the parser bumped to B.
- * The read now keys on expectedParserVersion() (env BRIEF_PARSER_VERSION), known
- * BEFORE the parse, so a version bump genuinely invalidates the stale entry.
+ * The read now keys on expectedParserVersion() + expectedBriefParseMode(), known
+ * BEFORE the parse, so a version bump or mode toggle invalidates stale entries.
  *
  * Also covers §4 through the REAL resolve path (not just the pure projection):
  * a blank/malformed parse must not survive as usable content.
@@ -18,8 +18,10 @@ import { test, beforeEach, afterEach } from "node:test";
 import {
   resolveBriefKnowledge,
   deriveBriefAvailability,
+  expectedBriefParseMode,
   expectedParserVersion,
   _clearBriefCache,
+  type BriefParseMode,
   type BriefResolveDeps,
 } from "./briefKnowledge.js";
 import type { NodeSnapshot } from "../types.js";
@@ -36,26 +38,34 @@ const graph: NodeSnapshot[] = [
 function depsReturning(payload: Record<string, unknown>): {
   deps: BriefResolveDeps;
   calls: () => number;
+  modes: () => BriefParseMode[];
 } {
   let calls = 0;
+  const modes: BriefParseMode[] = [];
   const deps: BriefResolveDeps = {
     readFile: async () => Buffer.from("%PDF-1.4 fake"),
-    parse: async () => {
+    parse: async (_pdfBase64, parseMode) => {
       calls += 1;
+      modes.push(parseMode);
       return payload;
     },
   };
-  return { deps, calls: () => calls };
+  return { deps, calls: () => calls, modes: () => modes };
 }
 
 let savedVersion: string | undefined;
+let savedStructuredFlag: string | undefined;
 beforeEach(() => {
   savedVersion = process.env["BRIEF_PARSER_VERSION"];
+  savedStructuredFlag = process.env["STRUCTURED_BRIEF_PARSING_ENABLED"];
+  delete process.env["STRUCTURED_BRIEF_PARSING_ENABLED"];
   _clearBriefCache();
 });
 afterEach(() => {
   if (savedVersion === undefined) delete process.env["BRIEF_PARSER_VERSION"];
   else process.env["BRIEF_PARSER_VERSION"] = savedVersion;
+  if (savedStructuredFlag === undefined) delete process.env["STRUCTURED_BRIEF_PARSING_ENABLED"];
+  else process.env["STRUCTURED_BRIEF_PARSING_ENABLED"] = savedStructuredFlag;
   _clearBriefCache();
 });
 
@@ -64,6 +74,13 @@ test("expectedParserVersion honors the env override and falls back to the defaul
   assert.equal(expectedParserVersion(), "brief-parser-v1.1");
   process.env["BRIEF_PARSER_VERSION"] = "brief-parser-v9.9";
   assert.equal(expectedParserVersion(), "brief-parser-v9.9");
+});
+
+test("expectedBriefParseMode maps the shared flag to an explicit request capability", () => {
+  delete process.env["STRUCTURED_BRIEF_PARSING_ENABLED"];
+  assert.equal(expectedBriefParseMode(), "flat");
+  process.env["STRUCTURED_BRIEF_PARSING_ENABLED"] = " true ";
+  assert.equal(expectedBriefParseMode(), "structured");
 });
 
 test("a version-A result is NOT reused after the expected version bumps to B (§3)", async () => {
@@ -115,11 +132,59 @@ test("a parse_failed is not cached (a transient failure never poisons the brief)
 
 test("§4 — a blank/malformed parse resolves to PARSE_FAILED, never AVAILABLE", async () => {
   // Missing status + blank text + no sections: the resolver normalizes the status
-  // and deriveBriefAvailability must classify it as a failure, not availability.
+  // for legacy compatibility, then promotes an unusable response to parse_failed
+  // before caching so the next turn gets a clean retry.
   process.env["BRIEF_PARSER_VERSION"] = "A";
   const blank = depsReturning({ text: "", parserVersion: "A" }); // no `status` key
   const resolved = await resolveBriefKnowledge(graph, undefined, blank.deps);
+  assert.equal(resolved.status, "parse_failed");
   const availability = deriveBriefAvailability(resolved, []);
   assert.notEqual(availability.status, "AVAILABLE", "a blank/malformed parse must not read AVAILABLE");
   assert.equal(availability.status, "PARSE_FAILED");
+  await resolveBriefKnowledge(graph, undefined, blank.deps);
+  assert.equal(blank.calls(), 2, "a malformed blank response must not poison the cache");
+});
+
+test("flat and structured results use separate cache identities when the flag toggles", async () => {
+  process.env["BRIEF_PARSER_VERSION"] = "A";
+  delete process.env["STRUCTURED_BRIEF_PARSING_ENABLED"];
+  const flat = depsReturning({
+    status: "ok",
+    text: "flat result",
+    parserVersion: "A",
+    parseMode: "flat",
+  });
+  const flatResult = await resolveBriefKnowledge(graph, undefined, flat.deps);
+  assert.equal(flatResult.flatText, "flat result");
+  assert.deepEqual(flat.modes(), ["flat"], "server must explicitly request flat mode");
+
+  process.env["STRUCTURED_BRIEF_PARSING_ENABLED"] = "true";
+  const structured = depsReturning({
+    status: "ok",
+    text: "structured result",
+    parserVersion: "A",
+    parseMode: "structured",
+    sections: { usageRights: { type: "usageRights", text: "90 days" } },
+  });
+  const structuredResult = await resolveBriefKnowledge(graph, undefined, structured.deps);
+  assert.equal(structuredResult.flatText, "structured result");
+  assert.deepEqual(
+    structured.modes(),
+    ["structured"],
+    "mode toggle must miss the flat cache and request a structured parse",
+  );
+
+  delete process.env["STRUCTURED_BRIEF_PARSING_ENABLED"];
+  const flatAgain = await resolveBriefKnowledge(graph, undefined, flat.deps);
+  assert.equal(flatAgain.flatText, "flat result");
+  assert.equal(flat.calls(), 1, "switching back may reuse only the matching flat-mode cache");
+});
+
+test("a legacy text-only agent response is inferred as flat and never becomes false PARTIAL", async () => {
+  process.env["BRIEF_PARSER_VERSION"] = "A";
+  process.env["STRUCTURED_BRIEF_PARSING_ENABLED"] = "true";
+  const legacy = depsReturning({ status: "ok", text: "legacy flat text", parserVersion: "A" });
+  const resolved = await resolveBriefKnowledge(graph, undefined, legacy.deps);
+  assert.equal(resolved.parseMode, "flat");
+  assert.equal(deriveBriefAvailability(resolved, ["usageRights"]).status, "AVAILABLE");
 });

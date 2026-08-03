@@ -16,8 +16,11 @@
 
 import assert from "node:assert/strict";
 import {
+  attachKnowledgeRecord,
+  buildKnowledgeRecord,
   conflictAffectsCreatorCommitment,
   escalateMaterialConflict,
+  formatBriefConflictWarning,
 } from "./negotiation.js";
 import type { BriefFieldConflict } from "./briefKnowledge.js";
 
@@ -83,6 +86,28 @@ test("FALSE-POSITIVE PREVENTED: no creator questions at all → []", () => {
     conflictAffectsCreatorCommitment([paymentConflict], undefined, undefined, []),
     [],
   );
+});
+
+test("raw creator reply is the fallback when comprehension metadata is absent", () => {
+  const matched = conflictAffectsCreatorCommitment(
+    [paymentConflict],
+    undefined,
+    undefined,
+    [],
+    "Could you confirm when I get paid?",
+  );
+  assert.deepEqual(matched, ["paymentTerms"]);
+});
+
+test("raw-reply fallback still ignores an unrelated interested response", () => {
+  const matched = conflictAffectsCreatorCommitment(
+    [paymentConflict],
+    undefined,
+    undefined,
+    [],
+    "Yes, I'm interested — sounds great.",
+  );
+  assert.deepEqual(matched, []);
 });
 
 test("FALSE-POSITIVE PREVENTED: creator asked about a DIFFERENT field (deliverables) → []", () => {
@@ -255,6 +280,85 @@ test("routes to MANUAL_REVIEW (terminal) with the right reason + fields", () => 
   assert.equal(conflicts.length, 1);
   assert.equal(conflicts[0]!.campaignValue, "Net 30");
   assert.equal(conflicts[0]!.briefExcerpt, "payment is Net 60 after delivery");
+});
+
+console.log("\nknowledge snapshots — recovery and terminal-path persistence\n");
+
+test("AVAILABLE with no conflicts is still an explicit clearing snapshot", () => {
+  const record = buildKnowledgeRecord(
+    { status: "AVAILABLE", text: "Campaign terms" },
+    [],
+  );
+  assert.deepEqual(record, {
+    knowledge: {
+      briefAvailability: { status: "AVAILABLE" },
+      conflicts: [],
+    },
+  });
+});
+
+test("knowledge snapshots never persist the full extracted brief text", () => {
+  const record = buildKnowledgeRecord(
+    {
+      status: "PARTIAL",
+      text: "sensitive full PDF extraction",
+      fileReference: "briefs/campaign.pdf",
+      missingSections: ["paymentTerms"],
+    },
+    [],
+  );
+  const knowledge = record["knowledge"] as Record<string, unknown>;
+  assert.deepEqual(knowledge["briefAvailability"], {
+    status: "PARTIAL",
+    fileReference: "briefs/campaign.pdf",
+    missingSections: ["paymentTerms"],
+  });
+  assert.equal(JSON.stringify(record).includes("sensitive full PDF extraction"), false);
+});
+
+test("knowledge snapshots retain the brief reference for operator provenance", () => {
+  const record = buildKnowledgeRecord(
+    { status: "AVAILABLE", fileReference: "briefs/campaign.pdf" },
+    [],
+  );
+  const knowledge = record["knowledge"] as Record<string, unknown>;
+  assert.deepEqual(knowledge["briefAvailability"], {
+    status: "AVAILABLE",
+    fileReference: "briefs/campaign.pdf",
+  });
+});
+
+test("stdout conflict summaries never expose reasons or source values", () => {
+  const summary = formatBriefConflictWarning([paymentConflict, usageConflict]);
+  assert.equal(summary, "paymentTerms (p2); usageRights");
+  assert.equal(summary.includes("Net 30"), false);
+  assert.equal(summary.includes("Net 60"), false);
+  assert.equal(summary.includes("90"), false);
+  assert.equal(summary.includes("180"), false);
+  assert.equal(summary.includes("mismatch"), false);
+});
+
+test("attaching a snapshot preserves escalation audit fields and nests conflicts", () => {
+  const escalation = escalateMaterialConflict({
+    round: 1,
+    message: "when do I get paid?",
+    conflictFields: ["paymentTerms"],
+    conflicts: [paymentConflict],
+  });
+  const result = attachKnowledgeRecord(
+    escalation,
+    buildKnowledgeRecord(
+      { status: "PARTIAL", missingSections: ["paymentTerms"] },
+      [paymentConflict],
+    ),
+  );
+  const payload = result.eventPayload as Record<string, unknown>;
+  assert.equal(payload["reason"], "material_knowledge_conflict");
+  assert.deepEqual(payload["conflictFields"], ["paymentTerms"]);
+  assert.deepEqual(payload["knowledge"], {
+    briefAvailability: { status: "PARTIAL", missingSections: ["paymentTerms"] },
+    conflicts: [paymentConflict],
+  });
 });
 
 console.log(`\n${n} passed\n`);

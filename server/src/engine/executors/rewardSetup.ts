@@ -2,7 +2,11 @@ import { listEventsByInstance } from "../../db/index.js";
 import type { ExecutionContext, NodeResult } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import { resolveAgreedFee } from "./agreedFee.js";
-import { resolveKnowledgeField, type SourceLabel } from "../knowledgePrecedence.js";
+import {
+  agreedFeeSource,
+  resolveKnowledgeField,
+  type SourceLabel,
+} from "../knowledgePrecedence.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { sendOnce } from "./idempotentSend.js";
 import { blockedByGuard, blockedByMissingBrand } from "./guardEscalation.js";
@@ -62,6 +66,7 @@ export async function executeRewardSetup(
   // passed (undefined = skipped) and the resolved value/label match the inline
   // read exactly. `resolvedSources` records the winning label per field (§4.6).
   const resolvedSources: Record<string, SourceLabel> = {};
+  resolvedSources["fixedFee"] = agreedFeeSource(agreedFee);
   const commission = resolveKnowledgeField("commissionRate", {
     workflowConfig: config["commissionRate"],
     negotiationState: negotiationConfig["commissionRate"],

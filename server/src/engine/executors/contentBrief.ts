@@ -7,7 +7,11 @@ import { readStoredFile } from "../../storage/localFileStorage.js";
 import { sendOnce } from "./idempotentSend.js";
 import { renderContentBriefEmail } from "./contentBriefEmail.js";
 import { resolveAgreedFee } from "./agreedFee.js";
-import { resolveKnowledgeField, type SourceLabel } from "../knowledgePrecedence.js";
+import {
+  agreedFeeSource,
+  resolveKnowledgeField,
+  type SourceLabel,
+} from "../knowledgePrecedence.js";
 import { resolvePaymentToken } from "./paymentInfo.js";
 import { paymentFormLink } from "./paymentEmail.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
@@ -76,7 +80,14 @@ export async function executeContentBrief(
   const briefFileRef = str(config, "briefFileRef");
   const briefFileName = str(config, "briefFileName") || "campaign-brief.pdf";
   const creatorNotes = str(config, "creatorNotes");
-  const rewardDescription = str(config, "rewardDescription");
+  // Preserve this executor's legacy `str()` behavior (workflow config only,
+  // trimmed before rendering) while routing presence/provenance through the
+  // shared knowledge resolver like the other finalized terms.
+  const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
+    workflowConfig: config["rewardDescription"],
+  });
+  const rewardDescription =
+    typeof rewardDescriptionR.value === "string" ? rewardDescriptionR.value.trim() : "";
 
   // The Campaign Brief PDF is required (enforced at publish/launch validation);
   // fail loudly if it's somehow missing at runtime rather than sending a brief
@@ -120,6 +131,7 @@ export async function executeContentBrief(
   const resolvedSources: Record<string, SourceLabel> = {};
 
   if (isMerged) {
+    resolvedSources["rewardDescription"] = rewardDescriptionR.source;
     // The negotiation commission is stamped onto THIS node's config at save/publish
     // (stampRewardFromNegotiation). Read the NEGOTIATION node as a defensive
     // fallback for versions published before the stamp (or direct-created instances).
@@ -141,6 +153,7 @@ export async function executeContentBrief(
         eventPayload: { outcome: "ESCALATE", reason: "no_agreed_fee", node: node.type },
       };
     }
+    resolvedSources["fixedFee"] = agreedFeeSource(fixedFee);
     // PLU-82 (§4.3): resolve through the documented precedence resolver instead of
     // the inline chains — byte-identical (invariant #3), golden-test locked. 2-tier
     // here (config → negotiationConfig, no campaign fallback), so campaignDefault

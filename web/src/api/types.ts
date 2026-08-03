@@ -192,6 +192,7 @@ export interface KnowledgeConflictDTO {
 
 export interface BriefAvailabilityDTO {
   status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
+  fileReference: string | null;
   error: string | null;
   missingSections: string[];
   round: number | null;

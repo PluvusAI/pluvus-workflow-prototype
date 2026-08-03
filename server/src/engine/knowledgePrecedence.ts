@@ -25,10 +25,10 @@
 // the per-field annotations. The brief is deliberately NOT a source slot here: it
 // is a CONFLICT CHALLENGER, never a resolution fallback (invariant #2, §4.5).
 //
-// This module is PURE and, on this branch, INERT until Phase 2 migrates the
-// executor call sites to it. It touches no money path: `fixedFee` is special-
-// cased out of this resolver entirely (CA via resolveAgreedFee, or escalate — the
-// resolver must never fabricate a fee; agreedFee.ts / §9).
+// This module is PURE and is used by the three post-acceptance executors to
+// resolve finalized terms. It does not arbitrate the money path: `fixedFee` is
+// special-cased out of this resolver entirely (CA via resolveAgreedFee, or
+// escalate — the resolver must never fabricate a fee; agreedFee.ts / §9).
 
 import { firstString, firstNumber } from "./executors/agreedFee.js";
 
@@ -64,10 +64,10 @@ export interface KnowledgeSources {
    *  present) so a future operator-override feature lights up with no resolver
    *  change and no re-litigation of the order. */
   operatorOverride?: unknown;
-  /** The NEGOTIATION node's config (negotiationConfig). */
-  negotiationState?: unknown;
   /** THIS node's published config (node.config) — "node config wins". */
   workflowConfig?: unknown;
+  /** The NEGOTIATION node's config (negotiationConfig). */
+  negotiationState?: unknown;
   /** campaign.* column. */
   campaignDefault?: unknown;
   // briefSection is deliberately NOT a slot — the brief is a CONFLICT CHALLENGER,
@@ -77,8 +77,8 @@ export interface KnowledgeSources {
 export type SourceLabel =
   | "confirmed_agreement"
   | "operator_override"
-  | "negotiation_state"
   | "workflow_config"
+  | "negotiation_state"
   | "campaign_default"
   | null;
 
@@ -88,14 +88,24 @@ export interface Resolved<T> {
   source: SourceLabel;
 }
 
+/**
+ * `fixedFee` deliberately stays outside the fallback resolver: its only valid
+ * value is a rate recovered from persisted negotiation history. This helper
+ * records that special-case provenance without pretending the fee walked the
+ * configurable source ladder.
+ */
+export function agreedFeeSource(value: number | undefined): SourceLabel {
+  return value === undefined ? null : "confirmed_agreement";
+}
+
 // Label → slot lookup. This is NOT the precedence order (that lives per-category
 // in PRECEDENCE_BY_CATEGORY); it only maps a category's label list back to the
 // KnowledgeSources field to read.
 const SLOT_BY_LABEL: Record<NonNullable<SourceLabel>, keyof KnowledgeSources> = {
   confirmed_agreement: "confirmedAgreement",
   operator_override: "operatorOverride",
-  negotiation_state: "negotiationState",
   workflow_config: "workflowConfig",
+  negotiation_state: "negotiationState",
   campaign_default: "campaignDefault",
 };
 
@@ -104,7 +114,7 @@ const SLOT_BY_LABEL: Record<NonNullable<SourceLabel>, keyof KnowledgeSources> = 
 // category consults. Two families (invariant #2):
 //
 //   Finalized-terms family (commissionRate / deliverables / timeline /
-//   rewardDescription / paymentTerms) — walks a subset of the CA/OO/NS/WC/CD
+//   rewardDescription / paymentTerms) — walks a subset of the CA/OO/WC/NS/CD
 //   ladder. This is what resolveKnowledgeField consolidates from the inline
 //   chains.
 //

@@ -51,12 +51,20 @@ test("reads availability off a NEGOTIATION_TURN.knowledge record", () => {
     ev("NEGOTIATION_TURN", {
       outcome: "present_offer",
       round: 0,
-      knowledge: { briefAvailability: { status: "PARTIAL", error: null, missingSections: ["exclusivity"] } },
+      knowledge: {
+        briefAvailability: {
+          status: "PARTIAL",
+          fileReference: "briefs/campaign.pdf",
+          error: null,
+          missingSections: ["exclusivity"],
+        },
+      },
     }),
   ];
   const k = mapKnowledge(events)!;
   assert.ok(k);
   assert.equal(k.briefAvailability?.status, "PARTIAL");
+  assert.equal(k.briefAvailability?.fileReference, "briefs/campaign.pdf");
   assert.deepEqual(k.briefAvailability?.missingSections, ["exclusivity"]);
   assert.equal(k.briefAvailability?.round, 0);
 });
@@ -135,6 +143,45 @@ test("the SAME conflict repeated across rounds is deduped (field+reason key)", (
   const k = mapKnowledge(events)!;
   assert.equal(k.conflicts.length, 1, "repeated conflict must dedupe");
   assert.equal(k.conflicts[0]!.round, 0, "first occurrence round is kept");
+});
+
+test("a repeated same-key conflict refreshes its displayed values and page", () => {
+  const reason = "exclusivity stance mismatch (campaign vs brief disagree on exclusivity)";
+  const events = [
+    ev("NEGOTIATION_TURN", {
+      round: 0,
+      knowledge: {
+        conflicts: [{
+          section: "exclusivity",
+          campaignField: "exclusivity",
+          campaignValue: "Not exclusive in footwear",
+          briefExcerpt: "Exclusive for 90 days",
+          pageStart: 2,
+          reason,
+        }],
+      },
+    }),
+    ev("NEGOTIATION_TURN", {
+      round: 1,
+      knowledge: {
+        conflicts: [{
+          section: "exclusivity",
+          campaignField: "exclusivity",
+          campaignValue: "Without category exclusivity",
+          briefExcerpt: "Exclusive for 180 days",
+          pageStart: 4,
+          reason,
+        }],
+      },
+    }),
+  ];
+  const row = mapKnowledge(events)!.conflicts[0]!;
+  assert.equal(row.round, 0, "first occurrence round remains stable");
+  assert.equal(row.lastRound, 1);
+  assert.equal(row.campaignValue, "Without category exclusivity");
+  assert.equal(row.briefExcerpt, "Exclusive for 180 days");
+  assert.equal(row.pageStart, 4);
+  assert.equal(row.status, "active");
 });
 
 test("distinct conflicts on the same field (different reason) are both kept", () => {
@@ -244,6 +291,43 @@ test("a conflict ABSENT from a later re-resolution reads as CLEARED, not active 
   assert.equal(k.briefAvailability?.status, "AVAILABLE");
 });
 
+test("a later clean snapshot in the SAME round clears the earlier conflict", () => {
+  // `present_offer` can produce multiple knowledge snapshots without advancing
+  // the negotiation round. Chronological event order, not round equality, decides
+  // whether the conflict survived the latest snapshot.
+  const events = [
+    ev("NEGOTIATION_TURN", {
+      round: 0,
+      knowledge: {
+        briefAvailability: { status: "PARTIAL", error: null, missingSections: [] },
+        conflicts: [netConflict],
+      },
+    }),
+    ev("NEGOTIATION_TURN", {
+      round: 0,
+      knowledge: {
+        briefAvailability: { status: "AVAILABLE", error: null, missingSections: [] },
+        conflicts: [],
+      },
+    }),
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts[0]!.status, "cleared");
+  assert.equal(k.conflicts[0]!.round, 0);
+  assert.equal(k.conflicts[0]!.lastRound, 0);
+  assert.equal(k.briefAvailability?.status, "AVAILABLE");
+});
+
+test("a conflict repeated in a later SAME-round snapshot stays active", () => {
+  const events = [
+    ev("NEGOTIATION_TURN", { round: 0, knowledge: { conflicts: [netConflict] } }),
+    ev("NEGOTIATION_TURN", { round: 0, knowledge: { conflicts: [netConflict] } }),
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts[0]!.status, "active");
+  assert.equal(k.conflicts[0]!.lastRound, 0);
+});
+
 test("a later turn WITHOUT a knowledge block does not clear a standing conflict", () => {
   // A plain counter turn (no re-resolution) must not be treated as a clean
   // knowledge round — the conflict stays active.
@@ -261,6 +345,17 @@ test("conflicts with null rounds stay ACTIVE (can't prove recovery — conservat
   ];
   const k = mapKnowledge(events)!;
   assert.equal(k.conflicts[0]!.status, "active");
+});
+
+test("a later clean snapshot clears a conflict even when both rounds are null", () => {
+  const events = [
+    ev("NEGOTIATION_TURN", { knowledge: { conflicts: [netConflict] } }),
+    ev("NEGOTIATION_TURN", { knowledge: { conflicts: [] } }),
+  ];
+  const k = mapKnowledge(events)!;
+  assert.equal(k.conflicts[0]!.status, "cleared");
+  assert.equal(k.conflicts[0]!.round, null);
+  assert.equal(k.conflicts[0]!.lastRound, null);
 });
 
 test("recovery is per-field: one field clears while another stays active", () => {
