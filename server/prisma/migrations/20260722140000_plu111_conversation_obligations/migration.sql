@@ -70,20 +70,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS "ConversationObligation_open_key"
     ON "ConversationObligation" ("instanceId", "type", "normalizedKey")
     WHERE ("status" IN ('OPEN', 'DEFERRED', 'ESCALATED'));
 
--- AddForeignKey
-ALTER TABLE "ConversationObligation"
-    ADD CONSTRAINT "ConversationObligation_instanceId_fkey"
-    FOREIGN KEY ("instanceId") REFERENCES "ExecutionInstance"("id")
-    ON DELETE RESTRICT ON UPDATE CASCADE;
+-- AddForeignKey (idempotent)
+DO $$ BEGIN
+  ALTER TABLE "ConversationObligation"
+      ADD CONSTRAINT "ConversationObligation_instanceId_fkey"
+      FOREIGN KEY ("instanceId") REFERENCES "ExecutionInstance"("id")
+      ON DELETE RESTRICT ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
--- AddForeignKey
-ALTER TABLE "ConversationObligation"
-    ADD CONSTRAINT "ConversationObligation_sourceMessageId_fkey"
-    FOREIGN KEY ("sourceMessageId") REFERENCES "Message"("id")
-    ON DELETE SET NULL ON UPDATE CASCADE;
+-- AddForeignKey (idempotent)
+DO $$ BEGIN
+  ALTER TABLE "ConversationObligation"
+      ADD CONSTRAINT "ConversationObligation_sourceMessageId_fkey"
+      FOREIGN KEY ("sourceMessageId") REFERENCES "Message"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
--- AddForeignKey
-ALTER TABLE "ConversationObligation"
-    ADD CONSTRAINT "ConversationObligation_resolutionMessageId_fkey"
-    FOREIGN KEY ("resolutionMessageId") REFERENCES "Message"("id")
-    ON DELETE SET NULL ON UPDATE CASCADE;
+-- AddForeignKey (idempotent)
+DO $$ BEGIN
+  ALTER TABLE "ConversationObligation"
+      ADD CONSTRAINT "ConversationObligation_resolutionMessageId_fkey"
+      FOREIGN KEY ("resolutionMessageId") REFERENCES "Message"("id")
+      ON DELETE SET NULL ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
