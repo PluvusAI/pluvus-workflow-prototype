@@ -97,15 +97,24 @@ def _render_delta(delta: list[SummarizeHistoryEntry]) -> str:
 
 
 def _guard_summary(text: str, source: str) -> str:
-    """Drop any money figure the model introduced that is absent from the source
-    turns. A narrative summary carries no figures at all, so this is a hard backstop
-    against the summary's known failure mode (upgrading uncertain → confirmed)."""
-    source_figures = set(_MONEY_RE.findall(source))
-    invented = [m for m in _MONEY_RE.findall(text) if m not in source_figures]
-    if invented:
-        logger.warning("summarize: stripping %d invented money figure(s)", len(invented))
-        for fig in invented:
-            text = text.replace(fig, "").strip()
+    """Strip EVERY money figure from the summary — a narrative carries no figures at
+    all. Rates/percentages are owned by negotiation events / obligations / creator
+    memory, never the summary, so even a source-faithful figure (one the creator
+    actually said) is removed here: the summary must never be a place a $ or % can
+    live, which is the hard backstop against its known failure mode (a lossy
+    restatement upgrading uncertain → confirmed). `source` is retained for logging
+    only. Removing a figure collapses the surrounding whitespace so the narrative
+    doesn't keep a visible hole where the figure was."""
+    figures = _MONEY_RE.findall(text)
+    if figures:
+        logger.warning("summarize: stripping %d money figure(s) from summary", len(figures))
+        for fig in figures:
+            text = text.replace(fig, "")
+        # Collapse the gaps left behind (double spaces, and a space stranded before
+        # punctuation) so the sentence still reads cleanly.
+        text = re.sub(r"\s{2,}", " ", text)
+        text = re.sub(r"\s+([.,;:])", r"\1", text)
+        text = text.strip()
     return text
 
 

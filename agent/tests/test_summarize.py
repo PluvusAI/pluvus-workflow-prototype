@@ -25,10 +25,32 @@ def test_guard_strips_invented_percentage():
     assert "15%" not in out
 
 
-def test_guard_keeps_a_figure_present_in_the_source():
-    # $500 appears in the source, so it is a faithful restatement, not an invention.
+def test_guard_strips_even_a_source_faithful_figure():
+    # Regression (live-Ollama finding): the summary is strictly figure-free. Even a
+    # figure the creator actually said — here $500 is in the source — is removed,
+    # because rates/percentages are owned by events/obligations/memory, never the
+    # narrative summary. This is the stricter "no figures at all" contract.
     out = _guard_summary("We held at $500.", "we said $500 is our rate")
-    assert "$500" in out
+    assert "$500" not in out
+    assert "$" not in out
+
+
+def test_guard_strips_every_figure_when_several_appear():
+    out = _guard_summary(
+        "We started at $400, they wanted $650, and asked for 10% on top.",
+        "the creator mentioned $650 and 10%",
+    )
+    assert "$400" not in out and "$650" not in out and "10%" not in out
+
+
+def test_guard_collapses_whitespace_left_by_a_removed_figure():
+    # Regression (live-Ollama finding): stripping a mid-sentence figure must not
+    # leave a visible double-space hole ("offer of  stating") or a space before
+    # punctuation.
+    out = _guard_summary("They pushed back on the offer of $400 and hesitated.", "src")
+    assert "  " not in out  # no double space
+    assert " ." not in out and " ," not in out  # no space stranded before punctuation
+    assert "$400" not in out
 
 
 def test_guard_leaves_narrative_without_figures_untouched():
