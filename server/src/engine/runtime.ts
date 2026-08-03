@@ -19,6 +19,7 @@ import {
   linkResolutionMessage,
   escalateObligations,
   listOpenObligationsByInstance,
+  ensureMessageScheduledFor,
 } from "../db/index.js";
 import type { Db, DbTx } from "../db/drizzle.js";
 import { findCampaignById } from "../db/campaigns.js";
@@ -275,6 +276,7 @@ export class WorkflowRuntime {
     // step back and the job retries. The transaction returns whether the OCC
     // write won; a StaleInstanceError is thrown OUTSIDE the tx so the rollback
     // has already happened by the time callers see it.
+    let deferredDueAt: Date | undefined;
     const updated = await db.transaction(async (tx) => {
       // Persist state change — OCC: only succeeds if (currentState AND version)
       // still match the snapshot we loaded. BUG-E1: passing the loaded version
@@ -339,6 +341,18 @@ export class WorkflowRuntime {
         await applyObligationWrites(instanceId, result.obligationWrites, tx);
       }
 
+      // Persist the authoritative due time in the same transaction as the
+      // owning state/event commit. Recovery can therefore distinguish an
+      // intentionally deferred outbox row from a lost overdue BullMQ job, and
+      // a rolled-back executor reservation never gains a committed schedule.
+      if (result.deferredSend) {
+        deferredDueAt = await ensureMessageScheduledFor(
+          result.deferredSend.messageId,
+          new Date(now.getTime() + Math.max(0, result.deferredSend.delayMs)),
+          tx,
+        );
+      }
+
       return row;
     });
 
@@ -360,7 +374,9 @@ export class WorkflowRuntime {
       try {
         await this.enqueueDelayedSendFn(
           { messageId: result.deferredSend.messageId },
-          result.deferredSend.delayMs,
+          deferredDueAt
+            ? Math.max(0, deferredDueAt.getTime() - Date.now())
+            : result.deferredSend.delayMs,
         );
       } catch (err) {
         console.error(
@@ -1059,7 +1075,14 @@ export class WorkflowRuntime {
     const closeSend = await reserveBrandRejectCloseEmail(rejectCtx, this.email);
     if (closeSend) {
       try {
-        await this.enqueueDelayedSendFn({ messageId: closeSend.messageId }, closeSend.delayMs);
+        const dueAt = await ensureMessageScheduledFor(
+          closeSend.messageId,
+          new Date(Date.now() + Math.max(0, closeSend.delayMs)),
+        );
+        await this.enqueueDelayedSendFn(
+          { messageId: closeSend.messageId },
+          Math.max(0, dueAt.getTime() - Date.now()),
+        );
       } catch (err) {
         console.error(
           `[runtime] enqueueDelayedSend failed for brand-reject close email ` +

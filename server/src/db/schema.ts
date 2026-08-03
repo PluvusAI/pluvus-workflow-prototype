@@ -121,6 +121,9 @@ export const instanceStateEnum = pgEnum("InstanceState", [
   // here until the BRAND approves (via magic link) before the content brief +
   // payout link go out. Appended to mirror the DB's ALTER TYPE ADD VALUE order.
   "AWAITING_BRAND_APPROVAL",
+  // PLU-122. Appended by ALTER TYPE; queued initial outreach has a durable
+  // Message reservation but has not yet been accepted for provider dispatch.
+  "OUTREACH_QUEUED",
 ]);
 
 // DB member order differs from schema.prisma's declaration order for the
@@ -403,10 +406,40 @@ export const campaigns = pgTable(
     emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
       onDelete: "set null",
     }),
+    // PLU-122. Nullable by design: NULL preserves legacy campaigns. The create
+    // route writes explicit defaults for new campaigns.
+    dailyInitialOutreachLimit: integer("dailyInitialOutreachLimit"),
+    outreachPacingMinMinutes: integer("outreachPacingMinMinutes"),
+    outreachPacingMaxMinutes: integer("outreachPacingMaxMinutes"),
+    negotiationReplyPacingMinMinutes: integer("negotiationReplyPacingMinMinutes"),
+    negotiationReplyPacingMaxMinutes: integer("negotiationReplyPacingMaxMinutes"),
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },
   (table) => [index("Campaign_emailAccountId_idx").on(table.emailAccountId)],
+);
+
+// PLU-122: per-campaign UTC-day quota + pacing cursor. Email payloads remain in
+// Message and delivery remains in the existing delayed-send queue.
+export const campaignOutreachDays = pgTable(
+  "CampaignOutreachDay",
+  {
+    id: cuidId("id"),
+    campaignId: text("campaignId")
+      .notNull()
+      .references(() => campaigns.id, { onDelete: "cascade" }),
+    dayStart: ts("dayStart").notNull(),
+    startedCount: integer("startedCount").notNull().default(0),
+    nextEligibleAt: ts("nextEligibleAt"),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    uniqueIndex("CampaignOutreachDay_campaignId_dayStart_key").on(
+      table.campaignId,
+      table.dayStart,
+    ),
+  ],
 );
 
 export const workflows = pgTable("Workflow", {
@@ -609,6 +642,8 @@ export const messages = pgTable(
     // that (or past SEND_DELAY_MAX_SWEEP_AGE_MS) it is left for manual inspection
     // rather than re-enqueued forever. 0 for every non-swept / inbound row.
     redriveCount: integer("redriveCount").notNull().default(0),
+    scheduledFor: ts("scheduledFor"),
+    initialOutreachQuotaDay: ts("initialOutreachQuotaDay"),
     sentAt: ts("sentAt"),
     receivedAt: ts("receivedAt"),
     processedAt: ts("processedAt"),
@@ -639,6 +674,7 @@ export const messages = pgTable(
     uniqueIndex("Message_idempotencyKey_key").on(table.idempotencyKey),
     index("Message_threadId_idx").on(table.threadId),
     index("Message_instanceId_idx").on(table.instanceId),
+    index("Message_scheduledFor_idx").on(table.scheduledFor),
     index("Message_emailAccountId_idx").on(table.emailAccountId),
   ],
 );
@@ -1202,6 +1238,7 @@ export const insertPayoutSchema = createInsertSchema(payouts).omit({
 // ---------------------------------------------------------------------------
 
 export type Campaign = typeof campaigns.$inferSelect;
+export type CampaignOutreachDay = typeof campaignOutreachDays.$inferSelect;
 export type ConnectedEmailAccount = typeof connectedEmailAccounts.$inferSelect;
 export type Workflow = typeof workflows.$inferSelect;
 export type WorkflowVersion = typeof workflowVersions.$inferSelect;
@@ -1253,6 +1290,7 @@ export type InsertPayout = z.infer<typeof insertPayoutSchema>;
 // Raw insert types (what db.insert(...).values() accepts, ids/timestamps
 // optional because of the $defaultFn/default declarations above).
 export type CampaignInsert = typeof campaigns.$inferInsert;
+export type CampaignOutreachDayInsert = typeof campaignOutreachDays.$inferInsert;
 export type ConnectedEmailAccountInsert = typeof connectedEmailAccounts.$inferInsert;
 export type InsertConnectedEmailAccount = z.infer<
   typeof insertConnectedEmailAccountSchema

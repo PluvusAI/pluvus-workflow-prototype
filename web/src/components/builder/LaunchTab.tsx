@@ -13,6 +13,7 @@ interface Props {
 
 const ALL_STATES: InstanceState[] = [
   "ENROLLED",
+  "OUTREACH_QUEUED",
   "OUTREACH_SENT",
   "AWAITING_REPLY",
   "FOLLOWED_UP",
@@ -43,7 +44,10 @@ export function LaunchTab({ workflow, onLaunched }: Props) {
   const data = execution.data;
   const enrolledCount = data?.stateCounts["ENROLLED"] ?? 0;
   const totalInstances = data?.totalInstances ?? 0;
-  const hasLaunched = totalInstances > 0 && (data?.stateCounts["OUTREACH_SENT"] ?? 0) > 0;
+  const hasLaunched =
+    totalInstances > 0 &&
+    ((data?.stateCounts["OUTREACH_QUEUED"] ?? 0) > 0 ||
+      (data?.stateCounts["OUTREACH_SENT"] ?? 0) > 0);
 
   async function handleLaunch() {
     setLaunching(true);

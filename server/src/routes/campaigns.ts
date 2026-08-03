@@ -15,6 +15,10 @@ import {
 import { findEmailAccountById } from "../db/emailAccounts.js";
 import { getTemplate } from "../templates/index.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
+import {
+  validateCreateSendingSettings,
+  validatePatchSendingSettings,
+} from "../validation/campaignSendingSettings.js";
 
 const router = Router();
 
@@ -36,6 +40,11 @@ router.get("/", async (_req: Request, res: Response) => {
         rewardDescription: c.rewardDescription,
         shipsPhysicalProduct: c.shipsPhysicalProduct,
         postAcceptanceMode: c.postAcceptanceMode,
+        dailyInitialOutreachLimit: c.dailyInitialOutreachLimit,
+        outreachPacingMinMinutes: c.outreachPacingMinMinutes,
+        outreachPacingMaxMinutes: c.outreachPacingMaxMinutes,
+        negotiationReplyPacingMinMinutes: c.negotiationReplyPacingMinMinutes,
+        negotiationReplyPacingMaxMinutes: c.negotiationReplyPacingMaxMinutes,
         emailAccountId: c.emailAccountId,
         createdAt: c.createdAt.toISOString(),
         updatedAt: c.updatedAt.toISOString(),
@@ -142,6 +151,12 @@ router.post("/", async (req: Request, res: Response) => {
     return;
   }
 
+  const sendingSettings = validateCreateSendingSettings(req.body as Record<string, unknown>);
+  if (!sendingSettings.valid) {
+    res.status(400).json({ error: sendingSettings.error });
+    return;
+  }
+
   // PLU-121: when a default sender is supplied, it must reference a real
   // connected account — reject an unknown id rather than silently storing a
   // dangling pointer that would fall back to the default account at enrollment.
@@ -185,6 +200,7 @@ router.post("/", async (req: Request, res: Response) => {
       // Omitted → the column default (local_payment) applies, so a client that
       // predates this field creates a campaign that behaves exactly as before.
       ...(isPostAcceptanceMode(postAcceptanceMode) ? { postAcceptanceMode } : {}),
+      ...sendingSettings.value,
       // PLU-121: the chosen default sender. Omitted → null → enrollment falls back
       // to the default connected account.
       ...(trimmedAccountId ? { emailAccountId: trimmedAccountId } : {}),
@@ -208,6 +224,11 @@ router.post("/", async (req: Request, res: Response) => {
       targetUrl: campaign.targetUrl,
       hiddenParamKey: campaign.hiddenParamKey,
       postAcceptanceMode: campaign.postAcceptanceMode,
+      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       emailAccountId: campaign.emailAccountId,
       createdAt: campaign.createdAt.toISOString(),
     });
@@ -238,6 +259,11 @@ router.get("/:id", async (req: Request, res: Response) => {
       rewardDescription: campaign.rewardDescription,
       shipsPhysicalProduct: campaign.shipsPhysicalProduct,
       postAcceptanceMode: campaign.postAcceptanceMode,
+      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       emailAccountId: campaign.emailAccountId,
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
@@ -355,6 +381,15 @@ router.patch("/:id", async (req: Request, res: Response) => {
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
 
+  const sendingSettings = validatePatchSendingSettings(
+    req.body as Record<string, unknown>,
+  );
+  if (!sendingSettings.valid) {
+    res.status(400).json({ error: sendingSettings.error });
+    return;
+  }
+  Object.assign(patch, sendingSettings.value);
+
   if (notifyEmail !== undefined) {
     const trimmed = typeof notifyEmail === "string" ? notifyEmail.trim() : "";
     if (trimmed && !isEmailish(trimmed)) {
@@ -436,6 +471,11 @@ router.patch("/:id", async (req: Request, res: Response) => {
       rewardDescription: campaign.rewardDescription,
       shipsPhysicalProduct: campaign.shipsPhysicalProduct,
       postAcceptanceMode: campaign.postAcceptanceMode,
+      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       emailAccountId: campaign.emailAccountId,
       updatedAt: campaign.updatedAt.toISOString(),
     });

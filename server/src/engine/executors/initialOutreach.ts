@@ -1,6 +1,6 @@
 import type { ExecutionContext, NodeResult, EmailDraft } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
-import { sendOnce } from "./idempotentSend.js";
+import { reserveOutbound } from "./idempotentSend.js";
 import { describeDeal, dealShape } from "../dealDescription.js";
 import {
   scanOutboundDraft,
@@ -137,31 +137,34 @@ export async function executeInitialOutreach(
     return outreachBlockedByGuard(guard.hits);
   }
 
-  // FIX-11: reserve-before-send so a crash between send and the row write can't
-  // double-send the outreach on a BullMQ retry. One outreach per instance.
-  const { messageId, threadId } = await sendOnce(
-    email,
+  // PLU-122: initial outreach now uses the same durable delayed-send outbox as
+  // negotiation replies. Reserving here (before the OCC state commit) is safe:
+  // runtime only enqueues after that commit, and the recovery sweep requires the
+  // OUTREACH_DRAFTED commit event before it can redrive this reservation.
+  const reserved = await reserveOutbound(
     instance.id,
-    creator,
     draft,
     `outreach:${instance.id}`,
-    undefined, // deps — default
-    undefined, // recipient — creator (not a brand-outbound send)
-    // Gmail Campaign Labels (§6.3): pass the already-loaded campaign name so the
-    // thread is labeled Pluvus/<name>. Free field read on ctx.campaign — no query.
-    ctx.campaign?.name,
   );
 
   const nextNode = nodeGraph.find((n) => n.order === node.order + 1) ?? null;
 
+  // A retry after the provider already delivered the row should finish the old
+  // synchronous lifecycle without enqueueing another flush. Fresh and reserved-
+  // but-unsent rows park in OUTREACH_QUEUED until the delayed-send worker sends.
+  const nextState = reserved.alreadySent ? "OUTREACH_SENT" : "OUTREACH_QUEUED";
+
   return {
-    nextState: "OUTREACH_SENT",
+    nextState,
     nextNodeId: nextNode?.id ?? null,
+    ...(!reserved.alreadySent
+      ? { deferredSend: { messageId: reserved.messageId, delayMs: 0 } }
+      : {}),
     eventType: "OUTREACH_DRAFTED",
     eventPayload: {
       subject: draft.subject,
-      messageId,
-      threadId,
+      messageId: reserved.messageId,
+      queued: !reserved.alreadySent,
       // aiGenerated=false marks an operator-written outreach so history and the
       // inspector can distinguish it from an AI draft. outreachMode records which
       // path produced this email for observability.

@@ -3,7 +3,7 @@ import {
   listEventsByInstance,
   listOpenObligationsByInstance,
 } from "../../db/index.js";
-import type { ConversationObligation, Message } from "../../db/schema.js";
+import type { Campaign, ConversationObligation, Message } from "../../db/schema.js";
 import type { ExecutionContext, NodeResult, NegotiationHistoryEntryLite, PriorNegotiationContext, EmailDraft } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import {
@@ -29,7 +29,7 @@ import {
 } from "../conversationContext.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
-import { randomSendDelayMs } from "../sendDelay.js";
+import { negotiationReplyDelayMs } from "../sendDelay.js";
 import { describeDeal } from "../dealDescription.js";
 import { extractReplyText } from "./replyText.js";
 import { mergeCampaignFallback } from "../campaignContext.js";
@@ -83,13 +83,14 @@ async function reserveAiReply(
   instanceId: string,
   draft: EmailDraft,
   idempotencyKey: string,
+  campaign: Campaign | null | undefined,
 ): Promise<{ deferredSend?: { messageId: string; delayMs: number }; sendScheduledInMs: number }> {
   const reserved = await reserveOutbound(instanceId, draft, idempotencyKey);
   if (reserved.alreadySent) {
     // Already delivered on a prior attempt — no re-enqueue, no re-draw.
     return { sendScheduledInMs: 0 };
   }
-  const delayMs = randomSendDelayMs();
+  const delayMs = negotiationReplyDelayMs(campaign);
   return {
     deferredSend: { messageId: reserved.messageId, delayMs },
     sendScheduledInMs: delayMs,
@@ -361,6 +362,7 @@ async function reserveCloseEmail(
       instance.id,
       draft,
       `negotiation:close:${instance.id}:${instance.negotiationRound}`,
+      ctx.campaign,
     );
   } catch (err) {
     // Best-effort (#15, Q2): never let a close-email reserve failure block the
@@ -1159,7 +1161,7 @@ export async function executeNegotiation(
         : `negotiation:present:${instance.id}:${instance.negotiationRound}`;
       // Reserve now, defer the send (§4.1, §4.3a): the runtime enqueues the
       // delayed flush after this turn's OCC commit.
-      const present = await reserveAiReply(instance.id, draft, presentKey);
+      const present = await reserveAiReply(instance.id, draft, presentKey, ctx.campaign);
 
       // Back to AWAITING_REPLY at the SAME node. The round is unchanged on a
       // "free" present turn; past the MED-W3 cap it advances so the loop is
@@ -1280,6 +1282,7 @@ export async function executeNegotiation(
         instance.id,
         draft,
         `negotiation:acceptance:${instance.id}:${instance.negotiationRound}`,
+        ctx.campaign,
       );
 
       // §6.1: records stamped uniformly by withContextRecord.
@@ -1434,6 +1437,7 @@ export async function executeNegotiation(
         instance.id,
         draft,
         `negotiation:counter_offer:${instance.id}:${newRound}`,
+        ctx.campaign,
       );
 
       // §6.1: records stamped uniformly by withContextRecord.

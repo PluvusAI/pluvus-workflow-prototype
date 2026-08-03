@@ -48,6 +48,7 @@ import {
   type ValidationIssue,
 } from "../../workflow/graphValidation";
 import { nodeLabel, nodeIconComponent } from "./nodeMeta";
+import { CampaignSendingSettings } from "./CampaignSendingSettings";
 
 type Tab = "build" | "enroll" | "launch" | "monitor" | "queue";
 
@@ -406,6 +407,12 @@ export function WorkflowBuilder({ workflowId, onBack }: Props) {
           <Breadcrumbs items={crumbs} />
         </div>
         <StatusBadge status={wf.status} />
+        {wf.campaign && (
+          <CampaignSendingSettings
+            campaign={wf.campaign}
+            onSaved={inv.invalidateWorkflow}
+          />
+        )}
         {wf.latestVersion && (
           <Button
             variant="secondary"

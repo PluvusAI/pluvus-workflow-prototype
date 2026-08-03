@@ -8,7 +8,11 @@ const TRANSITIONS: Record<InstanceState, InstanceState[]> = {
   // MANUAL_REVIEW is reachable from the outreach/follow-up states too (H4): if the
   // output guard catches a floor/ceiling leak in an AI-generated outreach or
   // follow-up email, the funnel halts for human review instead of sending it.
-  ENROLLED: ["OUTREACH_SENT", "OPTED_OUT", "MANUAL_REVIEW"],
+  ENROLLED: ["OUTREACH_QUEUED", "OUTREACH_SENT", "OPTED_OUT", "MANUAL_REVIEW"],
+  // PLU-122: the initial email has a committed outbox reservation but has not
+  // necessarily reached the provider. Only the delayed-send worker may advance
+  // this state, after Message.sentAt is durable.
+  OUTREACH_QUEUED: ["OUTREACH_SENT", "REPLY_RECEIVED", "OPTED_OUT", "MANUAL_REVIEW"],
   // CRITICAL-6: a creator reply can arrive while the instance is still
   // OUTREACH_SENT (before the scheduler has transitioned it to AWAITING_REPLY).
   // Without a REPLY_RECEIVED edge here, injectReply persisted the Message row and

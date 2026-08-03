@@ -116,6 +116,11 @@ export function createCampaign(data: {
   targetUrl?: string;
   hiddenParamKey?: string;
   postAcceptanceMode?: PostAcceptanceMode;
+  dailyInitialOutreachLimit?: number;
+  outreachPacingMinMinutes?: number;
+  outreachPacingMaxMinutes?: number;
+  negotiationReplyPacingMinMinutes?: number;
+  negotiationReplyPacingMaxMinutes?: number;
   /** PLU-121: the connected mailbox to send this campaign's outreach from. */
   emailAccountId?: string;
 }) {
@@ -134,11 +139,23 @@ export function updateCampaign(
     rewardDescription?: string | null;
     shipsPhysicalProduct?: boolean;
     postAcceptanceMode?: PostAcceptanceMode;
-    /** PLU-121: change the default sender (null clears back to the default account). */
-    emailAccountId?: string | null;
+  dailyInitialOutreachLimit?: number;
+  outreachPacingMinMinutes?: number;
+  outreachPacingMaxMinutes?: number;
+  negotiationReplyPacingMinMinutes?: number;
+  negotiationReplyPacingMaxMinutes?: number;
+  /** PLU-121: change the default sender (null clears back to the default account). */
+  emailAccountId?: string | null;
   },
 ) {
-  return apiFetch<{ id: string; notifyEmail: string | null }>(`/api/campaigns/${id}`, {
+  return apiFetch<{
+    id: string;
+    dailyInitialOutreachLimit: number | null;
+    outreachPacingMinMinutes: number | null;
+    outreachPacingMaxMinutes: number | null;
+    negotiationReplyPacingMinMinutes: number | null;
+    negotiationReplyPacingMaxMinutes: number | null;
+  }>(`/api/campaigns/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),

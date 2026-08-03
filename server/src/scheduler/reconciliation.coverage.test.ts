@@ -42,6 +42,11 @@ import type { NodeExecutionJobData } from "../workers/jobs.js";
 // accept commit and the handoff enqueue.
 const WAITING_STATES: InstanceState[] = [
   "AWAITING_REPLY",
+  // PLU-122: this state is owned by the delayed-send outbox, not the
+  // node-execution worker. Its dedicated sweep recovers a lost or overdue
+  // delayed-send job; re-enqueuing the instance here would run the follow-up
+  // node before the initial email has actually been sent.
+  "OUTREACH_QUEUED",
   "REWARD_PENDING",
   "PAYMENT_PENDING",
   // CONTENT_LINKS_PENDING parks on the creator's content-links reply, just like

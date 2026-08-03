@@ -55,7 +55,6 @@ export function defaultConfigFor(type: NodeType): NodeConfig {
         subjectTemplate: "Partnership opportunity with {{brandName}}",
         bodyTemplate:
           "Hi {{creatorName}},\n\nI'm reaching out from {{brandName}} — we've been enjoying your {{platform}} content and think there could be a great fit for a partnership.\n\nWould you be open to hearing the details? Happy to share what we have in mind.\n\nBest,\n{{senderName}}",
-        delaySeconds: 0,
       };
     case "FOLLOW_UP":
       return {

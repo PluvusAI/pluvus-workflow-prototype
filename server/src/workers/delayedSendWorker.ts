@@ -1,10 +1,19 @@
-import { Worker, type Job } from "bullmq";
+import { DelayedError, Worker, type Job } from "bullmq";
 import { redisConnection } from "./redis.js";
-import { QUEUE_DELAYED_SEND, workerConcurrency } from "./queues.js";
+import {
+  QUEUE_DELAYED_SEND,
+  enqueueNodeExecution,
+  workerConcurrency,
+} from "./queues.js";
 import type { DelayedSendJobData } from "./jobs.js";
 import { emailProvider } from "../engine/providerFactory.js";
 import { flushOutbound } from "../engine/executors/idempotentSend.js";
 import { deadLetterIfExhausted } from "./deadLetter.js";
+import {
+  claimInitialOutreachSlot,
+  completeQueuedInitialOutreach,
+  findMessageById,
+} from "../db/index.js";
 
 // ---------------------------------------------------------------------------
 // DelayedSend worker (Randomized Send Delay — §4.2, §6.6)
@@ -34,6 +43,27 @@ const email = emailProvider();
 async function handleDelayedSend(job: Job<DelayedSendJobData>): Promise<void> {
   const { messageId } = job.data;
   const startedAt = Date.now();
+  const message = await findMessageById(messageId);
+  const isInitialOutreach = message?.idempotencyKey?.startsWith("outreach:") ?? false;
+
+  if (isInitialOutreach) {
+    // The campaign row lock inside this claim serializes all concurrent workers
+    // for a campaign. The claim is the strict "accepted for dispatch" boundary:
+    // it consumes one daily slot before the provider call, and Message's claim
+    // marker makes provider retries idempotent.
+    const claim = await claimInitialOutreachSlot(messageId);
+    if (claim.status === "defer") {
+      const retryAt = Math.max(Date.now() + 1_000, claim.retryAt.getTime());
+      await job.moveToDelayed(retryAt, job.token);
+      console.log(
+        `[delayed-send] deferred outreach ${messageId} (${claim.reason}) until ` +
+          `${new Date(retryAt).toISOString()} (job ${job.id})`,
+      );
+      // BullMQ requires this sentinel after manually moving an active job. It
+      // prevents the worker from trying to mark the now-delayed job completed.
+      throw new DelayedError();
+    }
+  }
 
   // flushOutbound reloads the full send context from the id (§4.1a), takes the
   // per-send lock, and re-checks NULL — so it is safe to call on a retry or on a
@@ -50,6 +80,21 @@ async function handleDelayedSend(job: Job<DelayedSendJobData>): Promise<void> {
     console.log(
       `[delayed-send] flushed ${messageId} → ${result.messageId} after ${elapsed}ms (job ${job.id})`,
     );
+  }
+
+  if (isInitialOutreach) {
+    const completion = await completeQueuedInitialOutreach(messageId);
+    if (completion === "completed" || completion === "already_completed") {
+      await enqueueNodeExecution({
+        instanceId: message!.instanceId,
+        expectedState: "OUTREACH_SENT",
+        triggerRef: `outreach-delivered-${messageId}`,
+      });
+      console.log(
+        `[delayed-send] outreach ${messageId} delivered; queued follow-up lifecycle ` +
+          `(instance ${message!.instanceId})`,
+      );
+    }
   }
 }
 

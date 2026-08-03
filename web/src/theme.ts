@@ -295,6 +295,7 @@ export function statusKey(status: string): StatusKey {
 // negative red/brown, review amber.
 export const stateColor: Record<InstanceState, string> = {
   ENROLLED: "#8a7f6c", // neutral warm — just entered
+  OUTREACH_QUEUED: "#8b78bf", // queued behind campaign pacing/quota
   OUTREACH_SENT: "#7a6fd0", // active lavender
   AWAITING_REPLY: "#6b5fc4", // active lavender (deeper)
   FOLLOWED_UP: "#9265c9", // purple — re-engagement
@@ -317,6 +318,7 @@ export const stateColor: Record<InstanceState, string> = {
 
 export const stateLabel: Record<InstanceState, string> = {
   ENROLLED: "Enrolled",
+  OUTREACH_QUEUED: "Outreach Queued",
   OUTREACH_SENT: "Outreach Sent",
   AWAITING_REPLY: "Awaiting Reply",
   FOLLOWED_UP: "Followed Up",
@@ -340,6 +342,7 @@ export const stateLabel: Record<InstanceState, string> = {
 // Plain-English "what does this state mean" for non-engineers (node tooltips).
 export const stateDescription: Record<InstanceState, string> = {
   ENROLLED: "Imported into the campaign; outreach not yet sent.",
+  OUTREACH_QUEUED: "First email is queued and waiting for its campaign send slot.",
   OUTREACH_SENT: "First email sent; waiting to mark as awaiting reply.",
   AWAITING_REPLY: "Outreach delivered; waiting on the creator to respond.",
   FOLLOWED_UP: "A follow-up nudge was sent; waiting on a response.",

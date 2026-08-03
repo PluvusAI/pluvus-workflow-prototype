@@ -119,6 +119,8 @@ function message(instanceId: string): ThreadMessage {
     replyIntent: null,
     classifyConfidence: null,
     redriveCount: 0,
+    scheduledFor: null,
+    initialOutreachQuotaDay: null,
     processedAt: null,
     sentAt: new Date("2026-08-01T00:00:00.000Z"),
     receivedAt: null,

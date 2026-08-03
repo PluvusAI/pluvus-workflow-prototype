@@ -57,6 +57,7 @@ export interface SendDelaySweepDeps {
   listStrandedOutboundReservations(args: {
     now: Date;
     lowerBoundMs: number;
+    scheduleGraceMs: number;
     maxAgeMs: number;
     maxRedrives: number;
     limit?: number;
@@ -79,13 +80,17 @@ export interface SendDelaySweepDeps {
 // The idempotencyKey prefix for the brand-reject creator close email. Kept in sync
 // with brandRejectCloseKey() in brandRejectEmail.ts (`brand-reject-close:<id>`).
 export const BRAND_REJECT_CLOSE_PREFIX = "brand-reject-close:";
+export const INITIAL_OUTREACH_PREFIX = "outreach:";
 
 // Map a reservation to the event type whose committed presence proves its owning
 // action committed. Default is NEGOTIATION_TURN (AI negotiation replies, the
 // overwhelming majority of delayed sends); a brand-reject close email is committed
 // by the reject transition's BRAND_REJECTED event instead. Exported for unit tests.
-export function committingEventType(row: Message): "NEGOTIATION_TURN" | "BRAND_REJECTED" {
+export function committingEventType(
+  row: Message,
+): "NEGOTIATION_TURN" | "BRAND_REJECTED" | "OUTREACH_DRAFTED" {
   if (row.idempotencyKey?.startsWith(BRAND_REJECT_CLOSE_PREFIX)) return "BRAND_REJECTED";
+  if (row.idempotencyKey?.startsWith(INITIAL_OUTREACH_PREFIX)) return "OUTREACH_DRAFTED";
   return "NEGOTIATION_TURN";
 }
 
@@ -127,6 +132,7 @@ export async function sweepStrandedSends(
     stranded = await deps.listStrandedOutboundReservations({
       now,
       lowerBoundMs,
+      scheduleGraceMs: cfg.sweepGraceMs,
       maxAgeMs: cfg.maxSweepAgeMs,
       maxRedrives: cfg.maxRedrives,
       limit: 100,
