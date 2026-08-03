@@ -23,9 +23,13 @@
 -- No raw credentials are stored: only the Nylas GRANT id (an opaque per-mailbox
 -- handle) and the mailbox address live here. The application API key stays an
 -- env value shared across grants (single Nylas application, many grants).
+--
+-- Idempotent: CREATE TABLE/INDEX use IF NOT EXISTS, ADD COLUMN uses IF NOT EXISTS,
+-- the seed INSERT uses ON CONFLICT DO NOTHING, DROP INDEX uses IF EXISTS,
+-- ADD CONSTRAINT uses DO/EXCEPTION.
 
--- CreateTable
-CREATE TABLE "ConnectedEmailAccount" (
+-- CreateTable (idempotent)
+CREATE TABLE IF NOT EXISTS "ConnectedEmailAccount" (
     "id" TEXT NOT NULL,
     "nylasGrantId" TEXT NOT NULL,
     "emailAddress" TEXT NOT NULL,
@@ -39,19 +43,16 @@ CREATE TABLE "ConnectedEmailAccount" (
     CONSTRAINT "ConnectedEmailAccount_pkey" PRIMARY KEY ("id")
 );
 
--- CreateIndex
-CREATE UNIQUE INDEX "ConnectedEmailAccount_nylasGrantId_key" ON "ConnectedEmailAccount"("nylasGrantId");
-
--- CreateIndex
-CREATE INDEX "ConnectedEmailAccount_status_idx" ON "ConnectedEmailAccount"("status");
-
+-- CreateIndex (idempotent)
+CREATE UNIQUE INDEX IF NOT EXISTS "ConnectedEmailAccount_nylasGrantId_key" ON "ConnectedEmailAccount"("nylasGrantId");
+CREATE INDEX IF NOT EXISTS "ConnectedEmailAccount_status_idx" ON "ConnectedEmailAccount"("status");
 -- At most one default account (partial unique index over the default rows).
-CREATE UNIQUE INDEX "ConnectedEmailAccount_isDefault_key" ON "ConnectedEmailAccount"("isDefault") WHERE "isDefault" = true;
+CREATE UNIQUE INDEX IF NOT EXISTS "ConnectedEmailAccount_isDefault_key" ON "ConnectedEmailAccount"("isDefault") WHERE "isDefault" = true;
 
--- AlterTable — add the (nullable) account references.
-ALTER TABLE "Campaign" ADD COLUMN "emailAccountId" TEXT;
-ALTER TABLE "ExecutionInstance" ADD COLUMN "emailAccountId" TEXT;
-ALTER TABLE "Message" ADD COLUMN "emailAccountId" TEXT;
+-- AlterTable — add the (nullable) account references (idempotent).
+ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "emailAccountId" TEXT;
+ALTER TABLE "ExecutionInstance" ADD COLUMN IF NOT EXISTS "emailAccountId" TEXT;
+ALTER TABLE "Message" ADD COLUMN IF NOT EXISTS "emailAccountId" TEXT;
 
 -- Seed from the optional migration-session settings and backfill every existing
 -- row to the result, so multi-account is purely additive for existing data.
@@ -59,6 +60,8 @@ ALTER TABLE "Message" ADD COLUMN "emailAccountId" TEXT;
 -- missing grant produces a reconcilable placeholder row, but it must NOT become
 -- an active/default sender: doing so would route production mail through a fake
 -- grant until the seed was explicitly reconciled.
+-- ON CONFLICT DO NOTHING makes this idempotent: re-running does not overwrite
+-- a seed row already present (e.g. one customised by a later reconciliation step).
 WITH migration_config AS (
     SELECT
         NULLIF(
@@ -77,34 +80,53 @@ SELECT
     CASE WHEN grant_id IS NULL THEN 'disabled' ELSE 'active' END,
     grant_id IS NOT NULL,
     CURRENT_TIMESTAMP
-FROM migration_config;
+FROM migration_config
+ON CONFLICT DO NOTHING;
 
 UPDATE "Campaign" SET "emailAccountId" = 'seed_default_email_account' WHERE "emailAccountId" IS NULL;
 UPDATE "ExecutionInstance" SET "emailAccountId" = 'seed_default_email_account' WHERE "emailAccountId" IS NULL;
 UPDATE "Message" SET "emailAccountId" = 'seed_default_email_account' WHERE "emailAccountId" IS NULL;
 
--- CreateIndex
-CREATE INDEX "Campaign_emailAccountId_idx" ON "Campaign"("emailAccountId");
-CREATE INDEX "ExecutionInstance_emailAccountId_idx" ON "ExecutionInstance"("emailAccountId");
-CREATE INDEX "Message_emailAccountId_idx" ON "Message"("emailAccountId");
+-- CreateIndex (idempotent)
+CREATE INDEX IF NOT EXISTS "Campaign_emailAccountId_idx" ON "Campaign"("emailAccountId");
+CREATE INDEX IF NOT EXISTS "ExecutionInstance_emailAccountId_idx" ON "ExecutionInstance"("emailAccountId");
+CREATE INDEX IF NOT EXISTS "Message_emailAccountId_idx" ON "Message"("emailAccountId");
 
 -- Nylas message ids are scoped to a grant. The original single-mailbox schema
 -- enforced global uniqueness, which makes account B's message collide with an
 -- unrelated account A message carrying the same provider-local id. Replace it
 -- with one namespace per account. Account-less legacy/mock rows retain their
 -- original dedupe guarantee in a dedicated partial unique namespace.
-DROP INDEX "Message_externalMessageId_key";
-CREATE UNIQUE INDEX "Message_emailAccountId_externalMessageId_key"
+-- DROP INDEX IF EXISTS so a partial prior run that already dropped it does not fail.
+DROP INDEX IF EXISTS "Message_externalMessageId_key";
+CREATE UNIQUE INDEX IF NOT EXISTS "Message_emailAccountId_externalMessageId_key"
     ON "Message"("emailAccountId", "externalMessageId");
-CREATE UNIQUE INDEX "Message_legacyExternalMessageId_key"
+CREATE UNIQUE INDEX IF NOT EXISTS "Message_legacyExternalMessageId_key"
     ON "Message"("externalMessageId")
     WHERE "emailAccountId" IS NULL AND "externalMessageId" IS NOT NULL;
 
--- AddForeignKey. Campaign/run selections may clear when an unused account is
--- deleted. Message attribution is RESTRICTED: collapsing account-scoped provider
--- ids into the legacy NULL namespace can collide and would erase the durable
--- mailbox audit trail. Connected accounts with history are disabled/revoked,
--- never deleted.
-ALTER TABLE "Campaign" ADD CONSTRAINT "Campaign_emailAccountId_fkey" FOREIGN KEY ("emailAccountId") REFERENCES "ConnectedEmailAccount"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-ALTER TABLE "ExecutionInstance" ADD CONSTRAINT "ExecutionInstance_emailAccountId_fkey" FOREIGN KEY ("emailAccountId") REFERENCES "ConnectedEmailAccount"("id") ON DELETE SET NULL ON UPDATE CASCADE;
-ALTER TABLE "Message" ADD CONSTRAINT "Message_emailAccountId_fkey" FOREIGN KEY ("emailAccountId") REFERENCES "ConnectedEmailAccount"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- AddForeignKey (idempotent). Campaign/run selections may clear when an unused
+-- account is deleted. Message attribution is RESTRICTED: collapsing account-scoped
+-- provider ids into the legacy NULL namespace can collide and would erase the
+-- durable mailbox audit trail. Connected accounts with history are
+-- disabled/revoked, never deleted.
+DO $$ BEGIN
+  ALTER TABLE "Campaign" ADD CONSTRAINT "Campaign_emailAccountId_fkey"
+    FOREIGN KEY ("emailAccountId") REFERENCES "ConnectedEmailAccount"("id")
+    ON DELETE SET NULL ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE "ExecutionInstance" ADD CONSTRAINT "ExecutionInstance_emailAccountId_fkey"
+    FOREIGN KEY ("emailAccountId") REFERENCES "ConnectedEmailAccount"("id")
+    ON DELETE SET NULL ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+DO $$ BEGIN
+  ALTER TABLE "Message" ADD CONSTRAINT "Message_emailAccountId_fkey"
+    FOREIGN KEY ("emailAccountId") REFERENCES "ConnectedEmailAccount"("id")
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;

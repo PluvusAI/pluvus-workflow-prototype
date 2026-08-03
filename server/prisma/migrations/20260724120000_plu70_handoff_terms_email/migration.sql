@@ -7,8 +7,10 @@
 --
 -- All three are nullable with no default, so every existing DealHandoff row is
 -- valid as-is (NULL = "not captured") and no backfill is required.
+--
+-- Idempotent: ADD COLUMN IF NOT EXISTS so a partial prior run does not fail a re-run.
 
 -- AlterTable
-ALTER TABLE "DealHandoff" ADD COLUMN "negotiationFloor" DOUBLE PRECISION;
-ALTER TABLE "DealHandoff" ADD COLUMN "negotiationCeiling" DOUBLE PRECISION;
-ALTER TABLE "DealHandoff" ADD COLUMN "rewardDescription" TEXT;
+ALTER TABLE "DealHandoff" ADD COLUMN IF NOT EXISTS "negotiationFloor" DOUBLE PRECISION;
+ALTER TABLE "DealHandoff" ADD COLUMN IF NOT EXISTS "negotiationCeiling" DOUBLE PRECISION;
+ALTER TABLE "DealHandoff" ADD COLUMN IF NOT EXISTS "rewardDescription" TEXT;

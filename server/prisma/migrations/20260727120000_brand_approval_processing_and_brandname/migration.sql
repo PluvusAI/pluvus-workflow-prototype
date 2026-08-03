@@ -14,14 +14,10 @@
 -- No data backfill and no column is dropped or made NOT NULL, so every in-flight
 -- and historical BrandApproval row is untouched.
 --
--- Transactionality: Postgres forbids USING a newly added enum value in the SAME
--- transaction that adds it. This migration only ADDS the PROCESSING member — it
--- never inserts or compares it — so it is safe inside Prisma's single-transaction
--- migration, exactly like the gate's original migration.
+-- Idempotent: ALTER TYPE uses IF NOT EXISTS, ADD COLUMN uses IF NOT EXISTS.
 
--- AlterEnum: add PROCESSING between AWAITING_APPROVAL and APPROVED for readability
--- (enum member ORDER is cosmetic in Postgres; it does not affect comparisons here).
-ALTER TYPE "BrandApprovalStatus" ADD VALUE 'PROCESSING' BEFORE 'APPROVED';
+-- AlterEnum (idempotent)
+ALTER TYPE "BrandApprovalStatus" ADD VALUE IF NOT EXISTS 'PROCESSING' BEFORE 'APPROVED';
 
--- AlterTable
-ALTER TABLE "BrandApproval" ADD COLUMN "brandName" TEXT;
+-- AlterTable (idempotent)
+ALTER TABLE "BrandApproval" ADD COLUMN IF NOT EXISTS "brandName" TEXT;

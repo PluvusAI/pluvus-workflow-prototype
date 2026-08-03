@@ -10,30 +10,39 @@
 -- inserts or compares one — so it is safe inside Prisma's single-transaction
 -- migration. The new DealHandoffStatus/PostAcceptanceMode types are created
 -- whole by CREATE TYPE, which carries no such restriction.
+--
+-- Idempotent: ALTER TYPE uses IF NOT EXISTS, CREATE TYPE uses DO/EXCEPTION,
+-- tables/indexes/columns use IF NOT EXISTS, constraints use DO/EXCEPTION.
 
--- AlterEnum
-ALTER TYPE "InstanceState" ADD VALUE 'NEEDS_DEAL_FINALIZATION';
-ALTER TYPE "InstanceState" ADD VALUE 'HANDOFF_COMPLETE';
+-- AlterEnum (idempotent)
+ALTER TYPE "InstanceState" ADD VALUE IF NOT EXISTS 'NEEDS_DEAL_FINALIZATION';
+ALTER TYPE "InstanceState" ADD VALUE IF NOT EXISTS 'HANDOFF_COMPLETE';
 
--- AlterEnum
-ALTER TYPE "EventType" ADD VALUE 'DEAL_HANDOFF_REQUESTED';
-ALTER TYPE "EventType" ADD VALUE 'DEAL_HANDOFF_REPLY';
-ALTER TYPE "EventType" ADD VALUE 'DEAL_HANDOFF_COMPLETED';
+-- AlterEnum (idempotent)
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'DEAL_HANDOFF_REQUESTED';
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'DEAL_HANDOFF_REPLY';
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'DEAL_HANDOFF_COMPLETED';
 
--- CreateEnum
-CREATE TYPE "PostAcceptanceMode" AS ENUM ('local_payment', 'operator_handoff');
+-- CreateEnum (idempotent)
+DO $$ BEGIN
+  CREATE TYPE "PostAcceptanceMode" AS ENUM ('local_payment', 'operator_handoff');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
--- CreateEnum
-CREATE TYPE "DealHandoffStatus" AS ENUM ('AWAITING_FINALIZATION', 'COMPLETED');
+-- CreateEnum (idempotent)
+DO $$ BEGIN
+  CREATE TYPE "DealHandoffStatus" AS ENUM ('AWAITING_FINALIZATION', 'COMPLETED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
--- AlterTable
-ALTER TABLE "Campaign" ADD COLUMN "postAcceptanceMode" "PostAcceptanceMode" NOT NULL DEFAULT 'local_payment';
+-- AlterTable (idempotent)
+ALTER TABLE "Campaign" ADD COLUMN IF NOT EXISTS "postAcceptanceMode" "PostAcceptanceMode" NOT NULL DEFAULT 'local_payment';
 
--- AlterTable
-ALTER TABLE "ExecutionInstance" ADD COLUMN "postAcceptanceMode" "PostAcceptanceMode" NOT NULL DEFAULT 'local_payment';
+-- AlterTable (idempotent)
+ALTER TABLE "ExecutionInstance" ADD COLUMN IF NOT EXISTS "postAcceptanceMode" "PostAcceptanceMode" NOT NULL DEFAULT 'local_payment';
 
--- CreateTable
-CREATE TABLE "DealHandoff" (
+-- CreateTable (idempotent)
+CREATE TABLE IF NOT EXISTS "DealHandoff" (
     "id" TEXT NOT NULL,
     "instanceId" TEXT NOT NULL,
     "creatorName" TEXT NOT NULL,
@@ -56,11 +65,16 @@ CREATE TABLE "DealHandoff" (
     CONSTRAINT "DealHandoff_pkey" PRIMARY KEY ("id")
 );
 
--- CreateIndex
-CREATE UNIQUE INDEX "DealHandoff_instanceId_key" ON "DealHandoff"("instanceId");
+-- CreateIndex (idempotent)
+CREATE UNIQUE INDEX IF NOT EXISTS "DealHandoff_instanceId_key" ON "DealHandoff"("instanceId");
 
--- CreateIndex
-CREATE INDEX "DealHandoff_status_idx" ON "DealHandoff"("status");
+-- CreateIndex (idempotent)
+CREATE INDEX IF NOT EXISTS "DealHandoff_status_idx" ON "DealHandoff"("status");
 
--- AddForeignKey
-ALTER TABLE "DealHandoff" ADD CONSTRAINT "DealHandoff_instanceId_fkey" FOREIGN KEY ("instanceId") REFERENCES "ExecutionInstance"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- AddForeignKey (idempotent)
+DO $$ BEGIN
+  ALTER TABLE "DealHandoff" ADD CONSTRAINT "DealHandoff_instanceId_fkey"
+    FOREIGN KEY ("instanceId") REFERENCES "ExecutionInstance"("id")
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;

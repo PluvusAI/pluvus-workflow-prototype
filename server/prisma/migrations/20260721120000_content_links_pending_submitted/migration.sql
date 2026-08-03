@@ -12,9 +12,11 @@
 -- row can already hold either value). Applied to the live DB out-of-band via
 -- scripts/add-content-links-enums.ts (idempotent); recorded here so the Prisma
 -- migration history and the PGlite-backed tests build the same enum.
+--
+-- Idempotent: IF NOT EXISTS so a partial prior run does not fail a re-run.
 
 -- AlterEnum
-ALTER TYPE "InstanceState" ADD VALUE 'CONTENT_LINKS_PENDING';
+ALTER TYPE "InstanceState" ADD VALUE IF NOT EXISTS 'CONTENT_LINKS_PENDING';
 
 -- AlterEnum
-ALTER TYPE "EventType" ADD VALUE 'CONTENT_LINKS_SUBMITTED';
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'CONTENT_LINKS_SUBMITTED';

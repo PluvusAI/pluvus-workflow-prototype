@@ -12,20 +12,26 @@
 -- inserts or compares one — so it is safe inside Prisma's single-transaction
 -- migration. The new BrandApprovalStatus type is created whole by CREATE TYPE,
 -- which carries no such restriction.
+--
+-- Idempotent: ALTER TYPE uses IF NOT EXISTS, CREATE TYPE uses DO/EXCEPTION,
+-- table/indexes use IF NOT EXISTS, constraints use DO/EXCEPTION.
 
--- AlterEnum
-ALTER TYPE "InstanceState" ADD VALUE 'AWAITING_BRAND_APPROVAL';
+-- AlterEnum (idempotent)
+ALTER TYPE "InstanceState" ADD VALUE IF NOT EXISTS 'AWAITING_BRAND_APPROVAL';
 
--- AlterEnum
-ALTER TYPE "EventType" ADD VALUE 'BRAND_APPROVAL_REQUESTED';
-ALTER TYPE "EventType" ADD VALUE 'BRAND_APPROVED';
-ALTER TYPE "EventType" ADD VALUE 'BRAND_REJECTED';
+-- AlterEnum (idempotent)
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'BRAND_APPROVAL_REQUESTED';
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'BRAND_APPROVED';
+ALTER TYPE "EventType" ADD VALUE IF NOT EXISTS 'BRAND_REJECTED';
 
--- CreateEnum
-CREATE TYPE "BrandApprovalStatus" AS ENUM ('AWAITING_APPROVAL', 'APPROVED', 'REJECTED');
+-- CreateEnum (idempotent)
+DO $$ BEGIN
+  CREATE TYPE "BrandApprovalStatus" AS ENUM ('AWAITING_APPROVAL', 'APPROVED', 'REJECTED');
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
 
--- CreateTable
-CREATE TABLE "BrandApproval" (
+-- CreateTable (idempotent)
+CREATE TABLE IF NOT EXISTS "BrandApproval" (
     "id" TEXT NOT NULL,
     "instanceId" TEXT NOT NULL,
     "creatorName" TEXT NOT NULL,
@@ -55,11 +61,16 @@ CREATE TABLE "BrandApproval" (
     CONSTRAINT "BrandApproval_pkey" PRIMARY KEY ("id")
 );
 
--- CreateIndex
-CREATE UNIQUE INDEX "BrandApproval_instanceId_key" ON "BrandApproval"("instanceId");
+-- CreateIndex (idempotent)
+CREATE UNIQUE INDEX IF NOT EXISTS "BrandApproval_instanceId_key" ON "BrandApproval"("instanceId");
 
--- CreateIndex
-CREATE INDEX "BrandApproval_status_idx" ON "BrandApproval"("status");
+-- CreateIndex (idempotent)
+CREATE INDEX IF NOT EXISTS "BrandApproval_status_idx" ON "BrandApproval"("status");
 
--- AddForeignKey
-ALTER TABLE "BrandApproval" ADD CONSTRAINT "BrandApproval_instanceId_fkey" FOREIGN KEY ("instanceId") REFERENCES "ExecutionInstance"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+-- AddForeignKey (idempotent)
+DO $$ BEGIN
+  ALTER TABLE "BrandApproval" ADD CONSTRAINT "BrandApproval_instanceId_fkey"
+    FOREIGN KEY ("instanceId") REFERENCES "ExecutionInstance"("id")
+    ON DELETE RESTRICT ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
