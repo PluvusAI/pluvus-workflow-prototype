@@ -8,6 +8,8 @@ import {
 } from "../../db/index.js";
 import { findCampaignById } from "../../db/campaigns.js";
 import { findWorkflowById, findVersionById } from "../../db/workflows.js";
+import { findEmailAccountById } from "../../db/emailAccounts.js";
+import { emailProviderForAccount } from "../providerFactory.js";
 import { isUniqueViolation } from "../../db/errors.js";
 import type { DeferralClassifier } from "../../db/conversationObligations.js";
 import type { ConversationObligation, Creator, Message, MessageInsert } from "../../db/schema.js";
@@ -69,7 +71,9 @@ export interface SendOnceDeps {
   // §4.8 deferral vocabulary so the DB resolution can tell answered vs deferred.
   updateMessageSent(
     id: string,
-    data: { externalMessageId: string; threadId: string },
+    // PLU-121: emailAccountId attributes the sent row to the mailbox it went out
+    // on. Optional so pre-multi-mailbox callers/tests are unchanged.
+    data: { externalMessageId: string; threadId: string; emailAccountId?: string },
     deferralClassifier?: DeferralClassifier,
   ): Promise<Message>;
   // E5: resolves the instance's thread state (reply target + canonical subject)
@@ -92,6 +96,19 @@ export interface FlushDeps extends SendOnceDeps {
   resolveCampaignName(instanceId: string): Promise<string | undefined>;
   acquireSendLock(messageId: string): Promise<string | null>;
   releaseSendLock(messageId: string, token: string): Promise<void>;
+  /**
+   * PLU-121 (multi-mailbox): resolve the provider bound to the instance's PINNED
+   * connected account, plus that account's id (to stamp on the sent Message).
+   * Returns null only when the deployment isn't Nylas. Nylas runs must always
+   * have a migration-backed pin; a null pin is unsafe and rejects the send.
+   * Resolution errors and invalid pinned accounts must reject rather than send
+   * from the wrong mailbox. Injectable for tests; defaults to the real resolver.
+   * Optional so a test that injects a full FlushDeps literal without it simply
+   * gets single-mailbox behavior.
+   */
+  resolveInstanceProvider?(
+    instanceId: string,
+  ): Promise<{ provider: IEmailProvider; accountId: string } | null>;
 }
 
 const defaultThreadContext = new DefaultThreadContextResolver();
@@ -122,6 +139,47 @@ async function defaultResolveCampaignName(instanceId: string): Promise<string | 
   }
 }
 
+// PLU-121: resolve the run's pinned connected account into a grant-bound provider.
+// Engages only for a Nylas deployment. Mock deployments return null and keep the
+// caller's provider. Nylas resolution is strict: a null pin, missing/inactive
+// account, DB error, or provider-factory error rejects the flush. Falling back
+// in those cases would send a contract-forming email from a different mailbox,
+// breaking conversation ownership; a rejection leaves the reservation unsent
+// for BullMQ retry / DLQ.
+export async function defaultResolveInstanceProvider(
+  instanceId: string,
+): Promise<{ provider: IEmailProvider; accountId: string } | null> {
+  if ((process.env["EMAIL_PROVIDER"] ?? "").toLowerCase() !== "nylas") return null;
+
+  const instance = await findInstanceByIdDb(instanceId);
+  if (!instance) {
+    throw new Error(
+      `Cannot resolve sending mailbox: execution instance ${instanceId} was not found`,
+    );
+  }
+
+  const accountId = instance.emailAccountId;
+  if (!accountId) {
+    throw new Error(
+      `Cannot resolve sending mailbox: Nylas instance ${instanceId} has no pinned account`,
+    );
+  }
+
+  const account = await findEmailAccountById(accountId);
+  if (!account) {
+    throw new Error(
+      `Cannot resolve sending mailbox: pinned account ${accountId} for instance ${instanceId} was not found`,
+    );
+  }
+  if (account.status !== "active") {
+    throw new Error(
+      `Cannot resolve sending mailbox: pinned account ${accountId} for instance ${instanceId} is ${account.status}`,
+    );
+  }
+
+  return { provider: emailProviderForAccount(account), accountId: account.id };
+}
+
 const defaultFlushDeps: FlushDeps = {
   ...defaultDeps,
   findMessageById: findByIdDb,
@@ -130,6 +188,7 @@ const defaultFlushDeps: FlushDeps = {
   resolveCampaignName: defaultResolveCampaignName,
   acquireSendLock: acquireSendLockDefault,
   releaseSendLock: releaseSendLockDefault,
+  resolveInstanceProvider: defaultResolveInstanceProvider,
 };
 
 /**
@@ -165,6 +224,38 @@ function maybeLabelThreadAsync(
           `${err instanceof Error ? err.message : String(err)}`,
       );
     });
+}
+
+/**
+ * Self-heal a label on an already-finalized send without ever applying it via a
+ * different mailbox's provider. Resolution failures are non-fatal because the
+ * email is already delivered; skipping a cosmetic repair is safer than mutating
+ * the caller/default grant. Non-Nylas and resolver-less test paths retain their
+ * existing caller-provider behavior.
+ */
+async function maybeLabelFinalizedThread(
+  email: IEmailProvider,
+  instanceId: string,
+  threadId: string,
+  campaignName: string | undefined,
+  deps: FlushDeps,
+): Promise<void> {
+  if (!campaignName || !threadId) return;
+
+  let labelEmail = email;
+  if (deps.resolveInstanceProvider) {
+    try {
+      const resolved = await deps.resolveInstanceProvider(instanceId);
+      labelEmail = resolved?.provider ?? email;
+    } catch (err) {
+      console.warn(
+        `[labels] skipped finalized-thread repair for instance ${instanceId}; ` +
+          `sending mailbox unavailable. ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return;
+    }
+  }
+  maybeLabelThreadAsync(labelEmail, threadId, campaignName);
 }
 
 // Resolve the thread context ONCE (E5), degrading to empty context on a resolver
@@ -340,12 +431,32 @@ export async function flushOutbound(
   }
   if (row.externalMessageId) {
     // Already finalized by a prior flush/sweep. Re-apply the label (cheap,
-    // idempotent, self-healing) but do NOT resend.
-    maybeLabelThreadAsync(email, row.threadId ?? "", preResolved?.campaignName);
+    // idempotent, self-healing) through the PINNED account provider, never the
+    // caller/default provider from a different mailbox. Resolution failure is a
+    // safe label skip because delivery already completed.
+    await maybeLabelFinalizedThread(
+      email,
+      row.instanceId,
+      row.threadId ?? "",
+      preResolved?.campaignName,
+      deps,
+    );
     return { messageId: row.externalMessageId, threadId: row.threadId ?? "", skipped: true };
   }
 
   const instanceId = row.instanceId;
+
+  // ── PLU-121: select the sending mailbox for this run ──────────────────────
+  // Resolve the instance's PINNED connected account into a grant-bound provider.
+  // When it resolves, that provider (and its account id) is used for the send,
+  // the label, and the Message attribution — so the whole conversation stays on
+  // the pinned mailbox. Only a non-Nylas deployment falls back to the caller-
+  // supplied `email`; null/invalid pins and lookup errors reject above before
+  // any provider can send.
+  const resolvedAccount = deps.resolveInstanceProvider
+    ? await deps.resolveInstanceProvider(instanceId)
+    : null;
+  const activeEmail = resolvedAccount?.provider ?? email;
 
   // ── 2. Rebuild the send context (§4.1a) ────────────────────────────────────
   // recipient: all in-scope negotiation sends are creator-bound → undefined (the
@@ -421,12 +532,13 @@ export async function flushOutbound(
     const fresh = await deps.findMessageById(messageId);
     if (!fresh) return { messageId: "", threadId: "", skipped: true };
     if (fresh.externalMessageId) {
-      maybeLabelThreadAsync(email, fresh.threadId ?? "", campaignName);
+      maybeLabelThreadAsync(activeEmail, fresh.threadId ?? "", campaignName);
       return { messageId: fresh.externalMessageId, threadId: fresh.threadId ?? "", skipped: true };
     }
 
-    // Step 2 — send (guarded by the committed reservation + the lock).
-    const { messageId: externalMessageId, threadId } = await email.send(
+    // Step 2 — send (guarded by the committed reservation + the lock), from the
+    // run's pinned mailbox (PLU-121) when one is resolved.
+    const { messageId: externalMessageId, threadId } = await activeEmail.send(
       wireDraft,
       creator,
       recipient,
@@ -441,12 +553,17 @@ export async function flushOutbound(
     // mint a PLUVUS_COMMITMENT). The body is what actually went on the wire.
     await deps.updateMessageSent(
       messageId,
-      { externalMessageId, threadId },
+      {
+        externalMessageId,
+        threadId,
+        // PLU-121: attribute the sent row to the mailbox it went out on.
+        ...(resolvedAccount ? { emailAccountId: resolvedAccount.accountId } : {}),
+      },
       buildDeferralClassifier(wireDraft.body),
     );
 
     // Step 4 — label AFTER send + finalize (§6.4): fire-and-forget, best-effort.
-    maybeLabelThreadAsync(email, threadId, campaignName);
+    maybeLabelThreadAsync(activeEmail, threadId, campaignName);
 
     return { messageId: externalMessageId, threadId, skipped: false };
   } finally {
@@ -513,7 +630,13 @@ export async function sendOnce(
     // the prior identifiers (carried on the reserve result) and re-apply the
     // label (self-healing) without sending again — identical to the old sendOnce
     // alreadySent branch.
-    maybeLabelThreadAsync(email, reserved.priorThreadId ?? "", campaignName);
+    await maybeLabelFinalizedThread(
+      email,
+      instanceId,
+      reserved.priorThreadId ?? "",
+      campaignName,
+      flushDeps,
+    );
     return {
       messageId: reserved.priorExternalMessageId ?? "",
       threadId: reserved.priorThreadId ?? "",

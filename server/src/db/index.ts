@@ -2,6 +2,7 @@
 export { db, pool } from "./drizzle.js";
 export { isUniqueViolation, isForeignKeyViolation } from "./errors.js";
 export * from "./workflows.js";
+export * from "./emailAccounts.js";
 export * from "./creators.js";
 export * from "./instances.js";
 export * from "./messages.js";

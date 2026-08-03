@@ -21,9 +21,15 @@ import { readFileSync, readdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pool } from "../src/db/drizzle.js";
+import {
+  configureMigrationSession,
+  migrationSessionConfig,
+} from "../src/db/migrationSession.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = resolve(__dirname, "migrations");
+const CONNECTED_EMAIL_ACCOUNTS_MIGRATION =
+  "20260731120000_plu121_connected_email_accounts";
 const dryRun = process.argv.includes("--dry-run");
 
 // Migration dirs are named <timestamp>_<slug>; sorting the names sorts by time.
@@ -34,6 +40,12 @@ const dirs = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
 
 const client = await pool.connect();
 try {
+  const sessionConfig = migrationSessionConfig();
+  console.log(
+    sessionConfig.hasConfiguredNylasGrant
+      ? "[migration config] Legacy Nylas grant will seed the active default email account."
+      : "[migration config] NYLAS_GRANT_ID is absent/placeholder; PLU-121 will seed a disabled non-default account.",
+  );
   if (!dryRun) {
     await client.query(
       `CREATE TABLE IF NOT EXISTS "_migrations_applied" (
@@ -123,6 +135,11 @@ try {
     }
 
     if (needsAutocommit) {
+      if (name === CONNECTED_EMAIL_ACCOUNTS_MIGRATION) {
+        throw new Error(
+          `${name} must run transactionally so its Nylas seed configuration cannot be lost by a pooled connection`,
+        );
+      }
       // No wrapping transaction: node-postgres sends the whole file via the simple
       // query protocol. Enum-add files autocommit each statement; self-managed-txn
       // files run their own BEGIN…COMMIT. If such a file half-applies on error it is
@@ -132,6 +149,12 @@ try {
     } else {
       await client.query("BEGIN");
       try {
+        if (name === CONNECTED_EMAIL_ACCOUNTS_MIGRATION) {
+          // Neon pooled URLs use transaction-mode PgBouncer. Configure the seed
+          // only after BEGIN, on the backend reserved for this exact migration,
+          // and make it transaction-local so it cannot leak into a pooled session.
+          await configureMigrationSession(client, sessionConfig, true);
+        }
         await client.query(sql);
         await client.query("COMMIT");
       } catch (err) {

@@ -21,11 +21,19 @@ export async function findMessageById(id: string): Promise<Message | null> {
 
 export async function findMessageByExternalId(
   externalMessageId: string,
+  emailAccountId?: string,
 ): Promise<Message | null> {
+  // Provider message ids are unique only within a connected account/grant.
+  // Omitting the account deliberately selects the account-less legacy/mock
+  // namespace; it must never match an unrelated connected mailbox.
+  const accountPredicate =
+    emailAccountId !== undefined
+      ? eq(messages.emailAccountId, emailAccountId)
+      : isNull(messages.emailAccountId);
   const rows = await db
     .select()
     .from(messages)
-    .where(eq(messages.externalMessageId, externalMessageId))
+    .where(and(eq(messages.externalMessageId, externalMessageId), accountPredicate))
     .limit(1);
   return rows[0] ?? null;
 }
@@ -62,7 +70,7 @@ export async function findMessageByIdempotencyKey(
  *  module so messages.ts stays free of engine-layer imports. */
 export async function updateMessageSent(
   id: string,
-  data: { externalMessageId: string; threadId: string },
+  data: { externalMessageId: string; threadId: string; emailAccountId?: string },
   deferralClassifier?: DeferralClassifier,
 ): Promise<Message> {
   const updated = await db.transaction(async (tx) => {
@@ -72,6 +80,10 @@ export async function updateMessageSent(
         externalMessageId: data.externalMessageId,
         threadId: data.threadId,
         sentAt: new Date(),
+        // PLU-121: stamp the sending mailbox at finalize (the send path resolves
+        // the run's pinned account here). Conditional so a send with no resolved
+        // account leaves the column as the reserve/backfill value.
+        ...(data.emailAccountId ? { emailAccountId: data.emailAccountId } : {}),
       })
       .where(eq(messages.id, id))
       .returning();
@@ -96,20 +108,41 @@ export async function updateMessageSent(
  * mid-handler) is re-processed on retry rather than skipped. Best-effort by
  * externalMessageId; a no-op if the row is already gone.
  */
-export async function markMessageProcessed(externalMessageId: string): Promise<void> {
+export async function markMessageProcessed(
+  externalMessageId: string,
+  emailAccountId?: string,
+): Promise<void> {
+  const accountPredicate =
+    emailAccountId !== undefined
+      ? eq(messages.emailAccountId, emailAccountId)
+      : isNull(messages.emailAccountId);
   await db
     .update(messages)
     .set({ processedAt: new Date() })
-    .where(eq(messages.externalMessageId, externalMessageId));
+    .where(and(eq(messages.externalMessageId, externalMessageId), accountPredicate));
 }
 
-/** Find all messages in a thread. Used by Nylas webhook handler (Phase 6)
- *  to correlate an inbound reply to the right ExecutionInstance. */
-export async function findMessagesByThreadId(threadId: string): Promise<Message[]> {
+/** Find all messages in a thread. Used by the Nylas webhook handler to correlate
+ *  an inbound reply to the right ExecutionInstance.
+ *
+ *  PLU-121: `emailAccountId` scopes the lookup to a single connected mailbox.
+ *  Nylas thread ids are only unique WITHIN a grant, so once several grants are
+ *  connected a raw threadId match could correlate grant A's reply to grant B's
+ *  thread (cross-account leakage). The webhook passes the account it resolved
+ *  from the event's grant id; when omitted (or on legacy rows), the match is
+ *  unscoped exactly as before. */
+export async function findMessagesByThreadId(
+  threadId: string,
+  emailAccountId?: string,
+): Promise<Message[]> {
+  const predicate =
+    emailAccountId !== undefined
+      ? and(eq(messages.threadId, threadId), eq(messages.emailAccountId, emailAccountId))
+      : eq(messages.threadId, threadId);
   return db
     .select()
     .from(messages)
-    .where(eq(messages.threadId, threadId))
+    .where(predicate)
     .orderBy(asc(messages.createdAt));
 }
 

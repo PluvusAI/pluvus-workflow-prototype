@@ -164,9 +164,28 @@ export interface CampaignListItem {
   outreachPacingMaxMinutes: number | null;
   negotiationReplyPacingMinMinutes: number | null;
   negotiationReplyPacingMaxMinutes: number | null;
+  /** PLU-121: the connected mailbox outreach is sent from (a
+   *  ConnectedEmailAccount id), or null to use the default account. */
+  emailAccountId: string | null;
   createdAt: string;
   updatedAt: string;
   workflowCount: number;
+}
+
+/**
+ * PLU-121: a connected email account (one Nylas grant = one mailbox). Returned by
+ * GET /email-accounts and shown in the campaign wizard's sender picker.
+ */
+export interface ConnectedEmailAccount {
+  id: string;
+  nylasGrantId: string;
+  emailAddress: string;
+  displayName: string | null;
+  provider: string;
+  status: "active" | "disabled" | "revoked";
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface CampaignWorkflowItem {
@@ -198,6 +217,8 @@ export interface CampaignDetail {
   outreachPacingMaxMinutes: number | null;
   negotiationReplyPacingMinMinutes: number | null;
   negotiationReplyPacingMaxMinutes: number | null;
+  /** PLU-121: the connected mailbox outreach is sent from, or null for default. */
+  emailAccountId: string | null;
   createdAt: string;
   updatedAt: string;
   workflows: CampaignWorkflowItem[];

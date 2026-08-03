@@ -1,4 +1,10 @@
-import { Router, type Request, type Response } from "express";
+import {
+  Router,
+  type NextFunction,
+  type Request,
+  type RequestHandler,
+  type Response,
+} from "express";
 import { verifyNylasSignature } from "../providers/nylas/verifySignature.js";
 import {
   extractDeliveryTime,
@@ -7,6 +13,7 @@ import {
   SeenDeliveryIds,
 } from "../providers/nylas/replayGuard.js";
 import { findMessagesByThreadId } from "../db/index.js";
+import { findEmailAccountByGrantId } from "../db/emailAccounts.js";
 import { enqueueInboundEmail } from "../workers/queues.js";
 
 // ---------------------------------------------------------------------------
@@ -24,19 +31,31 @@ import { enqueueInboundEmail } from "../workers/queues.js";
 //   - No heavy work before the ack. Nylas requires a 200 within ~10s.
 //
 // Idempotency for duplicate deliveries is handled downstream:
-//   - enqueueInboundEmail builds jobId = inbound|<externalMessageId>, so BullMQ
-//     drops a duplicate enqueue.
-//   - inboundEmailWorker re-checks findMessageByExternalId before processing.
-//   - Message.externalMessageId is @unique as the final backstop.
+//   - enqueueInboundEmail builds an accountId + externalMessageId jobId, so
+//     BullMQ drops a duplicate enqueue within one grant without cross-grant loss.
+//   - inboundEmailWorker re-checks the same account-scoped DB key.
+//   - Message has account-scoped + legacy-null unique indexes as the backstop.
 //
 // IMPORTANT: this router must be mounted with a RAW body parser (express.raw),
 // not express.json — signature verification needs the exact bytes Nylas sent.
+
+export interface WebhookDependencies {
+  findMessagesByThreadId: typeof findMessagesByThreadId;
+  findEmailAccountByGrantId: typeof findEmailAccountByGrantId;
+  enqueueInboundEmail: typeof enqueueInboundEmail;
+}
+
+const defaultWebhookDependencies: WebhookDependencies = {
+  findMessagesByThreadId,
+  findEmailAccountByGrantId,
+  enqueueInboundEmail,
+};
 
 const router = Router();
 
 // BUG-SEC4: per-process replay guard for recently-seen delivery ids. A repeat of
 // the same signed delivery within the retention window is rejected as a replay
-// (the durable backstop is Message.externalMessageId @unique downstream).
+// (the durable backstop is Message's account-scoped unique key downstream).
 const seenDeliveries = new SeenDeliveryIds();
 
 // ── Extracted, normalized inbound message ──────────────────────────────────
@@ -86,6 +105,43 @@ function extractInboundMessage(payload: unknown): InboundMessage | null {
   };
 }
 
+// PLU-121 (multi-mailbox): pull the Nylas GRANT id an event belongs to. In v3 the
+// grant id sits on the notification envelope (`data.grant_id`) and is echoed on the
+// message object; tolerate both shapes + snake/camel case. Undefined when the
+// payload carries none (older single-grant deliveries) → the handler falls back to
+// an unscoped correlation, exactly as before multi-mailbox.
+function extractGrantId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const data = (payload as Record<string, unknown>)["data"];
+  if (data && typeof data === "object") {
+    const onData = pick<string>(data as Record<string, unknown>, "grant_id", "grantId");
+    if (onData) return onData;
+    const object = (data as Record<string, unknown>)["object"];
+    if (object && typeof object === "object") {
+      const onObject = pick<string>(
+        object as Record<string, unknown>,
+        "grant_id",
+        "grantId",
+      );
+      if (onObject) return onObject;
+    }
+  }
+  return undefined;
+}
+
+// Nylas identifies the notification delivery itself on the top-level envelope.
+// This is the replay key: `data.object.id` identifies the email message and can
+// legitimately appear in more than one notification (and in another grant).
+function extractNotificationId(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  return pick<string>(
+    payload as Record<string, unknown>,
+    "id",
+    "notification_id",
+    "notificationId",
+  );
+}
+
 // The From: address in a Nylas message is `from: [{ email, name }]` (or, on some
 // SDK/webhook shapes, a bare object). Pull the first email we can find, lowercased
 // for a case-insensitive compare downstream. Undefined if absent.
@@ -123,7 +179,11 @@ router.head("/nylas", (_req: Request, res: Response) => {
 // ── POST: inbound event ────────────────────────────────────────────────────
 // Note: the raw parser leaves req.body as a Buffer. We verify over it, then
 // JSON.parse it ourselves.
-router.post("/nylas", async (req: Request, res: Response) => {
+export async function handleNylasWebhook(
+  req: Request,
+  res: Response,
+  dependencies: WebhookDependencies = defaultWebhookDependencies,
+): Promise<void> {
   const secret = process.env["NYLAS_WEBHOOK_SECRET"];
   const signature = req.header("x-nylas-signature");
 
@@ -163,17 +223,39 @@ router.post("/nylas", async (req: Request, res: Response) => {
   const inbound = extractInboundMessage(payload);
   if (!inbound) {
     // Not a message event we can act on (e.g. a non-message notification type).
-    // Ack so Nylas doesn't retry; nothing to do.
+    // Ack so Nylas doesn't retry; nothing to do. Commit its envelope id as a
+    // deliberate terminal ignore, so the same signed non-message notification
+    // cannot be replayed repeatedly at the edge.
+    const ignoredNotificationId = extractNotificationId(payload);
+    if (ignoredNotificationId) {
+      const ignoredGrantId = extractGrantId(payload);
+      const ignoredReplayKey = ignoredGrantId
+        ? `${ignoredGrantId.length}|${ignoredGrantId}|${ignoredNotificationId}`
+        : ignoredNotificationId;
+      if (seenDeliveries.has(ignoredReplayKey)) {
+        res.status(200).json({ status: "ignored", reason: "duplicate delivery" });
+        return;
+      }
+      seenDeliveries.add(ignoredReplayKey);
+    }
     res.status(200).json({ status: "ignored", reason: "no actionable message" });
     return;
   }
+
+  const grantId = extractGrantId(payload);
 
   // ── Replay protection — seen delivery id (BUG-SEC4) ──────────────────────
   // Drop a repeat of the same delivery id (a replay, or a Nylas re-delivery of
   // one we already took). Ack 200 (idempotent no-op) so a legitimate Nylas retry
   // isn't triggered into a loop; the enqueue below is skipped. The durable
-  // backstop remains Message.externalMessageId @unique in the worker.
-  if (!seenDeliveries.add(inbound.messageId)) {
+  // backstop remains the account-scoped Message unique key in the worker.
+  // Nylas ids are grant-local, so the in-memory guard must use the same namespace
+  // or account B can be dropped just because account A used the same id.
+  const notificationId = extractNotificationId(payload) ?? inbound.messageId;
+  const replayKey = grantId
+    ? `${grantId.length}|${grantId}|${notificationId}`
+    : notificationId;
+  if (seenDeliveries.has(replayKey)) {
     console.log(
       `[webhook/nylas] dropping duplicate/replayed delivery (msg ${inbound.messageId})`,
     );
@@ -185,16 +267,51 @@ router.post("/nylas", async (req: Request, res: Response) => {
   // All messages in a conversation share the Nylas thread_id. The outbound
   // send persisted that thread_id on a Message row, so we look it up here.
   if (!inbound.threadId) {
+    seenDeliveries.add(replayKey);
     res.status(200).json({ status: "ignored", reason: "no threadId to correlate" });
     return;
   }
 
-  const threadMessages = await findMessagesByThreadId(inbound.threadId);
+  // PLU-121 (multi-mailbox): resolve WHICH connected account this event is for
+  // from its grant id, and scope the thread correlation to that account. Nylas
+  // thread ids are unique only within a grant, so once several grants are
+  // connected an unscoped match could attach grant A's reply to grant B's thread
+  // (cross-account leakage). Only a truly grant-less legacy payload degrades to
+  // the previous unscoped correlation; an explicit unknown grant is rejected.
+  const account = grantId
+    ? await dependencies.findEmailAccountByGrantId(grantId)
+    : null;
+
+  if (grantId && !account) {
+    // A modern delivery identified a grant that this deployment does not know.
+    // Do not guess by thread id: the same id may belong to a different connected
+    // mailbox. Grant-less payloads below retain the legacy single-mailbox path.
+    console.log(
+      `[webhook/nylas] unregistered grant ${grantId} — dropping ${inbound.messageId}`,
+    );
+    seenDeliveries.add(replayKey);
+    res.status(200).json({ status: "ignored", reason: "grant not registered" });
+    return;
+  }
+
+  // Once a grant resolves to an account, correlation MUST remain scoped to that
+  // account. Nylas thread ids are grant-local; retrying an unscoped lookup when
+  // the scoped one is empty could attach this reply to another mailbox that
+  // happens to use the same thread id. The unscoped branch exists only for
+  // legacy deliveries that carry no grant id at all.
+  //
+  // Account status is deliberately not an inbound gate. Disabling/revoking a
+  // mailbox stops new sends, but a late reply to an existing conversation is
+  // still durable business input and must reach the inbound worker.
+  const threadMessages = account
+    ? await dependencies.findMessagesByThreadId(inbound.threadId, account.id)
+    : await dependencies.findMessagesByThreadId(inbound.threadId);
   if (threadMessages.length === 0) {
     // A reply to a thread we never sent (or not ours). Drop, ack.
     console.log(
       `[webhook/nylas] no instance for thread ${inbound.threadId} — dropping ${inbound.messageId}`,
     );
+    seenDeliveries.add(replayKey);
     res.status(200).json({ status: "ignored", reason: "thread not found" });
     return;
   }
@@ -216,6 +333,7 @@ router.post("/nylas", async (req: Request, res: Response) => {
     console.log(
       `[webhook/nylas] dropping own outbound echo (msg ${inbound.messageId}, thread ${inbound.threadId})`,
     );
+    seenDeliveries.add(replayKey);
     res.status(200).json({ status: "ignored", reason: "outbound echo" });
     return;
   }
@@ -225,9 +343,10 @@ router.post("/nylas", async (req: Request, res: Response) => {
 
   // ── Enqueue (the only side effect) ───────────────────────────────────────
   // No mockIntent — Phase 7 classifies the real reply in the worker.
-  await enqueueInboundEmail({
+  await dependencies.enqueueInboundEmail({
     instanceId,
     externalMessageId: inbound.messageId,
+    ...(account ? { emailAccountId: account.id } : {}),
     threadId: inbound.threadId,
     subject: inbound.subject,
     body: inbound.body,
@@ -236,12 +355,30 @@ router.post("/nylas", async (req: Request, res: Response) => {
     ...(inbound.senderEmail !== undefined ? { senderEmail: inbound.senderEmail } : {}),
   });
 
+  // Commit the in-memory replay marker only after Redis accepted the durable
+  // handoff. A transient DB/Redis throw before this line must remain retryable;
+  // marking earlier would poison the next Nylas delivery into a false duplicate.
+  seenDeliveries.add(replayKey);
+
   console.log(
     `[webhook/nylas] enqueued inbound-email for instance ${instanceId} (msg ${inbound.messageId}, thread ${inbound.threadId})`,
   );
 
   // ── Ack fast ─────────────────────────────────────────────────────────────
   res.status(200).json({ status: "accepted", instanceId });
-});
+}
+
+export function wrapNylasWebhookHandler(
+  handler: (req: Request, res: Response) => Promise<void> = handleNylasWebhook,
+): RequestHandler {
+  return (req: Request, res: Response, next: NextFunction) => {
+    // Express 4 does not automatically forward rejected async-handler promises.
+    // Send DB/Redis failures to the central error handler so Nylas receives a 5xx
+    // and retries; never leave a floating rejection or accidental 200.
+    void handler(req, res).catch(next);
+  };
+}
+
+router.post("/nylas", wrapNylasWebhookHandler());
 
 export default router;

@@ -4,44 +4,26 @@
  * flips a row to terminal, scopes to the instance, and is idempotent.
  *
  * Runs against PGlite + every Prisma migration, monkeypatching the module-level
- * `db` (same technique as workflowSummary.scoping.test.ts). Applies each migration
- * WHOLE via pg.exec so the DO $$…$$ + partial-index migrations run correctly.
+ * `db` (same technique as workflowSummary.scoping.test.ts). The shared migration
+ * helper preserves DO $$…$$ bodies and enum-growth statement boundaries.
  *
  * Run:  npx tsx --test src/observability/obligations.repository.test.ts
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "../db/schema.js";
 import { db } from "../db/drizzle.js";
 import type { Db } from "../db/drizzle.js";
 import { getInstanceDetail, resolveInstanceObligation } from "./repository.js";
+import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   await fn();
   n++;
   console.log(`  ✓ ${name}`);
-}
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const MIGRATIONS_DIR = resolve(__dirname, "../../prisma/migrations");
-
-async function applyPrismaMigrations(pg: PGlite): Promise<number> {
-  const folders = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => d.name)
-    .sort();
-  let applied = 0;
-  for (const folder of folders) {
-    await pg.exec(readFileSync(join(MIGRATIONS_DIR, folder, "migration.sql"), "utf8"));
-    applied++;
-  }
-  return applied;
 }
 
 let seq = 0;
@@ -66,7 +48,7 @@ async function seedInstance(pgdb: Db): Promise<string> {
 async function main(): Promise<void> {
   console.log("\nPLU-111 observability repository (obligations)\n");
   const pg = new PGlite();
-  const migrated = await applyPrismaMigrations(pg);
+  const migrated = await applyPGliteMigrations(pg);
   console.log(`  (applied ${migrated} Prisma migrations to embedded Postgres)`);
   const pgdb = drizzle(pg, { schema }) as unknown as Db;
   Object.assign(db, pgdb); // redirect the module-level db the repository reads

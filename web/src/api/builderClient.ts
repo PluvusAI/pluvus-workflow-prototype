@@ -30,6 +30,7 @@ import type {
   NotifyResult,
   PostAcceptanceMode,
   CompleteHandoffResult,
+  ConnectedEmailAccount,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,14 @@ export function useCampaign(id: string | null) {
   });
 }
 
+// PLU-121: connected email accounts for the campaign sender picker.
+export function useEmailAccounts() {
+  return useQuery({
+    queryKey: ["email-accounts"],
+    queryFn: () => apiFetch<ConnectedEmailAccount[]>("/api/email-accounts"),
+  });
+}
+
 export function createCampaign(data: {
   name: string;
   brand: string;
@@ -112,6 +121,8 @@ export function createCampaign(data: {
   outreachPacingMaxMinutes?: number;
   negotiationReplyPacingMinMinutes?: number;
   negotiationReplyPacingMaxMinutes?: number;
+  /** PLU-121: the connected mailbox to send this campaign's outreach from. */
+  emailAccountId?: string;
 }) {
   return postJson<{ id: string; name: string }>("/api/campaigns", data);
 }
@@ -128,11 +139,13 @@ export function updateCampaign(
     rewardDescription?: string | null;
     shipsPhysicalProduct?: boolean;
     postAcceptanceMode?: PostAcceptanceMode;
-    dailyInitialOutreachLimit?: number;
-    outreachPacingMinMinutes?: number;
-    outreachPacingMaxMinutes?: number;
-    negotiationReplyPacingMinMinutes?: number;
-    negotiationReplyPacingMaxMinutes?: number;
+  dailyInitialOutreachLimit?: number;
+  outreachPacingMinMinutes?: number;
+  outreachPacingMaxMinutes?: number;
+  negotiationReplyPacingMinMinutes?: number;
+  negotiationReplyPacingMaxMinutes?: number;
+  /** PLU-121: change the default sender (null clears back to the default account). */
+  emailAccountId?: string | null;
   },
 ) {
   return apiFetch<{

@@ -303,11 +303,21 @@ model Campaign {
   negotiationReplyPacingMinMinutes     Int?
   negotiationReplyPacingMaxMinutes     Int?
 
+  /// PLU-121: the brand's chosen DEFAULT sending mailbox. Enrollment stamps the
+  /// effective account onto each ExecutionInstance, so editing this later changes
+  /// the default for FUTURE enrollments only and never moves a running conversation.
+  /// Nullable + ON DELETE SET NULL: a campaign created before multi-mailbox, or one
+  /// whose account was disconnected, falls back to the default ConnectedEmailAccount.
+  emailAccountId String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  workflows       Workflow[]
-  outreachDays    CampaignOutreachDay[]
+  workflows    Workflow[]
+  outreachDays CampaignOutreachDay[]
+  emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
+
+  @@index([emailAccountId])
 }
 
 /// PLU-122: one UTC calendar-day counter/pacing cursor per campaign. This is
@@ -325,6 +335,36 @@ model CampaignOutreachDay {
   campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
 
   @@unique([campaignId, dayStart])
+}
+
+/// PLU-121: a connected email account (one Nylas grant = one mailbox). The brand
+/// can connect several; outreach picks which one to send from, and each account
+/// owns its inbox/threads/replies/sent via the emailAccountId back-references on
+/// Message. Stores ONLY the opaque Nylas grant id + the mailbox address — never
+/// raw credentials (the application API key stays a shared env value). `isDefault`
+/// marks the fallback sender; a partial unique index enforces at most one.
+model ConnectedEmailAccount {
+  id            String  @id @default(cuid())
+  /// The Nylas grant id — the per-mailbox handle used as the `identifier` on every
+  /// Nylas API call. Unique so a grant maps to exactly one account row.
+  nylasGrantId  String  @unique
+  emailAddress  String
+  displayName   String?
+  /// Provider discriminator; "nylas" today. Kept so a future provider can coexist.
+  provider      String  @default("nylas")
+  /// active | disabled | revoked. A non-active account is never selected for a new
+  /// send; replies to already-running conversations are still ingested.
+  status        String  @default("active")
+  isDefault     Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaigns Campaign[]
+  instances ExecutionInstance[]
+  messages  Message[]
+
+  @@index([status])
 }
 
 /// A campaign definition. The logical container for a sequence of nodes.
@@ -535,6 +575,14 @@ model ExecutionInstance {
   /// every in-flight execution keeps the behavior it was enrolled under.
   postAcceptanceMode PostAcceptanceMode @default(local_payment)
 
+  /// PLU-121: the connected mailbox this run is PINNED to. Stamped once at
+  /// enrollment from (campaign default → default ConnectedEmailAccount) and never
+  /// rewritten — reading the account from the instance is what keeps an entire
+  /// conversation (outreach → follow-ups → negotiation → reply) on ONE mailbox even
+  /// if the campaign's default sender is later changed. Nullable + ON DELETE SET
+  /// NULL: pre-existing runs are backfilled to the default account by the migration.
+  emailAccountId String?
+
   enrolledAt  DateTime  @default(now())
   completedAt DateTime?
   createdAt   DateTime  @default(now())
@@ -542,6 +590,7 @@ model ExecutionInstance {
 
   workflowVersion    WorkflowVersion     @relation(fields: [workflowVersionId], references: [id])
   creator            Creator             @relation(fields: [creatorId], references: [id])
+  emailAccount       ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
   messages           Message[]
   events             Event[]
   brandNotifications BrandNotification[]
@@ -555,6 +604,7 @@ model ExecutionInstance {
   /// (+ dueAt for the due-follow-up path). This composite index keeps those scans
   /// index-backed as the instance table grows instead of degrading to full scans.
   @@index([currentState, dueAt])
+  @@index([emailAccountId])
 }
 
 /// Every outbound and inbound email tied to an ExecutionInstance.
@@ -582,7 +632,7 @@ model Message {
   /// not be able to resolve their own escalation. NULL for OUTBOUND messages and
   /// for inbound rows created before this field existed.
   senderEmail        String?
-  externalMessageId  String?          @unique
+  externalMessageId  String?
   /// Deterministic pre-send key for OUTBOUND AI messages (Phase: remediation
   /// FIX-11). Computed BEFORE email.send() from stable inputs
   /// (instanceId + purpose + round), so a crash between send and the row write
@@ -613,9 +663,18 @@ model Message {
   /// for OUTBOUND rows and for inbound rows that predate this field.
   processedAt        DateTime?
 
+  /// PLU-121: which connected mailbox this message was sent from (OUTBOUND, stamped
+  /// at send finalize) or received on (INBOUND, stamped from the run's pinned
+  /// account). Gives each account its own inbox/threads/sent view and lets webhook
+  /// correlation be scoped by account so thread ids can't collide across grants.
+  /// Nullable for legacy/mock rows; existing rows are backfilled to the default
+  /// account. ON DELETE RESTRICT preserves the historical provider-id namespace.
+  emailAccountId     String?
+
   createdAt DateTime @default(now())
 
   instance ExecutionInstance @relation(fields: [instanceId], references: [id])
+  emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id], onDelete: Restrict)
   /// PLU-111: obligations pointing at this row as the one that raised them
   /// (inbound) or the one that resolved them (a sent outbound answer).
   raisedObligations   ConversationObligation[] @relation("ConversationObligationSource")
@@ -623,6 +682,11 @@ model Message {
 
   @@index([threadId])
   @@index([instanceId])
+  @@index([emailAccountId])
+  /// Nylas message ids are unique within a grant/account, not globally. The
+  /// migration also owns a partial unique index for account-less legacy rows;
+  /// Prisma cannot model partial indexes, so that companion is documented here.
+  @@unique([emailAccountId, externalMessageId], map: "Message_emailAccountId_externalMessageId_key")
 }
 
 /// Append-only audit log of every trigger and state transition for an

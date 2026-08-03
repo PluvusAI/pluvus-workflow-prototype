@@ -215,10 +215,24 @@ def test_parse_brief_route_flag_off_is_text_only(monkeypatch):
     pdf = make_pdf(_HEADED)
     req = neg.ParseBriefRequest(pdfBase64=base64.b64encode(pdf).decode())
     resp = neg.parse_brief(req)
-    # Flag OFF → flat text only, sections None (wire byte-identical to today).
+    # Flag OFF → flat text only, sections None, with additive capability metadata.
     assert resp.sections is None
     assert "Usage Rights" in resp.text
     assert resp.status == "ok"  # default; old callers ignore it
+    assert resp.parseMode == "flat"
+
+
+def test_parse_brief_route_flat_empty_extraction_is_explicit(monkeypatch):
+    monkeypatch.setattr(b, "extract_brief_text", lambda _raw: "")
+    import base64
+
+    encoded = base64.b64encode(b"%PDF-1.4 unreadable").decode()
+    resp = neg.parse_brief(
+        neg.ParseBriefRequest(pdfBase64=encoded, parseMode="flat")
+    )
+    assert resp.text == ""
+    assert resp.status == "empty"
+    assert resp.parseMode == "flat"
 
 
 def test_parse_brief_route_flag_on_returns_sections(monkeypatch):
@@ -231,7 +245,28 @@ def test_parse_brief_route_flag_on_returns_sections(monkeypatch):
     assert resp.status == "ok"
     assert resp.sections and "usageRights" in resp.sections
     assert resp.parserVersion == b.PARSER_VERSION
+    assert resp.parseMode == "structured"
     assert resp.pageCount == 1
+
+
+def test_parse_brief_route_explicit_mode_overrides_agent_flag(monkeypatch):
+    import base64
+
+    pdf = make_pdf(_HEADED)
+    encoded = base64.b64encode(pdf).decode()
+
+    monkeypatch.delenv("STRUCTURED_BRIEF_PARSING_ENABLED", raising=False)
+    structured = neg.parse_brief(
+        neg.ParseBriefRequest(pdfBase64=encoded, parseMode="structured")
+    )
+    assert structured.parseMode == "structured"
+    assert structured.sections and "usageRights" in structured.sections
+
+    monkeypatch.setenv("STRUCTURED_BRIEF_PARSING_ENABLED", "true")
+    flat = neg.parse_brief(neg.ParseBriefRequest(pdfBase64=encoded, parseMode="flat"))
+    assert flat.parseMode == "flat"
+    assert flat.sections is None
+    assert flat.text == b.extract_brief_text(pdf)
 
 
 def test_parse_brief_route_bad_base64_is_parse_failed(monkeypatch):
@@ -242,6 +277,7 @@ def test_parse_brief_route_bad_base64_is_parse_failed(monkeypatch):
     # route never 500s and never claims a clean "ok".
     assert resp.status in {"parse_failed", "empty"}
     assert resp.text == ""
+    assert resp.parseMode == "structured"
 
 
 # ---------------------------------------------------------------------------

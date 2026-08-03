@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import type { BrandNotification, Creator } from "../db/schema.js";
+import type { BrandNotification, Creator, Message } from "../db/schema.js";
 import {
   notifyBrandOfEscalation,
   resolveBrandRecipient,
@@ -313,6 +313,40 @@ async function main() {
     );
   });
 
+  await test("mailbox isolation: RFC822 lookup and notice send use the pinned provider", async () => {
+    const { deps } = makeDeps({ notifyEmail: "brand@acme.com", threadId: "thread-live" });
+    const caller = makeEmail({ threadUrl: true });
+    const pinned = makeEmail({ threadUrl: true });
+    const rfcLookups: string[] = [];
+    const pinnedProvider = Object.assign(pinned.email, {
+      async rfc822MessageId(externalMessageId: string) {
+        rfcLookups.push(externalMessageId);
+        return "pinned-rfc822@example.com";
+      },
+    });
+    deps.resolveInstanceEmailProvider = async () => pinnedProvider;
+    deps.listMessagesByInstance = async () => [
+      {
+        direction: "OUTBOUND",
+        externalMessageId: "grant-local-message-id",
+        createdAt: new Date(0),
+      } as Message,
+    ];
+
+    const result = await notifyBrandOfEscalation(
+      caller.email,
+      "i1",
+      "escalated",
+      deps,
+    );
+
+    assert.equal(result.status, "SENT");
+    assert.deepEqual(rfcLookups, ["grant-local-message-id"]);
+    assert.equal(caller.sent.length, 0, "caller/default grant must not be used");
+    assert.equal(pinned.sent.length, 1, "notice is sent through the pinned grant");
+    assert.match(pinned.sent[0]!.body, /pinned-rfc822(%40|@)example\.com/);
+  });
+
   // ── Gmail deep-link (rfc822msgid — cold-load-safe) ─────────────────────────
   await test("Gmail link: prominent section with the default rfc822msgid search URL", async () => {
     delete process.env["GMAIL_THREAD_URL_TEMPLATE"]; // exercise the default template
@@ -449,6 +483,31 @@ async function main() {
     assert.equal(r.recipient, "affiliatepartner@pluvus.com");
     assert.equal(sent[0]!.to, "affiliatepartner@pluvus.com");
     if (prev !== undefined) process.env["BRAND_NOTIFY_EMAIL"] = prev;
+  });
+
+  // PLU-82 §4.5 / §8-h: the new material_knowledge_conflict reason renders its own
+  // label in the brand FYI email (not the generic fallback). This is the
+  // escalation-side half of the two-map drift guard.
+  await test("buildEscalationEmail renders the material_knowledge_conflict reason label", async () => {
+    const draft = buildEscalationEmail(
+      {
+        creator,
+        campaignName: "Summer Launch",
+        brandName: "Acme Co",
+        workflowName: "Summer Outreach",
+        notifyEmail: null,
+        transcript: [],
+        threadId: null,
+        gmailRfc822MessageId: null,
+      },
+      "material_knowledge_conflict",
+    );
+    // The specific label, not the "(material_knowledge_conflict)" fallback.
+    assert.match(draft.body, /brief and the campaign settings disagree/);
+    assert.ok(
+      !/it was escalated for human review \(material_knowledge_conflict\)/.test(draft.body),
+      "must not fall through to the generic reason fallback",
+    );
   });
 
   console.log(`\n✓ escalation: all ${n} tests passed\n`);

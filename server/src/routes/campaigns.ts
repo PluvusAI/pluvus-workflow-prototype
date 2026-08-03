@@ -12,6 +12,7 @@ import {
   createWorkflow,
   updateWorkflow,
 } from "../db/workflows.js";
+import { findEmailAccountById } from "../db/emailAccounts.js";
 import { getTemplate } from "../templates/index.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
 import {
@@ -44,6 +45,7 @@ router.get("/", async (_req: Request, res: Response) => {
         outreachPacingMaxMinutes: c.outreachPacingMaxMinutes,
         negotiationReplyPacingMinMinutes: c.negotiationReplyPacingMinMinutes,
         negotiationReplyPacingMaxMinutes: c.negotiationReplyPacingMaxMinutes,
+        emailAccountId: c.emailAccountId,
         createdAt: c.createdAt.toISOString(),
         updatedAt: c.updatedAt.toISOString(),
         workflowCount: c._count.workflows,
@@ -92,6 +94,7 @@ router.post("/", async (req: Request, res: Response) => {
     targetUrl,
     hiddenParamKey,
     postAcceptanceMode,
+    emailAccountId,
   } = req.body as {
     name?: string;
     brand?: string;
@@ -111,6 +114,8 @@ router.post("/", async (req: Request, res: Response) => {
     targetUrl?: string;
     hiddenParamKey?: string;
     postAcceptanceMode?: string;
+    // PLU-121: the campaign's default sending mailbox (a ConnectedEmailAccount id).
+    emailAccountId?: string;
   };
 
   if (!name || typeof name !== "string" || !name.trim()) {
@@ -152,7 +157,22 @@ router.post("/", async (req: Request, res: Response) => {
     return;
   }
 
+  // PLU-121: when a default sender is supplied, it must reference a real
+  // connected account — reject an unknown id rather than silently storing a
+  // dangling pointer that would fall back to the default account at enrollment.
+  const trimmedAccountId =
+    typeof emailAccountId === "string" ? emailAccountId.trim() : "";
   try {
+    if (trimmedAccountId) {
+      const account = await findEmailAccountById(trimmedAccountId);
+      if (!account || account.status !== "active") {
+        res.status(400).json({
+          error: "emailAccountId must reference an active connected account",
+        });
+        return;
+      }
+    }
+
     const campaign = await createCampaign({
       name: name.trim(),
       brand: brand.trim(),
@@ -181,6 +201,9 @@ router.post("/", async (req: Request, res: Response) => {
       // predates this field creates a campaign that behaves exactly as before.
       ...(isPostAcceptanceMode(postAcceptanceMode) ? { postAcceptanceMode } : {}),
       ...sendingSettings.value,
+      // PLU-121: the chosen default sender. Omitted → null → enrollment falls back
+      // to the default connected account.
+      ...(trimmedAccountId ? { emailAccountId: trimmedAccountId } : {}),
     });
     res.status(201).json({
       id: campaign.id,
@@ -206,6 +229,7 @@ router.post("/", async (req: Request, res: Response) => {
       outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
       negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
       negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
+      emailAccountId: campaign.emailAccountId,
       createdAt: campaign.createdAt.toISOString(),
     });
   } catch (err) {
@@ -240,6 +264,7 @@ router.get("/:id", async (req: Request, res: Response) => {
       outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
       negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
       negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
+      emailAccountId: campaign.emailAccountId,
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
       workflows: campaign.workflows.map((w) => ({
@@ -340,6 +365,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     rewardDescription,
     shipsPhysicalProduct,
     postAcceptanceMode,
+    emailAccountId,
   } = req.body as {
     notifyEmail?: string | null;
     objective?: string | null;
@@ -350,6 +376,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     rewardDescription?: string | null;
     shipsPhysicalProduct?: boolean;
     postAcceptanceMode?: string;
+    emailAccountId?: string | null;
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
@@ -404,8 +431,27 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // already running carry their own stamped mode and are untouched.
     patch.postAcceptanceMode = postAcceptanceMode;
   }
-
   try {
+    if (emailAccountId !== undefined) {
+      // PLU-121: null/"" clears the default sender (back to the default account);
+      // a non-empty value must reference a real, active connected account. Like
+      // the mode, this changes only FUTURE enrollments — running instances keep
+      // their pin.
+      const trimmed = typeof emailAccountId === "string" ? emailAccountId.trim() : "";
+      if (trimmed) {
+        const account = await findEmailAccountById(trimmed);
+        if (!account || account.status !== "active") {
+          res.status(400).json({
+            error: "emailAccountId must reference an active connected account",
+          });
+          return;
+        }
+        patch.emailAccountId = trimmed;
+      } else {
+        patch.emailAccountId = null;
+      }
+    }
+
     const existing = await findCampaignById(req.params["id"]!);
     if (!existing) {
       res.status(404).json({ error: "campaign not found" });
@@ -430,6 +476,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
       outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
       negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
       negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
+      emailAccountId: campaign.emailAccountId,
       updatedAt: campaign.updatedAt.toISOString(),
     });
   } catch (err) {

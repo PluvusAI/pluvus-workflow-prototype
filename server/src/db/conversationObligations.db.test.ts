@@ -15,17 +15,13 @@
  *   - concurrent double-insert → partial-unique constraint → one row.
  *   - operator manual resolution (idempotent on a terminal row).
  *
- * NOTE: this file applies each migration file WHOLE via pg.exec() (which handles
- * DO $$…$$ blocks and partial indexes natively) rather than the naive ";"-splitter
- * some older .db.test.ts files use — so the new DO-block migration runs correctly.
+ * The shared migration helper preserves DO $$…$$ blocks while executing each
+ * top-level statement separately, including enum-growth migrations.
  *
  * Run:  npx tsx --test src/db/conversationObligations.db.test.ts
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { eq } from "drizzle-orm";
@@ -43,31 +39,13 @@ import {
   escalateObligations,
   type DeferralClassifier,
 } from "./conversationObligations.js";
+import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   await fn();
   n++;
   console.log(`  ✓ ${name}`);
-}
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const MIGRATIONS_DIR = resolve(__dirname, "../../prisma/migrations");
-
-/** Apply each migration file WHOLE — pg.exec handles multi-statement SQL, DO
- *  $$…$$ blocks, and partial indexes. Comment lines are harmless to pg.exec. */
-async function applyPrismaMigrations(pg: PGlite): Promise<number> {
-  const folders = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => d.name)
-    .sort();
-  let applied = 0;
-  for (const folder of folders) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, folder, "migration.sql"), "utf8");
-    await pg.exec(sql);
-    applied++;
-  }
-  return applied;
 }
 
 let seedN = 0;
@@ -124,7 +102,7 @@ async function seedInbound(pgdb: Db, instanceId: string): Promise<string> {
 async function main(): Promise<void> {
   console.log("\nconversationObligations.db\n");
   const pg = new PGlite();
-  const migrated = await applyPrismaMigrations(pg);
+  const migrated = await applyPGliteMigrations(pg);
   console.log(`  (applied ${migrated} Prisma migrations to embedded Postgres)`);
   const pgdb = drizzle(pg, { schema }) as unknown as Db;
 

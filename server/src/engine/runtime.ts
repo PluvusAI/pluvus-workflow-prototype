@@ -454,12 +454,20 @@ export class WorkflowRuntime {
     externalMessageId: string,
     data: Omit<MessageInsert, "instanceId" | "direction" | "externalMessageId">,
   ): Promise<void> {
-    const existing = await findMessageByExternalId(externalMessageId);
+    // PLU-121: attribute the inbound row to the mailbox this run is pinned to.
+    // A reply arrives on the same account the outreach was sent from (thread
+    // continuity), so the run's pinned account IS the receiving mailbox. Modern
+    // webhook callers also pass the account explicitly; that value wins so a
+    // deleted/null run pin cannot move the provider id into the legacy namespace.
+    const instance = await findInstanceById(instanceId);
+    const emailAccountId = data.emailAccountId ?? instance?.emailAccountId ?? undefined;
+    const existing = await findMessageByExternalId(externalMessageId, emailAccountId);
     if (existing) return; // already persisted by a prior (crashed) attempt
     await createMessage({
       instanceId,
       direction: "INBOUND",
       externalMessageId,
+      ...(emailAccountId ? { emailAccountId } : {}),
       ...data,
     });
   }
@@ -475,6 +483,7 @@ export class WorkflowRuntime {
       body: string;
       threadId?: string;
       externalMessageId?: string;
+      emailAccountId?: string;
     },
   ): Promise<void> {
     const instance = await findInstanceById(instanceId);
@@ -512,6 +521,7 @@ export class WorkflowRuntime {
       body: opts.body,
       threadId: opts.threadId ?? `mock-thread-${instance.creatorId}`,
       receivedAt: now,
+      ...(opts.emailAccountId ? { emailAccountId: opts.emailAccountId } : {}),
     });
 
     // Transition to REPLY_RECEIVED — OCC: only succeeds if state hasn't changed.
@@ -599,6 +609,7 @@ export class WorkflowRuntime {
       body: string;
       threadId?: string;
       externalMessageId?: string;
+      emailAccountId?: string;
       source?: TransitionSource;
       worker?: string | undefined;
       queueJobId?: string | undefined;
@@ -627,6 +638,7 @@ export class WorkflowRuntime {
       body: opts.body,
       threadId: opts.threadId ?? `mock-thread-${instance.creatorId}`,
       receivedAt: now,
+      ...(opts.emailAccountId ? { emailAccountId: opts.emailAccountId } : {}),
     });
 
     await appendEvent({
@@ -668,6 +680,7 @@ export class WorkflowRuntime {
       body: string;
       threadId?: string;
       externalMessageId?: string;
+      emailAccountId?: string;
       source?: TransitionSource;
       worker?: string | undefined;
       queueJobId?: string | undefined;
@@ -695,6 +708,7 @@ export class WorkflowRuntime {
       body: opts.body,
       threadId: opts.threadId ?? `mock-thread-${instance.creatorId}`,
       receivedAt: now,
+      ...(opts.emailAccountId ? { emailAccountId: opts.emailAccountId } : {}),
     });
 
     await appendEvent({
@@ -737,6 +751,7 @@ export class WorkflowRuntime {
       body: string;
       threadId?: string;
       externalMessageId?: string;
+      emailAccountId?: string;
       source?: TransitionSource;
       worker?: string | undefined;
       queueJobId?: string | undefined;
@@ -764,6 +779,7 @@ export class WorkflowRuntime {
       body: opts.body,
       threadId: opts.threadId ?? `mock-thread-${instance.creatorId}`,
       receivedAt: now,
+      ...(opts.emailAccountId ? { emailAccountId: opts.emailAccountId } : {}),
     });
 
     await appendEvent({
@@ -808,6 +824,7 @@ export class WorkflowRuntime {
       body: string;
       threadId?: string;
       externalMessageId?: string;
+      emailAccountId?: string;
     },
   ): Promise<void> {
     const instance = await findInstanceById(instanceId);
@@ -832,6 +849,7 @@ export class WorkflowRuntime {
       body: opts.body,
       threadId: opts.threadId ?? `mock-thread-${instance.creatorId}`,
       receivedAt: now,
+      ...(opts.emailAccountId ? { emailAccountId: opts.emailAccountId } : {}),
     });
 
     await appendEvent({
