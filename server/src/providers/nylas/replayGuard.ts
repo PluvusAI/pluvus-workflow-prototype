@@ -12,12 +12,14 @@
 //      fail OPEN on this check alone (can't prove staleness) — the seen-id guard
 //      below is the backstop for that case.
 //
-//   2. Seen-delivery-id — a bounded in-process set of recently-seen message ids
-//      (data.object.id). A repeat within the retention window is treated as a
-//      replay/duplicate and rejected. This is a best-effort, per-process guard
-//      (a multi-process fleet each keeps its own set); the durable idempotency
-//      backstop remains downstream (deterministic jobId + Message.externalMessageId
-//      @unique). Its job here is to reject an obvious replay at the edge.
+//   2. Seen-delivery-id — a bounded in-process set of Nylas notification ids
+//      (the top-level webhook envelope `id`), scoped by grant at the route. A
+//      repeat within the retention window is treated as a replay/duplicate. This
+//      is a best-effort, per-process guard (a multi-process fleet each keeps its
+//      own set); the durable backstop remains downstream: BullMQ and Message use
+//      the connected-account + provider-message-id tuple, with a separate null-
+//      account namespace for legacy/mock rows. Its job here is to reject an
+//      obvious replay at the edge.
 //
 // Both are pure/injectable so they unit-test without a clock or Express.
 

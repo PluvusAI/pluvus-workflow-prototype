@@ -13,6 +13,7 @@ import webhooksRouter from "./routes/webhooks.js";
 import observabilityRouter from "./routes/observability.js";
 import campaignsRouter from "./routes/campaigns.js";
 import workflowsRouter from "./routes/workflows.js";
+import emailAccountsRouter from "./routes/emailAccounts.js";
 import manualQueueRouter from "./routes/manualQueue.js";
 import creatorsRouter from "./routes/creators.js";
 import creatorImportsRouter from "./routes/creatorImports.js";
@@ -130,6 +131,9 @@ export function createApp(): Express {
   // Phase 10 — Workflow Builder APIs (create + cascade-DELETE a campaign).
   app.use("/campaigns", requireOperatorKey, campaignsRouter);
   app.use("/workflows", requireOperatorKey, workflowsRouter);
+  // PLU-121 — connected email accounts (multi-mailbox): register/list/manage the
+  // Nylas grants outreach can be sent from.
+  app.use("/email-accounts", requireOperatorKey, emailAccountsRouter);
   // Phase 11 — Manual Queue (escalated-creator data + notify mutation).
   app.use("/manual-queue", requireOperatorKey, manualQueueRouter);
   // Creator roster + CSV import — used by the enrollment UI.
@@ -186,6 +190,7 @@ export function createApp(): Express {
     apiRouter.use("/observability", requireOperatorKey, observabilityRouter);
     apiRouter.use("/campaigns", requireOperatorKey, campaignsRouter);
     apiRouter.use("/workflows", requireOperatorKey, workflowsRouter);
+    apiRouter.use("/email-accounts", requireOperatorKey, emailAccountsRouter);
     apiRouter.use("/manual-queue", requireOperatorKey, manualQueueRouter);
     apiRouter.use("/creators/imports", requireOperatorKey, creatorImportsRouter);
     apiRouter.use("/creators", requireOperatorKey, creatorsRouter);

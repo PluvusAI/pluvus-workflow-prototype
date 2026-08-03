@@ -54,8 +54,37 @@ async function handleInboundEmail(
   // senderEmail is carried on the job for audit/correlation but no longer consumed
   // here: it was only used to verify a brand-decision reply's sender identity, and
   // escalations are now terminal MANUAL_REVIEW (#14) with no reply handling.
-  const { instanceId, externalMessageId, threadId, subject, body, mockIntent } =
-    job.data;
+  const {
+    instanceId,
+    externalMessageId,
+    emailAccountId,
+    threadId,
+    subject,
+    body,
+    mockIntent,
+  } = job.data;
+
+  const instance = await findInstanceById(instanceId);
+  if (!instance) {
+    console.warn(`[inbound-email] instance not found: ${instanceId} (job ${job.id})`);
+    return;
+  }
+
+  // The webhook's account id is authoritative for a modern delivery. It must
+  // agree with the immutable run pin when both exist; processing a mismatched
+  // manually-forged/stale job would move a reply across mailbox boundaries.
+  if (
+    emailAccountId &&
+    instance.emailAccountId &&
+    emailAccountId !== instance.emailAccountId
+  ) {
+    throw new Error(
+      `[inbound-email] account mismatch for ${instanceId}: job=${emailAccountId}, ` +
+        `instance=${instance.emailAccountId}`,
+    );
+  }
+  const effectiveEmailAccountId =
+    emailAccountId ?? instance.emailAccountId ?? undefined;
 
   // ── Idempotency check ───────────────────────────────────────────────────
   // CRITICAL-6 (b): skip ONLY when the reply was fully PROCESSED (processedAt
@@ -65,7 +94,10 @@ async function handleInboundEmail(
   // the reply was permanently stranded. A persisted-but-unprocessed row now falls
   // through to be re-processed (the persist step itself is idempotent on the
   // unique externalMessageId — see below).
-  const existing = await findMessageByExternalId(externalMessageId);
+  const existing = await findMessageByExternalId(
+    externalMessageId,
+    effectiveEmailAccountId,
+  );
   if (existing?.processedAt) {
     console.log(
       `[inbound-email] skip — message ${externalMessageId} already processed (job ${job.id})`,
@@ -87,12 +119,6 @@ async function handleInboundEmail(
   // NB: a persisted-but-unprocessed row (existing != null, processedAt == null)
   // falls through — the persist step below is idempotent on externalMessageId
   // (persistInboundMessageOnce), so re-processing after a crash never double-inserts.
-
-  const instance = await findInstanceById(instanceId);
-  if (!instance) {
-    console.warn(`[inbound-email] instance not found: ${instanceId} (job ${job.id})`);
-    return;
-  }
 
   if (isTerminal(instance.currentState)) {
     console.log(
@@ -150,6 +176,7 @@ async function handleInboundEmail(
           body,
           threadId,
           externalMessageId,
+          ...(effectiveEmailAccountId ? { emailAccountId: effectiveEmailAccountId } : {}),
           worker: "inbound-email",
           queueJobId: job.id,
         });
@@ -210,6 +237,7 @@ async function handleInboundEmail(
         body,
         threadId,
         externalMessageId,
+        ...(effectiveEmailAccountId ? { emailAccountId: effectiveEmailAccountId } : {}),
       });
       processed = true;
       return;
@@ -229,6 +257,7 @@ async function handleInboundEmail(
           body,
           threadId,
           externalMessageId,
+          ...(effectiveEmailAccountId ? { emailAccountId: effectiveEmailAccountId } : {}),
           worker: "inbound-email",
           queueJobId: job.id,
         });
@@ -260,6 +289,7 @@ async function handleInboundEmail(
           body,
           threadId,
           externalMessageId,
+          ...(effectiveEmailAccountId ? { emailAccountId: effectiveEmailAccountId } : {}),
           worker: "inbound-email",
           queueJobId: job.id,
         });
@@ -278,7 +308,13 @@ async function handleInboundEmail(
     }
 
     try {
-      await runtime.injectReply(instanceId, { subject, body, threadId, externalMessageId });
+      await runtime.injectReply(instanceId, {
+        subject,
+        body,
+        threadId,
+        externalMessageId,
+        ...(effectiveEmailAccountId ? { emailAccountId: effectiveEmailAccountId } : {}),
+      });
     } catch (err) {
       if (err instanceof StaleInstanceError) {
         console.log(`[inbound-email] OCC conflict on injectReply — ${err.message} (job ${job.id})`);
@@ -312,7 +348,7 @@ async function handleInboundEmail(
     // threw, `processed` is false and the reply stays re-processable on retry.
     await releaseLock(instanceId, lockToken);
     if (processed) {
-      await markMessageProcessed(externalMessageId);
+      await markMessageProcessed(externalMessageId, effectiveEmailAccountId);
     }
   }
 

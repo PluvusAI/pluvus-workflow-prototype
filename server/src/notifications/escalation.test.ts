@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import type { BrandNotification, Creator } from "../db/schema.js";
+import type { BrandNotification, Creator, Message } from "../db/schema.js";
 import {
   notifyBrandOfEscalation,
   resolveBrandRecipient,
@@ -311,6 +311,40 @@ async function main() {
       sent[0]!.body,
       /Open the full email thread: https:\/\/mail\.example\.test\/threads\/thread-live/,
     );
+  });
+
+  await test("mailbox isolation: RFC822 lookup and notice send use the pinned provider", async () => {
+    const { deps } = makeDeps({ notifyEmail: "brand@acme.com", threadId: "thread-live" });
+    const caller = makeEmail({ threadUrl: true });
+    const pinned = makeEmail({ threadUrl: true });
+    const rfcLookups: string[] = [];
+    const pinnedProvider = Object.assign(pinned.email, {
+      async rfc822MessageId(externalMessageId: string) {
+        rfcLookups.push(externalMessageId);
+        return "pinned-rfc822@example.com";
+      },
+    });
+    deps.resolveInstanceEmailProvider = async () => pinnedProvider;
+    deps.listMessagesByInstance = async () => [
+      {
+        direction: "OUTBOUND",
+        externalMessageId: "grant-local-message-id",
+        createdAt: new Date(0),
+      } as Message,
+    ];
+
+    const result = await notifyBrandOfEscalation(
+      caller.email,
+      "i1",
+      "escalated",
+      deps,
+    );
+
+    assert.equal(result.status, "SENT");
+    assert.deepEqual(rfcLookups, ["grant-local-message-id"]);
+    assert.equal(caller.sent.length, 0, "caller/default grant must not be used");
+    assert.equal(pinned.sent.length, 1, "notice is sent through the pinned grant");
+    assert.match(pinned.sent[0]!.body, /pinned-rfc822(%40|@)example\.com/);
   });
 
   // ── Gmail deep-link (rfc822msgid — cold-load-safe) ─────────────────────────

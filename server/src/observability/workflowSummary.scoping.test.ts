@@ -14,9 +14,6 @@
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { eq } from "drizzle-orm";
@@ -24,6 +21,7 @@ import * as schema from "../db/schema.js";
 import { db } from "../db/drizzle.js";
 import { getWorkflowSummary, listWorkflowOptions } from "./repository.js";
 import type { Db } from "../db/drizzle.js";
+import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
@@ -32,36 +30,9 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
   console.log(`  ✓ ${name}`);
 }
 
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const MIGRATIONS_DIR = resolve(__dirname, "../../prisma/migrations");
-
-async function applyPrismaMigrations(pg: PGlite): Promise<number> {
-  const folders = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => d.name)
-    .sort();
-  let applied = 0;
-  for (const folder of folders) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, folder, "migration.sql"), "utf8");
-    const withoutComments = sql
-      .split(/\r?\n/)
-      .filter((line) => !line.trim().startsWith("--"))
-      .join("\n");
-    const statements = withoutComments
-      .split(";")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-    for (const stmt of statements) {
-      await pg.exec(stmt);
-    }
-    applied++;
-  }
-  return applied;
-}
-
 async function main(): Promise<void> {
   const pg = new PGlite();
-  const migrated = await applyPrismaMigrations(pg);
+  const migrated = await applyPGliteMigrations(pg);
   console.log(`  (applied ${migrated} Prisma migrations to embedded Postgres)`);
   const pgdb = drizzle(pg, { schema }) as unknown as Db;
 

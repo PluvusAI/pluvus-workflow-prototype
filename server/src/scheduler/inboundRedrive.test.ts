@@ -85,9 +85,11 @@ describe("BUG-Q2 inboundJobFromPayload", () => {
   it("carries optional senderEmail / mockIntent when present", () => {
     const job = inboundJobFromPayload({
       ...goodPayload,
+      emailAccountId: "account-1",
       senderEmail: "casey@example.com",
       mockIntent: "POSITIVE",
     });
+    assert.equal(job?.emailAccountId, "account-1");
     assert.equal(job?.senderEmail, "casey@example.com");
     assert.equal(job?.mockIntent, "POSITIVE");
   });

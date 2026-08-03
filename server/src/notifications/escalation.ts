@@ -46,11 +46,14 @@ import {
   appendEvent,
   listEventsByInstance,
   listMessagesByInstance,
+  findInstanceById,
 } from "../db/index.js";
+import { findEmailAccountById } from "../db/emailAccounts.js";
 import { findDealHandoffByInstance } from "../db/dealHandoffs.js";
 import { buildDraftHistory } from "../engine/executors/negotiationHistory.js";
 import type { DraftHistoryEntry } from "../adapters/negotiation/types.js";
 import type { IEmailProvider } from "../engine/providers.js";
+import { emailProviderForAccount } from "../engine/providerFactory.js";
 import type { EmailDraft } from "../engine/types.js";
 import { DefaultThreadContextResolver } from "../engine/threadContext.js";
 
@@ -180,6 +183,36 @@ export interface EscalationDeps {
     data: { status: BrandNotificationStatus; error?: string | null },
   ): Promise<BrandNotification>;
   appendEvent(data: EventInsert): Promise<Event>;
+  /** Resolve the run's pinned mailbox for every provider operation in the
+   * notice (RFC822 lookup, thread URL, and send). Optional for existing tests. */
+  resolveInstanceEmailProvider?(
+    instanceId: string,
+    callerProvider: IEmailProvider,
+  ): Promise<IEmailProvider | null>;
+  listMessagesByInstance?(instanceId: string): Promise<Message[]>;
+}
+
+async function resolveInstanceEmailProvider(
+  instanceId: string,
+  callerProvider: IEmailProvider,
+): Promise<IEmailProvider | null> {
+  if ((process.env["EMAIL_PROVIDER"] ?? "").toLowerCase() !== "nylas") {
+    return callerProvider;
+  }
+  try {
+    const instance = await findInstanceById(instanceId);
+    if (!instance?.emailAccountId) return null;
+    const account = await findEmailAccountById(instance.emailAccountId);
+    if (!account || account.status !== "active") return null;
+    return emailProviderForAccount(account);
+  } catch (err) {
+    console.error(
+      `[escalation] could not resolve pinned mailbox for instance ${instanceId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return null;
+  }
 }
 
 async function loadEscalationContext(
@@ -335,6 +368,8 @@ const defaultDeps: EscalationDeps = {
   findBrandNotificationByKey,
   updateBrandNotificationStatus,
   appendEvent,
+  resolveInstanceEmailProvider,
+  listMessagesByInstance,
 };
 
 // ---------------------------------------------------------------------------
@@ -559,7 +594,10 @@ async function deliverOperatorNotice(
   email: IEmailProvider,
   instanceId: string,
   reason: string,
-  buildDraft: (ctx: EscalationContext) => Promise<EmailDraft | null> | EmailDraft | null,
+  buildDraft: (
+    ctx: EscalationContext,
+    email: IEmailProvider,
+  ) => Promise<EmailDraft | null> | EmailDraft | null,
   deps: EscalationDeps,
   opts?: { withTranscript?: boolean; logLabel?: string },
 ): Promise<EscalationResult> {
@@ -605,15 +643,33 @@ async function deliverOperatorNotice(
       return { status: "SKIPPED", recipient: null };
     }
 
+    // Provider operations must stay in the execution's mailbox namespace. In a
+    // Nylas deployment the caller is commonly the process-wide/default provider,
+    // which may belong to another grant. Never use it for this run's header
+    // lookup, link builder, or notice send when a pin cannot be resolved.
+    const activeEmail = deps.resolveInstanceEmailProvider
+      ? await deps.resolveInstanceEmailProvider(instanceId, email)
+      : email;
+    if (!activeEmail) {
+      const message = "Pinned email account is unavailable";
+      await deps.updateBrandNotificationStatus(reservedId, {
+        status: "FAILED",
+        error: message,
+      });
+      console.error(`[${label}] ${message} for instance ${instanceId}`);
+      return { status: "FAILED", recipient };
+    }
+
     // ── E6b: resolve the Gmail deep-link's rfc822 Message-ID ─────────────────
     // The cold-load-safe Gmail link keys off the RFC822 Message-ID of the first
     // OUTBOUND message on this thread (not the hex thread id). Resolve it here,
     // where we have the email provider. Best-effort: any failure leaves it null and
     // the Gmail section is simply omitted — the notice is never blocked.
     let gmailRfc822MessageId: string | null = null;
-    if (email.rfc822MessageId) {
+    if (activeEmail.rfc822MessageId) {
       try {
-        const msgs = await listMessagesByInstance(instanceId);
+        const loadMessages = deps.listMessagesByInstance ?? listMessagesByInstance;
+        const msgs = await loadMessages(instanceId);
         const firstOutbound = msgs
           .filter((m) => m.direction === "OUTBOUND" && m.externalMessageId)
           .sort(
@@ -621,7 +677,7 @@ async function deliverOperatorNotice(
           )[0];
         if (firstOutbound?.externalMessageId) {
           gmailRfc822MessageId =
-            (await email.rfc822MessageId(firstOutbound.externalMessageId)) ?? null;
+            (await activeEmail.rfc822MessageId(firstOutbound.externalMessageId)) ?? null;
         }
       } catch (err) {
         console.error(
@@ -637,7 +693,7 @@ async function deliverOperatorNotice(
     // draft builder (loadContext leaves it null; it can only be resolved here,
     // where the email provider is available). The escalation builder reads it to
     // render the E6 cold-load-safe Gmail deep-link; handoff builders ignore it.
-    const draft = await buildDraft({ ...ctx, gmailRfc822MessageId });
+    const draft = await buildDraft({ ...ctx, gmailRfc822MessageId }, activeEmail);
     if (!draft) {
       // The notice had nothing to say (its backing record was missing). Record
       // SKIPPED so the gap is visible rather than silently absent.
@@ -652,7 +708,7 @@ async function deliverOperatorNotice(
     // not this email.) The creator is still passed as the thread owner for the
     // provider's fallback fields.
     try {
-      await email.send(draft, ctx.creator, {
+      await activeEmail.send(draft, ctx.creator, {
         email: recipient,
         name: ctx.brandName ?? ctx.creator.name,
       });
@@ -701,16 +757,16 @@ export async function notifyBrandOfEscalation(
   reason: string,
   deps: EscalationDeps = defaultDeps,
 ): Promise<EscalationResult> {
-  // E6: hand the email builder the provider's own thread-URL helper (bound to
-  // `email` so `this` resolves) so it can deep-link the thread. Providers that
-  // don't implement it (or aren't configured) yield undefined and the link is
-  // omitted — the notice is unaffected.
-  const threadUrl = email.threadUrl?.bind(email);
   return deliverOperatorNotice(
     email,
     instanceId,
     reason,
-    (ctx) => buildEscalationEmail(ctx, reason, threadUrl),
+    (ctx, activeEmail) =>
+      buildEscalationEmail(
+        ctx,
+        reason,
+        activeEmail.threadUrl?.bind(activeEmail),
+      ),
     deps,
     { logLabel: "escalation" },
   );
