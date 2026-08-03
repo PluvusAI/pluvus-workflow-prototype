@@ -18,14 +18,18 @@ export async function appendEvent(
   return rows[0]!;
 }
 
+// PLU-81 §8: `client` is injectable (defaults to the top-level `db`) so the
+// centralized context builder's I/O shell can be exercised against a test
+// transaction. Backward-compatible — existing callers pass no client.
 export async function listEventsByInstance(
   instanceId: string,
   opts?: { limit?: number; type?: EventType },
+  client: Db | DbTx = db,
 ): Promise<Event[]> {
   const where = opts?.type
     ? and(eq(events.instanceId, instanceId), eq(events.type, opts.type))
     : eq(events.instanceId, instanceId);
-  const query = db
+  const query = client
     .select()
     .from(events)
     .where(where)

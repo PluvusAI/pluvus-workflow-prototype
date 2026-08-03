@@ -428,9 +428,16 @@ const DRAFT_MAX_ATTEMPTS = 3;
 // proposedTerms), never the floor/ceiling band. Removing them at the draft seam
 // stops the model from writing "$200-$500" into the body; the output guard is
 // the backstop if a model invents a bound anyway.
-const BAND_CONTEXT_KEYS = ["minBudget", "maxBudget", "termFloor", "termCeiling"] as const;
+//
+// PLU-81 §4.3: EXPORTED so the centralized context builder
+// (conversationContext.ts toDraftContext) strips the band using this ONE list
+// rather than re-listing the keys — the band-key list stays a single source of
+// truth. Note it strips the RAW minBudget/maxBudget keys too, not just the
+// term-shaped names: those raw keys are the real leak surface (a plain config
+// number, not a struct a getter could gate).
+export const BAND_CONTEXT_KEYS = ["minBudget", "maxBudget", "termFloor", "termCeiling"] as const;
 
-function stripBandFromContext(
+export function stripBandFromContext(
   config: Record<string, unknown>,
 ): Record<string, unknown> {
   const safe: Record<string, unknown> = { ...config };

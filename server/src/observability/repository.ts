@@ -61,6 +61,7 @@ import {
   type KnowledgeDTO,
   type KnowledgeConflictDTO,
   type BriefAvailabilityDTO,
+  type ContextDTO,
 } from "./dto.js";
 
 // An instance in a waiting state is "stuck" if its dueAt passed more than this
@@ -686,6 +687,44 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
   return { briefAvailability, conflicts, resolvedSources };
 }
 
+// PLU-81 §7.2: read the sanitized AI-context record folded onto the NEGOTIATION_TURN
+// payloads (under a `context` key by buildContextRecord). Mirrors mapKnowledge:
+// zero extra I/O, reads the LATEST turn that carries a context sub-object (events are
+// chronological oldest-first, so the last one wins). Returns undefined when no turn
+// has assembled context yet, so a parked/pre-first-turn instance renders an empty
+// panel ("empty = no turn ran," §7.1) — NOT a live rebuild. Every field is
+// labels/keys/counts; the record never carried band VALUES (§7.5), so nothing to
+// redact here. Exported for the mapper unit test.
+export function mapContext(events: Event[]): ContextDTO | undefined {
+  let latest: ContextDTO | undefined;
+  for (const e of events) {
+    if (e.type !== "NEGOTIATION_TURN") continue;
+    const p = asRecord(e.payload);
+    if (!p) continue;
+    const ctx = asRecord(p["context"] as JsonValue | undefined);
+    if (!ctx) continue;
+    const purpose = payloadString(ctx, "purpose");
+    if (!purpose) continue; // a context record always stamps its purpose
+    const strArray = (raw: unknown): string[] =>
+      Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
+    const summaryVersion = payloadString(ctx, "summaryVersion");
+    latest = {
+      purpose,
+      round: payloadNumber(ctx, "round") ?? payloadNumber(p, "round"),
+      messageIdsIncluded: strArray(ctx["messageIdsIncluded"]),
+      eventCount: payloadNumber(ctx, "eventCount") ?? 0,
+      campaignFieldsSelected: strArray(ctx["campaignFieldsSelected"]),
+      briefSectionsUsed: strArray(ctx["briefSectionsUsed"]),
+      openObligationIds: strArray(ctx["openObligationIds"]),
+      ...(summaryVersion ? { summaryVersion } : {}),
+      estimatedTokens: payloadNumber(ctx, "estimatedTokens") ?? 0,
+      sourcesUsed: strArray(ctx["sourcesUsed"]),
+      bandPresent: ctx["bandPresent"] === true,
+    };
+  }
+  return latest;
+}
+
 export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO | null> {
   const instRows = await db
     .select({ instance: executionInstances, creator: creators })
@@ -747,6 +786,8 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
 
   // PLU-82: the knowledge block, computed once from the event log.
   const knowledge = mapKnowledge(instEvents);
+  // PLU-81: the sanitized AI-context record from the latest turn (labels/keys/counts).
+  const context = mapContext(instEvents);
 
   return {
     instance: {
@@ -786,6 +827,9 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
     // PLU-82: the knowledge block (brief availability + conflicts + selected
     // sources) from the event log. Undefined → the panel renders empty.
     ...(knowledge ? { knowledge } : {}),
+    // PLU-81: the sanitized AI-context record. Undefined → the panel renders empty
+    // ("empty = no turn ran," §7.1).
+    ...(context ? { context } : {}),
   };
 }
 
