@@ -12,6 +12,10 @@
 // hand instead.
 import { readFileSync } from "node:fs";
 import { pool } from "../src/db/drizzle.js";
+import {
+  configureMigrationSession,
+  migrationSessionConfig,
+} from "../src/db/migrationSession.js";
 
 const target = process.argv[2];
 if (!target) {
@@ -22,7 +26,17 @@ if (!target) {
 const sql = readFileSync(target, "utf8");
 const client = await pool.connect();
 try {
+  const sessionConfig = migrationSessionConfig();
+  console.log(
+    sessionConfig.hasConfiguredNylasGrant
+      ? "[migration config] Legacy Nylas grant will seed the active default email account."
+      : "[migration config] NYLAS_GRANT_ID is absent/placeholder; PLU-121 will seed a disabled non-default account.",
+  );
   await client.query("BEGIN");
+  // This must happen after BEGIN: a transaction-mode pooled URL can switch
+  // backend sessions between standalone statements. Transaction-local settings
+  // are guaranteed to be visible to the migration query that follows.
+  await configureMigrationSession(client, sessionConfig, true);
   await client.query(sql);
   await client.query("COMMIT");
   console.log(`applied: ${target}`);

@@ -27,9 +27,11 @@ export interface NodeExecutionJobData {
 /**
  * Process an inbound email reply and advance the instance to REPLY_RECEIVED.
  *
- * idempotency key: `externalMessageId`
- * The worker checks whether a Message row with this externalMessageId already
- * exists before creating one, so a re-delivered job is a safe no-op.
+ * idempotency key: `emailAccountId + externalMessageId`
+ * Provider ids are grant-local. The worker checks the Message row in that
+ * account's namespace before creating one, so a re-delivered job is a safe
+ * no-op without colliding with another connected mailbox. Jobs without an
+ * account remain in the account-less legacy/mock namespace.
  */
 /**
  * Flush a reserved OUTBOUND message after a randomized delay (Randomized Send
@@ -51,8 +53,10 @@ export interface DelayedSendJobData {
 
 export interface InboundEmailJobData {
   instanceId: string;
-  /** The Nylas (or mock) message id — globally unique per inbound email. */
+  /** The Nylas (or mock) message id — unique within emailAccountId. */
   externalMessageId: string;
+  /** Connected mailbox/grant namespace. Absent only for legacy/mock intake. */
+  emailAccountId?: string;
   threadId: string;
   subject: string;
   body: string;
