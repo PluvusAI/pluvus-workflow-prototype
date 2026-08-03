@@ -22,18 +22,22 @@ import type { AssembledContext, AssembleInputs } from "./types.js";
 import { LatestMessageMismatchError } from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Internal helpers (mirrors of the inline negotiation.ts logic, kept byte-identical)
+// Internal helpers (kept byte-identical to the former inline negotiation logic)
 // ---------------------------------------------------------------------------
 
-// The four authoritative flat knowledge fields (§ negotiation.ts FLAT_KNOWLEDGE_KEYS).
-const FLAT_KNOWLEDGE_KEYS = [
+// The four authoritative flat knowledge fields. Exported through the barrel and
+// re-exported from negotiation.ts for backward-compatible tests/callers, so the
+// builder's live projection and its regression tests share one implementation.
+export const FLAT_KNOWLEDGE_KEYS = [
   "usageRights",
   "exclusivity",
   "paymentTerms",
   "attributionWindow",
 ] as const;
 
-function projectFlatKnowledge(config: Record<string, unknown>): Record<string, string> {
+export function projectFlatKnowledge(
+  config: Record<string, unknown>,
+): Record<string, string> {
   const out: Record<string, string> = {};
   for (const key of FLAT_KNOWLEDGE_KEYS) {
     const v = config[key];

@@ -59,33 +59,12 @@ function materialConflictEscalationEnabled(): boolean {
   return process.env["MATERIAL_CONFLICT_ESCALATION_ENABLED"] === "true";
 }
 
-// PLU-114 REVIEW #1 (Calvin follow-up W1): the four authoritative flat knowledge
-// fields (usageRights / exclusivity / paymentTerms / attributionWindow) live on
-// `config` and reach /draft (via draftConfig = {...config}) but were NEVER placed
-// on the negotiate campaignContext — so the negotiate router resolved a configured
-// term to requested_but_unavailable and steered the model to defer a KNOWN answer,
-// an asymmetry with /draft. Project them (trimmed, non-empty only) so they can be
-// spread onto the negotiate knowledgeContext the same additive way as briefSections.
-// These are REFERENCE DATA only — campaignContext is documented "NEVER a money
-// input"; adding four string fields does not change that (guards + fee path
-// untouched). Exported for the request-shape unit test.
-export const FLAT_KNOWLEDGE_KEYS = [
-  "usageRights",
-  "exclusivity",
-  "paymentTerms",
-  "attributionWindow",
-] as const;
-
-export function projectFlatKnowledge(
-  config: Record<string, unknown>,
-): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const key of FLAT_KNOWLEDGE_KEYS) {
-    const v = config[key];
-    if (typeof v === "string" && v.trim()) out[key] = v.trim();
-  }
-  return out;
-}
+// Preserve the PLU-114 public test seam while keeping the live projection in the
+// centralized builder as the single source of truth.
+export {
+  FLAT_KNOWLEDGE_KEYS,
+  projectFlatKnowledge,
+} from "../conversationContext.js";
 
 // FIX-11 + Randomized Send Delay (§4.1, §4.3a): outbound AI replies use the
 // reserve-before-send helper, keyed on negotiation:<purpose>:<instance>:<round>,

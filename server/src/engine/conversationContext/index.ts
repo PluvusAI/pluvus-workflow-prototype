@@ -50,8 +50,13 @@ export type {
 } from "./types.js";
 export { LatestMessageMismatchError } from "./types.js";
 
-// Pure assemble core (§8).
-export { assembleContext } from "./assemble.js";
+// Pure assemble core (§8) + the canonical flat-knowledge projection. The latter
+// remains re-exported by negotiation.ts for compatibility, but lives only here.
+export {
+  assembleContext,
+  FLAT_KNOWLEDGE_KEYS,
+  projectFlatKnowledge,
+} from "./assemble.js";
 
 // Pure projections (§4.2).
 export { toDecisionContext, toDraftContext } from "./projections.js";
