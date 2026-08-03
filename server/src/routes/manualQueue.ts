@@ -89,6 +89,12 @@ const REASON_LABELS: Record<string, string> = {
   needs_deal_finalization: "Agreement reached — ready for operator onboarding",
   // Brand-approval gate: the brand rejected the closed deal via the magic link.
   brand_rejected: "Brand rejected the deal — needs a human to follow up",
+  // PLU-82 §4.5: a material brief-vs-Campaign conflict on a field the creator
+  // asked about — the AI must not pick between two disagreeing sources.
+  // NB: this label MUST stay in sync with the identical key in
+  // notifications/escalation.ts REASON_LABELS (no shared constant — §8-h).
+  material_knowledge_conflict:
+    "Brief and campaign disagree on a term the creator asked about",
 };
 
 function reasonLabel(reason: string): string {

@@ -485,6 +485,31 @@ async function main() {
     if (prev !== undefined) process.env["BRAND_NOTIFY_EMAIL"] = prev;
   });
 
+  // PLU-82 §4.5 / §8-h: the new material_knowledge_conflict reason renders its own
+  // label in the brand FYI email (not the generic fallback). This is the
+  // escalation-side half of the two-map drift guard.
+  await test("buildEscalationEmail renders the material_knowledge_conflict reason label", async () => {
+    const draft = buildEscalationEmail(
+      {
+        creator,
+        campaignName: "Summer Launch",
+        brandName: "Acme Co",
+        workflowName: "Summer Outreach",
+        notifyEmail: null,
+        transcript: [],
+        threadId: null,
+        gmailRfc822MessageId: null,
+      },
+      "material_knowledge_conflict",
+    );
+    // The specific label, not the "(material_knowledge_conflict)" fallback.
+    assert.match(draft.body, /brief and the campaign settings disagree/);
+    assert.ok(
+      !/it was escalated for human review \(material_knowledge_conflict\)/.test(draft.body),
+      "must not fall through to the generic reason fallback",
+    );
+  });
+
   console.log(`\n✓ escalation: all ${n} tests passed\n`);
 }
 

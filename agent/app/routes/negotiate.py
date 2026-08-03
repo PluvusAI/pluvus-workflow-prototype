@@ -5179,6 +5179,10 @@ class ParseBriefRequest(BaseModel):
     text is threaded back into campaignContext as `briefKnowledge`."""
 
     pdfBase64: str
+    # Additive capability negotiation. New server callers explicitly request the
+    # mode so cache identity and parser behavior cannot drift across services.
+    # None preserves old/direct callers: the agent environment remains fallback.
+    parseMode: Literal["flat", "structured"] | None = None
 
 
 class ParseBriefResponse(BaseModel):
@@ -5190,10 +5194,14 @@ class ParseBriefResponse(BaseModel):
     # PARSE FAILURE (invariant #2). Defaults keep old callers unaffected.
     status: str = "ok"
     # The parser version that produced this result (invariant #3), so the TS cache
-    # can key on (ref, parserVersion) and self-invalidate on a bump.
+    # can key on (ref, parserVersion, parseMode) and self-invalidate on a bump.
     parserVersion: str = _BRIEF_PARSER_VERSION
-    # The structured section map (invariant #4) — None when structured parsing is
-    # off, so the wire is byte-identical to today with the flag off.
+    # The capability actually used. This is explicit even when no recognized
+    # sections were found, which lets the server distinguish a complete flat
+    # extraction from an incomplete structured extraction.
+    parseMode: Literal["flat", "structured"] = "flat"
+    # The structured section map (invariant #4) — None in flat mode. parseMode is
+    # additive metadata; the legacy text itself remains byte-identical.
     sections: dict[str, Any] | None = None
     # Observability substrate (§4.8): which segmentation tier fired + page count.
     tierUsed: str | None = None
@@ -5201,9 +5209,18 @@ class ParseBriefResponse(BaseModel):
 
 
 def _structured_brief_enabled() -> bool:
-    """PLU-107: gate the structured segmentation pass. Default OFF → /parse-brief
-    returns text-only and the wire is byte-identical to today (invariant #9)."""
+    """Legacy-call fallback for the structured segmentation pass. Default OFF."""
     return os.getenv("STRUCTURED_BRIEF_PARSING_ENABLED", "").strip().lower() == "true"
+
+
+def _brief_parse_mode(
+    requested: Literal["flat", "structured"] | None,
+) -> Literal["flat", "structured"]:
+    """Use an explicit caller capability when present; retain the agent flag as
+    a backward-compatible fallback for callers deployed before parseMode."""
+    if requested is not None:
+        return requested
+    return "structured" if _structured_brief_enabled() else "flat"
 
 
 @router.post(
@@ -5217,12 +5234,15 @@ def parse_brief(req: ParseBriefRequest) -> ParseBriefResponse:
     Returns "" text (never 500s on a bad PDF) so a brief we can't read degrades to
     "no extra knowledge" rather than breaking the run.
 
-    With STRUCTURED_BRIEF_PARSING_ENABLED on, additionally returns the structured
-    section map + explicit status (invariant #2); with it off the response is the
-    flat text only, byte-identical to today (invariant #9)."""
+    New callers select `parseMode` explicitly; callers that omit it fall back to
+    STRUCTURED_BRIEF_PARSING_ENABLED. Structured mode additionally returns the
+    section map. Both modes report the capability actually used so a text-only
+    flat success cannot be mistaken for a partial structured parse."""
     import base64
 
     from app.brief import extract_brief_text, parse_brief_structured
+
+    parse_mode = _brief_parse_mode(req.parseMode)
 
     try:
         raw = base64.b64decode(req.pdfBase64, validate=False)
@@ -5230,12 +5250,23 @@ def parse_brief(req: ParseBriefRequest) -> ParseBriefResponse:
         # Malformed base64 → no knowledge, not an error (the run must not break).
         # A base64 failure IS a genuine failure (we never got readable bytes), so
         # report parse_failed so the caller doesn't cache/treat it as authoritative.
-        return ParseBriefResponse(text="", status="parse_failed", parserVersion=_BRIEF_PARSER_VERSION)
+        return ParseBriefResponse(
+            text="",
+            status="parse_failed",
+            parserVersion=_BRIEF_PARSER_VERSION,
+            parseMode=parse_mode,
+        )
 
-    if not _structured_brief_enabled():
-        # Flag OFF: flat text only — byte-identical to today. Status stays the
-        # default "ok" (old callers ignore it).
-        return ParseBriefResponse(text=extract_brief_text(raw), parserVersion=_BRIEF_PARSER_VERSION)
+    if parse_mode == "flat":
+        # Flat mode: extraction output is byte-identical to the legacy route;
+        # parseMode is additive metadata that old callers ignore.
+        flat_text = extract_brief_text(raw)
+        return ParseBriefResponse(
+            text=flat_text,
+            status="ok" if flat_text.strip() else "empty",
+            parserVersion=_BRIEF_PARSER_VERSION,
+            parseMode=parse_mode,
+        )
 
     parsed = parse_brief_structured(raw)
     # Stamp the immutable file ref onto every section (invariant #4). The route is
@@ -5248,6 +5279,7 @@ def parse_brief(req: ParseBriefRequest) -> ParseBriefResponse:
         text=parsed.flat_text,
         status=parsed.status,
         parserVersion=parsed.parser_version,
+        parseMode=parse_mode,
         sections=parsed.sections_payload() if parsed.status == "ok" else None,
         tierUsed=parsed.tier_used,
         pageCount=parsed.page_count,

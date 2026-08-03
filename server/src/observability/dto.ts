@@ -229,6 +229,57 @@ export interface ConversationObligationDTO {
   resolvedAt: string | null;
 }
 
+// PLU-82 §4.6: the knowledge observability block. Read-only; operator-gated via
+// the /observability requireOperatorKey. Backed entirely by the existing event
+// log (no new EventType/table).
+
+/** One material brief-vs-Campaign conflict (mirrors BriefFieldConflict). The
+ *  campaignValue + briefExcerpt are the two disagreeing sources shown to the
+ *  operator (requirement: expose the conflicting sources). */
+export interface KnowledgeConflictDTO {
+  section: string;
+  campaignField: string;
+  campaignValue: string;
+  briefExcerpt: string;
+  pageStart?: number;
+  reason: string;
+  /** The round this conflict was FIRST recorded on (from the NEGOTIATION_TURN
+   *  payload). Kept as `round` for backward compatibility with the panel. */
+  round: number | null;
+  /** review §6 (Calvin): the last round this exact conflict was still reported. */
+  lastRound: number | null;
+  /** review §6 (Calvin): "active" — still present in the most recent turn whose
+   *  brief was re-resolved; "cleared" — present earlier but absent from that latest
+   *  resolution (the source was corrected). Lets the operator panel distinguish a
+   *  currently-active conflict from a since-corrected one instead of showing every
+   *  historical conflict as though it were live. */
+  status: "active" | "cleared";
+}
+
+/** The four-state brief availability (§4.4), as last surfaced on a turn. */
+export interface BriefAvailabilityDTO {
+  status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
+  /** Immutable uploaded-brief reference, when a brief is configured. */
+  fileReference: string | null;
+  error: string | null;
+  missingSections: string[];
+  /** The round this availability was recorded on. */
+  round: number | null;
+}
+
+export interface KnowledgeDTO {
+  /** Latest brief availability seen across the instance's turns (null if none). */
+  briefAvailability: BriefAvailabilityDTO | null;
+  /** All material conflicts recorded across turns (deduped by field+reason). Each
+   *  carries a `status` — "active" (still present in the latest resolution) vs
+   *  "cleared" (since corrected) — so a recovered conflict no longer reads as live
+   *  (review §6). */
+  conflicts: KnowledgeConflictDTO[];
+  /** The winning-source label per finalized term, from the post-acceptance
+   *  executor's event payload (deliverables/timeline/paymentTerms/… → label). */
+  resolvedSources: Record<string, string | null>;
+}
+
 export interface InstanceDetailDTO {
   instance: {
     instanceId: string;
@@ -265,6 +316,10 @@ export interface InstanceDetailDTO {
   /** PLU-111: the conversation obligations — open creator questions + Pluvus
    *  commitments (and their resolved history) — for the inspector. */
   obligations: ConversationObligationDTO[];
+  /** PLU-82: the knowledge block — brief availability, material conflicts, and
+   *  the selected finalized-terms sources. Absent (undefined) when nothing has
+   *  been recorded yet, so older instances render an empty panel. */
+  knowledge?: KnowledgeDTO;
 }
 
 // ---------------------------------------------------------------------------

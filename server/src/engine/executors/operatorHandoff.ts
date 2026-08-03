@@ -8,7 +8,12 @@ import type { ExecutionContext, NodeResult } from "../types.js";
 import type { IEmailProvider } from "../providers.js";
 import { sendOnce } from "./idempotentSend.js";
 import { renderOperatorHandoffEmail } from "./operatorHandoffEmail.js";
-import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
+import { resolveAgreedFee } from "./agreedFee.js";
+import {
+  agreedFeeSource,
+  resolveKnowledgeField,
+  type SourceLabel,
+} from "../knowledgePrecedence.js";
 import { resolveBand } from "../band.js";
 import { resolveBrandName } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
@@ -76,21 +81,44 @@ export async function executeOperatorHandoff(
   // and commission-only campaigns legitimately close with no fee at all. So we
   // record `null` and let the operator see "30% commission".
   const fixedFee = resolveAgreedFee(events, negotiationConfig, config);
-  const commissionRate = firstNumber(
-    config["commissionRate"],
-    negotiationConfig["commissionRate"],
-  );
-  const deliverables = firstString(
-    config["deliverables"],
-    negotiationConfig["deliverables"],
-    campaign?.deliverables,
-  );
-  const timeline = firstString(
-    config["timeline"],
-    negotiationConfig["timeline"],
-    campaign?.timeline,
-  );
-  const paymentTerms = firstString(config["paymentTerms"], campaign?.paymentTerms);
+  // PLU-82 (§4.3): the finalized terms now resolve through the ONE documented
+  // precedence resolver instead of the inline firstString/firstNumber chains. The
+  // resolver reuses firstString/firstNumber, so this is byte-identical (invariant
+  // #3) — the golden test locks it. Each call passes only the source slots this
+  // executor had inline (an omitted slot is undefined = skipped), which reproduces
+  // this executor's exact 3-tier deliverables/timeline and 2-tier commission +
+  // NS-skipping paymentTerms without a per-executor policy table. `resolvedSources`
+  // records the winning-source label per field for the debug event payload (§4.6).
+  const resolvedSources: Record<string, SourceLabel> = {};
+  resolvedSources["fixedFee"] = agreedFeeSource(fixedFee);
+  const commission = resolveKnowledgeField("commissionRate", {
+    workflowConfig: config["commissionRate"],
+    negotiationState: negotiationConfig["commissionRate"],
+  });
+  const commissionRate = commission.value as number | undefined;
+  resolvedSources["commissionRate"] = commission.source;
+  const deliverablesR = resolveKnowledgeField("deliverables", {
+    workflowConfig: config["deliverables"],
+    negotiationState: negotiationConfig["deliverables"],
+    campaignDefault: campaign?.deliverables,
+  });
+  const deliverables = deliverablesR.value as string | undefined;
+  resolvedSources["deliverables"] = deliverablesR.source;
+  const timelineR = resolveKnowledgeField("timeline", {
+    workflowConfig: config["timeline"],
+    negotiationState: negotiationConfig["timeline"],
+    campaignDefault: campaign?.timeline,
+  });
+  const timeline = timelineR.value as string | undefined;
+  resolvedSources["timeline"] = timelineR.source;
+  // paymentTerms: WC → CD only (negotiationConfig deliberately NOT passed — the
+  // preserved inconsistency, §7 / invariant #3).
+  const paymentTermsR = resolveKnowledgeField("paymentTerms", {
+    workflowConfig: config["paymentTerms"],
+    campaignDefault: campaign?.paymentTerms,
+  });
+  const paymentTerms = paymentTermsR.value as string | undefined;
+  resolvedSources["paymentTerms"] = paymentTermsR.source;
 
   // The negotiation band the deal closed within, so the brand confirmation email
   // can restate "your range: $X–$Y". Read from the SAME node config the agent
@@ -102,11 +130,13 @@ export async function executeOperatorHandoff(
   // The campaign perk/reward blurb ("one pair of the Tempo trainer"), for the
   // "Perk" line of the confirmation email. Same config-then-campaign precedence
   // as the other denormalized terms.
-  const rewardDescription = firstString(
-    config["rewardDescription"],
-    negotiationConfig["rewardDescription"],
-    campaign?.rewardDescription,
-  );
+  const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
+    workflowConfig: config["rewardDescription"],
+    negotiationState: negotiationConfig["rewardDescription"],
+    campaignDefault: campaign?.rewardDescription,
+  });
+  const rewardDescription = rewardDescriptionR.value as string | undefined;
+  resolvedSources["rewardDescription"] = rewardDescriptionR.source;
 
   // The accepting turn's own message — the "acceptance message or event" the
   // snapshot records. Not the thread: the full conversation stays in Message and
@@ -203,6 +233,10 @@ export async function executeOperatorHandoff(
       ...(commissionRate !== undefined ? { commissionRate } : {}),
       acceptedAt: acceptedAt.toISOString(),
       ccOperator: ccOperator ?? null,
+      // PLU-82 (§4.6): the winning-source label per finalized term — the "selected
+      // source in internal debug context" criterion. Debug metadata only (the
+      // observability mapper reads it); never a money/term input.
+      resolvedSources,
     } as JsonObject,
   };
 }
