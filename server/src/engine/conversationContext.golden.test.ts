@@ -42,6 +42,7 @@ import {
 import { mergeCampaignFallback } from "./campaignContext.js";
 import { extractReplyText } from "./executors/replyText.js";
 import { assembleContext, toDecisionContext, toDraftContext, type AssembleInputs } from "./conversationContext.js";
+import { windowDraftHistory } from "./executors/conversationWindow.js";
 
 let n = 0;
 function test(name: string, fn: () => void): void {
@@ -531,6 +532,50 @@ test("intent reaches DECISION only; dealDescription reaches DRAFT only (neither 
     assert.ok(!("dealDescription" in b.negotiationContext), "dealDescription must not reach the negotiate context");
     assert.ok(!("dealDescription" in b.draftConfig), "dealDescription is per-branch extra, not on the shared draftConfig");
   });
+});
+
+// ---------------------------------------------------------------------------
+// PLU-112 — the summary MUST NOT alter the DECISION request nor the draftConfig
+// (money path is never windowed; the summary rides via draft extras only), and
+// windowing is byte-identical to today when no valid summary is present.
+// ---------------------------------------------------------------------------
+
+test("PLU-112: an injected summary does not change the DECISION request or draftConfig", () => {
+  withFlags({}, () => {
+    const r = rows();
+    const base: AssembleInputs = {
+      purpose: "NEGOTIATION_DECISION",
+      instance: inst(), creator: creator(), campaign: r.campaign, node: NODE, nodeGraph: NODE_GRAPH,
+      messages: r.msgs, events: r.evs, obligationRows: r.obs, resolvedBrief: r.brief,
+      mergedConfig: mergeCampaignFallback(NODE.config, r.campaign),
+    };
+    const withoutSummary = assembleContext(base);
+    const withSummary = assembleContext({
+      ...base,
+      conversationSummary: { text: "the arc so far", version: "summary-v1.0", summarizedThroughSentAt: new Date(0) },
+    });
+    // Decision request: byte-identical (the money model never sees a windowed
+    // transcript nor a summary key).
+    const negA = buildNegotiationRequest(ROUND, base.mergedConfig, withoutSummary.creatorReply, toDecisionContext(withoutSummary).decisionHistory);
+    const negB = buildNegotiationRequest(ROUND, base.mergedConfig, withSummary.creatorReply, toDecisionContext(withSummary).decisionHistory);
+    assert.equal(canonical(negB), canonical(negA), "summary must not touch the decision request");
+    // draftConfig: the summary rides via draft EXTRAS, never the shared draftConfig.
+    assert.ok(!("conversationSummary" in toDraftContext(withSummary).draftConfig), "summary must not enter draftConfig");
+  });
+});
+
+test("PLU-112: windowing is a no-op with no valid summary (flag-OFF byte-identical)", () => {
+  const r = rows();
+  const ctx = assembleContext({
+    purpose: "NEGOTIATION_DECISION",
+    instance: inst(), creator: creator(), campaign: r.campaign, node: NODE, nodeGraph: NODE_GRAPH,
+    messages: r.msgs, events: r.evs, obligationRows: r.obs, resolvedBrief: r.brief,
+    mergedConfig: mergeCampaignFallback(NODE.config, r.campaign),
+  });
+  // No summary (the flag-OFF loader returns undefined) → full transcript, unchanged.
+  const off = windowDraftHistory(ctx.datedRecentMessages, undefined, { window: 8, tokenBudget: 6000 });
+  assert.equal(canonical(off.history), canonical(ctx.recentMessages), "no summary → the full transcript, byte-identical");
+  assert.equal(off.summary, undefined);
 });
 
 console.log(`\n${n} passed\n`);

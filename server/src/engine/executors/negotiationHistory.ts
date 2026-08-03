@@ -126,8 +126,10 @@ export function buildPriorContextFromEvents(events: Event[]): PriorNegotiationCo
 // escalation (A1/A2), not the creator — excluded here so the brand's "approve"
 // never appears as a creator turn.
 
-/** A dated item to sort our-turns and creator-messages into one timeline. */
-interface DatedEntry {
+/** A dated item to sort our-turns and creator-messages into one timeline.
+ *  `at` is the sentAt/receivedAt epoch — the same key the transcript orders by
+ *  and PLU-112's summary cursor (`summarizedThroughSentAt`) compares against. */
+export interface DatedEntry {
   at: number;
   entry: DraftHistoryEntry;
 }
@@ -252,6 +254,18 @@ export function buildDraftHistory(
   excludedMessageIds: Set<string>,
   events: Event[],
 ): DraftHistoryEntry[] {
+  return buildDatedDraftHistory(messages, excludedMessageIds, events).map((i) => i.entry);
+}
+
+/** Same chronological transcript as buildDraftHistory, but retains each entry's
+ *  `at` timestamp — PLU-112's summary windowing needs the sentAt cursor that
+ *  buildDraftHistory discards. buildDraftHistory is a thin `.map` on top, so the
+ *  two stay byte-identical. */
+export function buildDatedDraftHistory(
+  messages: Message[],
+  excludedMessageIds: Set<string>,
+  events: Event[],
+): DatedEntry[] {
   const items: DatedEntry[] = [];
   const eventsByRound = indexEventsByRound(events);
 
@@ -292,7 +306,7 @@ export function buildDraftHistory(
   }
 
   items.sort((a, b) => a.at - b.at);
-  return items.map((i) => i.entry);
+  return items;
 }
 
 // HARD-N2 answered-questions ledger. Each NEGOTIATION_TURN event persists the

@@ -269,7 +269,7 @@ export type ManualResolveStatus =
 
 // ---- LLM usage (HARD-O1) ----
 
-export type LlmCallRole = "classify" | "negotiate" | "draft";
+export type LlmCallRole = "classify" | "negotiate" | "draft" | "summarize";
 
 export interface LlmCallDTO {
   id: string;

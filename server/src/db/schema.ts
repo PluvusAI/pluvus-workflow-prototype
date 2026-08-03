@@ -964,6 +964,43 @@ export const conversationObligations = pgTable(
   ],
 );
 
+// PLU-112: one rolling narrative summary per instance. The summary covers the
+// ELIDED transcript prefix so a long draft prompt can window its raw history
+// without losing it. `summarizedThroughSentAt` is the coverage cursor — the
+// sentAt high-water mark of the folded-in prefix, the same ordering key the
+// transcript uses (never a message id; a filtered/rolled-back message must not
+// strand the cursor). Narrative-only: rates/questions/commitments stay owned by
+// events / obligations / creator memory, never restated here.
+export const conversationSummaries = pgTable(
+  "ConversationSummary",
+  {
+    id: cuidId("id"),
+    // One summary per instance (unique) — refreshed incrementally, not per-thread.
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+    // The narrative body (no dollar/percent figures — post-gen guarded).
+    text: text("text").notNull(),
+    // The coverage cursor: entries with sentAt <= this are covered by the summary
+    // and may be windowed out; entries after it always stay raw. Populated, never
+    // null (the whole point — windowing is gated on a real cursor).
+    summarizedThroughSentAt: ts("summarizedThroughSentAt").notNull(),
+    // The specific Message at the cursor, for audit/debug only (not the key).
+    summarizedThroughMessageId: text("summarizedThroughMessageId").references(
+      () => messages.id,
+    ),
+    // Summarizer prompt-version stamp → observability `summaryVersion`.
+    version: text("version").notNull(),
+    // Best-effort tokens the window saved, for the debug proxy.
+    estimatedTokensSaved: integer("estimatedTokensSaved").notNull().default(0),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    uniqueIndex("ConversationSummary_instanceId_key").on(table.instanceId),
+  ],
+);
+
 // HARD-O1: one row per LLM call the agent service made on behalf of a workflow
 // instance — the durable token/latency/cost telemetry the in-process agent ring
 // buffer cannot provide. Rows are written best-effort by the observability sink
@@ -999,7 +1036,7 @@ export const llmCalls = pgTable(
 );
 
 /** The agent paths that produce LLM calls (LlmCall.role values). */
-export type LlmCallRole = "classify" | "negotiate" | "draft";
+export type LlmCallRole = "classify" | "negotiate" | "draft" | "summarize";
 
 // ---------------------------------------------------------------------------
 // Attribution & Payout ledger (Phase 1+)
@@ -1255,6 +1292,7 @@ export type PaymentInfo = typeof paymentInfo.$inferSelect;
 export type DealHandoff = typeof dealHandoffs.$inferSelect;
 export type BrandApproval = typeof brandApprovals.$inferSelect;
 export type ConversationObligation = typeof conversationObligations.$inferSelect;
+export type ConversationSummary = typeof conversationSummaries.$inferSelect;
 export type Partnership = typeof partnerships.$inferSelect;
 export type Click = typeof clicks.$inferSelect;
 export type Conversion = typeof conversions.$inferSelect;
@@ -1310,6 +1348,7 @@ export type PaymentInfoInsert = typeof paymentInfo.$inferInsert;
 export type DealHandoffInsert = typeof dealHandoffs.$inferInsert;
 export type BrandApprovalInsert = typeof brandApprovals.$inferInsert;
 export type ConversationObligationInsert = typeof conversationObligations.$inferInsert;
+export type ConversationSummaryInsert = typeof conversationSummaries.$inferInsert;
 export type PartnershipInsert = typeof partnerships.$inferInsert;
 export type ClickInsert = typeof clicks.$inferInsert;
 export type ConversionInsert = typeof conversions.$inferInsert;

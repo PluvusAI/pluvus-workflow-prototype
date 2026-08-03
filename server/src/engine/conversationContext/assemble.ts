@@ -8,7 +8,7 @@
 import type { Event, Message } from "../../db/schema.js";
 import {
   buildPriorContextFromEvents,
-  buildDraftHistory,
+  buildDatedDraftHistory,
   buildOpenObligations,
   buildStructuredObligations,
 } from "../executors/negotiationHistory.js";
@@ -189,8 +189,11 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
   const classifiedIntent =
     typeof latestInbound?.replyIntent === "string" ? latestInbound.replyIntent : undefined;
 
-  // PLU-85 both-sides transcript from Message rows (events only enrich).
-  const recentMessages = buildDraftHistory(messages, brandReplyMsgIds, priorEvents);
+  // PLU-85 both-sides transcript from Message rows (events only enrich). Keep the
+  // dated form too — PLU-112's draft windowing needs each entry's sentAt cursor,
+  // which the plain transcript discards. `recentMessages` stays byte-identical.
+  const datedRecentMessages = buildDatedDraftHistory(messages, brandReplyMsgIds, priorEvents);
+  const recentMessages = datedRecentMessages.map((d) => d.entry);
 
   // PLU-111 obligations.
   const ledgerSplit = buildOpenObligations(obligationRows);
@@ -245,6 +248,7 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
     decisionHistory: priorContext,
     priorEvents,
     recentMessages,
+    datedRecentMessages,
     latestInbound,
     creatorReply,
     brandReplyMsgIds,

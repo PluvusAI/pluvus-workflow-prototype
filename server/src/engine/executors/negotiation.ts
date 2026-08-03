@@ -27,6 +27,17 @@ import {
   toDraftContext,
   buildContextRecord,
 } from "../conversationContext.js";
+// PLU-112: rolling summary loader + pure draft windowing. The flag lives inside the
+// loader, so off ⇒ no summary ⇒ the window step is a no-op and the draft prompt is
+// byte-identical.
+import { loadConversationSummary } from "../../db/conversationSummary.js";
+import {
+  conversationSummaryEnabled,
+  recentMessageWindow,
+  rawTranscriptTokenBudget,
+} from "./summaryConfig.js";
+import { windowDraftHistory } from "./conversationWindow.js";
+import { refreshConversationSummary } from "./summaryRefresh.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { negotiationReplyDelayMs } from "../sendDelay.js";
@@ -804,18 +815,37 @@ export async function executeNegotiation(
   // obligations split, brief resolution + section/flat-knowledge projection, the
   // band-free knowledge campaignContext, and the classify intent. The prompt-facing
   // request objects are BYTE-IDENTICAL to before (golden matrix, §10).
-  const cc = await buildConversationContext({
-    instanceId: instance.id,
-    purpose: "NEGOTIATION_DECISION",
-    nodeGraph,
-    node,
-    campaign: ctx.campaign,
-    instance,
-    creator,
-    // Reuse the exact mergeCampaignFallback result already used by every
-    // precondition above. This is the turn's one merge point.
-    mergedConfig: config,
-  });
+  const cc = await buildConversationContext(
+    {
+      instanceId: instance.id,
+      purpose: "NEGOTIATION_DECISION",
+      nodeGraph,
+      node,
+      campaign: ctx.campaign,
+      instance,
+      creator,
+      // Reuse the exact mergeCampaignFallback result already used by every
+      // precondition above. This is the turn's one merge point.
+      mergedConfig: config,
+    },
+    {
+      // PLU-112: the SINGLE read path for the rolling summary (PLU-81 §9.1 loader
+      // seam). The flag check lives INSIDE the loader — off ⇒ undefined ⇒ no
+      // windowing, prompt byte-identical. The cursor rides along for windowing.
+      loadConversationSummary: async (instanceId) => {
+        if (!conversationSummaryEnabled()) return undefined;
+        const row = await loadConversationSummary(instanceId);
+        return row
+          ? {
+              text: row.text,
+              version: row.version,
+              summarizedThroughSentAt: row.summarizedThroughSentAt,
+              tokensSaved: row.estimatedTokensSaved,
+            }
+          : undefined;
+      },
+    },
+  );
 
   // Names the branches below already use, sourced from the builder (§6). The
   // builder derived `latestInbound`/`creatorReply` with the SAME logic (§5.4), so
@@ -823,7 +853,23 @@ export async function executeNegotiation(
   const latestInbound = cc.latestInbound;
   const creatorReply = cc.creatorReply;
   const priorContext = cc.decisionHistory;
-  const draftHistory = cc.recentMessages;
+  // PLU-112: window ONLY the draft transcript against the summary's coverage cursor
+  // (the money DECISION path keeps the full history — it needs older rate anchors).
+  // No summary (flag off / absent) ⇒ windowDraftHistory returns the full transcript,
+  // byte-identical to today. The summary travels with the shortened history below.
+  const draftWindow = windowDraftHistory(cc.datedRecentMessages, cc.conversationSummary, {
+    window: recentMessageWindow(),
+    tokenBudget: rawTranscriptTokenBudget(),
+  });
+  const draftHistory = draftWindow.history;
+  const conversationSummaryExtra = draftWindow.summary
+    ? { conversationSummary: { text: draftWindow.summary.text, version: draftWindow.summary.version } }
+    : {};
+  // PLU-112: incrementally refresh the summary for the NEXT turn (fire-and-forget,
+  // fail-soft — never blocks or fails this turn). Only when the flag is on.
+  if (conversationSummaryEnabled()) {
+    void refreshConversationSummary(instance.id, cc.datedRecentMessages, agent);
+  }
   const openObligationRows = cc.openObligationRows;
   const openCommitments = cc.openCommitments;
   const resolvedBrief = cc.brief;
@@ -1019,6 +1065,9 @@ export async function executeNegotiation(
   // request stays minimal; every field defaults so the copy is unchanged when unset.
   const draftHistoryExtra = {
     ...(draftHistory.length ? { history: draftHistory } : {}),
+    // PLU-112: the summary rides WITH the windowed history — a shortened transcript
+    // never travels without the narrative that covers what was dropped.
+    ...conversationSummaryExtra,
     ...(openQuestions.length ? { openQuestions } : {}),
     ...(openCommitments.length ? { openCommitments } : {}),
     ...(changedFields.length ? { changedFields } : {}),

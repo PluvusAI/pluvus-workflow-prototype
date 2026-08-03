@@ -16,7 +16,7 @@ import type {
 } from "../../db/schema.js";
 import type { NodeSnapshot, PriorNegotiationContext } from "../types.js";
 import type { DraftHistoryEntry } from "../../adapters/negotiation/types.js";
-import type { StructuredObligation } from "../executors/negotiationHistory.js";
+import type { StructuredObligation, DatedEntry } from "../executors/negotiationHistory.js";
 import type {
   resolveBriefKnowledge,
   ResolvedBrief,
@@ -66,14 +66,17 @@ export interface CreatorMemoryPayload {
 }
 
 /**
- * PLU-112 §9.4 — shape UNVERIFIED (canonical owner: PLU-112; adjust on that issue).
- * PLU-112 is not built anywhere; this is a minimal placeholder so the slot + the
- * `summaryVersion` observability field have a type. No budget logic ships (§3).
+ * PLU-112 — the rolling narrative summary of the ELIDED transcript prefix.
+ * `summarizedThroughSentAt` is the coverage cursor: draft turns with a later
+ * sentAt stay raw, earlier ones are covered here and may be windowed out. The
+ * wire-facing request carries only `{ text, version }` — the cursor never reaches
+ * the model. Narrative-only; carries no rates/questions/commitments.
  */
 export interface ConversationSummary {
   text: string;
   version?: string;
   tokensSaved?: number;
+  summarizedThroughSentAt?: Date | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +127,8 @@ export interface AssembledContext {
 
   // Communication transcript (PLU-85 — Message-sourced, both sides).
   recentMessages: DraftHistoryEntry[];
+  // Same transcript with each entry's sentAt cursor (PLU-112 draft windowing).
+  datedRecentMessages: DatedEntry[];
 
   // The creator's latest inbound + its derived reply text (§5.4). One source of truth.
   latestInbound?: Message | undefined;
