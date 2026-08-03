@@ -45,3 +45,6 @@ uploads/
 .claude-user
 **/.*.claude-user
 **/.claude
+
+# Redis snapshot
+dump.rdb
