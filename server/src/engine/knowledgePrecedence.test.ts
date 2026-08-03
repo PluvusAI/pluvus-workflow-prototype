@@ -12,6 +12,7 @@
 
 import assert from "node:assert/strict";
 import {
+  agreedFeeSource,
   resolveKnowledgeField,
   PRECEDENCE_BY_CATEGORY,
   type KnowledgeCategory,
@@ -25,6 +26,12 @@ function test(name: string, fn: () => void): void {
 }
 
 console.log("\nresolveKnowledgeField — ordered walk + label (§4.1/§4.2)\n");
+
+test("fixedFee provenance is confirmed_agreement only when a real rate exists", () => {
+  assert.equal(agreedFeeSource(425), "confirmed_agreement");
+  assert.equal(agreedFeeSource(0), "confirmed_agreement");
+  assert.equal(agreedFeeSource(undefined), null);
+});
 
 test("deliverables: workflow_config wins over campaign_default (node config wins)", () => {
   const r = resolveKnowledgeField("deliverables", {

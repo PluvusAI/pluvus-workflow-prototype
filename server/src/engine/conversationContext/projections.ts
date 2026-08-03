@@ -37,7 +37,6 @@ function buildDebug(
   if (ctx.recentMessages.length) sources.push(`transcript:${ctx.recentMessages.length}turns`);
   if (ctx.creatorMemory) sources.push("memory:present");
   if (ctx.conversationSummary) sources.push("summary:present");
-  if (ctx.campaignConstraints.bandPresent) sources.push("band:present");
   sources.push(...extraSources);
 
   return {
@@ -78,7 +77,10 @@ export function toDecisionContext(ctx: AssembledContext): DecisionContext {
       ? { campaignContext: ctx.knowledgeContext }
       : {}),
   };
-  const debug = buildDebug(ctx, decisionHistory, ["intent:decision-only"]);
+  const debug = buildDebug(ctx, decisionHistory, [
+    ...(ctx.campaignConstraints.bandPresent ? ["band:present"] : []),
+    ...(ctx.classifiedIntent ? ["intent:decision-only"] : []),
+  ]);
   return {
     decisionHistory,
     campaignConstraints: ctx.campaignConstraints,
@@ -115,7 +117,10 @@ export function toDraftContext(ctx: AssembledContext): DraftContext {
       ? { structuredObligations: ctx.structuredObligations }
       : {}),
   };
-  const debug = buildDebug(ctx, draftConfig, ["dealDescription:draft-only"]);
+  // The draft projection is band-stripped and does not receive the per-branch
+  // dealDescription extras assembled later by the executor. Neither can be
+  // truthfully claimed as a source here.
+  const debug = buildDebug(ctx, draftConfig, []);
   return {
     draftConfig,
     history: ctx.recentMessages,

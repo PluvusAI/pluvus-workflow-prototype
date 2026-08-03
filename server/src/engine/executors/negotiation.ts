@@ -14,7 +14,10 @@ import {
   computeChangedFields,
   computeRelationshipWarmth,
 } from "./negotiationHistory.js";
-import { type BriefFieldConflict } from "./briefKnowledge.js";
+import {
+  type BriefFieldConflict,
+  type BriefKnowledgeResult,
+} from "./briefKnowledge.js";
 // PLU-81: the centralized, purpose-aware context builder. executeNegotiation calls
 // it ONCE per turn and projects it for BOTH the NEGOTIATION_DECISION and EMAIL_DRAFT
 // purposes (the AC "negotiation uses the builder" + "another AI path reuses it").
@@ -47,11 +50,11 @@ import { blockedByGuard } from "./guardEscalation.js";
 
 // PLU-82 §4.5 / §6: gates ONLY the material-conflict escalation DECISION (not the
 // detection or observability surfacing, which ship unconditionally). Default OFF
-// → today's behavior (console.warn + the observability record), byte-identical on
-// every real deal. Orthogonal to the two brief-into-prompt flags above; has a
-// HIDDEN dependency on the agent's STRUCTURED_BRIEF_PARSING_ENABLED (no structured
-// sections → resolvedBrief.conflicts is always empty → this path is inert
-// regardless of its own flag, invariant #9 / §8-f).
+// leaves prompts, resolved terms, and deal-state decisions unchanged. Orthogonal
+// to the two brief-into-prompt flags above; has a
+// DEPENDENCY on STRUCTURED_BRIEF_PARSING_ENABLED (the server requests this mode
+// explicitly; no structured sections → resolvedBrief.conflicts is always empty →
+// this path is inert regardless of its own flag, invariant #9 / §8-f).
 function materialConflictEscalationEnabled(): boolean {
   return process.env["MATERIAL_CONFLICT_ESCALATION_ENABLED"] === "true";
 }
@@ -552,6 +555,7 @@ export function conflictAffectsCreatorCommitment(
   creatorQuestions: string[] | undefined,
   pushedFixedTerms: string[] | undefined,
   openObligations: ReadonlyArray<Pick<ConversationObligation, "category">>,
+  creatorReply?: string,
 ): string[] {
   if (!conflicts.length) return [];
 
@@ -569,7 +573,15 @@ export function conflictAffectsCreatorCommitment(
   //       coarse-category open obligation re-surfaces a field only when the field
   //       has no less-ambiguous signal. This is the "conservative fallback is fine
   //       when genuinely ambiguous" case Calvin called out.
-  const thisTurnText = [...(creatorQuestions ?? []), ...(pushedFixedTerms ?? [])];
+  // Always include the raw creator reply as a deterministic fallback. Rules mode,
+  // an older agent, or a malformed additive field can legitimately omit
+  // creatorQuestions; a safety gate must not become inert merely because model
+  // comprehension metadata is unavailable.
+  const thisTurnText = [
+    ...(creatorQuestions ?? []),
+    ...(pushedFixedTerms ?? []),
+    ...(creatorReply?.trim() ? [creatorReply] : []),
+  ];
   const openCoarseCategories = new Set<string>();
   for (const o of openObligations) {
     if (o.category) openCoarseCategories.add(o.category);
@@ -617,7 +629,7 @@ export function conflictAffectsCreatorCommitment(
  *
  * The section VALUES ride the payload (persisted, operator-only via the
  * /observability gate) so the inspector can show both disagreeing sources; they
- * are NEVER logged to stdout (the caller keeps the keys/reason-only console.warn).
+ * are NEVER logged to stdout (the caller logs canonical keys/page numbers only).
  */
 export function escalateMaterialConflict(args: {
   round: number;
@@ -646,6 +658,66 @@ export function escalateMaterialConflict(args: {
       conflicts: conflicts as unknown as BriefFieldConflict[],
     },
   };
+}
+
+/**
+ * Build the explicit knowledge snapshot persisted on every negotiation turn that
+ * reached brief resolution. Healthy snapshots are intentionally retained (with
+ * an empty conflicts array): the observability mapper needs that positive record
+ * to clear an older parse failure, partial result, or material conflict.
+ */
+export function buildKnowledgeRecord(
+  briefAvailability: BriefKnowledgeResult,
+  conflicts: ReadonlyArray<BriefFieldConflict>,
+): Record<string, unknown> {
+  // `BriefKnowledgeResult.text` is the full extracted PDF and is useful to the
+  // model, not to observability. Never duplicate it into every event: the panel
+  // consumes only state/provenance metadata, and retaining the blob here would
+  // bloat the event log while unnecessarily broadening sensitive-data exposure.
+  const compactAvailability = {
+    status: briefAvailability.status,
+    ...(briefAvailability.fileReference
+      ? { fileReference: briefAvailability.fileReference }
+      : {}),
+    ...(briefAvailability.error ? { error: briefAvailability.error } : {}),
+    ...(briefAvailability.missingSections
+      ? { missingSections: [...briefAvailability.missingSections] }
+      : {}),
+  };
+  return {
+    knowledge: {
+      briefAvailability: compactAvailability,
+      conflicts: [...conflicts],
+    },
+  };
+}
+
+/** Attach the current brief snapshot without discarding branch-specific audit data. */
+export function attachKnowledgeRecord(
+  result: NodeResult,
+  knowledgeRecord: Record<string, unknown>,
+): NodeResult {
+  return {
+    ...result,
+    eventPayload: {
+      ...(result.eventPayload ?? {}),
+      ...knowledgeRecord,
+    },
+  };
+}
+
+/** Value-free conflict summary for stdout. Full reasons/excerpts stay only in the
+ * operator-gated event payload because some reason strings embed exact terms. */
+export function formatBriefConflictWarning(
+  conflicts: ReadonlyArray<BriefFieldConflict>,
+): string {
+  return conflicts
+    .map((conflict) =>
+      `${conflict.section}${
+        conflict.pageStart !== undefined ? ` (p${conflict.pageStart})` : ""
+      }`,
+    )
+    .join("; ");
 }
 
 export async function executeNegotiation(
@@ -746,8 +818,8 @@ export async function executeNegotiation(
   // read-model. The two PURE projections (toDecisionContext / toDraftContext)
   // re-shape it with zero new I/O — so the brief resolves exactly once per turn.
   //
-  // This absorbs the ~150 lines of inline assembly that used to live here: merge
-  // fallback, latest-inbound + creatorReply, prior context, both-sides transcript,
+  // This absorbs the ~150 lines of inline assembly that used to live here:
+  // latest-inbound + creatorReply, prior context, both-sides transcript,
   // obligations split, brief resolution + section/flat-knowledge projection, the
   // band-free knowledge campaignContext, and the classify intent. The prompt-facing
   // request objects are BYTE-IDENTICAL to before (golden matrix, §10).
@@ -759,6 +831,9 @@ export async function executeNegotiation(
     campaign: ctx.campaign,
     instance,
     creator,
+    // Reuse the exact mergeCampaignFallback result already used by every
+    // precondition above. This is the turn's one merge point.
+    mergedConfig: config,
   });
 
   // Names the branches below already use, sourced from the builder (§6). The
@@ -827,24 +902,24 @@ export async function executeNegotiation(
 
   // PLU-107 observability (§4.8): a material brief-vs-Campaign conflict is surfaced
   // (not resolved) so PLU-82 / a human can act on it. Log a compact record; the
-  // section VALUES are not logged (keys/pages/reason only) — the operator sees the
+  // section VALUES/reasons are not logged (keys/pages only) — the operator sees the
   // values in the inspector's operator-gated Knowledge panel, never in stdout
   // (§4.6 / §8-j).
   if (resolvedBrief.conflicts && resolvedBrief.conflicts.length) {
     console.warn(
       `[briefKnowledge] material brief-vs-Campaign conflict(s) on instance ${instance.id}: ` +
-        resolvedBrief.conflicts
-          .map((c) => `${c.section}(${c.reason}${c.pageStart ? `, p${c.pageStart}` : ""})`)
-          .join("; "),
+        formatBriefConflictWarning(resolvedBrief.conflicts),
     );
   }
 
-  // PLU-82 §4.6: the compact KNOWLEDGE observability record folded onto THIS turn's
-  // NEGOTIATION_TURN payload (one per round — a BullMQ retry recomputes the same
-  // record under OCC, so the audit log never bloats, §8-e). Ships UNFLAGGED: it is
+  // PLU-82 §4.6: the compact KNOWLEDGE observability snapshot folded onto THIS
+  // NEGOTIATION_TURN payload (one per committed turn — a BullMQ retry recomputes
+  // the same record under OCC, so the audit log never bloats, §8-e). Ships
+  // UNFLAGGED: it is
   // pure surfacing (invariant #9 / §6) — the escalation FLAG gates only the routing
   // decision (§4.5). No new EventType/table (invariant #10); it rides the existing
-  // payload. Byte-identical to a real DEAL — this adds only debug keys.
+  // payload. It changes no prompt, money, or deal-state decision; it adds only
+  // operator-gated debug keys.
   //
   //   briefAvailability — the four-state result (§4.4). expectedSections = the
   //     authoritative Campaign knowledge fields the campaign actually declared
@@ -860,18 +935,10 @@ export async function executeNegotiation(
   // to the old inline deriveBriefAvailability call.
   const briefAvailability = cc.briefAvailability;
   const knowledgeConflicts: BriefFieldConflict[] = resolvedBrief.conflicts ?? [];
-  // Fold onto the turn payload only when there is something to report — a fully
-  // available brief with no conflicts adds nothing (keeps the payload minimal and
-  // "byte-identical when nothing to say"). AVAILABLE + no conflicts ⇒ omitted.
-  const knowledgeRecord: Record<string, unknown> =
-    knowledgeConflicts.length || briefAvailability.status !== "AVAILABLE"
-      ? {
-          knowledge: {
-            briefAvailability,
-            ...(knowledgeConflicts.length ? { conflicts: knowledgeConflicts } : {}),
-          },
-        }
-      : {};
+  // This is a SNAPSHOT, not merely an error report. Persist AVAILABLE + [] too,
+  // otherwise the inspector has no positive event with which to clear an older
+  // PARSE_FAILED/PARTIAL result or conflict after the brief is repaired.
+  const knowledgeRecord = buildKnowledgeRecord(briefAvailability, knowledgeConflicts);
 
   // PLU-81 §7.2: the sanitized CONTEXT observability record, folded onto THIS turn's
   // NEGOTIATION_TURN payload the SAME way as knowledgeRecord (the PLU-82 fold-onto-
@@ -1006,8 +1073,8 @@ export async function executeNegotiation(
   // escalate the "unsupported automated answer" case once we know what the creator
   // actually asked (invariant #7, §8-b). All of:
   //   - the flag is on (default OFF → today's behavior);
-  //   - a conflict was detected (inert unless STRUCTURED_BRIEF_PARSING is on
-  //     agent-side → resolvedBrief.conflicts non-empty, invariant #9);
+  //   - a conflict was detected (inert unless STRUCTURED_BRIEF_PARSING is on →
+  //     resolvedBrief.conflicts non-empty, invariant #9);
   //   - the agent did NOT itself escalate (defer to the topic gate's reason —
   //     usage_rights_or_licensing / undefined_terms already always-escalate with a
   //     specific reason BEFORE any conflict logic, invariant #8);
@@ -1023,6 +1090,7 @@ export async function executeNegotiation(
       creatorQuestions,
       pushedFixedTerms,
       openObligationRows,
+      creatorReply,
     );
     if (matchedFields.length) {
       // §6.1: an escalation is exactly a turn the operator needs the Context panel for.

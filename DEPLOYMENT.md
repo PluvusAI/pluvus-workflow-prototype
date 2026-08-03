@@ -88,7 +88,7 @@ them in `.env` on a public Repl or commit them.
 | 2 | **Replit account** (Core plan for Reserved VM) | https://replit.com | hosts the server + agent Repls |
 | 3 | **Upstash Redis database** | https://upstash.com | `REDIS_URL` (the `rediss://` connection string) |
 | 4 | **OpenRouter API key** | https://openrouter.ai/keys | `OPENROUTER_API_KEY` |
-| 5 | **Nylas API key + Grant ID** | https://dashboard.nylas.com (already set up) | `NYLAS_API_KEY`, `NYLAS_GRANT_ID` |
+| 5 | **Nylas API key + Grant ID** | https://dashboard.nylas.com (already set up) | `NYLAS_API_KEY`, `NYLAS_GRANT_ID`, optionally `NYLAS_EMAIL_ADDRESS` |
 | 6 | **Nylas webhook secret** | Created when you register the webhook (§8) | `NYLAS_WEBHOOK_SECRET` |
 | 7 | **Two secrets you generate yourself** | node crypto (below) | `ATTRIBUTION_WEBHOOK_SECRET`, `OPERATOR_API_KEY` |
 
@@ -135,8 +135,10 @@ Do these in order. Each step is expanded in the sections below.
 2. Copy the **pooled** connection string → this is `DATABASE_URL`. Keep `?sslmode=require`.
 3. **Apply migrations.** The migration SQL lives in `server/prisma/migrations/` (Prisma runtime
    is gone; the `.sql` files are the schema of record). For a **fresh** Neon branch, apply all
-   22 migrations in order with the bundled all-in-one runner. Run from a **shell** (local, or the
-   Server Repl's Shell tab) with `DATABASE_URL` set to the Neon prod branch:
+   migrations in order with the bundled all-in-one runner. Run from a **shell** (local, or the
+   Server Repl's Shell tab) with `DATABASE_URL` and the legacy
+   `NYLAS_GRANT_ID` set. Optionally set `NYLAS_EMAIL_ADDRESS` so the seeded
+   account has the real mailbox address in the dashboard:
 
    ```bash
    cd server
@@ -150,6 +152,19 @@ Do these in order. Each step is expanded in the sections below.
    migrations **without** a wrapping transaction — so the classic "enum add can't run in a
    transaction" failure does not happen. The `--dry-run` output tags each file `[transaction]`,
    `[no-wrap (enum add)]`, or `[no-wrap (self-managed txn)]`.
+
+   The runner passes `NYLAS_GRANT_ID` into the same PostgreSQL transaction that runs
+   PLU-121. Existing campaigns, executions, and messages are therefore backfilled
+   to an active default account for the exact legacy grant. If the value is absent
+   or is `UNCONFIGURED_DEFAULT_GRANT`, the migration intentionally creates a
+   disabled, non-default placeholder instead of making a fake grant send-capable.
+   Because applied migrations are skipped, set these values before the first
+   application of PLU-121; for an experimental database where it already ran,
+   recreate the database or reconcile the seed row explicitly.
+
+   This is safe with Neon's pooled connection string: the runner applies the
+   mailbox settings inside the same transaction as PLU-121, so transaction-mode
+   pooling cannot switch away from the configured backend before the seed runs.
 
    > ⚠ **Fresh DB only.** The ledger is created by this runner, so point it at a **new** Neon
    > branch for go-live. Do **not** run it against a DB already migrated the old way
@@ -192,6 +207,7 @@ each Repl's **Secrets** pane.
 | `EMAIL_PROVIDER` | ✅ | `nylas` |
 | `NYLAS_API_KEY` | ✅ | from Nylas |
 | `NYLAS_GRANT_ID` | ✅ | from Nylas |
+| `NYLAS_EMAIL_ADDRESS` | optional | address belonging to `NYLAS_GRANT_ID`; used as migration seed metadata |
 | `NYLAS_WEBHOOK_SECRET` | ✅ | from webhook registration (§8) |
 | `PAYMENT_BASE_URL` | ✅ | the **Server Repl public URL** (§8) — creator links + webhook are minted from this |
 | `PORT` | ✅ | Replit sets this; the app reads it. Bind to `0.0.0.0:$PORT`. |

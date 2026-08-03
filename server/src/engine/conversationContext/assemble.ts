@@ -12,7 +12,11 @@ import {
   buildOpenObligations,
   buildStructuredObligations,
 } from "../executors/negotiationHistory.js";
-import { deriveBriefAvailability, type ResolvedBrief } from "../executors/briefKnowledge.js";
+import {
+  briefRefFromGraph,
+  deriveBriefAvailability,
+  type ResolvedBrief,
+} from "../executors/briefKnowledge.js";
 import { extractReplyText } from "../executors/replyText.js";
 import type { AssembledContext, AssembleInputs } from "./types.js";
 import { LatestMessageMismatchError } from "./types.js";
@@ -108,7 +112,7 @@ export function estimateTokens(view: unknown): number {
  * negotiation.ts did (§5), so the projections feed byte-identical request shapes
  * (§10).
  *
- * §5.1 / §6.2: mergeCampaignFallback already ran ONCE in the shell and was threaded
+ * §5.1 / §6.2: mergeCampaignFallback already ran ONCE in the executor and was threaded
  * in via inputs.mergedConfig — the canonical source for band resolution, conflict
  * detection, flat-knowledge, AND draftConfig.
  * §5.4: "latest" is derived internally; a supplied latestMessageId is a validated
@@ -131,7 +135,7 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
     mergedConfig,
   } = inputs;
 
-  // §6.2 — the merge already ran ONCE in the shell (buildConversationContext) and was
+  // §6.2 — the merge already ran ONCE in the executor and was
   // threaded in via inputs.mergedConfig. assembleContext no longer re-calls
   // mergeCampaignFallback: one merge site, no precedence drift.
 
@@ -212,7 +216,11 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
   const expectedSections = FLAT_KNOWLEDGE_KEYS.filter(
     (k) => typeof mergedConfig[k] === "string" && (mergedConfig[k] as string).trim(),
   );
-  const briefAvailability = deriveBriefAvailability(resolvedBrief, expectedSections);
+  const briefAvailability = deriveBriefAvailability(
+    resolvedBrief,
+    expectedSections,
+    briefRefFromGraph(inputs.nodeGraph),
+  );
 
   // §5.3 — the decision-only compartment. Band PRESENCE only; the floor/ceiling
   // VALUES stay in mergedConfig (buildNegotiationRequest resolves them at

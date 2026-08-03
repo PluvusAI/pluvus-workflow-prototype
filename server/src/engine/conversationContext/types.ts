@@ -187,7 +187,6 @@ export interface ContextRecord {
   estimatedTokens: number; // §7.3 coarse proxy, labeled as such
   sourcesUsed: string[]; // §7.4 provenance labels
   bandPresent: boolean; // band PRESENCE only — never values (§7.5)
-  briefAvailability: BriefKnowledgeResult; // already surfaced by PLU-82
 }
 
 // ---------------------------------------------------------------------------
@@ -256,8 +255,9 @@ export interface AssembleInputs {
   creatorMemory?: CreatorMemoryPayload | undefined;
   conversationSummary?: ConversationSummary | undefined;
   latestMessageId?: string | undefined;
-  /** §6.2 — mergeCampaignFallback(node.config, campaign), computed ONCE in the shell
-   *  (buildConversationContext) and threaded in. Fed to the brief resolver's
+  /** §6.2 — mergeCampaignFallback(node.config, campaign), computed ONCE by the
+   *  executor before its preconditions and threaded through the I/O shell. Fed to
+   *  the brief resolver's
    *  campaignFields AND consumed here, so the merge runs exactly once per turn (no
    *  precedence drift, no second future change point). Pure callers/tests build it
    *  directly (they can call mergeCampaignFallback in the fixture, or pass a literal). */

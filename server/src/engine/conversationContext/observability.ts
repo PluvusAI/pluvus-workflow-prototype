@@ -31,6 +31,5 @@ export function buildContextRecord(ctx: AssembledContext): ContextRecord {
     estimatedTokens: decision.debug.estimatedTokens,
     sourcesUsed: decision.debug.sourcesUsed,
     bandPresent: ctx.campaignConstraints.bandPresent,
-    briefAvailability: ctx.briefAvailability,
   };
 }

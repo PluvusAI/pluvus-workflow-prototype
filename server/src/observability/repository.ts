@@ -525,7 +525,9 @@ function extractAgentDecisions(events: Event[]): AgentDecisionDTO[] {
 //     (review §6, Calvin) so a conflict that a LATER re-resolution dropped reads as
 //     "cleared", not as a live failure. A conflict is ACTIVE iff it was still
 //     present in the most recent turn whose brief was re-resolved (the latest
-//     "knowledge round"); one seen only in earlier rounds is "cleared".
+//     chronological "knowledge snapshot"); one seen only in an earlier snapshot
+//     is "cleared". Negotiation rounds are display metadata only: multiple
+//     knowledge snapshots can legitimately be emitted in the same round.
 //   - resolvedSources: on the post-acceptance executors' event payloads
 //     (DEAL_HANDOFF_REQUESTED / REWARD_SETUP_SENT / PAYMENT_INFO_SENT). Latest wins.
 // Returns undefined when the log carries nothing knowledge-related, so an older
@@ -538,19 +540,15 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
   let resolvedSources: Record<string, string | null> = {};
   let sawAnything = false;
 
-  // review §6: the round of the most recent turn that RE-RESOLVED the brief (i.e.
-  // carried a `knowledge` block OR a material-conflict escalation). Conflicts whose
-  // lastRound equals this are still live; earlier-only ones were corrected. Tracked
-  // as the numeric max so an out-of-order/round-null event can't mis-rank it.
-  let latestKnowledgeRound: number | null = null;
-  const noteKnowledgeRound = (round: number | null): void => {
-    if (round === null) return;
-    if (latestKnowledgeRound === null || round > latestKnowledgeRound) {
-      latestKnowledgeRound = round;
-    }
-  };
+  // review §6: liveness follows the chronological event sequence, not the
+  // negotiation round. A `present_offer` turn can re-resolve the brief more than
+  // once without advancing its round, so comparing rounds would leave a conflict
+  // active after a later same-round clean snapshot. `lastRound` remains on the DTO
+  // purely as useful display metadata.
+  let latestKnowledgeSequence: number | null = null;
+  const lastSeenSequence = new Map<KnowledgeConflictDTO, number>();
 
-  for (const e of events) {
+  for (const [eventSequence, e] of events.entries()) {
     const p = asRecord(e.payload);
     if (!p) continue;
 
@@ -560,7 +558,11 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
     // historical one. Shared by the folded observability record
     // (NEGOTIATION_TURN.knowledge.conflicts) and the material-conflict escalation
     // payload (top-level NEGOTIATION_TURN.conflicts) so BOTH surface in the panel.
-    const harvestConflicts = (raw: unknown, round: number | null): void => {
+    const harvestConflicts = (
+      raw: unknown,
+      round: number | null,
+      knowledgeSequence: number,
+    ): void => {
       if (!Array.isArray(raw)) return;
       for (const c of raw) {
         const cr = asRecord(c as JsonValue);
@@ -569,20 +571,31 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
         const reason = payloadString(cr, "reason");
         if (!field) continue;
         const key = `${field}::${reason}`;
+        const section = payloadString(cr, "section") ?? field;
+        const campaignValue = payloadString(cr, "campaignValue") ?? "";
+        const briefExcerpt = payloadString(cr, "briefExcerpt") ?? "";
+        const pageStart = payloadNumber(cr, "pageStart");
         const existing = byKey.get(key);
         if (existing) {
-          // Same conflict seen again on a later turn — advance lastRound.
-          if (round !== null && (existing.lastRound === null || round > existing.lastRound)) {
-            existing.lastRound = round;
-          }
+          // Same conflict seen again in a later snapshot. Keep `round` as the
+          // first sighting, but refresh the displayed source values/provenance so
+          // an ACTIVE row never shows stale text from an older brief/config.
+          existing.section = section;
+          existing.campaignValue = campaignValue;
+          existing.briefExcerpt = briefExcerpt;
+          if (pageStart !== null) existing.pageStart = pageStart;
+          else delete existing.pageStart;
+          // Round is display-only, so retain the value from the latest event even
+          // when it is unchanged, null, or numerically lower than the prior one.
+          existing.lastRound = round;
+          lastSeenSequence.set(existing, knowledgeSequence);
           continue;
         }
-        const pageStart = payloadNumber(cr, "pageStart");
         const row: KnowledgeConflictDTO = {
-          section: payloadString(cr, "section") ?? field,
+          section,
           campaignField: field,
-          campaignValue: payloadString(cr, "campaignValue") ?? "",
-          briefExcerpt: payloadString(cr, "briefExcerpt") ?? "",
+          campaignValue,
+          briefExcerpt,
           ...(pageStart !== null ? { pageStart } : {}),
           reason: reason ?? "",
           round,
@@ -590,6 +603,7 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
           status: "active", // finalized after the scan (see below)
         };
         byKey.set(key, row);
+        lastSeenSequence.set(row, knowledgeSequence);
         conflicts.push(row);
         sawAnything = true;
       }
@@ -600,10 +614,10 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
       const knowledge = asRecord(p["knowledge"] as JsonValue | undefined);
 
       if (knowledge) {
-        // This turn re-resolved the brief (availability is always present in a
-        // knowledge block), so it defines a "current" knowledge snapshot round —
-        // even when it reported NO conflicts (that's exactly the recovery case).
-        noteKnowledgeRound(round);
+        // This turn re-resolved the brief, so it defines the current chronological
+        // knowledge snapshot even when it reported NO conflicts (the recovery
+        // case). Do not use `round` as the identity: two snapshots can share it.
+        latestKnowledgeSequence = eventSequence;
         const avail = asRecord(knowledge["briefAvailability"] as JsonValue | undefined);
         if (avail) {
           const status = payloadString(avail, "status");
@@ -617,6 +631,7 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
             // LATEST wins — events are chronological (oldest-first), so overwrite.
             briefAvailability = {
               status,
+              fileReference: payloadString(avail, "fileReference"),
               error: payloadString(avail, "error"),
               missingSections: Array.isArray(missingRaw)
                 ? missingRaw.filter((s): s is string => typeof s === "string")
@@ -626,7 +641,7 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
             sawAnything = true;
           }
         }
-        harvestConflicts(knowledge["conflicts"], round);
+        harvestConflicts(knowledge["conflicts"], round, eventSequence);
       }
 
       // The material-conflict ESCALATION payload (reason material_knowledge_conflict)
@@ -634,8 +649,8 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
       // those up too — otherwise the very turn that escalated wouldn't show its
       // conflicts in the panel. This is also a knowledge-bearing round.
       if (payloadString(p, "reason") === "material_knowledge_conflict") {
-        noteKnowledgeRound(round);
-        harvestConflicts(p["conflicts"], round);
+        latestKnowledgeSequence = eventSequence;
+        harvestConflicts(p["conflicts"], round, eventSequence);
       }
     } else if (
       e.type === "DEAL_HANDOFF_REQUESTED" ||
@@ -657,14 +672,14 @@ export function mapKnowledge(events: Event[]): KnowledgeDTO | undefined {
   if (!sawAnything) return undefined;
 
   // review §6: finalize active vs cleared. A conflict is ACTIVE iff it survived to
-  // the latest knowledge-bearing round; one whose lastRound is earlier than that was
-  // absent from the most recent re-resolution, i.e. corrected. When no round is
-  // known at all (older instances with round-null payloads) we can't prove
-  // recovery, so we leave it active — conservative (never hide a possibly-live
-  // conflict).
+  // the latest chronological knowledge snapshot. Round values are intentionally
+  // irrelevant here, including when they are null or repeated.
   for (const c of conflicts) {
+    const lastSeen = lastSeenSequence.get(c);
     c.status =
-      latestKnowledgeRound !== null && c.lastRound !== null && c.lastRound < latestKnowledgeRound
+      latestKnowledgeSequence !== null &&
+      lastSeen !== undefined &&
+      lastSeen < latestKnowledgeSequence
         ? "cleared"
         : "active";
   }
@@ -739,7 +754,9 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
       .select()
       .from(eventsTable)
       .where(eq(eventsTable.instanceId, id))
-      .orderBy(asc(eventsTable.occurredAt)),
+      // mapKnowledge uses event sequence for conflict liveness. The id tie-breaker
+      // keeps that sequence deterministic when two events share a timestamp.
+      .orderBy(asc(eventsTable.occurredAt), asc(eventsTable.id)),
     db
       .select()
       .from(llmCallsTable)

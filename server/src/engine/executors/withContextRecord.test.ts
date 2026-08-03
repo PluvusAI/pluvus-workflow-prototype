@@ -46,7 +46,6 @@ const CONTEXT = {
     estimatedTokens: 128,
     sourcesUsed: ["campaign:usageRights", "band:present"],
     bandPresent: true,
-    briefAvailability: { status: "PARTIAL" as const },
   },
 };
 

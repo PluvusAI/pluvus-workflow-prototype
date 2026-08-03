@@ -259,6 +259,8 @@ export interface KnowledgeConflictDTO {
 /** The four-state brief availability (§4.4), as last surfaced on a turn. */
 export interface BriefAvailabilityDTO {
   status: "NO_BRIEF" | "AVAILABLE" | "PARTIAL" | "PARSE_FAILED";
+  /** Immutable uploaded-brief reference, when a brief is configured. */
+  fileReference: string | null;
   error: string | null;
   missingSections: string[];
   /** The round this availability was recorded on. */

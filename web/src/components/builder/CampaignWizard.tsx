@@ -1,6 +1,10 @@
 import { useId, useState, type ReactNode } from "react";
 import { TrendingUp, Handshake, DollarSign } from "lucide-react";
-import { createCampaign, createWorkflowForCampaign } from "../../api/builderClient";
+import {
+  createCampaign,
+  createWorkflowForCampaign,
+  useEmailAccounts,
+} from "../../api/builderClient";
 import { colors, radii, font } from "../../theme";
 import { Modal, Button, Input, Textarea, Toggle, Select, FormField, useToast } from "../ds";
 import type { PostAcceptanceMode, TemplateKey } from "../../api/builderTypes";
@@ -57,6 +61,12 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   // gets exactly the campaign they would have got before.
   const [postAcceptanceMode, setPostAcceptanceMode] =
     useState<PostAcceptanceMode>("local_payment");
+  // PLU-121: which connected mailbox this campaign's outreach is sent from. Empty
+  // string = "use the default account", so a brand that ignores this field gets
+  // the default sender exactly as before multi-mailbox.
+  const [emailAccountId, setEmailAccountId] = useState("");
+  const { data: emailAccounts } = useEmailAccounts();
+  const activeAccounts = (emailAccounts ?? []).filter((a) => a.status === "active");
 
   // Step 2 selection
   const [selectedTemplate, setSelectedTemplate] = useState<TemplateKey | null>(null);
@@ -75,6 +85,7 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   const targetUrlId = useId();
   const hiddenParamKeyId = useId();
   const postAcceptId = useId();
+  const senderId = useId();
 
   const notifyEmailInvalid =
     !!notifyEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(notifyEmail.trim());
@@ -137,6 +148,9 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
       // ordinary campaign is unchanged.
       if (postAcceptanceMode !== "local_payment")
         campaignData.postAcceptanceMode = postAcceptanceMode;
+      // PLU-121: send only when a specific mailbox was chosen; empty → the server
+      // leaves it null and enrollment falls back to the default account.
+      if (emailAccountId) campaignData.emailAccountId = emailAccountId;
       const campaign = await createCampaign(campaignData);
       const workflow = await createWorkflowForCampaign(campaign.id, {
         name: workflowName.trim(),
@@ -298,6 +312,30 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
                 placeholder="e.g. partnerships@acme.com"
                 invalid={notifyEmailInvalid}
               />
+            </FormField>
+            <FormField
+              label="Send outreach from"
+              htmlFor={senderId}
+              hint={
+                activeAccounts.length === 0
+                  ? "No active mailbox is registered yet. An operator must register one through the email-accounts API before a Nylas campaign can enroll creators."
+                  : "The connected mailbox this campaign's outreach, follow-ups, and replies are sent from. The whole conversation stays on this mailbox."
+              }
+            >
+              <Select
+                id={senderId}
+                value={emailAccountId}
+                onChange={(e) => setEmailAccountId(e.target.value)}
+                disabled={activeAccounts.length === 0}
+              >
+                <option value="">Default account</option>
+                {activeAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.displayName ? `${a.displayName} — ${a.emailAddress}` : a.emailAddress}
+                    {a.isDefault ? " (default)" : ""}
+                  </option>
+                ))}
+              </Select>
             </FormField>
             <FormField
               label="After a creator accepts"

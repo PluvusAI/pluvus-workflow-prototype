@@ -306,7 +306,7 @@ function builder(inputsRows: {
     events: inputsRows.evs,
     obligationRows: inputsRows.obs,
     resolvedBrief: inputsRows.brief,
-    // §6.2 — the shell merges once and threads it in; mirror that here.
+    // §6.2 — the executor merges once and threads it through the shell; mirror that here.
     mergedConfig: mergeCampaignFallback(NODE.config, inputsRows.campaign),
   };
   const ctx = assembleContext(inputs);

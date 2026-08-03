@@ -10,6 +10,7 @@ import {
   type MockAgentOptions,
 } from "./providers.js";
 import { NylasEmailProvider } from "../providers/nylas/nylasEmailProvider.js";
+import { getNylasClient } from "../providers/nylas/client.js";
 import { LangGraphClassificationProvider } from "../adapters/classification/LangGraphClassificationProvider.js";
 import { MockClassificationProvider } from "../adapters/classification/MockClassificationProvider.js";
 import type { ClassificationProvider } from "../adapters/classification/ClassificationProvider.js";
@@ -142,6 +143,37 @@ export function emailProvider(): IEmailProvider {
   throw new Error(
     `Unknown EMAIL_PROVIDER="${raw}". Expected "nylas" or "mock".`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Per-account email provider (PLU-121 — multi-mailbox)
+// ---------------------------------------------------------------------------
+// The default emailProvider() above binds the process-wide env grant. Multi-
+// mailbox instead selects the mailbox PER RUN: the send path resolves the
+// instance's pinned ConnectedEmailAccount and asks here for a provider bound to
+// that account's grant. Only the grant (the Nylas `identifier`) varies — the API
+// key + client are shared across grants (single Nylas application, many grants),
+// so we reuse the one client singleton and just swap the grant id.
+//
+// Providers are cached per grant so the Gmail label caches inside
+// NylasEmailProvider survive across sends to the same mailbox.
+const _providerByGrant = new Map<string, IEmailProvider>();
+
+export function emailProviderForAccount(account: {
+  nylasGrantId: string;
+}): IEmailProvider {
+  const cached = _providerByGrant.get(account.nylasGrantId);
+  if (cached) return cached;
+  // Bind the shared client + this account's grant. The remaining constructor
+  // args (thread-url template, labels flag) keep their env-driven defaults.
+  const provider = new NylasEmailProvider(getNylasClient(), account.nylasGrantId);
+  _providerByGrant.set(account.nylasGrantId, provider);
+  return provider;
+}
+
+// Test seam: clear the per-grant provider cache between cases.
+export function _resetProviderByGrantCache(): void {
+  _providerByGrant.clear();
 }
 
 // ---------------------------------------------------------------------------

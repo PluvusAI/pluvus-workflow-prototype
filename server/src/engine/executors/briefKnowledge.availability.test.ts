@@ -57,6 +57,28 @@ test("ok + no expected sections → AVAILABLE (vacuously complete)", () => {
   assert.equal(r.text, "brief text");
 });
 
+test("ok + flat mode + expected sections → AVAILABLE (sections were not attempted)", () => {
+  const resolved: ResolvedBrief = {
+    flatText: "complete flat extraction",
+    status: "ok",
+    parseMode: "flat",
+  };
+  const r = deriveBriefAvailability(resolved, ["usageRights", "paymentTerms"]);
+  assert.equal(r.status, "AVAILABLE");
+  assert.equal(r.missingSections, undefined);
+});
+
+test("ok + structured mode + absent expected section → PARTIAL", () => {
+  const resolved: ResolvedBrief = {
+    flatText: "structured extraction without a usage-rights section",
+    status: "ok",
+    parseMode: "structured",
+  };
+  const r = deriveBriefAvailability(resolved, ["usageRights"]);
+  assert.equal(r.status, "PARTIAL");
+  assert.deepEqual(r.missingSections, ["usageRights"]);
+});
+
 test("ok + every expected section present → AVAILABLE", () => {
   const resolved: ResolvedBrief = {
     flatText: "full",
@@ -105,7 +127,7 @@ test("a section the campaign does NOT expect never forces PARTIAL", () => {
   assert.equal(r.status, "AVAILABLE");
 });
 
-console.log("\nfileReference + text threading (observability detail, not status-affecting)\n");
+console.log("\nfileReference + internal text projection (not status-affecting)\n");
 
 test("fileReference is threaded through when provided (and does not change status)", () => {
   const r = deriveBriefAvailability({ flatText: "", status: "no_brief" }, [], "upload-ref-123");
@@ -118,7 +140,7 @@ test("a blank fileReference is omitted", () => {
   assert.equal(r.fileReference, undefined);
 });
 
-test("AVAILABLE omits text when flatText is present but a section carries it", () => {
+test("AVAILABLE omits text when only a structured section carries content", () => {
   // Usable content via a section (not flatText) → AVAILABLE, but text is omitted
   // because flatText itself is blank (no empty-string noise on the payload).
   const r = deriveBriefAvailability(

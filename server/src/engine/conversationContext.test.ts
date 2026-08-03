@@ -184,7 +184,7 @@ function baseInputs(overrides: Partial<AssembleInputs> = {}): AssembleInputs {
     events,
     obligationRows: [],
     resolvedBrief,
-    // §6.2 — the shell now merges once and threads mergedConfig in. Placeholder here;
+    // §6.2 — the executor merges once and threads mergedConfig through the shell. Placeholder here;
     // recomputed from the FINAL (post-override) node/campaign below so a test that
     // overrides `node` still gets a matching merged config, exactly as the shell would.
     mergedConfig: {},
@@ -309,9 +309,21 @@ test("classified intent reaches DECISION only (never the draft path)", () => {
   assert.equal(ctx.classifiedIntent, "POSITIVE");
   const decision = toDecisionContext(ctx);
   assert.equal(decision.decisionHistory.intent, "POSITIVE");
+  assert.ok(decision.debug.sourcesUsed.includes("intent:decision-only"));
   // The draft projection has no `intent` anywhere in its config or history shape.
   const draft = toDraftContext(ctx);
   assert.ok(!("intent" in draft.draftConfig));
+  assert.ok(!draft.debug.sourcesUsed.includes("intent:decision-only"));
+});
+
+test("debug sources omit intent, draft deal-description, and draft band claims when absent", () => {
+  const inputs = baseInputs();
+  const withoutIntent = inputs.messages.map((m) => ({ ...m, replyIntent: null })) as Message[];
+  const ctx = assembleContext({ ...inputs, messages: withoutIntent });
+  assert.ok(!toDecisionContext(ctx).debug.sourcesUsed.includes("intent:decision-only"));
+  const draftSources = toDraftContext(ctx).debug.sourcesUsed;
+  assert.ok(!draftSources.includes("dealDescription:draft-only"));
+  assert.ok(!draftSources.includes("band:present"));
 });
 
 test("estimatedTokens differs between the DECISION and DRAFT projections", () => {
@@ -353,13 +365,25 @@ test("contextRecord is keys/counts only — no band value, no section text", () 
   assert.deepEqual(rec.openObligationIds, [ob.id]);
   assert.equal(rec.bandPresent, true);
   assert.equal(typeof rec.estimatedTokens, "number");
-  assert.equal(rec.briefAvailability.status, "PARTIAL"); // ok parse, but expected sections not all present
+  assert.ok(!("briefAvailability" in rec), "knowledge availability is persisted only by the redacted knowledge record");
   // no value strings anywhere in the serialized record
   const serialized = JSON.stringify(rec);
+  assert.ok(!serialized.includes(ctx.brief.flatText), "no extracted PDF text in the context record");
   assert.ok(!serialized.includes('"200"') && !serialized.includes(":200"), "no band value in the record");
   assert.ok(!serialized.includes("Net 30") || serialized.includes("paymentTerms"), "only keys, not the paymentTerms value");
   // messageIdsIncluded are ids, matched to the transcript rows
   assert.equal(rec.messageIdsIncluded.length, ctx.recentMessages.length);
+});
+
+test("briefAvailability keeps the configured brief file reference for the redacted knowledge record", () => {
+  const briefNode: NodeSnapshot = {
+    id: "node-brief",
+    type: "CONTENT_BRIEF",
+    order: 2,
+    config: { briefFileRef: "briefs/campaign.pdf" },
+  };
+  const ctx = assembleContext(baseInputs({ nodeGraph: [node, briefNode] }));
+  assert.equal(ctx.briefAvailability.fileReference, "briefs/campaign.pdf");
 });
 
 // ---------------------------------------------------------------------------

@@ -71,6 +71,34 @@ test("flags an exclusivity stance mismatch (non-exclusive vs exclusive)", () => 
   assert.match(conflicts[0]!.reason, /exclusivity stance mismatch/);
 });
 
+test("recognizes common non-exclusive negations on the Campaign side", () => {
+  for (const campaignValue of ["not exclusive", "no exclusivity", "without exclusivity"]) {
+    const conflicts = detectBriefConflicts(
+      { exclusivity: section("exclusivity", "An exclusive category partnership is required.") },
+      { exclusivity: campaignValue },
+    );
+    assert.equal(conflicts.length, 1, `${campaignValue} must be treated as non-exclusive`);
+  }
+});
+
+test("recognizes common non-exclusive negations on the brief side", () => {
+  for (const briefValue of ["not exclusive", "no exclusivity", "without exclusivity"]) {
+    const conflicts = detectBriefConflicts(
+      { exclusivity: section("exclusivity", briefValue) },
+      { exclusivity: "Exclusive category partnership" },
+    );
+    assert.equal(conflicts.length, 1, `${briefValue} must be treated as non-exclusive`);
+  }
+});
+
+test("does not flag two differently worded non-exclusive stances", () => {
+  const conflicts = detectBriefConflicts(
+    { exclusivity: section("exclusivity", "This partnership is not exclusive.") },
+    { exclusivity: "without exclusivity" },
+  );
+  assert.equal(conflicts.length, 0);
+});
+
 test("no conflict when a Campaign field is absent (nothing authoritative to compare)", () => {
   const conflicts = detectBriefConflicts(
     { paymentTerms: section("paymentTerms", "Net 60.") },

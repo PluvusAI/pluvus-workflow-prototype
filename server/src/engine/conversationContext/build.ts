@@ -3,8 +3,8 @@
 // ---------------------------------------------------------------------------
 // The one place per turn that does I/O: the DB reads (under a read tx — §6.5), the
 // single /parse-brief HTTP call, and the two injectable optional-slot loaders. It
-// merges the campaign fallback ONCE (§6.2) and hands everything to the pure
-// assembleContext core; callers then project with the PURE toDecisionContext/
+// receives the executor's one campaign-fallback merge (§6.2) and hands everything
+// to the pure assembleContext core; callers then project with the PURE toDecisionContext/
 // toDraftContext (never calling this builder twice per turn — §4.2 build-once).
 
 import { db, type Db, type DbTx } from "../../db/drizzle.js";
@@ -16,7 +16,6 @@ import {
 import type { Campaign, Creator, ExecutionInstance } from "../../db/schema.js";
 import type { NodeSnapshot } from "../types.js";
 import { resolveBriefKnowledge } from "../executors/briefKnowledge.js";
-import { mergeCampaignFallback } from "../campaignContext.js";
 import { assembleContext } from "./assemble.js";
 import type {
   AssembledContext,
@@ -36,10 +35,13 @@ import type {
  * The executor already holds `instance`/`creator`/`campaign`/`node`/`nodeGraph`
  * (from ExecutionContext) — they're passed in to avoid re-reading.
  *
- * `client` is injectable (defaults to `db`) so the reads can enlist a test tx. When
- * it's the default `db`, the three DB reads run under one read transaction for a
- * consistent snapshot (§6.5); when a caller injects its own tx, that tx already
- * provides the single snapshot and no nested tx is opened.
+ * `mergedConfig` is the executor's single mergeCampaignFallback result, so
+ * preconditions, brief conflict detection, and both projections share one object.
+ *
+ * `client` is injectable for tests or callers already inside a transaction. When
+ * omitted, the three DB reads run in one REPEATABLE READ, READ ONLY transaction
+ * for a consistent snapshot (§6.5). A supplied client is used directly: its caller
+ * owns any surrounding transaction and we never create a nested savepoint.
  */
 export async function buildConversationContext(
   args: {
@@ -50,6 +52,7 @@ export async function buildConversationContext(
     campaign?: Campaign | null | undefined;
     instance: ExecutionInstance;
     creator: Creator;
+    mergedConfig: Record<string, unknown>;
     latestMessageId?: string | undefined;
     client?: Db | DbTx | undefined;
   },
@@ -66,38 +69,38 @@ export async function buildConversationContext(
     deps.loadConversationSummary ??
     (async (): Promise<ConversationSummary | undefined> => undefined);
 
-  // §5.1 / §6.2 — merge the node config with the campaign fallback EXACTLY ONCE per
-  // turn (node wins). This single merged object feeds BOTH the brief resolver's
-  // conflict-detection campaignFields (below) AND assembleContext (threaded in as
-  // inputs.mergedConfig), so the merge has one change point and cannot drift.
-  const mergedConfig = mergeCampaignFallback(args.node.config, args.campaign);
+  // §5.1 / §6.2 — the executor merged node + campaign EXACTLY ONCE before its
+  // pure-config preconditions. Reuse that same object for brief conflict detection
+  // and both projections; the builder must not introduce a second merge point.
+  const mergedConfig = args.mergedConfig;
 
   // §6.5 — the THREE DB reads (messages, events, obligations) run under ONE read
-  // transaction so they observe a single consistent snapshot, rather than three
-  // independently-timed snapshots that a concurrent write could interleave. Drizzle
-  // runs the callback's statements over one connection inside a real BEGIN/COMMIT;
-  // the reads inside still fan out via Promise.all but share that snapshot. The brief
+  // REPEATABLE READ, READ ONLY transaction so they observe one transaction snapshot,
+  // rather than three independently-timed READ COMMITTED statement snapshots that a
+  // concurrent write could interleave. The reads still fan out via Promise.all but
+  // share that snapshot. The brief
   // /parse HTTP call and the optional PLU-112/113 loaders are NOT database reads on
   // this instance's mutable rows, so they run OUTSIDE the tx (concurrently with it) —
   // keeping the tx short and never holding a DB connection across a network call.
   //
-  // When a caller injects its own tx `client` (e.g. a test enlisting the reads in an
-  // outer transaction), we do NOT open a nested tx — that client already provides a
-  // single snapshot. `db` (the default) is the only value that owns `.transaction`.
-  const readRows =
-    "transaction" in client
-      ? client.transaction(async (tx) =>
+  // When a caller supplies `client`, use it directly. DbTx also exposes
+  // `.transaction()` (nested savepoints), so capability detection would
+  // accidentally nest; presence of args.client is the authoritative distinction.
+  const readRows = args.client
+    ? Promise.all([
+        listMessagesByInstance(args.instanceId, client),
+        listEventsByInstance(args.instanceId, undefined, client),
+        listOpenObligationsByInstance(args.instanceId, client),
+      ])
+    : db.transaction(
+        async (tx) =>
           Promise.all([
             listMessagesByInstance(args.instanceId, tx),
             listEventsByInstance(args.instanceId, undefined, tx),
             listOpenObligationsByInstance(args.instanceId, tx),
           ]),
-        )
-      : Promise.all([
-          listMessagesByInstance(args.instanceId, client),
-          listEventsByInstance(args.instanceId, undefined, client),
-          listOpenObligationsByInstance(args.instanceId, client),
-        ]);
+        { isolationLevel: "repeatable read", accessMode: "read only" },
+      );
 
   // The reads — ONCE. The 3 DB reads (snapshot-consistent, above) run concurrently
   // with the brief resolve (best-effort, never throws — §5.5) and the optional

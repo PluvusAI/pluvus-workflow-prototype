@@ -110,6 +110,19 @@ export function KnowledgePanel({ knowledge }: { knowledge: KnowledgeDTO | undefi
               {briefAvailability.error}
             </div>
           )}
+          {briefAvailability.fileReference && (
+            <div
+              style={{
+                fontSize: 11,
+                color: colors.textDim,
+                fontFamily: font.family.mono,
+                overflowWrap: "anywhere",
+                marginTop: 6,
+              }}
+            >
+              Brief file: {briefAvailability.fileReference}
+            </div>
+          )}
           {briefAvailability.missingSections.length > 0 && (
             <div style={{ fontSize: 11, color: colors.textDim, marginTop: 6 }}>
               Missing expected sections: {briefAvailability.missingSections.join(", ")}

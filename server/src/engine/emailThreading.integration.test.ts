@@ -20,7 +20,7 @@
  */
 
 import assert from "node:assert/strict";
-import { sendOnce, type SendOnceDeps } from "./executors/idempotentSend.js";
+import { sendOnce, type FlushDeps } from "./executors/idempotentSend.js";
 import {
   DefaultThreadContextResolver,
   type ThreadContextDeps,
@@ -104,7 +104,19 @@ function makeStore() {
     } as unknown as Message);
   }
 
-  const sendDeps: Omit<SendOnceDeps, "threadContext"> = {
+  const sendDeps: Pick<
+    FlushDeps,
+    | "createMessage"
+    | "findMessageByIdempotencyKey"
+    | "updateMessageSent"
+    | "findMessageById"
+    | "findInstanceById"
+    | "findCreatorById"
+    | "resolveCampaignName"
+    | "acquireSendLock"
+    | "releaseSendLock"
+    | "resolveInstanceProvider"
+  > = {
     async createMessage(data) {
       return createMessage(data);
     },
@@ -117,6 +129,27 @@ function makeStore() {
       (row as any).threadId = data.threadId;
       (row as any).sentAt = new Date(++clock);
       return row;
+    },
+    async findMessageById(id) {
+      return rows.find((r) => r.id === id) ?? null;
+    },
+    async findInstanceById(id) {
+      return { id, creatorId: creator.id, workflowVersionId: "version-1" };
+    },
+    async findCreatorById() {
+      return creator;
+    },
+    async resolveCampaignName() {
+      return undefined;
+    },
+    async acquireSendLock() {
+      return "test-lock";
+    },
+    async releaseSendLock() {
+      // no-op
+    },
+    async resolveInstanceProvider() {
+      return null;
     },
   };
 
@@ -132,7 +165,7 @@ function makeStore() {
 }
 
 // Assemble real sendOnce deps over the store + the real resolver reading it.
-function makeDeps(store: ReturnType<typeof makeStore>): SendOnceDeps {
+function makeDeps(store: ReturnType<typeof makeStore>): FlushDeps {
   return {
     ...store.sendDeps,
     threadContext: new DefaultThreadContextResolver(store.threadDeps),

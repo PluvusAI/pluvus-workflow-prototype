@@ -9,7 +9,11 @@ import type { IEmailProvider } from "../providers.js";
 import { sendOnce } from "./idempotentSend.js";
 import { renderOperatorHandoffEmail } from "./operatorHandoffEmail.js";
 import { resolveAgreedFee } from "./agreedFee.js";
-import { resolveKnowledgeField, type SourceLabel } from "../knowledgePrecedence.js";
+import {
+  agreedFeeSource,
+  resolveKnowledgeField,
+  type SourceLabel,
+} from "../knowledgePrecedence.js";
 import { resolveBand } from "../band.js";
 import { resolveBrandName } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
@@ -86,6 +90,7 @@ export async function executeOperatorHandoff(
   // NS-skipping paymentTerms without a per-executor policy table. `resolvedSources`
   // records the winning-source label per field for the debug event payload (§4.6).
   const resolvedSources: Record<string, SourceLabel> = {};
+  resolvedSources["fixedFee"] = agreedFeeSource(fixedFee);
   const commission = resolveKnowledgeField("commissionRate", {
     workflowConfig: config["commissionRate"],
     negotiationState: negotiationConfig["commissionRate"],
