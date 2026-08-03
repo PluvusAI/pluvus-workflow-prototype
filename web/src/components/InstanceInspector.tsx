@@ -18,8 +18,9 @@ import { LogsTrace } from "./LogsTrace";
 import { InstanceLlmUsage } from "./LlmUsagePanel";
 import { ObligationsPanel } from "./ObligationsPanel";
 import { KnowledgePanel } from "./KnowledgePanel";
+import { ContextPanel } from "./ContextPanel";
 
-type Tab = "timeline" | "messages" | "decisions" | "obligations" | "knowledge" | "usage" | "logs";
+type Tab = "timeline" | "messages" | "decisions" | "obligations" | "knowledge" | "context" | "usage" | "logs";
 
 interface Props {
   instanceId: string;
@@ -115,6 +116,12 @@ export function InstanceInspector({ instanceId, onClose }: Props) {
           onClick={() => setTab("knowledge")}
           count={d?.knowledge?.conflicts.length}
         />
+        <TabButton
+          label="Context"
+          active={tab === "context"}
+          onClick={() => setTab("context")}
+          count={d?.context?.sourcesUsed.length}
+        />
         <TabButton label="AI Usage" active={tab === "usage"} onClick={() => setTab("usage")} count={d?.llmUsage?.calls.length} />
         <TabButton label="Logs" active={tab === "logs"} onClick={() => setTab("logs")} count={logs.data?.trace.length} />
       </div>
@@ -153,6 +160,12 @@ export function InstanceInspector({ instanceId, onClose }: Props) {
           <>
             <SectionTitle>Campaign Knowledge</SectionTitle>
             {detail.isLoading ? <Spinner /> : <KnowledgePanel knowledge={d?.knowledge} />}
+          </>
+        )}
+        {tab === "context" && (
+          <>
+            <SectionTitle>AI Context</SectionTitle>
+            {detail.isLoading ? <Spinner /> : <ContextPanel context={d?.context} />}
           </>
         )}
         {tab === "usage" && (
