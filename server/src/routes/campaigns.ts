@@ -147,15 +147,17 @@ router.post("/", async (req: Request, res: Response) => {
   // dangling pointer that would fall back to the default account at enrollment.
   const trimmedAccountId =
     typeof emailAccountId === "string" ? emailAccountId.trim() : "";
-  if (trimmedAccountId) {
-    const account = await findEmailAccountById(trimmedAccountId);
-    if (!account) {
-      res.status(400).json({ error: "emailAccountId does not reference a connected account" });
-      return;
-    }
-  }
-
   try {
+    if (trimmedAccountId) {
+      const account = await findEmailAccountById(trimmedAccountId);
+      if (!account || account.status !== "active") {
+        res.status(400).json({
+          error: "emailAccountId must reference an active connected account",
+        });
+        return;
+      }
+    }
+
     const campaign = await createCampaign({
       name: name.trim(),
       brand: brand.trim(),
@@ -394,24 +396,27 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // already running carry their own stamped mode and are untouched.
     patch.postAcceptanceMode = postAcceptanceMode;
   }
-  if (emailAccountId !== undefined) {
-    // PLU-121: null/"" clears the default sender (back to the default account);
-    // a non-empty value must reference a real connected account. Like the mode,
-    // this changes only FUTURE enrollments — running instances keep their pin.
-    const trimmed = typeof emailAccountId === "string" ? emailAccountId.trim() : "";
-    if (trimmed) {
-      const account = await findEmailAccountById(trimmed);
-      if (!account) {
-        res.status(400).json({ error: "emailAccountId does not reference a connected account" });
-        return;
-      }
-      patch.emailAccountId = trimmed;
-    } else {
-      patch.emailAccountId = null;
-    }
-  }
-
   try {
+    if (emailAccountId !== undefined) {
+      // PLU-121: null/"" clears the default sender (back to the default account);
+      // a non-empty value must reference a real, active connected account. Like
+      // the mode, this changes only FUTURE enrollments — running instances keep
+      // their pin.
+      const trimmed = typeof emailAccountId === "string" ? emailAccountId.trim() : "";
+      if (trimmed) {
+        const account = await findEmailAccountById(trimmed);
+        if (!account || account.status !== "active") {
+          res.status(400).json({
+            error: "emailAccountId must reference an active connected account",
+          });
+          return;
+        }
+        patch.emailAccountId = trimmed;
+      } else {
+        patch.emailAccountId = null;
+      }
+    }
+
     const existing = await findCampaignById(req.params["id"]!);
     if (!existing) {
       res.status(404).json({ error: "campaign not found" });

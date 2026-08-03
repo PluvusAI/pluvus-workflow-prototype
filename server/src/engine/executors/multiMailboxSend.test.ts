@@ -7,9 +7,9 @@
  *   1. When a run pins a connected account, the send goes out on THAT account's
  *      provider (not the caller's default provider), and the sent Message is
  *      attributed to that account id.
- *   2. When no account is pinned (resolveInstanceProvider → null, or the seam is
- *      absent), the caller-supplied provider is used and no account is stamped —
- *      i.e. single-mailbox behavior is byte-for-byte unchanged.
+ *   2. On a non-Nylas/test path (resolveInstanceProvider → null, or the seam is
+ *      absent), the caller-supplied provider is used and no account is stamped.
+ *      Production Nylas resolution is covered separately and fails closed.
  */
 
 import assert from "node:assert/strict";
@@ -32,7 +32,10 @@ const draft: EmailDraft = { subject: "Hi", body: "Let's collaborate." };
 // A provider that tags its returned ids so a test can tell WHICH provider sent.
 function makeTaggedEmail(tag: string) {
   let sends = 0;
-  const email: IEmailProvider = {
+  const labels: Array<{ threadId: string; label: string }> = [];
+  const email: IEmailProvider & {
+    applyThreadLabel(threadId: string, label: string): Promise<void>;
+  } = {
     async draft() {
       return draft;
     },
@@ -40,8 +43,11 @@ function makeTaggedEmail(tag: string) {
       sends++;
       return { messageId: `${tag}-ext-${sends}`, threadId: `${tag}-thread-${sends}` };
     },
+    async applyThreadLabel(threadId, label) {
+      labels.push({ threadId, label });
+    },
   };
-  return { email, sends: () => sends };
+  return { email, sends: () => sends, labels };
 }
 
 // A full FlushDeps over an in-memory rows map. `resolveInstanceProvider` is
@@ -137,7 +143,7 @@ async function run() {
     assert.equal(row.emailAccountId, "acc_2", "sent Message must be stamped with the account id");
   });
 
-  await test("no pinned account → falls back to the caller's provider, no stamp", async () => {
+  await test("non-Nylas resolver → caller provider, no account stamp", async () => {
     const defaultEmail = makeTaggedEmail("default");
     // resolver returns null (deployment not nylas / run unpinned).
     const { deps, rows } = makeDeps(async () => null);
@@ -158,6 +164,78 @@ async function run() {
 
     assert.equal(defaultEmail.sends(), 1);
     assert.ok(res.messageId.startsWith("default-ext-"));
+  });
+
+  await test("already-sent retry repairs labels through the pinned provider", async () => {
+    const defaultEmail = makeTaggedEmail("default");
+    const accountEmail = makeTaggedEmail("acct");
+    const { deps } = makeDeps(async () => ({
+      provider: accountEmail.email,
+      accountId: "acc_2",
+    }));
+
+    await sendOnce(
+      defaultEmail.email,
+      "i1",
+      creator,
+      draft,
+      "outreach:label-retry",
+      deps,
+      undefined,
+      "Summer",
+    );
+    const retry = await sendOnce(
+      defaultEmail.email,
+      "i1",
+      creator,
+      draft,
+      "outreach:label-retry",
+      deps,
+      undefined,
+      "Summer",
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(retry.alreadySent, true);
+    assert.equal(defaultEmail.labels.length, 0, "caller/default mailbox must never be labeled");
+    assert.equal(accountEmail.labels.length, 2, "initial send + retry repair use pinned mailbox");
+  });
+
+  await test("already-sent retry safely skips labeling when pinned provider is unavailable", async () => {
+    const defaultEmail = makeTaggedEmail("default");
+    const accountEmail = makeTaggedEmail("acct");
+    let resolutions = 0;
+    const { deps } = makeDeps(async () => {
+      resolutions++;
+      if (resolutions > 1) throw new Error("account lookup unavailable");
+      return { provider: accountEmail.email, accountId: "acc_2" };
+    });
+
+    await sendOnce(
+      defaultEmail.email,
+      "i1",
+      creator,
+      draft,
+      "outreach:label-skip",
+      deps,
+      undefined,
+      "Summer",
+    );
+    const retry = await sendOnce(
+      defaultEmail.email,
+      "i1",
+      creator,
+      draft,
+      "outreach:label-skip",
+      deps,
+      undefined,
+      "Summer",
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(retry.alreadySent, true, "delivery retry remains a successful no-op");
+    assert.equal(defaultEmail.labels.length, 0, "unavailable pin never falls back for repair");
+    assert.equal(accountEmail.labels.length, 1, "only the initial successful send was labeled");
   });
 
   console.log(`\n${n} passed`);

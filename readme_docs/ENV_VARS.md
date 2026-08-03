@@ -94,6 +94,7 @@ AI negotiation replies — outreach, follow-ups, and transactional emails send i
 | `EMAIL_PROVIDER` | ⬜ | `mock` | `mock` (no real email) · `nylas` (real send/receive). |
 | `NYLAS_API_KEY` | ✅ 🔒 | — | Required when `EMAIL_PROVIDER=nylas`. |
 | `NYLAS_GRANT_ID` | ✅ 🔒 | — | The connected mailbox grant. |
+| `NYLAS_EMAIL_ADDRESS` | ⬜ | — | Optional address metadata for the legacy grant seeded by the migration runner. |
 | `NYLAS_WEBHOOK_SECRET` | ✅ 🔒 | — | Verifies `X-Nylas-Signature` on inbound deliveries; the webhook route rejects events without it. |
 | `NYLAS_API_URI` | ⬜ | — | API base override (e.g. `https://api.us.nylas.com`). |
 | `WEBHOOK_MAX_AGE_SECONDS` | ⬜ | `300` | Replay-freshness window; a signed delivery older/newer than this is rejected. `0` disables (dup-id guard still applies). |
@@ -248,5 +249,7 @@ You're on OpenRouter + Replit-managed DB, not touching payment/attribution flows
 
 **Worth setting:** `SEND_DELAY_ENABLED=false` while testing (else replies wait up to 5 min),
 `AGENT_ENV=production` (fail-closed agent auth), `BRAND_NOTIFY_EMAIL` (custom escalation inbox).
+Set `NYLAS_EMAIL_ADDRESS` before the PLU-121 migration if you want the seeded
+legacy mailbox to display its real address immediately.
 
 **Everything else** has a safe default — leave unset.

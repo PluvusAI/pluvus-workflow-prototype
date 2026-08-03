@@ -325,14 +325,9 @@ model ConnectedEmailAccount {
   /// Provider discriminator; "nylas" today. Kept so a future provider can coexist.
   provider      String  @default("nylas")
   /// active | disabled | revoked. A non-active account is never selected for a new
-  /// send and its webhooks are ignored, without affecting other accounts.
+  /// send; replies to already-running conversations are still ingested.
   status        String  @default("active")
   isDefault     Boolean @default(false)
-  /// Optional per-account webhook signing secret, for deployments that wire each
-  /// grant to its OWN Nylas webhook destination. When null the shared
-  /// NYLAS_WEBHOOK_SECRET env value verifies the delivery (single-application,
-  /// many-grants — the common case).
-  webhookSecret String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -609,7 +604,7 @@ model Message {
   /// not be able to resolve their own escalation. NULL for OUTBOUND messages and
   /// for inbound rows created before this field existed.
   senderEmail        String?
-  externalMessageId  String?          @unique
+  externalMessageId  String?
   /// Deterministic pre-send key for OUTBOUND AI messages (Phase: remediation
   /// FIX-11). Computed BEFORE email.send() from stable inputs
   /// (instanceId + purpose + round), so a crash between send and the row write
@@ -638,13 +633,14 @@ model Message {
   /// at send finalize) or received on (INBOUND, stamped from the run's pinned
   /// account). Gives each account its own inbox/threads/sent view and lets webhook
   /// correlation be scoped by account so thread ids can't collide across grants.
-  /// Nullable + ON DELETE SET NULL; existing rows backfilled to the default account.
+  /// Nullable for legacy/mock rows; existing rows are backfilled to the default
+  /// account. ON DELETE RESTRICT preserves the historical provider-id namespace.
   emailAccountId     String?
 
   createdAt DateTime @default(now())
 
   instance ExecutionInstance @relation(fields: [instanceId], references: [id])
-  emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
+  emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id], onDelete: Restrict)
   /// PLU-111: obligations pointing at this row as the one that raised them
   /// (inbound) or the one that resolved them (a sent outbound answer).
   raisedObligations   ConversationObligation[] @relation("ConversationObligationSource")
@@ -653,6 +649,10 @@ model Message {
   @@index([threadId])
   @@index([instanceId])
   @@index([emailAccountId])
+  /// Nylas message ids are unique within a grant/account, not globally. The
+  /// migration also owns a partial unique index for account-less legacy rows;
+  /// Prisma cannot model partial indexes, so that companion is documented here.
+  @@unique([emailAccountId, externalMessageId], map: "Message_emailAccountId_externalMessageId_key")
 }
 
 /// Append-only audit log of every trigger and state transition for an

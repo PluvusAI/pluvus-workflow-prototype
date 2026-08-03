@@ -46,8 +46,9 @@ To enable real LLM calls:
 
 ## Database
 
-- ORM: **Drizzle** (runtime queries) + **Prisma** (migrations)
-- Migrations: `cd server && node ../node_modules/.bin/prisma migrate deploy`
+- ORM: **Drizzle** (runtime queries) + versioned SQL under `server/prisma/migrations`
+- Migrations: with `DATABASE_URL` and `NYLAS_GRANT_ID` set, run
+  `cd server && npx tsx prisma/apply-all-migrations.ts`
 - Seed demo data: `npm run db:seed:demo -w server`
 
 ## Creator CSV Import

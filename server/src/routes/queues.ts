@@ -219,6 +219,7 @@ router.post("/inbound-email", requireInjectionEnabled, async (req, res) => {
   await enqueueInboundEmail({
     instanceId,
     externalMessageId,
+    ...(instance.emailAccountId ? { emailAccountId: instance.emailAccountId } : {}),
     threadId: resolvedThreadId,
     subject,
     body,

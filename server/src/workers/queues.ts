@@ -140,8 +140,24 @@ export async function enqueueInboundEmail(
   data: InboundEmailJobData,
 ): Promise<void> {
   const queue = getInboundEmailQueue();
-  const jobId = `inbound|${data.externalMessageId}`;
+  const jobId = inboundEmailJobId(data);
   await queue.add("reply", data, { jobId });
+}
+
+/**
+ * BullMQ dedupe key for one provider-account message namespace. Keep the exact
+ * legacy shape when no account is supplied so already-enqueued/dead-lettered
+ * single-mailbox jobs remain compatible. Modern account-scoped components are
+ * URI-encoded so a provider id containing `|` cannot alias another tuple.
+ */
+export function inboundEmailJobId(
+  data: Pick<InboundEmailJobData, "emailAccountId" | "externalMessageId">,
+): string {
+  if (!data.emailAccountId) return `inbound|${data.externalMessageId}`;
+  return (
+    `inbound|account|${encodeURIComponent(data.emailAccountId)}` +
+    `|message|${encodeURIComponent(data.externalMessageId)}`
+  );
 }
 
 /**

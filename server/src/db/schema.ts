@@ -358,7 +358,6 @@ export const connectedEmailAccounts = pgTable(
     // active | disabled | revoked.
     status: text("status").notNull().default("active"),
     isDefault: boolean("isDefault").notNull().default(false),
-    webhookSecret: text("webhookSecret"),
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },
@@ -372,39 +371,43 @@ export const connectedEmailAccounts = pgTable(
   ],
 );
 
-export const campaigns = pgTable("Campaign", {
-  id: cuidId("id"),
-  name: text("name").notNull(),
-  brand: text("brand").notNull(),
-  objective: text("objective"),
-  notes: text("notes"),
-  notifyEmail: text("notifyEmail"),
-  brandDescription: text("brandDescription"),
-  deliverables: text("deliverables"),
-  timeline: text("timeline"),
-  rewardDescription: text("rewardDescription"),
-  shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
-  usageRights: text("usageRights"),
-  exclusivity: text("exclusivity"),
-  paymentTerms: text("paymentTerms"),
-  attributionWindow: text("attributionWindow"),
-  targetUrl: text("targetUrl"),
-  hiddenParamKey: text("hiddenParamKey").notNull().default("_from"),
-  // PLU-70: the campaign-level DEFAULT only. Enrollment stamps the effective
-  // mode onto each ExecutionInstance, so editing this cannot reach a running one.
-  postAcceptanceMode: postAcceptanceModeEnum("postAcceptanceMode")
-    .notNull()
-    .default("local_payment"),
-  // PLU-121: the brand's DEFAULT sending mailbox. Enrollment stamps the effective
-  // account onto each ExecutionInstance, so editing this reaches only FUTURE
-  // enrollments. Nullable — pre-multi-mailbox campaigns fall back to the default
-  // ConnectedEmailAccount at enrollment.
-  emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
-    onDelete: "set null",
-  }),
-  createdAt: tsNow("createdAt"),
-  updatedAt: tsUpdatedAt("updatedAt"),
-});
+export const campaigns = pgTable(
+  "Campaign",
+  {
+    id: cuidId("id"),
+    name: text("name").notNull(),
+    brand: text("brand").notNull(),
+    objective: text("objective"),
+    notes: text("notes"),
+    notifyEmail: text("notifyEmail"),
+    brandDescription: text("brandDescription"),
+    deliverables: text("deliverables"),
+    timeline: text("timeline"),
+    rewardDescription: text("rewardDescription"),
+    shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
+    usageRights: text("usageRights"),
+    exclusivity: text("exclusivity"),
+    paymentTerms: text("paymentTerms"),
+    attributionWindow: text("attributionWindow"),
+    targetUrl: text("targetUrl"),
+    hiddenParamKey: text("hiddenParamKey").notNull().default("_from"),
+    // PLU-70: the campaign-level DEFAULT only. Enrollment stamps the effective
+    // mode onto each ExecutionInstance, so editing this cannot reach a running one.
+    postAcceptanceMode: postAcceptanceModeEnum("postAcceptanceMode")
+      .notNull()
+      .default("local_payment"),
+    // PLU-121: the brand's DEFAULT sending mailbox. Enrollment stamps the effective
+    // account onto each ExecutionInstance, so editing this reaches only FUTURE
+    // enrollments. Nullable — pre-multi-mailbox campaigns fall back to the default
+    // ConnectedEmailAccount at enrollment.
+    emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
+      onDelete: "set null",
+    }),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [index("Campaign_emailAccountId_idx").on(table.emailAccountId)],
+);
 
 export const workflows = pgTable("Workflow", {
   id: cuidId("id"),
@@ -580,6 +583,7 @@ export const executionInstances = pgTable(
       table.currentState,
       table.dueAt,
     ),
+    index("ExecutionInstance_emailAccountId_idx").on(table.emailAccountId),
   ],
 );
 
@@ -612,12 +616,26 @@ export const messages = pgTable(
     // Stamped at send finalize (OUTBOUND) and from the run's pinned account
     // (INBOUND). Nullable; backfilled to the default account by the migration.
     emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
-      onDelete: "set null",
+      // Historical provider-id namespaces must never collapse to NULL on account
+      // deletion: two grants may reuse the same externalMessageId. Operators
+      // disable/revoke accounts; rows with message history are deletion-restricted.
+      onDelete: "restrict",
     }),
     createdAt: tsNow("createdAt"),
   },
   (table) => [
-    uniqueIndex("Message_externalMessageId_key").on(table.externalMessageId),
+    // Provider message ids are grant-local, not globally unique. Keep one
+    // namespace per connected mailbox, while preserving the pre-PLU-121
+    // account-less namespace for legacy/mock rows. The second partial index is
+    // intentionally not represented in Prisma (partial indexes are unsupported
+    // there), but is created by the owning migration.
+    uniqueIndex("Message_emailAccountId_externalMessageId_key").on(
+      table.emailAccountId,
+      table.externalMessageId,
+    ),
+    uniqueIndex("Message_legacyExternalMessageId_key")
+      .on(table.externalMessageId)
+      .where(sql`${table.emailAccountId} IS NULL AND ${table.externalMessageId} IS NOT NULL`),
     uniqueIndex("Message_idempotencyKey_key").on(table.idempotencyKey),
     index("Message_threadId_idx").on(table.threadId),
     index("Message_instanceId_idx").on(table.instanceId),

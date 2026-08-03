@@ -16,7 +16,10 @@ import {
 } from "../db/instances.js";
 import { listCreators } from "../db/creators.js";
 import { findCampaignById } from "../db/campaigns.js";
-import { resolveAccountForCampaign } from "../db/emailAccounts.js";
+import {
+  EmailAccountUnavailableError,
+  resolveAccountForCampaign,
+} from "../db/emailAccounts.js";
 import { db } from "../db/drizzle.js";
 import { isForeignKeyViolation, isUniqueViolation } from "../db/errors.js";
 import {
@@ -720,9 +723,10 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
       effectiveMode = "operator_handoff";
     }
 
-    // PLU-121: resolve the mailbox to PIN for this batch — the campaign's chosen
-    // account, else the default account, else null (no accounts configured yet →
-    // the send path falls back to the env grant, exactly as before multi-mailbox).
+    // PLU-121: resolve the mailbox to PIN for this batch — an explicitly chosen
+    // account must still be active; campaigns without a choice use the active
+    // default. Nylas enrollments fail closed when no active account exists;
+    // non-Nylas providers may continue without an account pin.
     // Stamping it once at enrollment is what keeps every message of a run — and its
     // replies — on the same mailbox even if the campaign default is later changed.
     const pinnedAccount = await resolveAccountForCampaign(campaign?.emailAccountId);
@@ -760,6 +764,10 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
       postAcceptanceMode: effectiveMode,
     });
   } catch (err) {
+    if (err instanceof EmailAccountUnavailableError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
     console.error("[workflows] enroll error:", err);
     res.status(500).json({ error: "internal server error" });
   }

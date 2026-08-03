@@ -21,11 +21,19 @@ export async function findMessageById(id: string): Promise<Message | null> {
 
 export async function findMessageByExternalId(
   externalMessageId: string,
+  emailAccountId?: string,
 ): Promise<Message | null> {
+  // Provider message ids are unique only within a connected account/grant.
+  // Omitting the account deliberately selects the account-less legacy/mock
+  // namespace; it must never match an unrelated connected mailbox.
+  const accountPredicate =
+    emailAccountId !== undefined
+      ? eq(messages.emailAccountId, emailAccountId)
+      : isNull(messages.emailAccountId);
   const rows = await db
     .select()
     .from(messages)
-    .where(eq(messages.externalMessageId, externalMessageId))
+    .where(and(eq(messages.externalMessageId, externalMessageId), accountPredicate))
     .limit(1);
   return rows[0] ?? null;
 }
@@ -100,11 +108,18 @@ export async function updateMessageSent(
  * mid-handler) is re-processed on retry rather than skipped. Best-effort by
  * externalMessageId; a no-op if the row is already gone.
  */
-export async function markMessageProcessed(externalMessageId: string): Promise<void> {
+export async function markMessageProcessed(
+  externalMessageId: string,
+  emailAccountId?: string,
+): Promise<void> {
+  const accountPredicate =
+    emailAccountId !== undefined
+      ? eq(messages.emailAccountId, emailAccountId)
+      : isNull(messages.emailAccountId);
   await db
     .update(messages)
     .set({ processedAt: new Date() })
-    .where(eq(messages.externalMessageId, externalMessageId));
+    .where(and(eq(messages.externalMessageId, externalMessageId), accountPredicate));
 }
 
 /** Find all messages in a thread. Used by the Nylas webhook handler to correlate

@@ -318,7 +318,7 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
               htmlFor={senderId}
               hint={
                 activeAccounts.length === 0
-                  ? "No email accounts are connected yet. Connect a mailbox in the Email Accounts settings; until then outreach uses the default account."
+                  ? "No active mailbox is registered yet. An operator must register one through the email-accounts API before a Nylas campaign can enroll creators."
                   : "The connected mailbox this campaign's outreach, follow-ups, and replies are sent from. The whole conversation stays on this mailbox."
               }
             >

@@ -169,8 +169,7 @@ export interface CampaignListItem {
 
 /**
  * PLU-121: a connected email account (one Nylas grant = one mailbox). Returned by
- * GET /email-accounts and shown in the campaign wizard's sender picker. Never
- * carries the webhook secret — only whether one is set.
+ * GET /email-accounts and shown in the campaign wizard's sender picker.
  */
 export interface ConnectedEmailAccount {
   id: string;
@@ -180,7 +179,6 @@ export interface ConnectedEmailAccount {
   provider: string;
   status: "active" | "disabled" | "revoked";
   isDefault: boolean;
-  hasWebhookSecret: boolean;
   createdAt: string;
   updatedAt: string;
 }

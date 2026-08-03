@@ -60,6 +60,9 @@ export function inboundJobFromPayload(
     subject: typeof subject === "string" ? subject : "",
     body: typeof body === "string" ? body : "",
   };
+  if (typeof p["emailAccountId"] === "string" && p["emailAccountId"]) {
+    data.emailAccountId = p["emailAccountId"];
+  }
   if (typeof p["senderEmail"] === "string") data.senderEmail = p["senderEmail"];
   if (typeof p["mockIntent"] === "string") data.mockIntent = p["mockIntent"];
   return data;

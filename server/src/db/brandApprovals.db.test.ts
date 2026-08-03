@@ -16,9 +16,6 @@
  */
 
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "./schema.js";
@@ -32,63 +29,13 @@ import {
   listStaleProcessingApprovals,
   findBrandApprovalById,
 } from "./brandApprovals.js";
+import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
 async function test(name: string, fn: () => Promise<void>): Promise<void> {
   await fn();
   n++;
   console.log(`  ✓ ${name}`);
-}
-
-const __dirname = fileURLToPath(new URL(".", import.meta.url));
-const MIGRATIONS_DIR = resolve(__dirname, "../../prisma/migrations");
-
-// Split a migration into statements on `;`, but NOT inside a `$$ … $$` dollar-quoted
-// block (Prisma's idempotency guards, e.g. `DO $$ BEGIN … END $$;`, contain inner
-// `;`). The shared .db.test.ts harness splits naively on `;` and so trips over these
-// blocks — this test uses a $$-aware splitter so the migrations actually apply here
-// and the BrandApproval invariants are exercised against real Postgres.
-function splitStatements(sql: string): string[] {
-  const withoutComments = sql
-    .split(/\r?\n/)
-    .filter((line) => !line.trim().startsWith("--"))
-    .join("\n");
-  const statements: string[] = [];
-  let current = "";
-  let inDollar = false;
-  for (let i = 0; i < withoutComments.length; i++) {
-    const ch = withoutComments[i]!;
-    if (ch === "$" && withoutComments[i + 1] === "$") {
-      inDollar = !inDollar;
-      current += "$$";
-      i++;
-      continue;
-    }
-    if (ch === ";" && !inDollar) {
-      const trimmed = current.trim();
-      if (trimmed) statements.push(trimmed);
-      current = "";
-      continue;
-    }
-    current += ch;
-  }
-  const tail = current.trim();
-  if (tail) statements.push(tail);
-  return statements;
-}
-
-async function applyPrismaMigrations(pg: PGlite): Promise<number> {
-  const folders = readdirSync(MIGRATIONS_DIR, { withFileTypes: true })
-    .filter((d) => d.isDirectory())
-    .map((d) => d.name)
-    .sort();
-  let applied = 0;
-  for (const folder of folders) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, folder, "migration.sql"), "utf8");
-    for (const stmt of splitStatements(sql)) await pg.exec(stmt);
-    applied++;
-  }
-  return applied;
 }
 
 // Seed an ExecutionInstance so the BrandApproval FK resolves. Returns its id.
@@ -141,7 +88,7 @@ function snapshot(instanceId: string): schema.BrandApprovalInsert {
 async function main(): Promise<void> {
   console.log("\nbrandApprovals.db\n");
   const pg = new PGlite();
-  const migrated = await applyPrismaMigrations(pg);
+  const migrated = await applyPGliteMigrations(pg);
   console.log(`  (applied ${migrated} Prisma migrations to embedded Postgres)`);
   const pgdb = drizzle(pg, { schema }) as unknown as Db;
 

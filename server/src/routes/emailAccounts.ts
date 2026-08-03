@@ -9,6 +9,7 @@ import {
 } from "../db/emailAccounts.js";
 import { isUniqueViolation } from "../db/errors.js";
 import type { ConnectedEmailAccount } from "../db/schema.js";
+import { UNCONFIGURED_NYLAS_GRANT_ID } from "../db/migrationSession.js";
 
 // ---------------------------------------------------------------------------
 // Connected email accounts (PLU-121) — registration + management API
@@ -32,9 +33,8 @@ function isEmailish(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 }
 
-// Never leak the webhook signing secret to clients — expose only a boolean of
-// whether one is configured. Everything else is safe (grant id is an opaque
-// handle, not a credential).
+// Grant ids are opaque mailbox handles, not raw credentials. Webhook delivery is
+// authenticated once at the Nylas-application level via NYLAS_WEBHOOK_SECRET.
 function toDto(a: ConnectedEmailAccount) {
   return {
     id: a.id,
@@ -44,7 +44,6 @@ function toDto(a: ConnectedEmailAccount) {
     provider: a.provider,
     status: a.status,
     isDefault: a.isDefault,
-    hasWebhookSecret: a.webhookSecret != null && a.webhookSecret !== "",
     createdAt: a.createdAt.toISOString(),
     updatedAt: a.updatedAt.toISOString(),
   };
@@ -63,17 +62,20 @@ router.get("/", async (_req: Request, res: Response) => {
 
 // POST /email-accounts — register a connected mailbox by its Nylas grant id.
 router.post("/", async (req: Request, res: Response) => {
-  const { nylasGrantId, emailAddress, displayName, isDefault, webhookSecret } =
+  const { nylasGrantId, emailAddress, displayName, isDefault } =
     req.body as {
       nylasGrantId?: string;
       emailAddress?: string;
       displayName?: string;
       isDefault?: boolean;
-      webhookSecret?: string;
     };
 
   if (!nylasGrantId || typeof nylasGrantId !== "string" || !nylasGrantId.trim()) {
     res.status(400).json({ error: "nylasGrantId is required" });
+    return;
+  }
+  if (nylasGrantId.trim() === UNCONFIGURED_NYLAS_GRANT_ID) {
+    res.status(400).json({ error: "nylasGrantId is reserved for an unconfigured migration seed" });
     return;
   }
   if (!emailAddress || typeof emailAddress !== "string" || !isEmailish(emailAddress.trim())) {
@@ -95,8 +97,6 @@ router.post("/", async (req: Request, res: Response) => {
       displayName:
         typeof displayName === "string" ? displayName.trim() || null : null,
       isDefault: isDefault === true,
-      webhookSecret:
-        typeof webhookSecret === "string" ? webhookSecret.trim() || null : null,
     });
     res.status(201).json(toDto(account));
   } catch (err) {
@@ -112,16 +112,16 @@ router.post("/", async (req: Request, res: Response) => {
 
 // PATCH /email-accounts/:id — update address/name, enable/disable, set default.
 // Disconnect = set status to "disabled" or "revoked"; other accounts are
-// unaffected, and no historical campaign/run/message is destroyed (the FKs are
-// ON DELETE SET NULL and we never hard-delete here).
+// unaffected, and no historical campaign/run/message is destroyed. Accounts
+// with message history are intentionally retained as disabled/revoked tombstones
+// so their grant-local provider-id namespace and audit attribution remain intact.
 router.patch("/:id", async (req: Request, res: Response) => {
-  const { emailAddress, displayName, status, isDefault, webhookSecret } =
-    req.body as {
+  const { emailAddress, displayName, status, isDefault } =
+    (req.body ?? {}) as {
       emailAddress?: string;
       displayName?: string | null;
       status?: string;
       isDefault?: boolean;
-      webhookSecret?: string | null;
     };
 
   const patch: Parameters<typeof updateEmailAccount>[1] = {};
@@ -143,14 +143,34 @@ router.patch("/:id", async (req: Request, res: Response) => {
     patch.status = status;
   }
   if (isDefault !== undefined) patch.isDefault = isDefault === true;
-  if (webhookSecret !== undefined) {
-    patch.webhookSecret = typeof webhookSecret === "string" ? webhookSecret.trim() || null : null;
-  }
 
   try {
     const existing = await findEmailAccountById(req.params["id"]!);
     if (!existing) {
       res.status(404).json({ error: "account not found" });
+      return;
+    }
+    if (
+      existing.nylasGrantId === UNCONFIGURED_NYLAS_GRANT_ID &&
+      (patch.status === "active" || patch.isDefault === true)
+    ) {
+      res.status(400).json({
+        error: "the unconfigured migration seed cannot be activated or made default",
+      });
+      return;
+    }
+    const effectiveStatus = patch.status ?? existing.status;
+    if (patch.isDefault === true && effectiveStatus !== "active") {
+      res.status(400).json({ error: "only an active account can be the default" });
+      return;
+    }
+    // Disabling/revoking the current default must release the partial-unique slot
+    // so another active account can become the fallback sender.
+    if (patch.status !== undefined && patch.status !== "active" && existing.isDefault) {
+      patch.isDefault = false;
+    }
+    if (Object.keys(patch).length === 0) {
+      res.json(toDto(existing));
       return;
     }
     const account = await updateEmailAccount(req.params["id"]!, patch);
