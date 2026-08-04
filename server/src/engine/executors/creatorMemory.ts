@@ -157,8 +157,9 @@ function verifyOneFact(
   if (!passesStructuredCheck(key, value, evidence)) return null;
 
   const numeric = isNumericMemoryKey(key);
-  const valueNumber = numeric ? coerceNumber(value) : null;
-  // A numeric key whose value carries no parseable number is not grounded.
+  const valueNumber = numeric ? parseRate(value) : null;
+  // A numeric key whose value carries no single, unambiguous number is not grounded
+  // (a range or compound figure is rejected rather than silently coerced).
   if (numeric && valueNumber === null) return null;
 
   const matchValue = normalizeMemoryValue(value);
@@ -178,11 +179,17 @@ function verifyOneFact(
 }
 
 /**
- * Deterministic per-key grounding (Calvin review #3). Runs AFTER the generic
- * evidence check, so `evidence` is already known to appear in the reply.
- *   MINIMUM_RATE     — must carry a parseable number (numeric grounding).
- *   MANAGER_CONTACT  — the value must reference a name or email present in the
- *                      evidence (not an invented contact).
+ * Deterministic per-key grounding (Calvin review #3, hardened per founder review).
+ * Runs AFTER the generic evidence check, so `evidence` is already known to appear
+ * in the reply.
+ *   MINIMUM_RATE     — the number in the stored value MUST equal the number in the
+ *                      evidence. A model that stored $800 with evidence "the lowest
+ *                      I can do is $500" is rejected — value and evidence must agree,
+ *                      not merely both contain a number.
+ *   MANAGER_CONTACT  — if the stored value is an email, it must exactly match an
+ *                      email present in the evidence (no swapping john@ for the
+ *                      sarah@ that was actually written). A name-only value must
+ *                      itself appear in the evidence.
  *   MANAGER_INVOLVED — the evidence must contain explicit manager/agent wording.
  * Every other key passes (the generic evidence check already grounds it).
  */
@@ -192,12 +199,25 @@ function passesStructuredCheck(
   evidence: string,
 ): boolean {
   switch (key) {
-    case "MINIMUM_RATE":
-      return coerceNumber(value) !== null;
+    case "MINIMUM_RATE": {
+      // The stored value must parse to a single unambiguous number...
+      const valueRate = parseRate(value);
+      if (valueRate === null) return false;
+      // ...and that number must be the one the creator actually wrote. We look for
+      // it among the numbers present in the evidence, so "$500" in the reply cannot
+      // ground a stored value of $800.
+      return evidenceRates(evidence).includes(valueRate);
+    }
     case "MANAGER_CONTACT": {
-      const email = extractEmail(evidence);
-      if (email) return true;
-      // Otherwise the recorded contact value must appear (name grounded in the reply).
+      const valueEmail = extractEmail(value);
+      if (valueEmail) {
+        // An email value must be the same email the evidence contains — case-
+        // insensitively, since email locals/domains are compared case-folded here.
+        return extractEmails(evidence).some(
+          (e) => e.toLowerCase() === valueEmail.toLowerCase(),
+        );
+      }
+      // Name-only contact: the recorded value must appear in the evidence.
       return normalizeMemoryValue(evidence).includes(normalizeMemoryValue(value));
     }
     case "MANAGER_INVOLVED":
@@ -209,17 +229,65 @@ function passesStructuredCheck(
 
 const MANAGER_WORDING = /\b(manager|agent|agency|management|represent(?:s|ed|ative)?|my team)\b/i;
 const EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
+const EMAIL_RE_G = /[^\s@]+@[^\s@]+\.[^\s@]+/g;
 
 function extractEmail(text: string): string | null {
   const m = text.match(EMAIL_RE);
   return m ? m[0] : null;
 }
 
-function coerceNumber(value: string): number | null {
-  const digits = value.replace(/[^0-9.]/g, "");
-  if (!digits) return null;
-  const n = Number(digits);
-  return Number.isFinite(n) ? n : null;
+function extractEmails(text: string): string[] {
+  return text.match(EMAIL_RE_G) ?? [];
+}
+
+// A rate token: digits with optional thousands separators and a decimal, an optional
+// k/K multiplier, and a trailing "%" captured so a percentage can be told apart from a
+// flat rate. Currency symbols and words around it are ignored — we match only the
+// numeric core, so a range ("$500-$700") or compound figure ("$500 per video + 10%")
+// surfaces as MULTIPLE tokens.
+const RATE_TOKEN_RE = /(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d+))?\s*([kK])?(%)?/g;
+
+/**
+ * Every flat-rate number in a string, in order. A token with a trailing "%" is a
+ * percentage, not a flat rate, and is skipped — so "$500 + 10%" yields [500]. "1k" →
+ * 1000, "1.5k" → 1500, "1,500" → 1500.
+ */
+function extractRates(text: string): number[] {
+  const out: number[] = [];
+  for (const m of text.matchAll(RATE_TOKEN_RE)) {
+    if (m[4]) continue; // trailing % — a percentage, not a flat rate
+    const intPart = m[1]!.replace(/,/g, "");
+    const frac = m[2] ? `.${m[2]}` : "";
+    const mult = m[3] ? 1000 : 1;
+    const n = Number(intPart + frac) * mult;
+    if (Number.isFinite(n)) out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Parse a single unambiguous flat rate from a STORED VALUE, or null.
+ *
+ * Handles: plain "$500", "1500", "1,500", "1k" → 1000, "1.5k" → 1500, "€500" → 500.
+ * REJECTS (returns null) anything ambiguous — a range ("$500–$700"), a compound
+ * figure ("$500 per video + 10%"), a bare percentage ("10%"), or empty — because
+ * guessing a minimum rate wrong is worse than dropping the fact.
+ *
+ * Ambiguity for a stored value is stricter than for evidence: a percent sign ANYWHERE
+ * makes the value compound ("$500 + 10%" is not a flat rate), so we reject outright.
+ * The value must then resolve to exactly one flat-rate number.
+ */
+function parseRate(value: string): number | null {
+  if (value.includes("%")) return null; // any percent ⇒ compound/ambiguous value
+  const nums = extractRates(value);
+  return nums.length === 1 ? nums[0]! : null;
+}
+
+/** The flat-rate numbers mentioned in evidence text (may be empty or many). */
+function evidenceRates(evidence: string): number[] {
+  // Evidence may legitimately contain several numbers; we don't reject on count —
+  // the stored value must simply be one of them.
+  return extractRates(evidence);
 }
 
 // ---------------------------------------------------------------------------

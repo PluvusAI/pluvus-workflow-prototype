@@ -162,6 +162,170 @@ test("MANAGER_CONTACT requires an email or the value present in evidence", () =>
 });
 
 // ---------------------------------------------------------------------------
+// Founder review — value/evidence AGREEMENT, not merely both-present
+// ---------------------------------------------------------------------------
+
+test("MINIMUM_RATE DROPS when the stored number disagrees with the evidence number", () => {
+  // Creator wrote $500; model tried to store $800 with that same evidence. The
+  // generic substring check passes (the phrase is in the reply) but the numbers
+  // disagree, so the fact must be dropped.
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({
+        key: "MINIMUM_RATE",
+        value: "$800",
+        evidenceText: "The lowest I can do is $500",
+      }),
+    ],
+    creatorReply: "The lowest I can do is $500.",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 0);
+});
+
+test("MINIMUM_RATE KEEPS when the stored number matches the evidence number", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({
+        key: "MINIMUM_RATE",
+        value: "$500",
+        evidenceText: "The lowest I can do is $500",
+      }),
+    ],
+    creatorReply: "The lowest I can do is $500.",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0]!.valueNumber, 500);
+});
+
+test("MANAGER_CONTACT DROPS when the stored email is not the one in the evidence", () => {
+  // Evidence names sarah@; model tried to store john@. Must be dropped.
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({
+        key: "MANAGER_CONTACT",
+        value: "john@example.com",
+        evidenceText: "Please contact Sarah at sarah@example.com",
+      }),
+    ],
+    creatorReply: "Please contact Sarah at sarah@example.com.",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 0);
+});
+
+test("MANAGER_CONTACT KEEPS when the stored email exactly matches the evidence email", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({
+        key: "MANAGER_CONTACT",
+        value: "sarah@example.com",
+        evidenceText: "Please contact Sarah at sarah@example.com",
+      }),
+    ],
+    creatorReply: "Please contact Sarah at sarah@example.com.",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0]!.value, "sarah@example.com");
+});
+
+test("MANAGER_CONTACT email match is case-insensitive", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({
+        key: "MANAGER_CONTACT",
+        value: "Sarah@Example.com",
+        evidenceText: "contact sarah@example.com",
+      }),
+    ],
+    creatorReply: "contact sarah@example.com",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Founder review — rate parsing (k suffix + ambiguity rejection)
+// ---------------------------------------------------------------------------
+
+test("MINIMUM_RATE parses a k suffix (1.5k => 1500, not 1.5)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [fact({ key: "MINIMUM_RATE", value: "1.5k", evidenceText: "my floor is 1.5k" })],
+    creatorReply: "my floor is 1.5k for a video",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0]!.valueNumber, 1500);
+});
+
+test("MINIMUM_RATE parses a bare k suffix (1k => 1000)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [fact({ key: "MINIMUM_RATE", value: "1k", evidenceText: "at least 1k" })],
+    creatorReply: "I'd need at least 1k",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0]!.valueNumber, 1000);
+});
+
+test("MINIMUM_RATE parses thousands separators (1,500 => 1500)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [fact({ key: "MINIMUM_RATE", value: "1,500", evidenceText: "floor is 1,500" })],
+    creatorReply: "floor is 1,500",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0]!.valueNumber, 1500);
+});
+
+test("MINIMUM_RATE parses a non-dollar currency (€500 => 500)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [fact({ key: "MINIMUM_RATE", value: "€500", evidenceText: "minimum €500" })],
+    creatorReply: "minimum €500 per post",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0]!.valueNumber, 500);
+});
+
+test("MINIMUM_RATE REJECTS an ambiguous range ($500-$700)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({ key: "MINIMUM_RATE", value: "$500-$700", evidenceText: "somewhere between $500-$700" }),
+    ],
+    creatorReply: "somewhere between $500-$700 depending on scope",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 0);
+});
+
+test("MINIMUM_RATE REJECTS a compound figure ($500 per video + 10%)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [
+      fact({
+        key: "MINIMUM_RATE",
+        value: "$500 per video + 10%",
+        evidenceText: "$500 per video + 10% of sales",
+      }),
+    ],
+    creatorReply: "$500 per video + 10% of sales works",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 0);
+});
+
+test("MINIMUM_RATE REJECTS a bare percentage (10%)", () => {
+  const plan = verifyAndBuildMemoryWritePlan({
+    creatorFacts: [fact({ key: "MINIMUM_RATE", value: "10%", evidenceText: "just 10% commission" })],
+    creatorReply: "just 10% commission is fine",
+    sourceMessageId: SRC,
+  });
+  assert.equal(plan.length, 0);
+});
+
+// ---------------------------------------------------------------------------
 // Validated requested rate (self-evidencing) + intra-turn dedup
 // ---------------------------------------------------------------------------
 
