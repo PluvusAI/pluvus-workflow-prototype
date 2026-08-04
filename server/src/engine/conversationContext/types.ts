@@ -67,9 +67,11 @@ export interface CreatorMemoryPayload {
 
 /**
  * PLU-112 — the rolling narrative summary of the ELIDED transcript prefix.
- * `summarizedThroughSentAt` is the coverage cursor: draft turns with a later
- * sentAt stay raw, earlier ones are covered here and may be windowed out. The
- * wire-facing request carries only `{ text, version }` — the cursor never reaches
+ * `summarizedThroughSentAt` + `summarizedThroughMessageId` are the COMPOUND coverage
+ * cursor: draft turns after `(sentAt, messageId)` stay raw, earlier-or-equal ones are
+ * covered here and may be windowed out. The messageId tie-breaks turns that share the
+ * exact same sentAt so a same-timestamp turn can't be dropped-yet-never-summarized.
+ * The wire-facing request carries only `{ text, version }` — the cursor never reaches
  * the model. Narrative-only; carries no rates/questions/commitments.
  */
 export interface ConversationSummary {
@@ -77,6 +79,7 @@ export interface ConversationSummary {
   version?: string;
   tokensSaved?: number;
   summarizedThroughSentAt?: Date | undefined;
+  summarizedThroughMessageId?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------

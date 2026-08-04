@@ -88,4 +88,44 @@ test("barrier: only finalized turns are in the input, so none can be summarized-
   assert.ok(!plan!.delta.some((d) => d.entry.messageId === "m21"));
 });
 
+// --- Identical-timestamp tie-break (founder review) ----------------------------
+// The delta filter must use the SAME compound cursor as windowing. If the cursor
+// covered only ONE of two same-sentAt turns, the OTHER must still land in the delta
+// (be folded) — otherwise it is dropped from the raw tail AND skipped here = lost.
+test("same-sentAt: the twin the cursor did NOT cover is still folded into the delta", () => {
+  // 12 turns, window 8 → prefix = turns 1..4. Make turns 3 & 4 share sentAt 4000,
+  // and set the cursor to cover m3 only (same at, smaller messageId).
+  const dated = transcript(12).map((d) =>
+    d.entry.messageId === "m3" || d.entry.messageId === "m4" ? { ...d, at: 4000 } : d,
+  );
+  const summary: ConversationSummary = {
+    text: "through m3",
+    version: "summary-v1.0",
+    summarizedThroughSentAt: new Date(4000),
+    summarizedThroughMessageId: "m3",
+  };
+  const plan = planSummaryRefresh(dated, summary, WINDOW);
+  assert.ok(plan, "there is still an uncovered twin to fold");
+  // m3 is covered; m4 (same sentAt, not folded) MUST be in the delta.
+  assert.deepEqual(plan!.delta.map((d) => d.entry.messageId), ["m4"]);
+  assert.equal(plan!.newThroughSentAt.getTime(), 4000);
+  assert.equal(plan!.newThroughMessageId, "m4");
+});
+
+test("same-sentAt: a cursor already covering the LARGER twin id → no-op", () => {
+  // Cursor covers m4 (the larger id at 4000). m3 shares the timestamp but sorts
+  // BEFORE the cursor, so it is covered too — nothing left in the prefix to fold.
+  const dated = transcript(12).map((d) =>
+    d.entry.messageId === "m3" || d.entry.messageId === "m4" ? { ...d, at: 4000 } : d,
+  );
+  const summary: ConversationSummary = {
+    text: "through m4",
+    version: "summary-v1.0",
+    summarizedThroughSentAt: new Date(4000),
+    summarizedThroughMessageId: "m4",
+  };
+  const plan = planSummaryRefresh(dated, summary, WINDOW);
+  assert.equal(plan, null);
+});
+
 console.log(`\n${n} passed\n`);

@@ -1,5 +1,5 @@
 import type { ConversationSummary } from "../conversationContext/types.js";
-import type { DatedEntry } from "./negotiationHistory.js";
+import { isAfterSummaryCursor, type DatedEntry, type SummaryCursor } from "./negotiationHistory.js";
 import type { IAgentProvider } from "../providers.js";
 import {
   loadConversationSummary,
@@ -40,11 +40,14 @@ export function planSummaryRefresh(
   if (dated.length <= window) return null;
   const prefix = dated.slice(0, dated.length - window);
 
-  const cursorMs =
+  // The delta uses the SAME compound `(sentAt, messageId)` cursor as windowDraftHistory
+  // so the two partition the transcript identically — a turn is either still raw OR
+  // folded here, never both-dropped-and-skipped on a same-sentAt tie.
+  const cursor: SummaryCursor =
     summary?.summarizedThroughSentAt instanceof Date
-      ? summary.summarizedThroughSentAt.getTime()
-      : -Infinity;
-  const delta = prefix.filter((d) => d.at > cursorMs);
+      ? { at: summary.summarizedThroughSentAt.getTime(), messageId: summary.summarizedThroughMessageId }
+      : { at: -Infinity };
+  const delta = prefix.filter((d) => isAfterSummaryCursor(d, cursor));
   if (delta.length === 0) return null; // idempotent: nothing new to fold.
 
   const last = delta[delta.length - 1]!;
@@ -71,8 +74,17 @@ export async function refreshConversationSummary(
   if (!agent.summarizeConversation) return;
   try {
     // Re-read the summary INSIDE the refresh so the CAS compares against the
-    // freshest stored cursor, not the one this turn's context loaded.
-    const current = await loadConversationSummary(instanceId);
+    // freshest stored cursor, not the one this turn's context loaded. Normalize the
+    // DB row's nullable cursor id to the in-memory `undefined` the planner expects.
+    const row = await loadConversationSummary(instanceId);
+    const current: ConversationSummary | undefined = row
+      ? {
+          text: row.text,
+          version: row.version,
+          summarizedThroughSentAt: row.summarizedThroughSentAt,
+          summarizedThroughMessageId: row.summarizedThroughMessageId ?? undefined,
+        }
+      : undefined;
     const plan = planSummaryRefresh(dated, current, recentMessageWindow());
     if (!plan) return;
 

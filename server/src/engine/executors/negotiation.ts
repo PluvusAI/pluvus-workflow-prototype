@@ -840,6 +840,9 @@ export async function executeNegotiation(
               text: row.text,
               version: row.version,
               summarizedThroughSentAt: row.summarizedThroughSentAt,
+              // Compound-cursor tie-breaker (PLU-112): carried so windowing can
+              // disambiguate turns that share the exact same sentAt.
+              summarizedThroughMessageId: row.summarizedThroughMessageId ?? undefined,
               tokensSaved: row.estimatedTokensSaved,
             }
           : undefined;

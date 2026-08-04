@@ -1,17 +1,19 @@
 import type { DraftHistoryEntry } from "../../adapters/negotiation/types.js";
 import type { ConversationSummary } from "../conversationContext/types.js";
 import { estimateTokens } from "../conversationContext/assemble.js";
-import type { DatedEntry } from "./negotiationHistory.js";
+import { isAfterSummaryCursor, type DatedEntry } from "./negotiationHistory.js";
 
 // ---------------------------------------------------------------------------
 // PLU-112 — pure draft-transcript windowing (no I/O)
 // ---------------------------------------------------------------------------
 // Window ⟺ the summary's cursor covers the dropped turns. A raw entry is removed
-// ONLY when its sentAt is at/before `summarizedThroughSentAt`; everything after the
-// cursor always stays raw (so nothing is ever in neither the summary nor the raw
-// tail — Calvin review #2/#3/#4). No valid summary → the full transcript, byte-
-// identical to today (the flag-OFF path). Draft path only — the money decision
-// keeps the full transcript.
+// ONLY when it is at/before the COMPOUND `(summarizedThroughSentAt, ...MessageId)`
+// cursor; everything after the cursor always stays raw (so nothing is ever in
+// neither the summary nor the raw tail — Calvin review #2/#3/#4). The messageId
+// tie-break means two turns sharing the same sentAt are split correctly instead of
+// both counted as covered. No valid summary → the full transcript, byte-identical to
+// today (the flag-OFF path). Draft path only — the money decision keeps the full
+// transcript.
 
 export interface WindowResult {
   history: DraftHistoryEntry[];
@@ -51,10 +53,14 @@ export function windowDraftHistory(
   // No valid summary → full transcript (§5.6 fallback = today's behavior).
   if (!hasValidCursor(summary)) return { history: all };
 
-  const cursor = summary.summarizedThroughSentAt.getTime();
+  const cursor = {
+    at: summary.summarizedThroughSentAt.getTime(),
+    messageId: summary.summarizedThroughMessageId,
+  };
   // Everything after the cursor is uncovered → must stay raw. Everything at/before
-  // is covered by the summary → droppable.
-  const tailCount = dated.filter((d) => d.at > cursor).length;
+  // is covered by the summary → droppable. Compound compare so a same-sentAt turn
+  // that was NOT folded is still counted as uncovered (not silently dropped).
+  const tailCount = dated.filter((d) => isAfterSummaryCursor(d, cursor)).length;
 
   // Keep the newest max(window, tail) entries. Dropping below the tail is
   // forbidden (would strand an uncovered entry); dropping a covered entry above

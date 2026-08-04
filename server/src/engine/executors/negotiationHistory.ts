@@ -134,6 +134,40 @@ export interface DatedEntry {
   entry: DraftHistoryEntry;
 }
 
+/** PLU-112 — the summary coverage cursor as a COMPOUND `(sentAt, messageId)` key.
+ *  A bare `sentAt` cursor is ambiguous when two messages share the exact same
+ *  timestamp (batched sends, DB-default now()): a strict `at > cursor` compare would
+ *  treat a same-`at` message that was NEVER folded as already covered, so it gets
+ *  dropped from the raw tail AND skipped by the next refresh delta — silently lost
+ *  from the draft context. Tie-breaking on `messageId` closes that gap. `messageId`
+ *  is undefined only for the pre-any-summary cursor (`-Infinity` at), where the
+ *  timestamp alone already decides. */
+export interface SummaryCursor {
+  at: number;
+  messageId?: string | undefined;
+}
+
+/**
+ * Is a dated entry strictly AFTER the coverage cursor — i.e. NOT yet covered by the
+ * summary, so it must stay in the raw tail (windowing) and be folded next (refresh)?
+ * Ordering is lexicographic on `(at, messageId)`: later timestamp wins; on an exact
+ * `at` tie the larger `messageId` is "after". An entry with no `messageId` sorts
+ * before any same-`at` entry that has one (it can only be an eventless placeholder,
+ * conservatively treated as already covered on a tie). Both files that reason about
+ * the cursor — windowDraftHistory and planSummaryRefresh — MUST use this one compare
+ * so the "raw tail" and the "fold delta" partition the transcript identically. */
+export function isAfterSummaryCursor(d: DatedEntry, cursor: SummaryCursor): boolean {
+  if (d.at !== cursor.at) return d.at > cursor.at;
+  // Same timestamp → tie-break on messageId. A cursor with no messageId (the
+  // pre-summary sentinel, or a legacy/eventless cursor) keeps the original
+  // timestamp-only semantics: an entry exactly AT the cursor's `at` is covered, not
+  // after — otherwise a bare-timestamp cursor would re-fold its own boundary turn.
+  if (cursor.messageId === undefined) return false;
+  const entryId = d.entry.messageId;
+  if (entryId === undefined) return false; // idless entry on a tie ⇒ covered.
+  return entryId > cursor.messageId;
+}
+
 /** Enrichment recovered from the owning NEGOTIATION_TURN event for a sent
  *  outbound row (a Message has `body` but not these). All optional — an eventless
  *  send (operator/manual/transactional) resolves to an empty enrichment and is

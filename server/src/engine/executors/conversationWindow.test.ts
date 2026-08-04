@@ -131,4 +131,57 @@ test("summary with no cursor → full transcript", () => {
   assert.equal(r.history.length, 30);
 });
 
+// --- Identical-timestamp tie-break (founder review) ----------------------------
+// Two messages share the EXACT same sentAt. The summary covered only the FIRST of
+// them (cursor = (at, mA)). A bare-timestamp compare would treat the SECOND (same at)
+// as covered too and drop it from the raw tail — even though it was never folded.
+// The compound (sentAt, messageId) cursor must keep the second one raw.
+
+function twinAt(count: number, twinAtMs: number): DatedEntry[] {
+  // A normal transcript, but turns `twinAtMs/1000` and the next one share `twinAtMs`.
+  const out: DatedEntry[] = [];
+  for (let i = 1; i <= count; i++) {
+    const at = i * 1000 >= twinAtMs && i * 1000 <= twinAtMs + 1000 ? twinAtMs : i * 1000;
+    out.push({
+      at,
+      entry: { role: i % 2 === 0 ? "us" : "creator", message: `turn ${i} body`, messageId: `m${i}` },
+    });
+  }
+  return out;
+}
+
+test("same-sentAt: a twin NOT covered by the cursor stays raw (no silent drop)", () => {
+  // Small window so the twin sits in the summarizable prefix, not the raw tail by
+  // count alone. 12 turns, window 8 → prefix is turns 1-4. Make turns 4 & 5 twins
+  // at 4000; cursor covers m4 only.
+  const dated = twinAt(12, 4000);
+  // Confirm the twins exist.
+  assert.equal(dated[3]!.at, 4000);
+  assert.equal(dated[4]!.at, 4000);
+  const summary: ConversationSummary = {
+    text: "narrative through m4",
+    version: "summary-v1.0",
+    summarizedThroughSentAt: new Date(4000),
+    summarizedThroughMessageId: "m4",
+  };
+  const r = windowDraftHistory(dated, summary, OPTS);
+  const kept = new Set(r.history.map((e) => e.messageId));
+  assert.ok(!kept.has("m4"), "m4 (covered) may be dropped");
+  assert.ok(kept.has("m5"), "m5 (same sentAt but NOT folded) must stay raw");
+});
+
+test("same-sentAt: the covered twin IS droppable while its sibling stays", () => {
+  // Cursor covers m4; m5 shares the timestamp. Under budget pressure m4 can be shed
+  // but m5 (uncovered by compound compare) is protected as part of the raw tail.
+  const dated = twinAt(12, 4000);
+  const summary: ConversationSummary = {
+    text: "n", version: "summary-v1.0",
+    summarizedThroughSentAt: new Date(4000), summarizedThroughMessageId: "m4",
+  };
+  const r = windowDraftHistory(dated, summary, { window: 2, tokenBudget: 1 });
+  const kept = new Set(r.history.map((e) => e.messageId));
+  assert.ok(kept.has("m5"), "the uncovered twin survives even under tight budget");
+  assert.equal(r.history[r.history.length - 1]!.messageId, "m12");
+});
+
 console.log(`\n${n} passed\n`);
