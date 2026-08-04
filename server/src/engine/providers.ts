@@ -7,7 +7,7 @@ import type {
   PriorNegotiationContext,
 } from "./types.js";
 import { MockNegotiationProvider } from "../adapters/negotiation/MockNegotiationProvider.js";
-import type { NegotiationTerm, NegotiationHistoryEntry, DraftHistoryEntry } from "../adapters/negotiation/types.js";
+import type { NegotiationTerm, NegotiationHistoryEntry, DraftHistoryEntry, ExtractedFact } from "../adapters/negotiation/types.js";
 import { resolveBand } from "./band.js";
 import { resolveOutreachTemplate } from "./outreachVariables.js";
 
@@ -487,7 +487,15 @@ export function buildNegotiationRequest(
   // executor attaches it only when BRIEF_INTO_NEGOTIATE is on; the agent applies the
   // §4.10 knowledge-turn gate. Attached only when non-empty → prompt byte-identical
   // to today otherwise. NEVER a money input.
-  const campaignContext = priorContext?.campaignContext;
+  //
+  // PLU-113: the sanitized creator-memory payload rides in the SAME campaignContext
+  // dict under `creatorMemory` (the agent's _creator_memory_block reads it there). It
+  // is CONTEXT/DATA, never a money input. Attached only when present so a memory-off
+  // turn leaves campaignContext byte-identical to today.
+  const campaignContext =
+    priorContext?.creatorMemory !== undefined
+      ? { ...(priorContext.campaignContext ?? {}), creatorMemory: priorContext.creatorMemory }
+      : priorContext?.campaignContext;
 
   return {
     creatorReply,
@@ -531,6 +539,7 @@ export function mapNegotiationResponse(
     creatorRequestedRate?: number;
     escalationReason?: string;
     isFinalRound?: boolean;
+    creatorFacts?: ExtractedFact[];
   },
   round: number,
 ): NegotiateResult {
@@ -562,6 +571,10 @@ export function mapNegotiationResponse(
     ...(typeof resp.responseDraft === "string" && resp.responseDraft.trim()
       ? { negotiatorAnswers: resp.responseDraft }
       : {}),
+    // PLU-113: carry the extracted durable facts across the seam so the executor
+    // can verify + build the memory write plan. Only spread when non-empty so
+    // memory-off / no-facts turns leave it undefined (byte-identical result).
+    ...(resp.creatorFacts?.length ? { creatorFacts: resp.creatorFacts } : {}),
   };
 
   switch (resp.action) {

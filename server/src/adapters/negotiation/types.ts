@@ -109,6 +109,21 @@ export interface NegotiationHistoryEntry {
   message?: string;
 }
 
+/**
+ * PLU-113: one durable creator fact the /negotiate model extracted from THIS turn's
+ * creator reply. Each fact MUST carry an `evidenceText` — the verbatim phrase from
+ * the creator's message that supports it — which the server re-verifies against the
+ * normalized reply before persisting (Calvin review #3). Confidence alone is not
+ * evidence. `key` is a MemoryFactKey; the server drops unknown keys.
+ */
+export interface ExtractedFact {
+  key: string;
+  value: string;
+  evidenceText: string;
+  confidence?: number;
+  category?: string;
+}
+
 export interface NegotiationResponse {
   action: NegotiationAction;
   proposedTerms?: NegotiationTerm;
@@ -138,6 +153,10 @@ export interface NegotiationResponse {
    *  this is our final rate and no further negotiation is possible. Absent/false
    *  on every non-final turn. */
   isFinalRound?: boolean;
+  /** PLU-113: durable creator facts extracted this turn, each with an evidence
+   *  phrase. The executor verifies + builds a memory write plan from these; absent
+   *  when the memory flag is off or nothing durable was stated. */
+  creatorFacts?: ExtractedFact[];
 }
 
 // ---------------------------------------------------------------------------

@@ -174,6 +174,50 @@ export interface InstanceDetail {
   // only — never values). Absent when no turn has assembled context ("empty = no
   // turn ran").
   context?: ContextDTO;
+  // PLU-113: durable creator facts (live + history) with revision trails and source
+  // traceability, plus any pending failed memory writes. Always present (possibly []).
+  memory: CreatorMemoryFactDTO[];
+  failedMemoryWrites: FailedMemoryWriteDTO[];
+}
+
+// ---- Creator memory (PLU-113) ----
+// Durable campaign-scoped creator facts. Each fact is a live head + its immutable
+// revision history; each revision links to its source message + evidence excerpt.
+
+export interface CreatorMemoryRevisionDTO {
+  id: string;
+  value: string;
+  valueNumber: number | null;
+  source: string; // "creator" | "operator"
+  sourceMessageId: string | null;
+  evidenceText: string | null;
+  confidence: number;
+  note: string | null;
+  createdAt: string;
+}
+
+export interface CreatorMemoryFactDTO {
+  id: string;
+  key: string;
+  status: string; // ACTIVE | CONFLICTED | SUPERSEDED | REMOVED
+  value: string;
+  valueNumber: number | null;
+  category: string | null;
+  live: boolean;
+  conflictValue: string | null;
+  conflictSourceMessageId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  revisions: CreatorMemoryRevisionDTO[];
+}
+
+export interface FailedMemoryWriteDTO {
+  id: string;
+  status: string;
+  error: string;
+  sourceMessageId: string | null;
+  attempts: number;
+  createdAt: string;
 }
 
 // ---- Knowledge (PLU-82) ----

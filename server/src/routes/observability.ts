@@ -26,6 +26,10 @@ import {
   resolveInstanceObligation,
   isManualResolveStatus,
   MANUAL_RESOLVE_STATUSES,
+  createInstanceMemory,
+  correctInstanceMemory,
+  removeInstanceMemory,
+  dismissFailedMemoryWrite,
 } from "../observability/repository.js";
 import { WORKFLOW_STATE_ORDER, TERMINAL_STATES, WAITING_STATES } from "../observability/dto.js";
 
@@ -227,6 +231,90 @@ router.post("/instances/:id/obligations/:obligationId/resolve", async (req, res)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: "obligation_resolve_failed", message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PLU-113: operator creator-memory mutations (Calvin review #5)
+// ---------------------------------------------------------------------------
+// Operator-gated with the rest of the router (X-Operator-Key applied at mount).
+//   POST /instances/:id/memory                     create a fact by hand
+//   POST /instances/:id/memory/:memoryId/correct   correct a fact's value
+//   POST /instances/:id/memory/:memoryId/remove     soft-remove a fact
+//   POST /instances/:id/failed-memory/:writeId/dismiss  dismiss a failed write
+
+router.post("/instances/:id/memory", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const key = typeof body["key"] === "string" ? body["key"] : "";
+    const value = typeof body["value"] === "string" ? body["value"].trim() : "";
+    if (!key || !value) {
+      res.status(400).json({ error: "key_and_value_required" });
+      return;
+    }
+    const outcome = await createInstanceMemory(req.params.id, {
+      key,
+      value,
+      ...(typeof body["category"] === "string" ? { category: body["category"] } : {}),
+      ...(typeof body["note"] === "string" ? { note: body["note"] } : {}),
+    });
+    if (!outcome.ok) {
+      res.status(outcome.reason === "invalid_key" ? 400 : 409).json({ error: outcome.reason });
+      return;
+    }
+    res.json({ memory: outcome.fact });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "memory_create_failed", message });
+  }
+});
+
+router.post("/instances/:id/memory/:memoryId/correct", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const value = typeof body["value"] === "string" ? body["value"].trim() : "";
+    if (!value) {
+      res.status(400).json({ error: "value_required" });
+      return;
+    }
+    const outcome = await correctInstanceMemory(req.params.id, req.params.memoryId, {
+      value,
+      ...(typeof body["note"] === "string" ? { note: body["note"] } : {}),
+    });
+    if (!outcome.ok) {
+      res.status(404).json({ error: outcome.reason, id: req.params.memoryId });
+      return;
+    }
+    res.json({ memory: outcome.fact });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "memory_correct_failed", message });
+  }
+});
+
+router.post("/instances/:id/memory/:memoryId/remove", async (req, res) => {
+  try {
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const note = typeof body["note"] === "string" ? body["note"] : null;
+    const outcome = await removeInstanceMemory(req.params.id, req.params.memoryId, note);
+    if (!outcome.ok) {
+      res.status(404).json({ error: outcome.reason, id: req.params.memoryId });
+      return;
+    }
+    res.json({ memory: outcome.fact });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "memory_remove_failed", message });
+  }
+});
+
+router.post("/instances/:id/failed-memory/:writeId/dismiss", async (req, res) => {
+  try {
+    await dismissFailedMemoryWrite(req.params.writeId);
+    res.json({ ok: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: "failed_memory_dismiss_failed", message });
   }
 });
 

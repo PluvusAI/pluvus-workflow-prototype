@@ -19,8 +19,9 @@ import { InstanceLlmUsage } from "./LlmUsagePanel";
 import { ObligationsPanel } from "./ObligationsPanel";
 import { KnowledgePanel } from "./KnowledgePanel";
 import { ContextPanel } from "./ContextPanel";
+import { MemoryPanel } from "./MemoryPanel";
 
-type Tab = "timeline" | "messages" | "decisions" | "obligations" | "knowledge" | "context" | "usage" | "logs";
+type Tab = "timeline" | "messages" | "decisions" | "obligations" | "memory" | "knowledge" | "context" | "usage" | "logs";
 
 interface Props {
   instanceId: string;
@@ -111,6 +112,12 @@ export function InstanceInspector({ instanceId, onClose }: Props) {
           count={d?.obligations?.filter((o) => o.open).length}
         />
         <TabButton
+          label="Memory"
+          active={tab === "memory"}
+          onClick={() => setTab("memory")}
+          count={d?.memory?.filter((f) => f.live).length}
+        />
+        <TabButton
           label="Knowledge"
           active={tab === "knowledge"}
           onClick={() => setTab("knowledge")}
@@ -153,6 +160,20 @@ export function InstanceInspector({ instanceId, onClose }: Props) {
               <Spinner />
             ) : (
               <ObligationsPanel instanceId={instanceId} obligations={d?.obligations ?? []} />
+            )}
+          </>
+        )}
+        {tab === "memory" && (
+          <>
+            <SectionTitle>Creator Memory</SectionTitle>
+            {detail.isLoading ? (
+              <Spinner />
+            ) : (
+              <MemoryPanel
+                instanceId={instanceId}
+                memory={d?.memory ?? []}
+                failedMemoryWrites={d?.failedMemoryWrites ?? []}
+              />
             )}
           </>
         )}

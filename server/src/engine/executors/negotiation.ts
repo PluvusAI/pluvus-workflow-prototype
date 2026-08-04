@@ -38,6 +38,19 @@ import {
 } from "./summaryConfig.js";
 import { windowDraftHistory } from "./conversationWindow.js";
 import { refreshConversationSummary } from "./summaryRefresh.js";
+// PLU-113: campaign-scoped creator memory. The loader (build-time read, gated by
+// the flag) is supplied to the context builder so memory is loaded ONCE through the
+// single read path (Calvin review #2); the pure verify-and-build turns THIS turn's
+// extracted facts into the write plan the runtime applies fail-soft after commit.
+import { listLiveCreatorMemory } from "../../db/campaignCreatorMemory.js";
+import {
+  creatorMemoryEnabled,
+  memoryMinConfidence,
+} from "./creatorMemoryConfig.js";
+import {
+  buildCreatorMemoryBlock,
+  verifyAndBuildMemoryWritePlan,
+} from "./creatorMemory.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { reserveOutbound } from "./idempotentSend.js";
 import { negotiationReplyDelayMs } from "../sendDelay.js";
@@ -847,6 +860,15 @@ export async function executeNegotiation(
             }
           : undefined;
       },
+      // PLU-113 §Calvin #2: the SINGLE read path for memory. The flag check lives
+      // INSIDE the loader (PLU-81 §9.1) — off ⇒ returns undefined ⇒ no memory block,
+      // prompt byte-identical. The executor never reads live memory rows again after
+      // this; it only builds the WRITE plan from the model result below.
+      loadCreatorMemory: async (instanceId) => {
+        if (!creatorMemoryEnabled()) return undefined;
+        const rows = await listLiveCreatorMemory(instanceId);
+        return buildCreatorMemoryBlock(rows) ?? undefined;
+      },
     },
   );
 
@@ -900,7 +922,7 @@ export async function executeNegotiation(
   // feeds the MONEY path (context.creatorRate on a brand decision, which a brand
   // APPROVE records as the deal rate). The regex remains a fallback for copy
   // acknowledgment and guard allowlisting only.
-  const { outcome, message, proposedRate, creatorQuestions, pushedFixedTerms, creatorRequestedRate, escalationReason, isFinalRound, negotiatorAnswers } =
+  const { outcome, message, proposedRate, creatorQuestions, pushedFixedTerms, creatorRequestedRate, escalationReason, isFinalRound, negotiatorAnswers, creatorFacts } =
     await agent.negotiate(instance.negotiationRound, config, creatorReply, negotiationContext);
 
   // For acknowledgment copy + the output-guard allowlist (NOT the money path):
@@ -997,8 +1019,33 @@ export async function executeNegotiation(
   // / maxRoundsReject all set one, as do the success arms), so we fold onto that
   // payload. Delegates to the pure, exported foldObservabilityRecords so the closure
   // just supplies THIS turn's two records; the merge contract is unit-tested there.
-  const withContextRecord = <T extends NodeResult>(result: T): T =>
-    foldObservabilityRecords(result, knowledgeRecord, contextRecord);
+  // PLU-113: THIS turn's verified memory write plan, built ONCE from the model's
+  // extracted facts + the validated ask, server-verified against the actual reply
+  // (Calvin review #3). Attached to EVERY post-build result the SAME way as the
+  // observability records — one decorator, so no outcome branch can forget it. The
+  // runtime applies it FAIL-SOFT after commit (review #6). Empty plan ⇒ the field
+  // is omitted (no memoryWrites key), so a memory-off / no-fact turn is unchanged.
+  const memoryPlan = creatorMemoryEnabled()
+    ? verifyAndBuildMemoryWritePlan({
+        creatorFacts,
+        creatorReply,
+        ...(latestInbound?.id ? { sourceMessageId: latestInbound.id } : {}),
+        creatorRequestedRate,
+        minConfidence: memoryMinConfidence(),
+      })
+    : [];
+  const memoryWrites: NodeResult["memoryWrites"] =
+    memoryPlan.length > 0
+      ? {
+          plan: memoryPlan,
+          ...(latestInbound?.id ? { sourceMessageId: latestInbound.id } : {}),
+        }
+      : undefined;
+
+  const withContextRecord = <T extends NodeResult>(result: T): T => {
+    const folded = foldObservabilityRecords(result, knowledgeRecord, contextRecord);
+    return memoryWrites ? { ...folded, memoryWrites } : folded;
+  };
 
   // PLU-111: the durable obligation ledger (loaded by the builder) supersedes the
   // event-diff as the source of "what creator questions are still open". This is a
