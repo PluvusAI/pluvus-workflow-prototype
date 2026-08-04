@@ -8,10 +8,16 @@ import type {
 } from "../db/schema.js";
 // F-H1: the full both-sides transcript entry, reused from the draft seam so the
 // negotiator receives the same conversation shape the copywriter already gets.
-import type { DraftHistoryEntry } from "../adapters/negotiation/types.js";
+import type { DraftHistoryEntry, ExtractedFact } from "../adapters/negotiation/types.js";
 // PLU-111: the pure obligation write-plan the executor returns and the runtime
 // applies in-tx.
 import type { QuestionObligationPlanItem } from "./executors/negotiationHistory.js";
+// PLU-113: the sanitized creator-memory read payload. type-only import (erased at
+// compile) so the type-level cycle with conversationContext/types.ts is harmless.
+import type { CreatorMemoryPayload } from "./conversationContext/types.js";
+// PLU-113: the pure memory write-plan item the executor builds and the runtime
+// applies fail-soft after commit.
+import type { MemoryWritePlanItem } from "./memoryKeys.js";
 
 // NodeSnapshot — matches what is stored in WorkflowVersion.nodeGraph
 export interface NodeSnapshot {
@@ -90,6 +96,20 @@ export interface NodeResult {
      *  context AND surface in the Manual Queue. The runtime resolves the ids AFTER
      *  applying questionPlan (so newly-minted rows are included). */
     escalateAfterWrite?: boolean | undefined;
+  };
+  /**
+   * PLU-113: the campaign-scoped creator-memory write-plan for this turn — the
+   * verified durable facts extracted from the creator's reply (already evidence-
+   * checked by the executor, so the runtime just applies them). Unlike
+   * obligationWrites, this is FAIL-SOFT (Calvin review #6): a memory-write error
+   * must NOT roll back the reply. The runtime applies the plan in its OWN
+   * transaction AFTER the turn commits; on failure it records a durable, operator-
+   * visible FailedMemoryWrite instead of throwing, so the failure is recoverable
+   * and never stdout-only. Absent on turns with no durable facts / flag off.
+   */
+  memoryWrites?: {
+    plan: MemoryWritePlanItem[];
+    sourceMessageId?: string | undefined;
   };
 }
 
@@ -187,6 +207,13 @@ export interface NegotiateResult {
    * hallucinating) them. Undefined when there is no genuine draft to pass.
    */
   negotiatorAnswers?: string;
+  /**
+   * PLU-113: durable creator facts the /negotiate model extracted this turn, each
+   * with an evidence phrase. The executor server-verifies each against the actual
+   * reply and builds the memory write plan. Undefined when the memory flag is off
+   * or nothing durable was stated.
+   */
+  creatorFacts?: ExtractedFact[];
 }
 
 // PriorNegotiationContext — assembled by the executor (the state authority) and
@@ -227,6 +254,13 @@ export interface PriorNegotiationContext {
   // executor only when the BRIEF_INTO_NEGOTIATE sub-flag is on; the agent applies
   // the §4.10 knowledge-turn cost gate. Absent → /negotiate prompt byte-identical.
   campaignContext?: Record<string, unknown> | undefined;
+  // PLU-113: campaign-scoped creator memory — durable creator facts (requested/
+  // minimum rate as CONTEXT, availability, objections, preferences, manager) the
+  // context-builder loaded for this instance. Rendered by /negotiate as sanitized
+  // DATA (like the transcript), NEVER a money input: requestedRate/minimumRate are
+  // what the creator SAID they want, not the offer figure. Attached only when the
+  // memory flag is on and there are live facts; absent → prompt byte-identical.
+  creatorMemory?: CreatorMemoryPayload | undefined;
 }
 
 // A trimmed history entry the executor can build purely from persisted events.

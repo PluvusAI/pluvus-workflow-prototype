@@ -20,6 +20,8 @@ import {
   escalateObligations,
   listOpenObligationsByInstance,
   ensureMessageScheduledFor,
+  applyMemoryWritePlan,
+  recordFailedMemoryWrite,
 } from "../db/index.js";
 import type { Db, DbTx } from "../db/drizzle.js";
 import { findCampaignById } from "../db/campaigns.js";
@@ -384,6 +386,39 @@ export class WorkflowRuntime {
             `(instance ${instanceId}); the poller sweep will reclaim it. ` +
             `${err instanceof Error ? err.message : String(err)}`,
         );
+      }
+    }
+
+    // ── PLU-113 creator memory — apply the write plan FAIL-SOFT (Calvin #6) ────
+    // The verified durable facts are persisted AFTER the turn committed, in their
+    // OWN transaction, so a memory-write error can NEVER roll back the reply. On
+    // failure we record a durable, operator-visible FailedMemoryWrite (recoverable
+    // by a sweep) instead of letting the failure exist only in stdout.
+    if (result.memoryWrites && result.memoryWrites.plan.length > 0) {
+      const mw = result.memoryWrites;
+      try {
+        await db.transaction((tx) => applyMemoryWritePlan(instanceId, mw.plan, tx));
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[runtime] memory write failed for instance ${instanceId}; recording a ` +
+            `recoverable FailedMemoryWrite. ${message}`,
+        );
+        try {
+          await recordFailedMemoryWrite({
+            instanceId,
+            plan: mw.plan,
+            ...(mw.sourceMessageId ? { sourceMessageId: mw.sourceMessageId } : {}),
+            error: message,
+          });
+        } catch (recErr) {
+          // Even the recovery record failed — the last resort is stdout, but the
+          // reply already went out, so the turn is unaffected.
+          console.error(
+            `[runtime] could not record FailedMemoryWrite for instance ${instanceId}: ` +
+              `${recErr instanceof Error ? recErr.message : String(recErr)}`,
+          );
+        }
       }
     }
 

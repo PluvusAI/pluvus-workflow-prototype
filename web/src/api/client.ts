@@ -18,6 +18,7 @@ import type {
   LlmUsageSummary,
   ConversationObligationDTO,
   ManualResolveStatus,
+  CreatorMemoryFactDTO,
 } from "./types";
 
 const BASE = "/api/observability";
@@ -167,6 +168,70 @@ export function useResolveObligation(instanceId: string) {
           status: vars.status,
           ...(vars.resolution ? { resolution: vars.resolution } : {}),
         },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["instance", instanceId] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// PLU-113 — operator creator-memory mutations
+// ---------------------------------------------------------------------------
+
+/** Correct a memory fact's value (source=operator). Invalidates the instance. */
+export function useCorrectMemory(instanceId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { memoryId: string; value: string; note?: string }) =>
+      postJson<{ memory: CreatorMemoryFactDTO }>(
+        `${BASE}/instances/${instanceId}/memory/${vars.memoryId}/correct`,
+        { value: vars.value, ...(vars.note ? { note: vars.note } : {}) },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["instance", instanceId] });
+    },
+  });
+}
+
+/** Soft-remove a memory fact (source=operator). */
+export function useRemoveMemory(instanceId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { memoryId: string; note?: string }) =>
+      postJson<{ memory: CreatorMemoryFactDTO }>(
+        `${BASE}/instances/${instanceId}/memory/${vars.memoryId}/remove`,
+        { ...(vars.note ? { note: vars.note } : {}) },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["instance", instanceId] });
+    },
+  });
+}
+
+/** Create a memory fact by hand (source=operator). */
+export function useCreateMemory(instanceId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { key: string; value: string; category?: string; note?: string }) =>
+      postJson<{ memory: CreatorMemoryFactDTO }>(
+        `${BASE}/instances/${instanceId}/memory`,
+        vars,
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["instance", instanceId] });
+    },
+  });
+}
+
+/** Dismiss a pending failed memory write. */
+export function useDismissFailedMemory(instanceId: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { writeId: string }) =>
+      postJson<{ ok: true }>(
+        `${BASE}/instances/${instanceId}/failed-memory/${vars.writeId}/dismiss`,
+        {},
       ),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["instance", instanceId] });

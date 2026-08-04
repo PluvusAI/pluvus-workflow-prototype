@@ -62,7 +62,30 @@ import {
   type KnowledgeConflictDTO,
   type BriefAvailabilityDTO,
   type ContextDTO,
+  type CreatorMemoryFactDTO,
+  type CreatorMemoryRevisionDTO,
+  type FailedMemoryWriteDTO,
 } from "./dto.js";
+import {
+  listCreatorMemoryWithRevisions,
+  listPendingFailedMemoryWrites,
+  operatorCorrectFact,
+  operatorRemoveFact,
+  operatorCreateFact,
+  resolveFailedMemoryWrite,
+  LIVE_MEMORY_STATUSES,
+  type CreatorMemoryWithRevisions,
+} from "../db/campaignCreatorMemory.js";
+import {
+  isMemoryFactKey,
+  memoryDedupKey,
+  normalizeMemoryValue,
+} from "../engine/memoryKeys.js";
+import type {
+  CampaignCreatorMemory,
+  CampaignCreatorMemoryRevision,
+  FailedMemoryWrite,
+} from "../db/schema.js";
 
 // An instance in a waiting state is "stuck" if its dueAt passed more than this
 // long ago — the scheduler should have advanced it by now.
@@ -488,6 +511,50 @@ function mapObligation(o: ConversationObligation): ConversationObligationDTO {
   };
 }
 
+// PLU-113: map a memory fact + its immutable revision history to the DTO.
+function mapMemoryRevision(r: CampaignCreatorMemoryRevision): CreatorMemoryRevisionDTO {
+  return {
+    id: r.id,
+    value: r.value,
+    valueNumber: r.valueNumber,
+    source: r.source,
+    sourceMessageId: r.sourceMessageId,
+    evidenceText: r.evidenceText,
+    confidence: r.confidence,
+    note: r.note,
+    createdAt: r.createdAt.toISOString(),
+  };
+}
+
+function mapMemoryFact(row: CreatorMemoryWithRevisions): CreatorMemoryFactDTO {
+  const f: CampaignCreatorMemory = row.fact;
+  return {
+    id: f.id,
+    key: f.key,
+    status: f.status,
+    value: f.value,
+    valueNumber: f.valueNumber,
+    category: f.category,
+    live: (LIVE_MEMORY_STATUSES as readonly string[]).includes(f.status),
+    conflictValue: f.conflictValue,
+    conflictSourceMessageId: f.conflictSourceMessageId,
+    createdAt: f.createdAt.toISOString(),
+    updatedAt: f.updatedAt.toISOString(),
+    revisions: row.revisions.map(mapMemoryRevision),
+  };
+}
+
+function mapFailedMemoryWrite(w: FailedMemoryWrite): FailedMemoryWriteDTO {
+  return {
+    id: w.id,
+    status: w.status,
+    error: w.error,
+    sourceMessageId: w.sourceMessageId,
+    attempts: w.attempts,
+    createdAt: w.createdAt.toISOString(),
+  };
+}
+
 /** Extract agent (AI) decisions from the event log for the inspector. */
 function extractAgentDecisions(events: Event[]): AgentDecisionDTO[] {
   const out: AgentDecisionDTO[] = [];
@@ -744,28 +811,33 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
     .limit(1);
   const versionInfo = versionRows[0] ?? null;
 
-  const [instMessages, instEvents, instLlmCalls, instObligations] = await Promise.all([
-    db
-      .select()
-      .from(messagesTable)
-      .where(eq(messagesTable.instanceId, id))
-      .orderBy(asc(messagesTable.createdAt)),
-    db
-      .select()
-      .from(eventsTable)
-      .where(eq(eventsTable.instanceId, id))
-      // mapKnowledge uses event sequence for conflict liveness. The id tie-breaker
-      // keeps that sequence deterministic when two events share a timestamp.
-      .orderBy(asc(eventsTable.occurredAt), asc(eventsTable.id)),
-    db
-      .select()
-      .from(llmCallsTable)
-      .where(eq(llmCallsTable.instanceId, id))
-      .orderBy(asc(llmCallsTable.createdAt)),
-    // PLU-111: every obligation for the instance (open + resolved), oldest-first.
-    // Reuses the DB access module (same query, one source of truth).
-    listObligationsByInstance(id),
-  ]);
+  const [instMessages, instEvents, instLlmCalls, instObligations, instMemory, instFailedMemory] =
+    await Promise.all([
+      db
+        .select()
+        .from(messagesTable)
+        .where(eq(messagesTable.instanceId, id))
+        .orderBy(asc(messagesTable.createdAt)),
+      db
+        .select()
+        .from(eventsTable)
+        .where(eq(eventsTable.instanceId, id))
+        // mapKnowledge uses event sequence for conflict liveness. The id tie-breaker
+        // keeps that sequence deterministic when two events share a timestamp.
+        .orderBy(asc(eventsTable.occurredAt), asc(eventsTable.id)),
+      db
+        .select()
+        .from(llmCallsTable)
+        .where(eq(llmCallsTable.instanceId, id))
+        .orderBy(asc(llmCallsTable.createdAt)),
+      // PLU-111: every obligation for the instance (open + resolved), oldest-first.
+      // Reuses the DB access module (same query, one source of truth).
+      listObligationsByInstance(id),
+      // PLU-113: every memory fact (live + history) with its full revision trail.
+      listCreatorMemoryWithRevisions(id),
+      // PLU-113: pending failed memory writes (recoverable, operator-visible).
+      listPendingFailedMemoryWrites(id),
+    ]);
 
   // Attribute each outbound message to a negotiation round, when discoverable
   // from the surrounding NEGOTIATION_TURN events sharing the same body.
@@ -830,6 +902,10 @@ export async function getInstanceDetail(id: string): Promise<InstanceDetailDTO |
     // PLU-81: the sanitized AI-context record. Undefined → the panel renders empty
     // ("empty = no turn ran," §7.1).
     ...(context ? { context } : {}),
+    // PLU-113: durable creator facts (live + history, with revision trails) and any
+    // pending failed writes. Always present (possibly empty) so the panel is simple.
+    memory: instMemory.map(mapMemoryFact),
+    failedMemoryWrites: instFailedMemory.map(mapFailedMemoryWrite),
   };
 }
 
@@ -880,6 +956,78 @@ export async function resolveInstanceObligation(
   const updated = await resolveObligationManual(obligationId, opts, "operator");
   if (!updated) return { ok: false, reason: "obligation_not_found" };
   return { ok: true, obligation: mapObligation(updated) };
+}
+
+// ---------------------------------------------------------------------------
+// PLU-113: operator memory mutations (Calvin review #5) — inspect + correct
+// ---------------------------------------------------------------------------
+// All operator-gated with the rest of the router. Each mutation reloads the fact's
+// full revision history so the panel shows the new operator revision immediately.
+
+export type MemoryMutationOutcome =
+  | { ok: true; fact: CreatorMemoryFactDTO }
+  | { ok: false; reason: string };
+
+async function reloadMemoryFactDTO(
+  instanceId: string,
+  memoryId: string,
+): Promise<CreatorMemoryFactDTO | null> {
+  const rows = await listCreatorMemoryWithRevisions(instanceId);
+  const row = rows.find((r) => r.fact.id === memoryId);
+  return row ? mapMemoryFact(row) : null;
+}
+
+/** Operator corrects a fact's value (source=operator, no source message). */
+export async function correctInstanceMemory(
+  instanceId: string,
+  memoryId: string,
+  opts: { value: string; note?: string | null },
+): Promise<MemoryMutationOutcome> {
+  const updated = await operatorCorrectFact(memoryId, opts);
+  if (!updated || updated.instanceId !== instanceId) {
+    return { ok: false, reason: "memory_not_found" };
+  }
+  const dto = await reloadMemoryFactDTO(instanceId, memoryId);
+  return dto ? { ok: true, fact: dto } : { ok: false, reason: "memory_not_found" };
+}
+
+/** Operator removes a fact (soft — REMOVED, revisions kept). */
+export async function removeInstanceMemory(
+  instanceId: string,
+  memoryId: string,
+  note: string | null,
+): Promise<MemoryMutationOutcome> {
+  // Scope-check first so a cross-instance id is a clean 404.
+  const dto0 = await reloadMemoryFactDTO(instanceId, memoryId);
+  if (!dto0) return { ok: false, reason: "memory_not_found" };
+  const updated = await operatorRemoveFact(memoryId, note);
+  if (!updated) return { ok: false, reason: "memory_not_found" };
+  const dto = await reloadMemoryFactDTO(instanceId, memoryId);
+  return dto ? { ok: true, fact: dto } : { ok: false, reason: "memory_not_found" };
+}
+
+/** Operator creates a fact by hand (source=operator). */
+export async function createInstanceMemory(
+  instanceId: string,
+  opts: { key: string; value: string; category?: string | null; note?: string | null },
+): Promise<MemoryMutationOutcome> {
+  if (!isMemoryFactKey(opts.key)) return { ok: false, reason: "invalid_key" };
+  const normalizedValue = memoryDedupKey(opts.key, normalizeMemoryValue(opts.value));
+  const created = await operatorCreateFact(instanceId, {
+    key: opts.key,
+    value: opts.value,
+    normalizedValue,
+    ...(opts.category ? { category: opts.category } : {}),
+    ...(opts.note ? { note: opts.note } : {}),
+  });
+  if (!created) return { ok: false, reason: "memory_conflict" };
+  const dto = await reloadMemoryFactDTO(instanceId, created.id);
+  return dto ? { ok: true, fact: dto } : { ok: false, reason: "memory_not_found" };
+}
+
+/** Operator dismisses a pending failed memory write (→ DISCARDED). */
+export async function dismissFailedMemoryWrite(id: string): Promise<void> {
+  await resolveFailedMemoryWrite(id, "DISCARDED");
 }
 
 // ---------------------------------------------------------------------------

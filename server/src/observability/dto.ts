@@ -231,6 +231,57 @@ export interface ConversationObligationDTO {
   resolvedAt: string | null;
 }
 
+// PLU-113: the campaign-scoped creator-memory observability block. Read-only;
+// operator-gated via the /observability requireOperatorKey. Each fact carries its
+// FULL immutable revision history (Calvin review #4) and each revision links to its
+// source message + evidence excerpt (review #8), so "traceable to a source message"
+// is usable at the product level, not only in the DB.
+
+/** One immutable revision in a fact's history. */
+export interface CreatorMemoryRevisionDTO {
+  id: string;
+  value: string;
+  valueNumber: number | null;
+  /** "creator" (extracted, carries sourceMessageId + evidence) | "operator" (edit). */
+  source: string;
+  sourceMessageId: string | null;
+  /** review #8: the verbatim creator phrase that supported this value. */
+  evidenceText: string | null;
+  confidence: number;
+  note: string | null;
+  createdAt: string;
+}
+
+/** One durable creator fact (the live head) + its revision history. */
+export interface CreatorMemoryFactDTO {
+  id: string;
+  key: string;
+  status: string;
+  value: string;
+  valueNumber: number | null;
+  category: string | null;
+  /** Live = ACTIVE/CONFLICTED (fed to the AI); false = SUPERSEDED/REMOVED history. */
+  live: boolean;
+  /** The prior value + its source when the fact is CONFLICTED (review — surfaced,
+   *  not silently overwritten). */
+  conflictValue: string | null;
+  conflictSourceMessageId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  revisions: CreatorMemoryRevisionDTO[];
+}
+
+/** A memory write plan that failed to apply (review #6) — operator-visible so the
+ *  failure is recoverable, never stdout-only. */
+export interface FailedMemoryWriteDTO {
+  id: string;
+  status: string;
+  error: string;
+  sourceMessageId: string | null;
+  attempts: number;
+  createdAt: string;
+}
+
 // PLU-82 §4.6: the knowledge observability block. Read-only; operator-gated via
 // the /observability requireOperatorKey. Backed entirely by the existing event
 // log (no new EventType/table).
@@ -361,6 +412,12 @@ export interface InstanceDetailDTO {
    *  context (labels/keys/counts only — never values, band presence only). Absent
    *  when no turn has run yet ("empty = no turn ran," §7.1). */
   context?: ContextDTO;
+  /** PLU-113: durable creator facts (live + history) with full revision trails and
+   *  source-message provenance. Empty array when memory is off / none recorded. */
+  memory: CreatorMemoryFactDTO[];
+  /** PLU-113: memory write plans that failed to apply (recoverable, operator-visible
+   *  — review #6). Empty when none are pending. */
+  failedMemoryWrites: FailedMemoryWriteDTO[];
 }
 
 // ---------------------------------------------------------------------------
