@@ -110,6 +110,37 @@ test("same-sentAt: the twin the cursor did NOT cover is still folded into the de
   assert.deepEqual(plan!.delta.map((d) => d.entry.messageId), ["m4"]);
   assert.equal(plan!.newThroughSentAt.getTime(), 4000);
   assert.equal(plan!.newThroughMessageId, "m4");
+  // founder review #2: the COMPOUND expected cursor is threaded to the CAS — both
+  // the sentAt AND the messageId half of the loaded row, so a stale worker sharing
+  // only the timestamp cannot clobber this advance.
+  assert.equal(plan!.expectedThroughSentAt!.getTime(), 4000);
+  assert.equal(plan!.expectedThroughMessageId, "m3");
+});
+
+test("compound expected cursor: prior messageId is carried into the plan for the CAS", () => {
+  // A plain (non-twin) prior cursor at turn 20 with a messageId → the plan must
+  // expose BOTH halves so upsertConversationSummary can guard on the compound key.
+  const dated = transcript(30);
+  const summary: ConversationSummary = {
+    text: "through 20",
+    version: "summary-v1.0",
+    summarizedThroughSentAt: new Date(20_000),
+    summarizedThroughMessageId: "m20",
+  };
+  const plan = planSummaryRefresh(dated, summary, WINDOW);
+  assert.ok(plan);
+  assert.equal(plan!.expectedThroughSentAt!.getTime(), 20_000);
+  assert.equal(plan!.expectedThroughMessageId, "m20");
+});
+
+test("no prior messageId (legacy cursor) → expectedThroughMessageId is undefined", () => {
+  // A prior cursor with a sentAt but no messageId (legacy/eventless boundary): the
+  // plan leaves expectedThroughMessageId undefined, which the CAS maps to IS NULL.
+  const dated = transcript(30);
+  const plan = planSummaryRefresh(dated, summaryThrough(20), WINDOW);
+  assert.ok(plan);
+  assert.equal(plan!.expectedThroughSentAt!.getTime(), 20_000);
+  assert.equal(plan!.expectedThroughMessageId, undefined);
 });
 
 test("same-sentAt: a cursor already covering the LARGER twin id → no-op", () => {

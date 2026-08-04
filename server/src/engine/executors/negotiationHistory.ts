@@ -339,7 +339,22 @@ export function buildDatedDraftHistory(
     items.push({ at, entry: { role: "creator", message: text, messageId: m.id } });
   }
 
-  items.sort((a, b) => a.at - b.at);
+  // Sort lexicographically on the COMPOUND `(at, messageId)` key — the EXACT
+  // ordering isAfterSummaryCursor (and therefore windowing + the refresh delta)
+  // compares against (PLU-112, founder review). A bare `a.at - b.at` leaves two
+  // same-`sentAt` turns in arbitrary insertion order; the cursor then tie-breaks on
+  // messageId, so the transcript's "raw tail" (last N array entries) and the
+  // cursor's covered/uncovered partition could disagree — an uncovered same-`at`
+  // twin could sort into the covered side and be dropped. Ordering both by the same
+  // key removes that gap. messageId is always present on a Message-sourced entry;
+  // the `?? ""` only guards the type (an idless entry sorts first on a tie, the
+  // same "before" side isAfterSummaryCursor assigns it).
+  items.sort((a, b) => {
+    if (a.at !== b.at) return a.at - b.at;
+    const aid = a.entry.messageId ?? "";
+    const bid = b.entry.messageId ?? "";
+    return aid < bid ? -1 : aid > bid ? 1 : 0;
+  });
   return items;
 }
 

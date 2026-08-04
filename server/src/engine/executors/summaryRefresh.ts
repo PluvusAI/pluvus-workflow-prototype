@@ -24,7 +24,11 @@ import { estimateTokens } from "../conversationContext/assemble.js";
 export interface SummaryRefreshPlan {
   delta: DatedEntry[];
   priorSummary: string;
+  // The COMPOUND cursor the CAS compares against (founder review #2): both halves
+  // are the values loaded from the stored row, so a stale worker whose write shares
+  // only the `sentAt` half — not the messageId — cannot clobber a newer summary.
   expectedThroughSentAt: Date | null;
+  expectedThroughMessageId?: string | undefined;
   newThroughSentAt: Date;
   newThroughMessageId?: string | undefined;
 }
@@ -51,11 +55,20 @@ export function planSummaryRefresh(
   if (delta.length === 0) return null; // idempotent: nothing new to fold.
 
   const last = delta[delta.length - 1]!;
+  // Narrow the loaded cursor to a concrete `Date | null` so TS carries the guard
+  // into the return object. Both compound halves come from THIS loaded value.
+  const priorSentAt: Date | null =
+    summary?.summarizedThroughSentAt instanceof Date ? summary.summarizedThroughSentAt : null;
+  const priorMessageId = priorSentAt !== null ? summary?.summarizedThroughMessageId : undefined;
   return {
     delta,
     priorSummary: summary?.text ?? "",
-    expectedThroughSentAt:
-      summary?.summarizedThroughSentAt instanceof Date ? summary.summarizedThroughSentAt : null,
+    expectedThroughSentAt: priorSentAt,
+    // The messageId half of the loaded cursor — passed to the CAS so both halves
+    // must still match for the advance to win. Undefined when there's no prior row
+    // or the prior boundary had no id (legacy/eventless), which the CAS maps to a
+    // NULL guard.
+    ...(priorMessageId ? { expectedThroughMessageId: priorMessageId } : {}),
     newThroughSentAt: new Date(last.at),
     ...(last.entry.messageId ? { newThroughMessageId: last.entry.messageId } : {}),
   };
@@ -105,6 +118,7 @@ export async function refreshConversationSummary(
         estimatedTokensSaved: saved > 0 ? saved : 0,
       },
       plan.expectedThroughSentAt,
+      plan.expectedThroughMessageId,
     );
   } catch (err) {
     console.error(

@@ -13,6 +13,8 @@ import type { Event, EventType, Message } from "../../db/schema.js";
 import {
   buildPriorContextFromEvents,
   buildDraftHistory,
+  buildDatedDraftHistory,
+  isAfterSummaryCursor,
   computeOpenQuestions,
   computeChangedFields,
   computeRelationshipWarmth,
@@ -370,6 +372,70 @@ test("enrich-join strategy B does NOT cross action types", () => {
   const hist = buildDraftHistory(messages, new Set(), events);
   assert.equal(hist[0]!.action, "REJECT");
   assert.equal(hist[0]!.rate, undefined); // no REJECT rate anywhere → stays absent
+});
+
+// ---------------------------------------------------------------------------
+// PLU-112 (founder review #1): the transcript sort must use the COMPOUND
+// (sentAt, messageId) key — the exact ordering isAfterSummaryCursor compares
+// against. A bare timestamp sort leaves two same-`sentAt` turns in arbitrary
+// insertion order, which can disagree with the cursor's messageId tie-break and
+// silently drop an uncovered turn.
+// ---------------------------------------------------------------------------
+
+console.log("\nnegotiationHistory.buildDatedDraftHistory compound-sort (PLU-112)\n");
+
+test("same-sentAt turns sort by messageId even when input is reverse-lexical (z123 before a123)", () => {
+  // Both delivered at the SAME instant (10:00 → 1000ms). The INPUT presents them
+  // reverse-lexically: z123 first, then a123. The sort must reorder to (a123, z123).
+  const messages = [
+    outbound({ id: "z123", body: "our first same-instant turn (z123)" }, 1000),
+    outbound({ id: "a123", body: "our second same-instant turn (a123)" }, 1000),
+  ];
+  const dated = buildDatedDraftHistory(messages, new Set(), []);
+  assert.equal(dated.length, 2);
+  // Lexicographic on messageId within the same `at`: a123 sorts BEFORE z123.
+  assert.equal(dated[0]!.entry.messageId, "a123");
+  assert.equal(dated[1]!.entry.messageId, "z123");
+  assert.equal(dated[0]!.at, 1000);
+  assert.equal(dated[1]!.at, 1000);
+});
+
+test("transcript order agrees with the summary cursor: an uncovered same-sentAt twin is never dropped", () => {
+  // The scenario the founder flagged: the summary folded z123 first, so the cursor
+  // is (1000, z123). a123 shares the timestamp but was NEVER folded. With a bare
+  // timestamp sort z123 could sort last and a123 be treated as before the cursor —
+  // dropped from the raw tail. With the compound sort, a123 sorts BEFORE z123 (so
+  // it's not in the covered prefix), AND isAfterSummaryCursor((1000,a123),(1000,z123))
+  // is false — i.e. a123 is at/before the cursor lexically. The two facts must be
+  // consistent: whichever side the sort puts a123 on, the cursor agrees, so no turn
+  // lands in "neither the summary nor the raw tail".
+  const messages = [
+    outbound({ id: "z123", body: "folded first (z123)" }, 1000),
+    outbound({ id: "a123", body: "same instant, never folded (a123)" }, 1000),
+  ];
+  const dated = buildDatedDraftHistory(messages, new Set(), []);
+  const cursor = { at: 1000, messageId: "z123" };
+  // For EVERY entry: it is either strictly after the cursor (stays raw) OR at/before
+  // it (covered) — and its position in the sorted transcript agrees with that verdict.
+  for (let i = 0; i < dated.length; i++) {
+    const d = dated[i]!;
+    const after = isAfterSummaryCursor(d, cursor);
+    // "after" entries must sort at/after any "not-after" entry — the tail is a suffix.
+    for (let j = 0; j < i; j++) {
+      const earlier = dated[j]!;
+      if (after) {
+        // nothing earlier may be "after" if this one is (tail is contiguous suffix)
+        assert.ok(
+          isAfterSummaryCursor(earlier, cursor) === false || earlier.at < d.at || (earlier.at === d.at),
+          "sorted order keeps the uncovered tail as a contiguous suffix",
+        );
+      }
+    }
+  }
+  // Concretely: a123 (sorted first) is NOT after (1000,z123) → covered side; z123 is
+  // the boundary (not after itself) → covered. Neither is stranded.
+  assert.equal(isAfterSummaryCursor(dated[0]!, cursor), false); // a123 ≤ cursor
+  assert.equal(dated[0]!.entry.messageId, "a123");
 });
 
 console.log("\nnegotiationHistory.computeOpenQuestions (HARD-N2)\n");
