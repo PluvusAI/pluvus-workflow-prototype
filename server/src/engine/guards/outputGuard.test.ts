@@ -213,4 +213,82 @@ test("missing terms yield undefined bounds (no false block)", () => {
   assert.equal(r.ok, true);
 });
 
+console.log("\nPLU-128 — trusted public-copy $ allowlist (4th arg)\n");
+
+// A1: a $ amount the brand wrote into its PUBLIC copy (passed as the 4th
+// publicCopyConfig arg) is authorized — added to allowedRates. The negotiation
+// config as the 1st arg carries only the band.
+test("public-copy config contributes its $ amounts to allowedRates", () => {
+  const c = guardConstraintsFromConfig(
+    { minBudget: 200, maxBudget: 500 }, // negotiation config → band only
+    undefined,
+    undefined,
+    { rewardDescription: "a $200 gift box for every creator" }, // trusted public copy
+  );
+  assert.deepEqual(c.allowedRates, [200]);
+  // and the band is still sourced from the 1st arg, not the public copy.
+  assert.equal(c.floor, 200);
+  assert.equal(c.ceiling, 500);
+});
+
+// A2: default-param byte-identity. Omitting the 4th arg reads the four public
+// fields from the 1st config — a negotiation-only config has none, so no
+// allowedRates are produced (unchanged behavior for followUp/negotiation/reward).
+test("omitting publicCopyConfig is unchanged for a negotiation-only config", () => {
+  const c = guardConstraintsFromConfig({ minBudget: 200, maxBudget: 500 });
+  assert.equal(c.allowedRates, undefined);
+  assert.equal(c.floor, 200);
+  assert.equal(c.ceiling, 500);
+});
+
+// A3: end-to-end through scanOutboundDraft — an authorized public $200 passes;
+// an unauthorized $250 in the same body blocks (kind:"amount").
+test("authorized public $200 passes; unauthorized $250 blocks", () => {
+  const c = guardConstraintsFromConfig(
+    { minBudget: 200, maxBudget: 500 },
+    undefined,
+    undefined,
+    { rewardDescription: "a $200 gift box" },
+  );
+  assert.equal(scanOutboundDraft({ body: "You'll receive a $200 gift box." }, c).ok, true);
+  const blocked = scanOutboundDraft({ body: "Here's a $250 bonus." }, c);
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) assert.ok(blocked.hits.some((h) => h.kind === "amount"));
+});
+
+// A4: the public-copy config contributes ONLY $ → allowedRates. It can NOT inject
+// a commissionRate / internalTerms / band — those come only from the 1st config.
+test("public-copy config cannot inject commission / terms / band", () => {
+  const c = guardConstraintsFromConfig(
+    { commissionRate: 10, minBudget: 200, maxBudget: 500, internalTerms: ["do not share"] },
+    undefined,
+    undefined,
+    // A malicious/garbage public config: none of these keys are read for
+    // commission/terms/band, only rewardDescription's $ is harvested.
+    { commissionRate: 99, internalTerms: ["leak me"], minBudget: 1, rewardDescription: "$200 box" } as Record<string, unknown>,
+  );
+  assert.equal(c.commissionRate, 10); // from the 1st config, not 99
+  assert.deepEqual(c.internalTerms, ["do not share"]); // from the 1st config
+  assert.equal(c.floor, 200); // band from the 1st config, not 1
+  assert.deepEqual(c.allowedRates, [200]); // only the $ was taken from public copy
+});
+
+// A5: AC4 both directions (pure). With ceiling 500 in the band, a $500 in the
+// body with NO authorizing field blocks; the same $500 authorized in public copy
+// passes. "Genuinely authorized in trusted public copy" is the exact discriminator.
+test("ceiling $500 blocks unless it is genuinely in trusted public copy", () => {
+  const unauthorized = guardConstraintsFromConfig({ minBudget: 200, maxBudget: 500 });
+  const blocked = scanOutboundDraft({ body: "We can go up to $500." }, unauthorized);
+  assert.equal(blocked.ok, false);
+  if (!blocked.ok) assert.ok(blocked.hits.some((h) => h.kind === "ceiling" || h.kind === "amount"));
+
+  const authorized = guardConstraintsFromConfig(
+    { minBudget: 200, maxBudget: 500 },
+    undefined,
+    undefined,
+    { rewardDescription: "a $500 product bundle" },
+  );
+  assert.equal(scanOutboundDraft({ body: "You'll get a $500 product bundle." }, authorized).ok, true);
+});
+
 console.log(`\n✓ outputGuard: all ${n} tests passed\n`);

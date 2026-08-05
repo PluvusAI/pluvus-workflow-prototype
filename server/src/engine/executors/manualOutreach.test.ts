@@ -27,6 +27,7 @@
 import assert from "node:assert/strict";
 import type { Creator } from "../../db/schema.js";
 import { executeInitialOutreach } from "./initialOutreach.js";
+import type { SendOnceDeps } from "./idempotentSend.js";
 import type { ExecutionContext, NodeResult, EmailDraft } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import { MockEmailProvider } from "../providers.js";
@@ -125,6 +126,32 @@ async function run(
     }
     throw err;
   }
+}
+
+// PLU-128: in-memory SendOnceDeps so a CLEAN manual draft reaches reserveOutbound
+// and the executor returns its real NodeResult without a live DB.
+function makeReserveDeps(): SendOnceDeps {
+  let seq = 0;
+  const rows = new Map<string, { id: string; idempotencyKey: string; externalMessageId: string | null }>();
+  return {
+    async createMessage(data) {
+      const key = data.idempotencyKey as string;
+      const row = { id: `m${++seq}`, idempotencyKey: key, externalMessageId: null };
+      rows.set(key, row);
+      return row as never;
+    },
+    async findMessageByIdempotencyKey(key: string) {
+      return (rows.get(key) ?? null) as never;
+    },
+    async updateMessageSent(id, d) {
+      return { id, ...d } as never;
+    },
+    threadContext: {
+      async resolve() {
+        return {};
+      },
+    },
+  };
 }
 
 async function main() {
@@ -292,6 +319,50 @@ async function main() {
     assert.equal(result?.nextState, "MANUAL_REVIEW");
     assert.equal(result?.eventPayload?.["reason"], "output_guard_blocked");
     assert.equal(agent.drafted, 0, "manual mode still skips the AI even when guard-blocked");
+  });
+
+  // C11 — AC2 (manual SENDS): manual mode, the operator's body says $200, which is
+  // authorized by the node's rewardDescription (ctxWith has no campaign, so the
+  // node config is the trusted public source). With the DB seam the guard runs and
+  // the draft QUEUES. The payload carries NO templateFallbackReason (manual was
+  // chosen, not a fallback) with outreachMode="manual", aiGenerated=false.
+  await test("manual mode: $200 authorized by rewardDescription sends (QUEUED)", async () => {
+    const email = makeEmail(false); // real draft render, returns the body
+    const agent = makeAgent();
+    const ctx = ctxWith({
+      outreachMode: "manual",
+      subjectTemplate: "A collab from {{brandName}}",
+      bodyTemplate: "Hi {{creatorName}}, you'll receive a $200 gift box.",
+      rewardDescription: "a $200 gift box",
+      brandName: "Acme",
+    });
+    const result = await executeInitialOutreach(ctx, email, agent, makeReserveDeps());
+    assert.equal(result.nextState, "OUTREACH_QUEUED", "authorized $200 must send in manual mode");
+    assert.equal(agent.drafted, 0, "manual mode never calls the AI");
+    assert.equal(result.eventPayload?.["outreachMode"], "manual");
+    assert.equal(result.eventPayload?.["aiGenerated"], false);
+    assert.equal(
+      result.eventPayload?.["templateFallbackReason"],
+      undefined,
+      "manual is a chosen path, never a fallback",
+    );
+  });
+
+  // C12 — AC3 (manual blocked): manual mode, $200 in the body with NO trusted
+  // field → still blocked → MANUAL_REVIEW. (No seam needed — returns before reserve.)
+  await test("manual mode: arbitrary $200 (no trusted field) is blocked", async () => {
+    const email = makeEmail(false);
+    const agent = makeAgent();
+    const ctx = ctxWith({
+      outreachMode: "manual",
+      subjectTemplate: "s",
+      bodyTemplate: "Hi {{creatorName}}, here's a $200 bonus.",
+      brandName: "Acme",
+    });
+    const result = await executeInitialOutreach(ctx, email, agent);
+    assert.equal(result.nextState, "MANUAL_REVIEW");
+    assert.equal(result.eventPayload?.["reason"], "output_guard_blocked");
+    assert.equal(agent.drafted, 0);
   });
 
   console.log(`\n✓ manualOutreach: all ${n} tests passed\n`);

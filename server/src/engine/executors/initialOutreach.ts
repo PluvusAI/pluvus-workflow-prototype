@@ -1,6 +1,6 @@
 import type { ExecutionContext, NodeResult, EmailDraft } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
-import { reserveOutbound } from "./idempotentSend.js";
+import { reserveOutbound, type SendOnceDeps } from "./idempotentSend.js";
 import { describeDeal, dealShape } from "../dealDescription.js";
 import {
   scanOutboundDraft,
@@ -28,7 +28,14 @@ function resolveOutreachMode(config: Record<string, unknown>): OutreachMode {
 // email is sent, but outreach/follow-up sent unguarded. Outreach quotes NO money
 // (rates are negotiated on reply), so any floor/ceiling number in the body is a
 // leak. On a hit we route to MANUAL_REVIEW and do NOT send — a human reviews.
-function outreachBlockedByGuard(hits: GuardHit[]): NodeResult {
+//
+// PLU-128 (founder review): when the AI path degraded and the approved template
+// was used as a FALLBACK, that fact must survive even when the guard then blocks
+// the template. Without threading it here the blocked event only records
+// `output_guard_blocked`, losing that AI unavailability triggered the fallback.
+// So carry templateFallbackReason into the blocked payload when applicable —
+// null (a guard block on a normal AI/manual draft) omits the field, byte-identical.
+function outreachBlockedByGuard(hits: GuardHit[], templateFallbackReason: string | null): NodeResult {
   return {
     nextState: "MANUAL_REVIEW",
     nextNodeId: null,
@@ -39,6 +46,10 @@ function outreachBlockedByGuard(hits: GuardHit[]): NodeResult {
       reason: "output_guard_blocked",
       // EASY-S2: mask the band VALUE — record only which KIND leaked.
       leaks: maskGuardHits(hits),
+      // PLU-128: present ONLY when this block landed on an AI-fallback template, so
+      // the audit trail shows the fallback path was AI-triggered even though it was
+      // ultimately blocked. Absent on manual and successful-AI blocks.
+      ...(templateFallbackReason ? { templateFallbackReason } : {}),
     },
   };
 }
@@ -66,6 +77,11 @@ export async function executeInitialOutreach(
   ctx: ExecutionContext,
   email: IEmailProvider,
   agent: IAgentProvider,
+  // PLU-128: injectable DB seam forwarded to reserveOutbound so the clean-send
+  // NodeResult (OUTREACH_QUEUED + event payload) is unit-observable without a live
+  // DB. Undefined → reserveOutbound's real defaultDeps, so the production caller
+  // (runtime.ts) is byte-identical.
+  deps?: SendOnceDeps,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
 
@@ -110,6 +126,11 @@ export async function executeInitialOutreach(
   const mode = resolveOutreachMode(config);
   let draft: EmailDraft;
   let aiGenerated: boolean;
+  // PLU-128: set only when AI drafting was attempted, returned null, and the
+  // approved template was used as a FALLBACK — so history/observability can tell a
+  // degraded fallback from an ordinary AI/manual send. Stays null on the manual
+  // path (the template was chosen, not a fallback) and on a successful AI draft.
+  let templateFallbackReason: string | null = null;
   if (mode === "manual") {
     // PLU-117 §3 / AC10: block (don't send) when a REQUIRED placeholder the
     // operator's template uses has no value for THIS creator. We check BEFORE
@@ -127,14 +148,29 @@ export async function executeInitialOutreach(
     });
     draft = aiDraft ?? await email.draft(creator, bodyTemplate, config);
     aiGenerated = aiDraft !== null;
+    // PLU-128: a null aiDraft means draftEmail exhausted its retries and degraded
+    // (draft_timeout / agent_unavailable, which providerFactory collapses to null)
+    // — the approved template is sending as a FALLBACK, not as a normal draft. The
+    // executor can't disambiguate the two null causes, so it records one honest
+    // umbrella reason. A valid template still sends after passing the guard; an
+    // invalid one is still blocked.
+    if (!aiGenerated) templateFallbackReason = "ai_draft_unavailable";
   }
 
-  // H4: scan the rendered draft for a leaked floor/ceiling before sending. The
-  // band lives on the NEGOTIATION node; outreach presents no rate, so nothing is
-  // allowlisted. A hit routes to MANUAL_REVIEW instead of emailing the creator.
-  const guard = scanOutboundDraft(draft, guardConstraintsFromConfig(negotiationConfig ?? {}));
+  // H4 + PLU-128: scan the rendered draft for a leaked floor/ceiling before
+  // sending. The band lives on the NEGOTIATION node (sole source of floor / ceiling
+  // / commission / internal terms). Outreach presents no negotiated rate, so no
+  // rate is allowlisted — BUT a "$" figure the brand itself wrote into its PUBLIC
+  // copy (rewardDescription / deliverables / timeline / brandDescription in the
+  // merged outreach `config`) is public-by-design, not a leak, so those amounts are
+  // authorized. A "$" figure with no trusted field behind it — or a bound the
+  // brand never published — still routes to MANUAL_REVIEW instead of the creator.
+  const guard = scanOutboundDraft(
+    draft,
+    guardConstraintsFromConfig(negotiationConfig ?? {}, undefined, undefined, config),
+  );
   if (!guard.ok) {
-    return outreachBlockedByGuard(guard.hits);
+    return outreachBlockedByGuard(guard.hits, templateFallbackReason);
   }
 
   // PLU-122: initial outreach now uses the same durable delayed-send outbox as
@@ -145,6 +181,9 @@ export async function executeInitialOutreach(
     instance.id,
     draft,
     `outreach:${instance.id}`,
+    // PLU-128: forward the injected seam when a test supplies one; undefined lets
+    // reserveOutbound apply its own defaultDeps (the production runtime path).
+    deps,
   );
 
   const nextNode = nodeGraph.find((n) => n.order === node.order + 1) ?? null;
@@ -170,6 +209,11 @@ export async function executeInitialOutreach(
       // path produced this email for observability.
       aiGenerated,
       outreachMode: mode,
+      // PLU-128: present ONLY when the AI path degraded and the template was used
+      // as a fallback — a distinct, auditable reason so an approved template that
+      // sent after AI was unavailable is not mistaken for an ordinary AI/manual
+      // send. Absent on a successful AI draft and on the manual path.
+      ...(templateFallbackReason ? { templateFallbackReason } : {}),
     },
   };
 }
