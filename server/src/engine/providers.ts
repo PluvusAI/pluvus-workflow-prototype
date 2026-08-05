@@ -305,8 +305,18 @@ export interface IAgentProvider {
       // draft, so the copy can never restate a number that contradicts the recorded
       // deal). Absent = today's behavior exactly.
       negotiatorAnswers?: string;
+      // PLU-112: the rolling summary of the elided prefix, threaded alongside a
+      // windowed `history` so the shortened transcript always carries the summary
+      // that covers what was dropped. Absent when nothing was windowed.
+      conversationSummary?: { text: string; version?: string | undefined };
     },
   ): Promise<EmailDraft | null>;
+  // PLU-112: incrementally refresh the rolling summary (fail-soft, optional — the
+  // mock provider omits it). Returns null on any error; caller keeps the old summary.
+  summarizeConversation?(
+    priorSummary: string,
+    delta: DraftHistoryEntry[],
+  ): Promise<{ text: string; version: string } | null>;
 }
 
 // ---------------------------------------------------------------------------

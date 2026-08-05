@@ -16,7 +16,7 @@ import type {
 } from "../../db/schema.js";
 import type { NodeSnapshot, PriorNegotiationContext } from "../types.js";
 import type { DraftHistoryEntry } from "../../adapters/negotiation/types.js";
-import type { StructuredObligation } from "../executors/negotiationHistory.js";
+import type { StructuredObligation, DatedEntry } from "../executors/negotiationHistory.js";
 import type {
   resolveBriefKnowledge,
   ResolvedBrief,
@@ -66,14 +66,20 @@ export interface CreatorMemoryPayload {
 }
 
 /**
- * PLU-112 §9.4 — shape UNVERIFIED (canonical owner: PLU-112; adjust on that issue).
- * PLU-112 is not built anywhere; this is a minimal placeholder so the slot + the
- * `summaryVersion` observability field have a type. No budget logic ships (§3).
+ * PLU-112 — the rolling narrative summary of the ELIDED transcript prefix.
+ * `summarizedThroughSentAt` + `summarizedThroughMessageId` are the COMPOUND coverage
+ * cursor: draft turns after `(sentAt, messageId)` stay raw, earlier-or-equal ones are
+ * covered here and may be windowed out. The messageId tie-breaks turns that share the
+ * exact same sentAt so a same-timestamp turn can't be dropped-yet-never-summarized.
+ * The wire-facing request carries only `{ text, version }` — the cursor never reaches
+ * the model. Narrative-only; carries no rates/questions/commitments.
  */
 export interface ConversationSummary {
   text: string;
   version?: string;
   tokensSaved?: number;
+  summarizedThroughSentAt?: Date | undefined;
+  summarizedThroughMessageId?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +130,8 @@ export interface AssembledContext {
 
   // Communication transcript (PLU-85 — Message-sourced, both sides).
   recentMessages: DraftHistoryEntry[];
+  // Same transcript with each entry's sentAt cursor (PLU-112 draft windowing).
+  datedRecentMessages: DatedEntry[];
 
   // The creator's latest inbound + its derived reply text (§5.4). One source of truth.
   latestInbound?: Message | undefined;

@@ -5,6 +5,8 @@ import type {
   NegotiationAction,
   DraftRequest,
   DraftResponse,
+  SummarizeRequest,
+  SummarizeResponse,
 } from "./types.js";
 import { agentBaseUrl, agentPostJson } from "../agentServiceClient.js";
 import { recordAgentLlmUsage } from "../../observability/llmUsage.js";
@@ -116,5 +118,16 @@ export class LangGraphNegotiationProvider implements NegotiationProvider {
     }
 
     return { subject: data["subject"], body: data["body"] };
+  }
+
+  async summarize(req: SummarizeRequest): Promise<SummarizeResponse> {
+    const data = await agentPostJson(this.baseUrl, "/summarize", req);
+    recordAgentLlmUsage("summarize", data);
+    if (typeof data["text"] !== "string" || typeof data["version"] !== "string") {
+      throw new Error(
+        `[LangGraphNegotiationProvider] malformed summarize response: ${JSON.stringify(data)}`,
+      );
+    }
+    return { text: data["text"], version: data["version"] };
   }
 }

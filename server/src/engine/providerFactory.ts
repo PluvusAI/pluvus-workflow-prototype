@@ -324,6 +324,8 @@ export class AgentProviderAdapter implements IAgentProvider {
       // Option A (negotiate→draft answer sync): the /negotiate model's own vetted
       // reply, so the copy rephrases approved answers instead of inventing them.
       negotiatorAnswers?: string;
+      // PLU-112: the rolling summary covering the windowed-out transcript prefix.
+      conversationSummary?: { text: string; version?: string | undefined };
     },
   ): Promise<EmailDraft | null> {
     // PLU-109: the CSV import accepts creator-discovery vendor exports carrying
@@ -374,6 +376,10 @@ export class AgentProviderAdapter implements IAgentProvider {
       // authoritative <vetted_answers> block. Undefined → Python default (None)
       // omits the block, so the copy is byte-identical for callers that pass none.
       negotiatorAnswers: extra?.negotiatorAnswers,
+      // PLU-112: forward the rolling summary so a windowed transcript never
+      // travels without the narrative that covers what was dropped. Absent →
+      // Python default omits the block (draft copy byte-identical).
+      conversationSummary: extra?.conversationSummary,
       // Strip the internal price band before handing config to the copy
       // generator. The negotiation prompt is told to keep floor/ceiling
       // secret, but the draft endpoint was being handed the raw band
@@ -410,6 +416,22 @@ export class AgentProviderAdapter implements IAgentProvider {
       `[agentProvider] draftEmail failed after ${DRAFT_MAX_ATTEMPTS} attempts, degrading to null: ${errMessage(lastErr)}`,
     );
     return null;
+  }
+
+  // PLU-112: incrementally refresh the rolling summary. Fail-soft — any error (or a
+  // provider with no summarizer) returns null, and the caller keeps the old summary.
+  // Never blocks or fails a turn.
+  async summarizeConversation(
+    priorSummary: string,
+    delta: DraftHistoryEntry[],
+  ): Promise<{ text: string; version: string } | null> {
+    if (!this.negotiator.summarize) return null;
+    try {
+      return await this.negotiator.summarize({ priorSummary, delta });
+    } catch (err) {
+      console.error(`[agentProvider] summarizeConversation failed (keeping prior summary): ${errMessage(err)}`);
+      return null;
+    }
   }
 }
 

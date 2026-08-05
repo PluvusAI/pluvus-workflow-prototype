@@ -250,8 +250,13 @@ export interface DraftRequest {
    *  so the copy can never restate a number that contradicts the recorded deal.
    *  Absent = today's behavior (block omitted). */
   negotiatorAnswers?: string | undefined;
+  /** PLU-112: the rolling narrative summary of the ELIDED transcript prefix. Sent
+   *  whenever `history` was windowed, so the shortened transcript never travels
+   *  without the summary that covers what was dropped. Rendered as narrative DATA,
+   *  NOT authoritative fact (rates/questions/commitments stay in their own blocks).
+   *  Absent when the flag is off or nothing was windowed. */
+  conversationSummary?: { text: string; version?: string | undefined } | undefined;
 }
-
 /** HARD-N2: one turn of the threaded /draft conversation. `role` is "us" for a
  *  turn we sent, "creator" for the creator's own inbound message. */
 export interface DraftHistoryEntry {
@@ -269,4 +274,17 @@ export interface DraftHistoryEntry {
 export interface DraftResponse {
   subject: string;
   body: string;
+}
+
+/** PLU-112: incremental summary refresh. `priorSummary` is the existing narrative
+ *  (empty on the first fold); `delta` is only the turns newly covered since the
+ *  cursor — the summarizer extends the prior narrative, never re-reads the thread. */
+export interface SummarizeRequest {
+  priorSummary: string;
+  delta: DraftHistoryEntry[];
+}
+
+export interface SummarizeResponse {
+  text: string;
+  version: string;
 }
