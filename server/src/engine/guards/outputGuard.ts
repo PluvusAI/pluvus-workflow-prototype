@@ -274,6 +274,16 @@ export function guardConstraintsFromConfig(
   config: Record<string, unknown>,
   allowedRate?: number,
   creatorRate?: number,
+  // PLU-128: trusted brand-authored PUBLIC copy whose explicit "$" amounts are
+  // authorized to appear in outbound (rewardDescription / deliverables / timeline
+  // / brandDescription). Contributes ONLY $ values to `allowedRates` — never the
+  // floor/ceiling/commission/internal terms, which stay sourced from `config`.
+  // Defaults to `config` so existing single-config callers (followUp, negotiation,
+  // rewardSetup, contentBrief) keep byte-identical behavior: they pass a
+  // negotiation config that carries none of these fields, so the extraction stays
+  // a no-op for them. Initial outreach passes the MERGED outreach config here so a
+  // legitimate public value ("a $200 gift box") is not treated as a leak.
+  publicCopyConfig: Record<string, unknown> = config,
 ): GuardConstraints {
   // Resolve floor/ceiling from EITHER termFloor/termCeiling or minBudget/
   // maxBudget so a UI-built workflow's bounds are still scanned for leaks (the
@@ -305,7 +315,7 @@ export function guardConstraintsFromConfig(
     allowedRates.push(creatorRate);
   }
   for (const key of ["rewardDescription", "deliverables", "timeline", "brandDescription"]) {
-    const v = config[key];
+    const v = publicCopyConfig[key];
     if (typeof v === "string" && v) {
       for (const amount of extractConfigDollarAmounts(v)) allowedRates.push(amount);
     }
