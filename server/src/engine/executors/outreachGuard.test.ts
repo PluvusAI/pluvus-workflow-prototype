@@ -269,6 +269,34 @@ async function main() {
     assert.equal(okResult.eventPayload?.["aiGenerated"], true);
   });
 
+  // B11 — founder review follow-up: when the AI path degrades (draftEmail→null)
+  // and the fallback template is THEN blocked by the guard, the blocked event must
+  // still carry templateFallbackReason. Otherwise the audit trail records only
+  // `output_guard_blocked` and loses that AI unavailability triggered the fallback.
+  await test("AI-null fallback blocked by guard still records templateFallbackReason", async () => {
+    // $500 is the ceiling with NO trusted field authorizing it → guard blocks.
+    const email = makeEmailBody("Partnership", "We can go up to $500 for this.");
+    const ctx = ctxWithConfig({ bodyTemplate: "t" }); // no rewardDescription/etc.
+    const result = await executeInitialOutreach(ctx, email, agentReturningNull());
+    assert.equal(result.nextState, "MANUAL_REVIEW");
+    assert.equal(result.eventPayload?.["reason"], "output_guard_blocked");
+    // The fallback provenance survives the block.
+    assert.equal(result.eventPayload?.["templateFallbackReason"], "ai_draft_unavailable");
+    assert.equal(email.sent, 0);
+  });
+
+  // B12 — a guard block on a NON-fallback draft (a leaking AI draft) must NOT carry
+  // templateFallbackReason — the field is fallback-only, so a normal blocked event
+  // stays byte-identical to before this change.
+  await test("guard block on a normal AI draft omits templateFallbackReason", async () => {
+    const email = makeEmail();
+    const agent = agentReturning("Hi Robin, our budget goes up to $500 for this campaign.");
+    const result = await executeInitialOutreach(ctx(), email, agent);
+    assert.equal(result.nextState, "MANUAL_REVIEW");
+    assert.equal(result.eventPayload?.["reason"], "output_guard_blocked");
+    assert.equal(result.eventPayload?.["templateFallbackReason"], undefined);
+  });
+
   console.log(`\n✓ outreachGuard: all ${n} tests passed\n`);
 }
 

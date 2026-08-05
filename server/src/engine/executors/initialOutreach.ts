@@ -28,7 +28,14 @@ function resolveOutreachMode(config: Record<string, unknown>): OutreachMode {
 // email is sent, but outreach/follow-up sent unguarded. Outreach quotes NO money
 // (rates are negotiated on reply), so any floor/ceiling number in the body is a
 // leak. On a hit we route to MANUAL_REVIEW and do NOT send — a human reviews.
-function outreachBlockedByGuard(hits: GuardHit[]): NodeResult {
+//
+// PLU-128 (founder review): when the AI path degraded and the approved template
+// was used as a FALLBACK, that fact must survive even when the guard then blocks
+// the template. Without threading it here the blocked event only records
+// `output_guard_blocked`, losing that AI unavailability triggered the fallback.
+// So carry templateFallbackReason into the blocked payload when applicable —
+// null (a guard block on a normal AI/manual draft) omits the field, byte-identical.
+function outreachBlockedByGuard(hits: GuardHit[], templateFallbackReason: string | null): NodeResult {
   return {
     nextState: "MANUAL_REVIEW",
     nextNodeId: null,
@@ -39,6 +46,10 @@ function outreachBlockedByGuard(hits: GuardHit[]): NodeResult {
       reason: "output_guard_blocked",
       // EASY-S2: mask the band VALUE — record only which KIND leaked.
       leaks: maskGuardHits(hits),
+      // PLU-128: present ONLY when this block landed on an AI-fallback template, so
+      // the audit trail shows the fallback path was AI-triggered even though it was
+      // ultimately blocked. Absent on manual and successful-AI blocks.
+      ...(templateFallbackReason ? { templateFallbackReason } : {}),
     },
   };
 }
@@ -159,7 +170,7 @@ export async function executeInitialOutreach(
     guardConstraintsFromConfig(negotiationConfig ?? {}, undefined, undefined, config),
   );
   if (!guard.ok) {
-    return outreachBlockedByGuard(guard.hits);
+    return outreachBlockedByGuard(guard.hits, templateFallbackReason);
   }
 
   // PLU-122: initial outreach now uses the same durable delayed-send outbox as
