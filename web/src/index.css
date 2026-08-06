@@ -133,6 +133,10 @@ select {
   stroke: var(--accent);
   stroke-width: 2;
 }
+/* Selected edge (PLU-130): accent glow so it lifts out of a bundle. */
+.react-flow__edge.rf-edge-selected .react-flow__edge-path {
+  filter: drop-shadow(0 0 3px var(--accent));
+}
 /* Zoom/fit controls: themed sticker buttons with the heavy border. */
 .react-flow__controls {
   box-shadow: 3px 3px 0 var(--shadowInk);
@@ -265,25 +269,54 @@ select.ds-input {
   box-shadow: 6px 6px 0 var(--shadowInk);
 }
 
-/* Workflow node connection handles -------------------------------------- */
+/* Workflow node connection handles (PLU-130): the handle element is a 24px
+   transparent hit target (RF hit-tests the element box) so connecting is
+   forgiving; the visible 11px dot is painted with ::after, coloured per-handle
+   via the --dot-* vars set inline in BuilderNode. */
 .react-flow__handle.rf-handle {
+  width: 24px;
+  height: 24px;
+  background: transparent;
+  border: none;
   border-radius: 50%;
   cursor: crosshair;
-  transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
-  opacity: 0.5;
-  z-index: 5;
+  z-index: 6;
 }
-.react-flow__node:hover .react-flow__handle.rf-handle,
-.react-flow__handle.rf-handle:hover {
+.react-flow__handle.rf-handle::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  background: var(--dot-bg, var(--panel));
+  border: 2px solid var(--dot-border, var(--accent));
+  transform: translate(-50%, -50%);
+  opacity: 0.55;
+  transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease,
+    background 0.12s ease, border-color 0.12s ease;
+}
+/* Reveal the dot on node/handle hover. */
+.react-flow__node:hover .react-flow__handle.rf-handle::after,
+.react-flow__handle.rf-handle:hover::after {
   opacity: 1;
 }
-.react-flow__handle.rf-handle:hover {
-  transform: scale(1.35);
-  box-shadow: 0 0 0 4px rgba(240, 96, 60, 0.3);
+.react-flow__handle.rf-handle:hover::after {
+  transform: translate(-50%, -50%) scale(1.4);
+  box-shadow: 0 0 0 4px var(--accentWash);
 }
-.react-flow__handle.rf-handle.connectingto,
-.react-flow.connecting .react-flow__handle.rf-handle {
+/* Handle under the pointer during a drag (RF adds this class in v11). */
+.react-flow__handle.rf-handle.react-flow__handle-connecting::after {
   opacity: 1;
+}
+/* Valid drop target while dragging (RF adds `react-flow__handle-valid`). */
+.react-flow__handle.rf-handle.react-flow__handle-valid::after {
+  opacity: 1;
+  transform: translate(-50%, -50%) scale(1.55);
+  background: var(--accent);
+  border-color: var(--panel);
+  box-shadow: 0 0 0 5px var(--accentWash);
 }
 
 /* Generic row hover ----------------------------------------------------- */

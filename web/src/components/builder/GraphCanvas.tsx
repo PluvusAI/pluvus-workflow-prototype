@@ -10,7 +10,7 @@
 // never drift.
 // ---------------------------------------------------------------------------
 
-import { useMemo, useCallback, useRef, useEffect } from "react";
+import { useMemo, useCallback, useRef, useEffect, useState } from "react";
 import ReactFlow, {
   Background,
   BackgroundVariant,
@@ -31,9 +31,11 @@ import ReactFlow, {
 } from "reactflow";
 import "reactflow/dist/style.css";
 import { BuilderNodeComponent } from "./BuilderNode";
+import { SelectableEdge, type SelectableEdgeData } from "./SelectableEdge";
 import { NodePalette, PALETTE_DND_MIME } from "./NodePalette";
-import { nodeColor } from "./nodeMeta";
+import { nodeColor, nodeLabel } from "./nodeMeta";
 import { colors } from "../../theme";
+import { useToast } from "../ds";
 import {
   defaultConfigFor,
   freshNodeId,
@@ -46,10 +48,18 @@ import {
   type GraphNode,
   type GraphEdge,
 } from "../../workflow/graphModel";
+import {
+  canConnect,
+  canReconnect,
+  applyConnect,
+  applyReconnect,
+  applyDisconnect,
+} from "../../workflow/connectionRules";
 import type { DraftNode, NodeType } from "../../api/builderTypes";
 import { issuesByNode, type ValidationIssue } from "../../workflow/graphValidation";
 
 const NODE_TYPES = { builderNode: BuilderNodeComponent };
+const EDGE_TYPES = { selectable: SelectableEdge };
 
 interface Props {
   definition: WorkflowDefinition;
@@ -90,7 +100,21 @@ function GraphCanvasInner({
   readOnly = false,
 }: Props) {
   const rf = useReactFlow();
+  const toast = useToast();
   const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  // PLU-130: selectedEdgeId drives the edge toolbar (single source of truth, fed
+  // into buildRfEdges); reconnectingEdgeId lets isValidConnection exclude the
+  // in-flight edge during a reconnect drag.
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
+  const reconnectingEdgeId = useRef<string | null>(null);
+
+  // Node-id → label lookup for edge toolbars.
+  const labelById = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const n of definition.nodes) m.set(n.id, nodeLabel(n.type));
+    return m;
+  }, [definition.nodes]);
 
   const isLive = useMemo(
     () => !!executionCounts && Object.values(executionCounts).some((v) => v > 0),
@@ -140,24 +164,50 @@ function GraphCanvasInner({
     [selectedNodeId, executionCounts, published, nodeIssueMap, readOnly],
   );
 
+  // Disconnect one edge (toolbar action) + clear its selection.
+  const disconnectEdge = useCallback(
+    (edgeIdToRemove: string) => {
+      if (readOnly) return;
+      onChange({ ...definition, edges: applyDisconnect(definition, edgeIdToRemove) });
+      setSelectedEdgeId((cur) => (cur === edgeIdToRemove ? null : cur));
+    },
+    [definition, onChange, readOnly],
+  );
+
   const buildRfEdges = useCallback(
-    (def: WorkflowDefinition): Edge[] =>
-      def.edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        type: "smoothstep",
-        updatable: !readOnly,
-        markerEnd: {
-          type: MarkerType.ArrowClosed,
-          color: colors.borderStrong,
-          width: 16,
-          height: 16,
-        },
-        style: { stroke: colors.borderStrong, strokeWidth: 2 },
-        animated: isLive,
-      })),
-    [readOnly, isLive],
+    (def: WorkflowDefinition): Edge<SelectableEdgeData>[] =>
+      def.edges.map((e) => {
+        // Selected edge lifts to accent + thicker + raised zIndex so it's
+        // separable from a converging bundle (A8).
+        const isSelected = e.id === selectedEdgeId;
+        const stroke = isSelected ? colors.accent : colors.borderStrong;
+        const edge: Edge<SelectableEdgeData> = {
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          type: "selectable",
+          updatable: !readOnly,
+          selected: isSelected,
+          zIndex: isSelected ? 10 : 0,
+          markerEnd: {
+            type: MarkerType.ArrowClosed,
+            color: stroke,
+            width: 16,
+            height: 16,
+          },
+          style: { stroke, strokeWidth: isSelected ? 3 : 2 },
+          animated: isLive,
+          data: {
+            sourceLabel: labelById.get(e.source) ?? e.source,
+            targetLabel: labelById.get(e.target) ?? e.target,
+            onDisconnect: disconnectEdge,
+            readOnly,
+          },
+        };
+        if (isSelected) edge.className = "rf-edge-selected";
+        return edge;
+      }),
+    [readOnly, isLive, selectedEdgeId, labelById, disconnectEdge],
   );
 
   // Inward sync: rebuild RF state whenever the STRUCTURE of the definition
@@ -284,51 +334,76 @@ function GraphCanvasInner({
     [definition, onChange],
   );
 
-  // -- new connection ------------------------------------------------------
-  // The workflow is a single linear chain, so each node has exactly one "next".
-  // When you draw source → target, we REROUTE the source: any existing outgoing
-  // edge from source is dropped first. So connecting an upstream node onto a
-  // freshly-added node removes that upstream node's old edge to whatever came
-  // after it — the new node is inserted into the flow instead of creating a
-  // branch. (Reconnect the new node's bottom handle onward to re-link the tail.)
+  // Live drag feedback (RF adds `react-flow__handle-valid` where this is true).
+  // Same rules as commit, so the highlight can't disagree with the drop; during
+  // a reconnect the in-flight edge is excluded (see canReconnect).
+  const isValidConnection = useCallback(
+    (conn: Connection) => {
+      const moving = reconnectingEdgeId.current;
+      const verdict = moving
+        ? canReconnect(definition, moving, conn.source, conn.target)
+        : canConnect(definition, conn.source, conn.target);
+      return verdict.ok;
+    },
+    [definition],
+  );
+
+  // New connection: applyConnect reroutes the source's "next" (insert, not
+  // branch); an invalid connection is blocked with an explanatory toast.
   const onConnect = useCallback(
     (conn: Connection) => {
       if (readOnly || !conn.source || !conn.target) return;
-      if (conn.source === conn.target) return; // no self-loops
-      const id = makeEdgeId(conn.source, conn.target);
-      if (definition.edges.some((e) => e.id === id)) return; // dedupe
-      // Drop source's previous outgoing edge(s) so we replace, not branch.
-      const withoutSourceOut = definition.edges.filter((e) => e.source !== conn.source);
-      emitEdges([...withoutSourceOut, { id, source: conn.source, target: conn.target }]);
+      const verdict = canConnect(definition, conn.source, conn.target);
+      if (!verdict.ok) {
+        toast.error(verdict.reason);
+        return;
+      }
+      emitEdges(applyConnect(definition, conn.source, conn.target));
     },
-    [definition.edges, emitEdges, readOnly],
+    [definition, emitEdges, readOnly, toast],
   );
 
-  // -- reconnect an existing edge's endpoint -------------------------------
+  // Reconnect an existing edge's endpoint (blocked with a toast if invalid).
   const onReconnect = useCallback(
     (oldEdge: Edge, conn: Connection) => {
       if (readOnly || !conn.source || !conn.target) return;
-      if (conn.source === conn.target) return;
-      const newId = makeEdgeId(conn.source, conn.target);
-      const withoutOld = definition.edges.filter((e) => e.id !== oldEdge.id);
-      if (withoutOld.some((e) => e.id === newId)) {
-        // Reconnecting onto an existing edge — just drop the old one.
-        emitEdges(withoutOld);
+      const verdict = canReconnect(definition, oldEdge.id, conn.source, conn.target);
+      if (!verdict.ok) {
+        toast.error(verdict.reason);
         return;
       }
-      emitEdges([...withoutOld, { id: newId, source: conn.source, target: conn.target }]);
+      emitEdges(applyReconnect(definition, oldEdge.id, conn.source, conn.target));
     },
-    [definition.edges, emitEdges, readOnly],
+    [definition, emitEdges, readOnly, toast],
   );
+
+  // Track the in-flight edge for isValidConnection; always cleared on end.
+  const onEdgeUpdateStart = useCallback((_: unknown, edge: Edge) => {
+    reconnectingEdgeId.current = edge.id;
+  }, []);
+  const onEdgeUpdateEnd = useCallback(() => {
+    reconnectingEdgeId.current = null;
+  }, []);
 
   // -- selection -----------------------------------------------------------
   const onNodeClick = useCallback(
     (_: React.MouseEvent, node: Node) => {
+      setSelectedEdgeId(null); // node + edge selection are mutually exclusive
       onSelectNode(node.id === selectedNodeId ? null : node.id);
     },
     [onSelectNode, selectedNodeId],
   );
-  const onPaneClick = useCallback(() => onSelectNode(null), [onSelectNode]);
+  const onEdgeClick = useCallback(
+    (_: React.MouseEvent, edge: Edge) => {
+      onSelectNode(null); // clear node selection so only the edge toolbar shows
+      setSelectedEdgeId((cur) => (cur === edge.id ? null : edge.id));
+    },
+    [onSelectNode],
+  );
+  const onPaneClick = useCallback(() => {
+    onSelectNode(null);
+    setSelectedEdgeId(null);
+  }, [onSelectNode]);
 
   // -- drop a new node from the palette ------------------------------------
   // A newly added node lands FREE — no edges are drawn for it. The user wires
@@ -392,11 +467,16 @@ function GraphCanvasInner({
           nodes={rfNodes}
           edges={rfEdges}
           nodeTypes={NODE_TYPES}
+          edgeTypes={EDGE_TYPES}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onEdgeUpdate={onReconnect}
+          onEdgeUpdateStart={onEdgeUpdateStart}
+          onEdgeUpdateEnd={onEdgeUpdateEnd}
+          isValidConnection={isValidConnection}
           onNodeClick={onNodeClick}
+          onEdgeClick={onEdgeClick}
           onPaneClick={onPaneClick}
           onDrop={onDrop}
           onDragOver={onDragOver}
@@ -408,6 +488,9 @@ function GraphCanvasInner({
           nodesConnectable={!readOnly}
           elementsSelectable
           deleteKeyCode={readOnly ? null : ["Backspace", "Delete"]}
+          // PLU-130: forgiving connect + edge-endpoint grab zones.
+          connectionRadius={20}
+          edgeUpdaterRadius={16}
           panOnDrag
           zoomOnScroll
           style={{ background: colors.bg }}
