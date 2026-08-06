@@ -464,6 +464,22 @@ function validateNodeConfig(n: GNode): ValidationIssue | null {
           "INVALID_ZERO_FLOOR",
           "Negotiation preferred budget must be greater than 0 when a maximum budget is set (a $0 floor opens the offer at $0).",
         );
+      // PLU-129: a campaign must offer SOMETHING. A zero-width fee band (max<=0 —
+      // the canonical commission-only shape) with no positive commission is
+      // "neither fee nor commission" — reject it so the builder can't publish a
+      // deal with nothing to negotiate or pay. This also enforces "a positive
+      // commission is required when the fixed fee is off" (the toggle's off state
+      // persists max:0). Ordered AFTER the bounds check so a garbage commission
+      // surfaces as INVALID_COMMISSION_RATE (0..100 bound) rather than here; we
+      // only ask "is there a POSITIVE commission".
+      const commission = cfg["commissionRate"];
+      const hasCommission = typeof commission === "number" && commission > 0;
+      if (max <= 0 && !hasCommission)
+        return err(
+          n,
+          "MISSING_COMPENSATION",
+          "This campaign has no fixed fee and no commission. Add a budget range or a commission rate greater than 0.",
+        );
       return null;
     }
     case "CONTENT_BRIEF": {

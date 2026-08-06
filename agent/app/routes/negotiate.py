@@ -2388,7 +2388,22 @@ def _langgraph_negotiate(req: NegotiateRequest) -> NegotiateResponse:
         )
 
     floor_rate = req.campaignConstraints.termFloor.rate or 0
-    ceiling_rate = req.campaignConstraints.termCeiling.rate or float("inf")
+    # PLU-129: distinguish an EXPLICIT zero ceiling from an ABSENT one. A
+    # commission-only campaign persists the canonical "no fee band" shape
+    # (minBudget:0, maxBudget:0), which resolves to termCeiling.rate == 0. A naive
+    # `rate or inf` treats that 0 as falsy → inf, giving the agent an UNBOUNDED
+    # fixed fee to negotiate on a campaign that offers no upfront fee — the exact
+    # opposite of the intended behavior. Treat a real numeric 0 (not a bool) as a
+    # genuine zero-width cap: floor 0 / ceiling 0 means there is NO fee to
+    # negotiate, so any upfront-fee ask above 0 trips the existing over-ceiling
+    # ESCALATE path below (rate > tolerance_ceiling) instead of being countered
+    # upward. Only a truly missing ceiling (None) falls back to inf.
+    _ceiling = req.campaignConstraints.termCeiling.rate
+    ceiling_rate = (
+        float(_ceiling)
+        if isinstance(_ceiling, (int, float)) and not isinstance(_ceiling, bool)
+        else float("inf")
+    )
     # Phase C (#12): the ESCALATE boundary — the ceiling raised by the merchant's
     # tolerance percent. An ask <= tolerance_ceiling is countered AT the ceiling
     # (the clamp target stays ceiling_rate, so we NEVER offer above the ceiling);

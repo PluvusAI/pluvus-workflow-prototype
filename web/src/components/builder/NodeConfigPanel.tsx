@@ -9,6 +9,7 @@ import {
   IconButton,
   ConfirmDialog,
   Badge,
+  Toggle,
 } from "../ds";
 import { stateColor, stateLabel } from "../../theme";
 import { nodeLabel, nodeIconComponent, nodeColor, nodeDescription } from "./nodeMeta";
@@ -1197,6 +1198,12 @@ function NegotiationForm({
   const [maxBudget, setMaxBudget] = useState(config.maxBudget ?? 1000);
   const [maxRounds, setMaxRounds] = useState(config.maxRounds ?? 3);
   const [commissionRate, setCommissionRate] = useState(config.commissionRate ?? 0);
+  // PLU-129: "Include fixed fee" is UI-LOCAL state DERIVED from the config on
+  // load — it is NEVER persisted. A saved config with a positive maximum budget
+  // is a fixed-fee (or hybrid) deal; the canonical commission-only shape is
+  // maxBudget:0 (no fee band). Deriving instead of persisting means legacy
+  // workflows render correctly with zero migration (backward-compat AC).
+  const [includeFixedFee, setIncludeFixedFee] = useState((config.maxBudget ?? 0) > 0);
   const minId = useId();
   const maxId = useId();
   const roundsId = useId();
@@ -1207,6 +1214,7 @@ function NegotiationForm({
     setMaxBudget(config.maxBudget ?? 1000);
     setMaxRounds(config.maxRounds ?? 3);
     setCommissionRate(config.commissionRate ?? 0);
+    setIncludeFixedFee((config.maxBudget ?? 0) > 0);
   }, [nodeId]);
 
   // commissionRate is only included when > 0 (0 is the omitted default = no
@@ -1216,30 +1224,58 @@ function NegotiationForm({
   // value by reading it straight from `config` here, so editing other fields
   // doesn't silently drop it; new campaigns just never set it (defaults to 0 =
   // escalate on any over-max ask).
-  function flush(over?: Partial<NegotiationConfig>) {
-    const next = {
-      minBudget,
-      maxBudget,
-      maxRounds,
-      commissionRate,
-      ...over,
-    };
-    const { commissionRate: rate, ...rest } = next;
+  //
+  // PLU-129: `over` carries values (the toggle, a seeded range) that haven't
+  // round-tripped through state yet. We read them LOCALLY and build the persisted
+  // object explicitly — `over` is NEVER spread wholesale — so the UI-only
+  // `includeFixedFee` key can never leak into the saved config. When fixed fee is
+  // OFF the persisted band is forced to 0/0 (the canonical commission-only shape),
+  // which actively CLEARS any previously-saved positive budget so a config never
+  // silently stays hybrid after the toggle is turned off (the "stale budget" fix).
+  function flush(over?: Partial<NegotiationConfig> & { includeFixedFee?: boolean }) {
+    const feeOn = over?.includeFixedFee ?? includeFixedFee;
+    const nextMin = over?.minBudget ?? minBudget;
+    const nextMax = over?.maxBudget ?? maxBudget;
+    const rate = over?.commissionRate ?? commissionRate;
     const savedTolerance = config.overCeilingTolerance;
+    const persistedMin = feeOn ? nextMin : 0;
+    const persistedMax = feeOn ? nextMax : 0;
     // approvalMode is no longer written: it had no consumer (the engine always
     // auto-accepts within budget), so the "manual" option promised a human gate
     // that never existed. flush rebuilds the config from these fields only, so
-    // any legacy approvalMode is naturally dropped on the next save.
+    // any legacy approvalMode is naturally dropped on the next save. The object
+    // below contains ONLY real config keys — no `includeFixedFee`.
     onUpdate(nodeId, {
-      ...rest,
+      minBudget: persistedMin,
+      maxBudget: persistedMax,
+      maxRounds: over?.maxRounds ?? maxRounds,
       ...(rate > 0 ? { commissionRate: rate } : {}),
-      ...(typeof savedTolerance === "number" && savedTolerance > 0
+      // Over-ceiling tolerance is fee-band-only; drop it when there's no fee band.
+      ...(feeOn && typeof savedTolerance === "number" && savedTolerance > 0
         ? { overCeilingTolerance: savedTolerance }
         : {}),
     });
   }
 
+  // Toggle handler. On → restore the operator's last positive range if the state
+  // currently holds 0/0 (freshly-off or never-set), else keep what they typed;
+  // seed a clearly-editable positive default when there's nothing to restore, so
+  // a re-enabled node is always a VALID positive band (never INVALID_ZERO_FLOOR).
+  // Off → the render hides the budget inputs and flush persists 0/0; the local
+  // min/max STATE is intentionally left intact so re-enabling restores it.
+  function selectIncludeFixedFee(next: boolean) {
+    setIncludeFixedFee(next);
+    if (next && minBudget <= 0 && maxBudget <= 0) {
+      setMinBudget(200);
+      setMaxBudget(500);
+      flush({ includeFixedFee: true, minBudget: 200, maxBudget: 500 });
+    } else {
+      flush({ includeFixedFee: next });
+    }
+  }
+
   const budgetInvalid = maxBudget < minBudget;
+  const commissionInvalid = !includeFixedFee && commissionRate <= 0;
 
   return (
     <FormStack>
@@ -1248,43 +1284,70 @@ function NegotiationForm({
         maximum. Escalates to Manual Review after the max rounds limit is reached.
       </InfoBox>
 
-      <Section title="Budget">
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          <FormField
-            label="Preferred Budget ($)"
-            htmlFor={minId}
-            hint="The rate you'd ideally close at — the agent opens here."
-          >
-            <Input
-              id={minId}
-              type="number"
-              min={0}
-              value={minBudget}
-              onChange={(e) => setMinBudget(Number(e.target.value))}
-              onBlur={() => flush()}
-            />
-          </FormField>
-          <FormField
-            label="Maximum Budget ($)"
-            htmlFor={maxId}
-            hint="Absolute ceiling — the agent never offers above this."
-            error={budgetInvalid ? "Must be ≥ preferred budget" : undefined}
-          >
-            <Input
-              id={maxId}
-              type="number"
-              min={0}
-              value={maxBudget}
-              invalid={budgetInvalid}
-              onChange={(e) => setMaxBudget(Number(e.target.value))}
-              onBlur={() => flush()}
-            />
-          </FormField>
-        </div>
+      <Section title="Compensation">
+        <FormField
+          label="Include fixed fee"
+          hint="On: negotiate an upfront fee (fixed-fee or hybrid). Off: commission-only — no upfront fee."
+        >
+          <Toggle
+            checked={includeFixedFee}
+            onChange={selectIncludeFixedFee}
+            label={includeFixedFee ? "Fixed fee on" : "Commission-only"}
+          />
+        </FormField>
+
+        {includeFixedFee ? (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <FormField
+              label="Preferred Budget ($)"
+              htmlFor={minId}
+              hint="The rate you'd ideally close at — the agent opens here."
+            >
+              <Input
+                id={minId}
+                type="number"
+                min={0}
+                value={minBudget}
+                onChange={(e) => setMinBudget(Number(e.target.value))}
+                onBlur={() => flush()}
+              />
+            </FormField>
+            <FormField
+              label="Maximum Budget ($)"
+              htmlFor={maxId}
+              hint="Absolute ceiling — the agent never offers above this."
+              error={budgetInvalid ? "Must be ≥ preferred budget" : undefined}
+            >
+              <Input
+                id={maxId}
+                type="number"
+                min={0}
+                value={maxBudget}
+                invalid={budgetInvalid}
+                onChange={(e) => setMaxBudget(Number(e.target.value))}
+                onBlur={() => flush()}
+              />
+            </FormField>
+          </div>
+        ) : (
+          <InfoBox>
+            Creators earn commission on attributed sales. No upfront fixed fee is offered.
+          </InfoBox>
+        )}
+
         <FormField
           label="Commission Rate (%)"
           htmlFor={commissionId}
-          hint="Set to 0 for fixed-fee deals."
+          hint={
+            includeFixedFee
+              ? "Set to 0 for fixed-fee deals."
+              : "Required — a commission-only campaign needs a rate greater than 0."
+          }
+          error={
+            commissionInvalid
+              ? "A commission rate greater than 0 is required for a commission-only campaign."
+              : undefined
+          }
         >
           <Input
             id={commissionId}
@@ -1292,6 +1355,7 @@ function NegotiationForm({
             min={0}
             max={100}
             value={commissionRate}
+            invalid={commissionInvalid}
             onChange={(e) => setCommissionRate(Number(e.target.value))}
             onBlur={() => flush()}
             style={{ width: 90 }}

@@ -297,6 +297,40 @@ test("H1: a fully-capped campaign (floor AND ceiling) does NOT trip the no-ceili
   );
 });
 
+test("PLU-129: a commission-only 0/0 band does NOT trip the no-ceiling guard", async () => {
+  // The canonical commission-only shape (minBudget:0, maxBudget:0) resolves to
+  // floor 0 AND ceiling 0 — both DEFINED, unlike floor-without-ceiling. It is a
+  // VALID configured state (no fee band to negotiate), so it must fall THROUGH to
+  // the agent, NOT escalate as "no_ceiling_configured". (The agent then refuses
+  // to negotiate a fixed fee — see agent/tests/test_negotiate_commission_only.py.)
+  const SENTINEL = "reached-agent-commission-only";
+  const spyAgent = {
+    negotiate: async () => {
+      throw new Error(SENTINEL);
+    },
+    draftEmail: async () => null,
+    classify: async () => ({ intent: "POSITIVE", confidence: 1 }),
+  } as never;
+
+  const cfg = { minBudget: 0, maxBudget: 0, commissionRate: 15 };
+  const ctx = {
+    instance: { id: "i1", currentState: "NEGOTIATING", negotiationRound: 1 },
+    node: { id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg },
+    nodeGraph: [{ id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg }],
+    creator: { id: "c1", name: "Alex" },
+  } as never;
+
+  await assert.rejects(
+    () => executeNegotiation(ctx, fakeEmail, spyAgent),
+    (err: Error) =>
+      // Reaching the agent sentinel OR failing at the DB load both prove the
+      // no-ceiling guard did NOT short-circuit a commission-only campaign.
+      err.message.includes(SENTINEL) ||
+      /database|connect|ECONNREFUSED|relation|DATABASE_URL|column .* does not exist/i.test(err.message),
+    "a commission-only 0/0 campaign proceeds past the no-ceiling guard",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Trap 4 — Always-escalate topic → MANUAL_REVIEW regardless of confidence (#5)
 // ---------------------------------------------------------------------------

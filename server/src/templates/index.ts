@@ -70,27 +70,23 @@ const affiliateNodes: NodeSnapshot[] = [
       // V1 #1 labels: minBudget is "Preferred Budget" (the rate the brand would
       // ideally close at) and maxBudget is "Maximum Budget" (the walk-away cap)
       // in the builder UI. Field names kept for config compatibility.
-      // HARD-N3: this is a fee band with a POSITIVE ceiling, so the floor must be
-      // > 0 too. Previously minBudget was 0, which — combined with open-at-floor
-      // (position 0.0) — computed a recommended opening offer of $0 for a bare
-      // "I'm interested" (the $0-offer bug). Opening at the floor (V1 #2, below)
-      // is only safe because every template keeps minBudget > 0.
-      minBudget: 50,
-      maxBudget: 500,
+      // PLU-129: the Affiliate template is COMMISSION-ONLY — no upfront fixed fee.
+      // It uses the canonical "no fee band" shape (minBudget:0, maxBudget:0), the
+      // same shape the "Include fixed fee = off" toggle persists in the builder.
+      // dealShape() classifies 0/0 + commission as an affiliate partnership ("No
+      // upfront fee."); resolveBand yields a zero-width band (floor 0 / ceiling 0),
+      // so the agent has no fixed fee to negotiate and escalates any upfront-fee
+      // ask per policy (see negotiate.py ceiling resolution, PLU-129). Because the
+      // ceiling is 0, the fee-band-only knobs recommendedOfferPosition and
+      // overCeilingTolerance are inert here and are intentionally omitted (leaving
+      // a stray recommendedOfferPosition:0.0 on a no-fee node is more confusing
+      // than absent). The HARD-N3 positive-floor requirement applies only to a
+      // POSITIVE-ceiling fee band (max>0), so a 0/0 affiliate node is exempt.
+      minBudget: 0,
+      maxBudget: 0,
       maxRounds: 3,
       approvalMode: "auto",
       commissionRate: 15,
-      // V1 #2: open at the FLOOR (preferred budget) and concede UP. Threaded
-      // through buildNegotiationRequest → CampaignConstraints.recommendedOfferPosition
-      // and clamped to [0,1] in the agent; 0.0 = floor. Requires minBudget > 0
-      // (HARD-N3 guard above) so the opening offer can never be $0.
-      recommendedOfferPosition: 0.0,
-      // Phase C (#12): merchant tolerance ABOVE maxBudget, as a percentage. 0 =
-      // zero tolerance (escalate the moment an ask exceeds the ceiling — today's
-      // behavior). E.g. 10 means an ask up to ceiling*1.10 is countered AT the
-      // ceiling (never above) rather than escalated; anything higher still
-      // escalates to a human. Only the fixed fee has tolerance in V1.
-      overCeilingTolerance: 0,
     },
   },
   {
@@ -162,10 +158,12 @@ const hybridNodes: NodeSnapshot[] = [
       approvalMode: "auto",
       commissionRate: 10,
       // V1 #2: open at the floor (preferred budget), concede up. minBudget > 0
-      // guards the $0-offer regression (HARD-N3). See the first template's note.
+      // guards the $0-offer regression (HARD-N3). Fee-band-only knob — meaningful
+      // here because this template has a positive fee band (the Affiliate template
+      // is commission-only 0/0 and omits it; see PLU-129 note there).
       recommendedOfferPosition: 0.0,
       // Phase C (#12): tolerance % above maxBudget; 0 = escalate the moment an ask
-      // exceeds the ceiling (today's behavior). See the first template's note.
+      // exceeds the ceiling (today's behavior). Fee-band-only.
       overCeilingTolerance: 0,
     },
   },
@@ -237,10 +235,12 @@ const fixedFeeNodes: NodeSnapshot[] = [
       maxRounds: 3,
       approvalMode: "manual",
       // V1 #2: open at the floor (preferred budget), concede up. minBudget > 0
-      // guards the $0-offer regression (HARD-N3). See the first template's note.
+      // guards the $0-offer regression (HARD-N3). Fee-band-only knob — meaningful
+      // here because this template has a positive fee band (the Affiliate template
+      // is commission-only 0/0 and omits it; see PLU-129 note there).
       recommendedOfferPosition: 0.0,
       // Phase C (#12): tolerance % above maxBudget; 0 = escalate the moment an ask
-      // exceeds the ceiling (today's behavior). See the first template's note.
+      // exceeds the ceiling (today's behavior). Fee-band-only.
       overCeilingTolerance: 0,
     },
   },

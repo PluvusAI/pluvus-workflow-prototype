@@ -443,6 +443,26 @@ function validateNodeConfig(n: GraphNode): ValidationIssue | null {
           "INVALID_ZERO_FLOOR",
           "Negotiation preferred budget must be greater than 0 when a maximum budget is set (a $0 floor opens the offer at $0).",
         );
+      // PLU-129: a campaign must offer SOMETHING. A zero-width fee band (max<=0 —
+      // the canonical commission-only shape) with no positive commission is
+      // "neither fee nor commission" — reject it so the builder can't publish a
+      // deal with nothing to negotiate or pay. This also enforces "a positive
+      // commission is required when the fixed fee is off" (the toggle's off state
+      // persists max:0). Kept byte-identical to the server rule
+      // (server/src/validation/graphValidation.ts). NOTE (D3): this web validator
+      // has no commission bounds check, so a NEGATIVE commission at a 0/0 band
+      // surfaces here as MISSING_COMPENSATION while the server emits
+      // INVALID_COMMISSION_RATE — both reject; the commission <Input min={0}>
+      // blocks the negative through the UI, and backfilling the web bounds check
+      // is out of scope for this change.
+      const commission = cfg["commissionRate"];
+      const hasCommission = typeof commission === "number" && commission > 0;
+      if (max <= 0 && !hasCommission)
+        return cfgErr(
+          n,
+          "MISSING_COMPENSATION",
+          "This campaign has no fixed fee and no commission. Add a budget range or a commission rate greater than 0.",
+        );
       return null;
     }
     case "CONTENT_BRIEF": {

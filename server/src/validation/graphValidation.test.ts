@@ -259,6 +259,68 @@ test("HARD-N3: a positive floor is accepted", () => {
   assert.ok(!codes(res).includes("INVALID_ZERO_FLOOR"));
 });
 
+// -- PLU-129: MISSING_COMPENSATION (neither fee band nor commission) ----------
+
+test("PLU-129: no fee band AND no commission is rejected (neither)", () => {
+  // The "Include fixed fee = off" toggle persists 0/0. Without a positive
+  // commission there is nothing to negotiate or pay — reject it.
+  const nodes = [
+    gnode("a", "INITIAL_OUTREACH", ["n"], OUTREACH_CFG),
+    gnode("n", "NEGOTIATION", ["r"], { minBudget: 0, maxBudget: 0 }),
+    gnode("r", "REWARD_SETUP", []),
+  ];
+  const res = validateWorkflowGraph(nodes);
+  assert.equal(res.valid, false);
+  assert.ok(codes(res).includes("MISSING_COMPENSATION"));
+});
+
+test("PLU-129: no fee band with a zero commission is rejected (neither)", () => {
+  const nodes = [
+    gnode("a", "INITIAL_OUTREACH", ["n"], OUTREACH_CFG),
+    gnode("n", "NEGOTIATION", ["r"], { minBudget: 0, maxBudget: 0, commissionRate: 0 }),
+    gnode("r", "REWARD_SETUP", []),
+  ];
+  const res = validateWorkflowGraph(nodes);
+  assert.equal(res.valid, false);
+  assert.ok(codes(res).includes("MISSING_COMPENSATION"));
+});
+
+test("PLU-129: commission-only (0/0 + positive commission) is valid", () => {
+  // The canonical affiliate shape — no fixed fee, commission carries the deal.
+  const nodes = [
+    gnode("a", "INITIAL_OUTREACH", ["n"], OUTREACH_CFG),
+    gnode("n", "NEGOTIATION", ["r"], { minBudget: 0, maxBudget: 0, commissionRate: 15 }),
+    gnode("r", "REWARD_SETUP", []),
+  ];
+  const res = validateWorkflowGraph(nodes);
+  assert.ok(!codes(res).includes("MISSING_COMPENSATION"));
+  assert.ok(!codes(res).includes("INVALID_ZERO_FLOOR"));
+});
+
+test("PLU-129: a fee-on node with a $0 floor still fails INVALID_ZERO_FLOOR (not MISSING_COMPENSATION)", () => {
+  // Turning fixed fee ON and leaving a $0 floor is the pre-existing $0-offer bug —
+  // that guard is untouched, and MISSING_COMPENSATION must NOT swallow it.
+  const nodes = [
+    gnode("a", "INITIAL_OUTREACH", ["n"], OUTREACH_CFG),
+    gnode("n", "NEGOTIATION", ["r"], { minBudget: 0, maxBudget: 500 }),
+    gnode("r", "REWARD_SETUP", []),
+  ];
+  const res = validateWorkflowGraph(nodes);
+  assert.equal(res.valid, false);
+  assert.ok(codes(res).includes("INVALID_ZERO_FLOOR"));
+  assert.ok(!codes(res).includes("MISSING_COMPENSATION"));
+});
+
+test("PLU-129: a valid fixed-fee band (positive floor) is not MISSING_COMPENSATION", () => {
+  const nodes = [
+    gnode("a", "INITIAL_OUTREACH", ["n"], OUTREACH_CFG),
+    gnode("n", "NEGOTIATION", ["r"], { minBudget: 200, maxBudget: 500 }),
+    gnode("r", "REWARD_SETUP", []),
+  ];
+  const res = validateWorkflowGraph(nodes);
+  assert.ok(!codes(res).includes("MISSING_COMPENSATION"));
+});
+
 // -- BUG-W1: server-side bounds on maxRounds / commissionRate / tolerance ----
 
 test("W1: maxRounds above 10 is rejected", () => {
