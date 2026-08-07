@@ -119,3 +119,31 @@ def test_reward_confirmation_routes_through_onboarding_prompt(monkeypatch):
     assert "CONFIRMED at an" in cap.prompt or "agreed rate" in cap.prompt
     assert "$500" in cap.prompt
     assert out.subject and out.body
+
+
+# ---------------------------------------------------------------------------
+# PLU-110 — negotiation_follow_up: same latent-422 class as M3. Must be a valid
+# purpose and route through the follow-up nudge prompt (existing thread, no
+# re-pitch, no dollar amounts) — never the cold-outreach or offer prompt.
+# ---------------------------------------------------------------------------
+
+
+def test_negotiation_follow_up_is_a_valid_purpose():
+    req = DraftRequest(
+        purpose="negotiation_follow_up",
+        creatorName="Alex",
+        senderName="Acme",
+        round=2,
+    )
+    assert req.purpose == "negotiation_follow_up"
+
+
+def test_negotiation_follow_up_routes_through_the_nudge_prompt(monkeypatch):
+    prompt = _run(monkeypatch, _followup_req(purpose="negotiation_follow_up", round=2))
+    # Framed as a reminder in an existing thread, not a fresh pitch...
+    assert "FOLLOW-UP" in prompt
+    assert "have NOT heard back" in prompt
+    # ...never the cold-outreach product paragraph...
+    assert "DEDICATED short paragraph" not in prompt
+    # ...and never a dollar amount (the standing offer is re-surfaced, not re-quoted).
+    assert "Do NOT state any dollar amount" in prompt
