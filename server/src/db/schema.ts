@@ -619,6 +619,8 @@ export const executionInstances = pgTable(
     currentNodeId: text("currentNodeId"),
     followUpCount: integer("followUpCount").notNull().default(0),
     negotiationRound: integer("negotiationRound").notNull().default(0),
+    // PLU-110: negotiation-nudge attempts (separate from outreach followUpCount).
+    negotiationFollowUpCount: integer("negotiationFollowUpCount").notNull().default(0),
     // BUG-E1: monotonic OCC counter. updateInstanceStateConditional predicates on
     // (currentState AND version) and bumps version on every write, so two
     // concurrent writes — including an X→X self-transition, which currentState

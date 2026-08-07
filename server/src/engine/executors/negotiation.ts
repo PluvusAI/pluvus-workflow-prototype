@@ -121,6 +121,39 @@ async function reserveAiReply(
   };
 }
 
+// PLU-110: negotiation-follow-up config helpers (NEGOTIATION node config).
+// Distinct keys from the FOLLOW_UP node's intervals/maxCount. Missing config ⇒
+// disabled, so legacy published nodes never start nudging after a deploy.
+export function negotiationFollowUpEnabled(config: Record<string, unknown>): boolean {
+  return config["negotiationFollowUpEnabled"] === true;
+}
+
+export function negotiationFollowUpMaxCount(config: Record<string, unknown>): number {
+  return typeof config["negotiationFollowUpMaxCount"] === "number"
+    ? config["negotiationFollowUpMaxCount"]
+    : 2;
+}
+
+export function resolveNegotiationFollowUpIntervalMs(
+  config: Record<string, unknown>,
+  attemptIndex: number,
+): number {
+  const intervals = Array.isArray(config["negotiationFollowUpIntervals"])
+    ? (config["negotiationFollowUpIntervals"] as number[])
+    : [2, 4];
+  const unit =
+    typeof config["negotiationFollowUpIntervalUnit"] === "string"
+      ? config["negotiationFollowUpIntervalUnit"]
+      : "days";
+  const value = intervals[attemptIndex] ?? intervals[intervals.length - 1] ?? 2;
+  const multiplier =
+    unit === "seconds" ? 1_000 :
+    unit === "minutes" ? 60 * 1_000 :
+    unit === "hours"   ? 60 * 60 * 1_000 :
+    24 * 60 * 60 * 1_000; // days (default)
+  return value * multiplier;
+}
+
 // PLU-81 §6.1 (Calvin review #3): fold the two sanitized observability records
 // (PLU-82 `knowledge`, PLU-81 `context`) onto a post-build NodeResult's
 // NEGOTIATION_TURN eventPayload. Pure + exported so the fold contract is
@@ -725,6 +758,111 @@ export function formatBriefConflictWarning(
     .join("; ");
 }
 
+// PLU-110: the two DB touchpoints of the follow-up executor, injectable so the
+// AC-15 harness can drive every branch without the module-level Neon singleton
+// (mirrors the reserveOutbound / sendDelaySweep deps-seam pattern). Defaults are
+// the real functions.
+export interface NegotiationFollowUpDeps {
+  listOpenObligations: typeof listOpenObligationsByInstance;
+  reserveReply: typeof reserveAiReply;
+}
+const defaultNegotiationFollowUpDeps: NegotiationFollowUpDeps = {
+  listOpenObligations: listOpenObligationsByInstance,
+  reserveReply: reserveAiReply,
+};
+
+// PLU-110: nudge an unanswered negotiation message. Reached ONLY from the poller
+// re-entering the NEGOTIATION node in AWAITING_REPLY (a real reply routes through
+// injectReply→NEGOTIATING and clears dueAt first), so this always means
+// "follow-up due, no new reply". Does NOT call agent.negotiate — a nudge invents
+// no new offer; it re-surfaces the standing deal + unresolved questions.
+export async function executeNegotiationFollowUp(
+  ctx: ExecutionContext,
+  email: IEmailProvider,
+  agent: IAgentProvider,
+  config: Record<string, unknown>,
+  deps: NegotiationFollowUpDeps = defaultNegotiationFollowUpDeps,
+): Promise<NodeResult> {
+  const { instance, node, creator } = ctx;
+
+  // Disabled (or legacy stale-dueAt instance): quiesce, clear the timer.
+  if (!negotiationFollowUpEnabled(config)) {
+    return {
+      nextState: "AWAITING_REPLY",
+      nextNodeId: node.id,
+      dueAt: null,
+      eventType: "NODE_ENTERED",
+      eventPayload: { outcome: "negotiation_follow_up_disabled", nodeId: node.id },
+    };
+  }
+
+  const max = negotiationFollowUpMaxCount(config);
+  if (instance.negotiationFollowUpCount >= max) {
+    return {
+      nextState: "NO_RESPONSE",
+      nextNodeId: null,
+      completedAt: new Date(),
+      dueAt: null,
+      eventType: "NODE_COMPLETED",
+      eventPayload: {
+        reason: "max_negotiation_follow_ups_reached",
+        negotiationFollowUpCount: instance.negotiationFollowUpCount,
+      },
+    };
+  }
+
+  const attempt = instance.negotiationFollowUpCount;
+  const round = instance.negotiationRound;
+  const dealDescription = describeDeal(config);
+  const obligations = buildOpenObligations(
+    await deps.listOpenObligations(instance.id),
+  );
+
+  const aiDraft = await agent.draftEmail("negotiation_follow_up", creator, config, {
+    round,
+    ...(dealDescription ? { dealDescription } : {}),
+    ...(obligations.openQuestions.length ? { openQuestions: obligations.openQuestions } : {}),
+    ...(obligations.openCommitments.length ? { openCommitments: obligations.openCommitments } : {}),
+  });
+  if (aiDraft === null && agent.generatesDraftCopy) {
+    return draftUnavailable(round, "negotiation_follow_up");
+  }
+  const bodyTemplate =
+    typeof config["negotiationFollowUpBodyTemplate"] === "string"
+      ? config["negotiationFollowUpBodyTemplate"]
+      : "";
+  const draft = aiDraft ?? (await email.draft(creator, bodyTemplate, config));
+
+  // A nudge quotes no money, so any floor/ceiling number is a leak → MANUAL_REVIEW
+  // WITHOUT advancing the counter or scheduling.
+  const guard = scanOutboundDraft(draft, guardConstraintsFromConfig(config));
+  if (!guard.ok) {
+    return blockedByGuard(round, guard.hits);
+  }
+
+  const reserved = await deps.reserveReply(
+    instance.id,
+    draft,
+    `negotiation-followup:${instance.id}:${attempt}`,
+    ctx.campaign,
+  );
+
+  return {
+    nextState: "AWAITING_REPLY",
+    nextNodeId: node.id,
+    negotiationFollowUpCount: attempt + 1,
+    dueAt: null, // flush hook writes the next dueAt from confirmed sentAt
+    ...(reserved.deferredSend ? { deferredSend: reserved.deferredSend } : {}),
+    eventType: "FOLLOW_UP_DUE",
+    eventPayload: {
+      outcome: "negotiation_follow_up",
+      negotiationFollowUpCount: attempt + 1,
+      round,
+      sendScheduledInMs: reserved.sendScheduledInMs,
+    },
+  };
+}
+
 export async function executeNegotiation(
   ctx: ExecutionContext,
   email: IEmailProvider,
@@ -736,6 +874,12 @@ export async function executeNegotiation(
   // negotiation + offer-copy LLM gets the real sender/brand/scope instead of
   // signing as "Pluvus Partnerships" with no scope. Node config always wins.
   const config = mergeCampaignFallback(node.config, ctx.campaign);
+
+  // PLU-110: the poller re-enters here in AWAITING_REPLY when a negotiation
+  // follow-up is due (no new reply — a reply moves to NEGOTIATING first).
+  if (instance.currentState === "AWAITING_REPLY") {
+    return executeNegotiationFollowUp(ctx, email, agent, config);
+  }
 
   if (instance.currentState !== "NEGOTIATING") {
     throw new Error(
@@ -1271,6 +1415,8 @@ export async function executeNegotiation(
         nextState: "AWAITING_REPLY",
         nextNodeId: node.id,
         ...(presentConsumesRound ? { negotiationRound: presentRound } : {}),
+        // PLU-110: a fresh outbound response resets the nudge budget.
+        negotiationFollowUpCount: 0,
         ...(present.deferredSend ? { deferredSend: present.deferredSend } : {}),
         // PLU-111: create/update this turn's question obligations and LINK the
         // reserved reply as their intended resolver (§4.5 step 1). The ANSWERED
@@ -1544,6 +1690,8 @@ export async function executeNegotiation(
         nextState: "AWAITING_REPLY",
         nextNodeId: node.id,
         negotiationRound: newRound,
+        // PLU-110: a fresh outbound response resets the nudge budget.
+        negotiationFollowUpCount: 0,
         ...(counter.deferredSend ? { deferredSend: counter.deferredSend } : {}),
         // PLU-111: the counter email answers this turn's questions — link it as
         // their intended resolver; they resolve to ANSWERED only on send (§4.5).

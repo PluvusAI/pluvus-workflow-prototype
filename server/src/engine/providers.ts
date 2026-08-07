@@ -263,6 +263,7 @@ export interface IAgentProvider {
     purpose:
       | "initial_outreach"
       | "follow_up"
+      | "negotiation_follow_up"
       | "counter_offer"
       | "acceptance"
       | "onboarding"
@@ -375,6 +376,7 @@ export class MockAgentProvider implements IAgentProvider {
     _purpose:
       | "initial_outreach"
       | "follow_up"
+      | "negotiation_follow_up"
       | "counter_offer"
       | "acceptance"
       | "onboarding"

@@ -47,6 +47,7 @@ export interface NodeResult {
   nextNodeId: string | null;
   followUpCount?: number;
   negotiationRound?: number;
+  negotiationFollowUpCount?: number;
   dueAt?: Date | null;
   completedAt?: Date | null;
   eventType: EventType;

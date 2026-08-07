@@ -167,6 +167,9 @@ export interface DraftRequest {
   purpose:
     | "initial_outreach"
     | "follow_up"
+    // PLU-110: nudge an unanswered negotiation message. Agent service falls back
+    // to a generic follow-up prompt until it adds a dedicated one.
+    | "negotiation_follow_up"
     | "counter_offer"
     | "acceptance"
     | "onboarding"

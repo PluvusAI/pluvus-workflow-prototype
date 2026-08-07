@@ -1197,16 +1197,30 @@ function NegotiationForm({
   const [maxBudget, setMaxBudget] = useState(config.maxBudget ?? 1000);
   const [maxRounds, setMaxRounds] = useState(config.maxRounds ?? 3);
   const [commissionRate, setCommissionRate] = useState(config.commissionRate ?? 0);
+  // PLU-110: automatic follow-ups for unanswered negotiation messages.
+  const [fuEnabled, setFuEnabled] = useState(config.negotiationFollowUpEnabled ?? false);
+  const [fuIntervals, setFuIntervals] = useState<number[]>(config.negotiationFollowUpIntervals ?? [2, 4]);
+  const [fuUnit, setFuUnit] = useState(config.negotiationFollowUpIntervalUnit ?? "days");
+  const [fuMaxCount, setFuMaxCount] = useState(config.negotiationFollowUpMaxCount ?? 2);
+  const [fuBody, setFuBody] = useState(config.negotiationFollowUpBodyTemplate ?? "");
   const minId = useId();
   const maxId = useId();
   const roundsId = useId();
   const commissionId = useId();
+  const fuMaxId = useId();
+  const fuUnitId = useId();
+  const fuBodyId = useId();
 
   useEffect(() => {
     setMinBudget(config.minBudget ?? 0);
     setMaxBudget(config.maxBudget ?? 1000);
     setMaxRounds(config.maxRounds ?? 3);
     setCommissionRate(config.commissionRate ?? 0);
+    setFuEnabled(config.negotiationFollowUpEnabled ?? false);
+    setFuIntervals(config.negotiationFollowUpIntervals ?? [2, 4]);
+    setFuUnit(config.negotiationFollowUpIntervalUnit ?? "days");
+    setFuMaxCount(config.negotiationFollowUpMaxCount ?? 2);
+    setFuBody(config.negotiationFollowUpBodyTemplate ?? "");
   }, [nodeId]);
 
   // commissionRate is only included when > 0 (0 is the omitted default = no
@@ -1222,6 +1236,11 @@ function NegotiationForm({
       maxBudget,
       maxRounds,
       commissionRate,
+      negotiationFollowUpEnabled: fuEnabled,
+      negotiationFollowUpIntervals: fuIntervals,
+      negotiationFollowUpIntervalUnit: fuUnit,
+      negotiationFollowUpMaxCount: fuMaxCount,
+      negotiationFollowUpBodyTemplate: fuBody,
       ...over,
     };
     const { commissionRate: rate, ...rest } = next;
@@ -1312,6 +1331,122 @@ function NegotiationForm({
             style={{ width: 90 }}
           />
         </FormField>
+      </Section>
+
+      <Section title="Follow-ups on no reply">
+        <InfoBox>
+          When a creator goes quiet after an offer or counter, the AI sends a nudge in the same
+          thread — reflecting the standing offer, never a new rate. It <strong>always stops as soon
+          as the creator replies</strong> and moves to <strong>No Response</strong> after the max
+          attempts.
+        </InfoBox>
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={fuEnabled}
+            onChange={(e) => {
+              setFuEnabled(e.target.checked);
+              flush({ negotiationFollowUpEnabled: e.target.checked });
+            }}
+          />
+          Enable automatic negotiation follow-ups
+        </label>
+
+        {fuEnabled && (
+          <>
+            <FormField label="Max Follow-Ups" htmlFor={fuMaxId}>
+              <Input
+                id={fuMaxId}
+                type="number"
+                min={1}
+                max={5}
+                value={fuMaxCount}
+                onChange={(e) => setFuMaxCount(Number(e.target.value))}
+                onBlur={() => flush()}
+                style={{ width: 90 }}
+              />
+            </FormField>
+
+            <FormField label="Intervals" hint="How long to wait before each follow-up.">
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                {fuIntervals.map((v, i) => (
+                  <div key={i} style={{ display: "flex", alignItems: "center", gap: 2 }}>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={v}
+                      aria-label={`Interval ${i + 1}`}
+                      onChange={(e) => {
+                        const next = [...fuIntervals];
+                        next[i] = Number(e.target.value);
+                        setFuIntervals(next);
+                      }}
+                      onBlur={() => flush()}
+                      style={{ width: 64 }}
+                    />
+                    {fuIntervals.length > 1 && (
+                      <IconButton
+                        label={`Remove interval ${i + 1}`}
+                        icon="×"
+                        size={22}
+                        style={{ color: colors.danger }}
+                        onClick={() => {
+                          const next = fuIntervals.filter((_, j) => j !== i);
+                          setFuIntervals(next);
+                          flush({ negotiationFollowUpIntervals: next });
+                        }}
+                      />
+                    )}
+                  </div>
+                ))}
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => {
+                    const next = [...fuIntervals, 4];
+                    setFuIntervals(next);
+                    flush({ negotiationFollowUpIntervals: next });
+                  }}
+                >
+                  + Add
+                </Button>
+              </div>
+            </FormField>
+
+            <FormField label="Interval Unit" htmlFor={fuUnitId}>
+              <Select
+                id={fuUnitId}
+                value={fuUnit}
+                onChange={(e) => {
+                  const next = e.target.value as "seconds" | "minutes" | "hours" | "days";
+                  setFuUnit(next);
+                  flush({ negotiationFollowUpIntervalUnit: next });
+                }}
+              >
+                <option value="seconds">Seconds</option>
+                <option value="minutes">Minutes</option>
+                <option value="hours">Hours</option>
+                <option value="days">Days</option>
+              </Select>
+            </FormField>
+
+            <FormField
+              label="Fallback message (optional)"
+              htmlFor={fuBodyId}
+              hint="Fallback only — used if AI generation is unavailable. Leave blank for the built-in default."
+            >
+              <Textarea
+                id={fuBodyId}
+                value={fuBody}
+                onChange={(e) => setFuBody(e.target.value)}
+                onBlur={() => flush()}
+                rows={6}
+                placeholder="Leave blank to use the built-in default…"
+              />
+            </FormField>
+          </>
+        )}
       </Section>
     </FormStack>
   );

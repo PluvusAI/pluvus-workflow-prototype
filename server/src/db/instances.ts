@@ -15,6 +15,7 @@ export type InstancePatch = Partial<
     | "currentNodeId"
     | "followUpCount"
     | "negotiationRound"
+    | "negotiationFollowUpCount"
     | "dueAt"
     | "completedAt"
   >

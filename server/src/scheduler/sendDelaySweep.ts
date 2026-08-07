@@ -81,6 +81,8 @@ export interface SendDelaySweepDeps {
 // with brandRejectCloseKey() in brandRejectEmail.ts (`brand-reject-close:<id>`).
 export const BRAND_REJECT_CLOSE_PREFIX = "brand-reject-close:";
 export const INITIAL_OUTREACH_PREFIX = "outreach:";
+// PLU-110: a negotiation follow-up send commits FOLLOW_UP_DUE, not NEGOTIATION_TURN.
+export const NEGOTIATION_FOLLOWUP_PREFIX = "negotiation-followup:";
 
 // Map a reservation to the event type whose committed presence proves its owning
 // action committed. Default is NEGOTIATION_TURN (AI negotiation replies, the
@@ -88,9 +90,12 @@ export const INITIAL_OUTREACH_PREFIX = "outreach:";
 // by the reject transition's BRAND_REJECTED event instead. Exported for unit tests.
 export function committingEventType(
   row: Message,
-): "NEGOTIATION_TURN" | "BRAND_REJECTED" | "OUTREACH_DRAFTED" {
+): "NEGOTIATION_TURN" | "BRAND_REJECTED" | "OUTREACH_DRAFTED" | "FOLLOW_UP_DUE" {
   if (row.idempotencyKey?.startsWith(BRAND_REJECT_CLOSE_PREFIX)) return "BRAND_REJECTED";
   if (row.idempotencyKey?.startsWith(INITIAL_OUTREACH_PREFIX)) return "OUTREACH_DRAFTED";
+  // PLU-110: without this a stranded follow-up whose flush job was lost would be
+  // misread as a rolled-back orphan and its email silently dropped forever.
+  if (row.idempotencyKey?.startsWith(NEGOTIATION_FOLLOWUP_PREFIX)) return "FOLLOW_UP_DUE";
   return "NEGOTIATION_TURN";
 }
 

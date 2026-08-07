@@ -189,7 +189,12 @@ from app.brief import PARSER_VERSION as _BRIEF_PARSER_VERSION  # noqa: E402
 # don't burn the negotiation budget.
 NegotiationAction = Literal["ACCEPT", "COUNTER", "REJECT", "ESCALATE", "PRESENT_OFFER"]
 DraftPurpose = Literal[
-    "initial_outreach", "follow_up", "counter_offer", "acceptance", "onboarding",
+    "initial_outreach", "follow_up",
+    # PLU-110: nudge for an unanswered negotiation offer/counter. Like follow_up
+    # (existing thread, gentle reminder, no re-pitch) — routes through the same
+    # follow-up prompt below. Missing here would 422 a real draft (see M3 note).
+    "negotiation_follow_up",
+    "counter_offer", "acceptance", "onboarding",
     # M3: the TS side calls draftEmail("reward_confirmation", ...) for the Reward
     # Setup "Campaign Agreement Confirmation" email. It was missing from this
     # literal, so a REAL draft provider (not the mock, which renders a template)
@@ -5056,12 +5061,12 @@ def _langgraph_draft(req: DraftRequest) -> DraftResponse:
     elif req.purpose in ("counter_offer", "acceptance"):
         prompt = _build_offer_prompt(req, sender, ctx, brand_context, scope_lines)
         prompt_version = _OFFER_PROMPT_VERSION
-    elif req.purpose == "follow_up":
-        # H3: a dedicated brief-nudge prompt so follow-ups don't re-pitch the
-        # brand from scratch (the initial-outreach prompt mandates a full product
-        # paragraph — wrong for a reminder). Round is surfaced so a later nudge
-        # can read slightly differently; no history exists to thread (follow-ups
-        # fire on non-reply).
+    elif req.purpose in ("follow_up", "negotiation_follow_up"):
+        # H3 / PLU-110: a dedicated brief-nudge prompt so follow-ups don't re-pitch
+        # the brand from scratch (the initial-outreach prompt mandates a full product
+        # paragraph — wrong for a reminder). negotiation_follow_up (an unanswered
+        # offer/counter) uses the SAME prompt: existing thread, gentle reminder, no
+        # re-pitch, no dollar amounts — exactly the ticket's requirement.
         extra_parts = []
         if req.round:
             extra_parts.append(f"This is follow-up reminder number {req.round}.")

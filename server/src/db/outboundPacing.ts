@@ -247,3 +247,66 @@ export async function completeQueuedInitialOutreach(
     return "completed";
   });
 }
+
+export type ScheduleNegotiationFollowUpResult =
+  | "scheduled"
+  | "not_sent"
+  | "not_waiting"
+  | "already_scheduled";
+
+/**
+ * PLU-110: arm the next negotiation follow-up deadline from CONFIRMED send.
+ * Runs after flush stamps Message.sentAt; sets dueAt = sentAt + intervalMs only
+ * while the instance still waits (AWAITING_REPLY) and has no pending timer.
+ * Version-guarded + idempotent under flush retries.
+ */
+export async function scheduleNegotiationFollowUpAfterSend(
+  messageId: string,
+  intervalMs: number,
+  now: Date = new Date(),
+  client: Db = db,
+): Promise<ScheduleNegotiationFollowUpResult> {
+  return client.transaction(async (tx): Promise<ScheduleNegotiationFollowUpResult> => {
+    const rows = await tx
+      .select({ message: messages, instance: executionInstances })
+      .from(messages)
+      .innerJoin(executionInstances, eq(messages.instanceId, executionInstances.id))
+      .where(eq(messages.id, messageId))
+      .limit(1);
+    const row = rows[0];
+    if (!row?.message.sentAt) return "not_sent";
+    // A reply/exhaustion already moved the instance — never re-arm.
+    if (row.instance.currentState !== "AWAITING_REPLY") return "not_waiting";
+    // Flush-retry idempotency: a pending timer is already set.
+    if (row.instance.dueAt !== null) return "already_scheduled";
+
+    const dueAt = new Date(row.message.sentAt.getTime() + intervalMs);
+    const updated = await tx
+      .update(executionInstances)
+      .set({ dueAt, version: sql`${executionInstances.version} + 1` })
+      .where(
+        and(
+          eq(executionInstances.id, row.instance.id),
+          eq(executionInstances.currentState, "AWAITING_REPLY"),
+          eq(executionInstances.version, row.instance.version),
+        ),
+      )
+      .returning({ id: executionInstances.id });
+    if (!updated[0]) return "not_waiting";
+
+    await tx.insert(events).values({
+      instanceId: row.instance.id,
+      type: "STATE_TRANSITION",
+      nodeId: row.instance.currentNodeId,
+      payload: {
+        from: "AWAITING_REPLY",
+        to: "AWAITING_REPLY",
+        source: "negotiation-followup-scheduler",
+        messageId,
+        dueAt: dueAt.toISOString(),
+      },
+      occurredAt: now,
+    });
+    return "scheduled";
+  });
+}
