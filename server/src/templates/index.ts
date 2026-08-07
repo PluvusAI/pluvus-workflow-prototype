@@ -17,6 +17,18 @@ export interface WorkflowTemplate {
   nodes: NodeSnapshot[];
 }
 
+// PLU-110: seed negotiation follow-ups ON. Band-free body (any floor/ceiling
+// number is blocked by the output guard). Stops on any reply; exhausts to
+// NO_RESPONSE after maxCount.
+const NEGOTIATION_FOLLOWUP_DEFAULTS = {
+  negotiationFollowUpEnabled: true,
+  negotiationFollowUpIntervals: [2, 4],
+  negotiationFollowUpIntervalUnit: "days",
+  negotiationFollowUpMaxCount: 2,
+  negotiationFollowUpBodyTemplate:
+    "Hi {{creatorName}},\n\nJust circling back on our last note — we'd still love to work with you on this. Happy to answer any questions and figure out what works for you.\n\nBest,\n{{brandName}} Team",
+} as const;
+
 // ---------------------------------------------------------------------------
 // Affiliate Campaign
 // ---------------------------------------------------------------------------
@@ -91,6 +103,7 @@ const affiliateNodes: NodeSnapshot[] = [
       // ceiling (never above) rather than escalated; anything higher still
       // escalates to a human. Only the fixed fee has tolerance in V1.
       overCeilingTolerance: 0,
+      ...NEGOTIATION_FOLLOWUP_DEFAULTS,
     },
   },
   {
@@ -167,6 +180,7 @@ const hybridNodes: NodeSnapshot[] = [
       // Phase C (#12): tolerance % above maxBudget; 0 = escalate the moment an ask
       // exceeds the ceiling (today's behavior). See the first template's note.
       overCeilingTolerance: 0,
+      ...NEGOTIATION_FOLLOWUP_DEFAULTS,
     },
   },
   {
@@ -242,6 +256,7 @@ const fixedFeeNodes: NodeSnapshot[] = [
       // Phase C (#12): tolerance % above maxBudget; 0 = escalate the moment an ask
       // exceeds the ceiling (today's behavior). See the first template's note.
       overCeilingTolerance: 0,
+      ...NEGOTIATION_FOLLOWUP_DEFAULTS,
     },
   },
   {
