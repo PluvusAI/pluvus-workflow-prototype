@@ -758,16 +758,30 @@ export function formatBriefConflictWarning(
     .join("; ");
 }
 
+// PLU-110: the two DB touchpoints of the follow-up executor, injectable so the
+// AC-15 harness can drive every branch without the module-level Neon singleton
+// (mirrors the reserveOutbound / sendDelaySweep deps-seam pattern). Defaults are
+// the real functions.
+export interface NegotiationFollowUpDeps {
+  listOpenObligations: typeof listOpenObligationsByInstance;
+  reserveReply: typeof reserveAiReply;
+}
+const defaultNegotiationFollowUpDeps: NegotiationFollowUpDeps = {
+  listOpenObligations: listOpenObligationsByInstance,
+  reserveReply: reserveAiReply,
+};
+
 // PLU-110: nudge an unanswered negotiation message. Reached ONLY from the poller
 // re-entering the NEGOTIATION node in AWAITING_REPLY (a real reply routes through
 // injectReply→NEGOTIATING and clears dueAt first), so this always means
 // "follow-up due, no new reply". Does NOT call agent.negotiate — a nudge invents
 // no new offer; it re-surfaces the standing deal + unresolved questions.
-async function executeNegotiationFollowUp(
+export async function executeNegotiationFollowUp(
   ctx: ExecutionContext,
   email: IEmailProvider,
   agent: IAgentProvider,
   config: Record<string, unknown>,
+  deps: NegotiationFollowUpDeps = defaultNegotiationFollowUpDeps,
 ): Promise<NodeResult> {
   const { instance, node, creator } = ctx;
 
@@ -801,7 +815,7 @@ async function executeNegotiationFollowUp(
   const round = instance.negotiationRound;
   const dealDescription = describeDeal(config);
   const obligations = buildOpenObligations(
-    await listOpenObligationsByInstance(instance.id),
+    await deps.listOpenObligations(instance.id),
   );
 
   const aiDraft = await agent.draftEmail("negotiation_follow_up", creator, config, {
@@ -826,7 +840,7 @@ async function executeNegotiationFollowUp(
     return blockedByGuard(round, guard.hits);
   }
 
-  const reserved = await reserveAiReply(
+  const reserved = await deps.reserveReply(
     instance.id,
     draft,
     `negotiation-followup:${instance.id}:${attempt}`,
