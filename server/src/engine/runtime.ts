@@ -252,6 +252,9 @@ export class WorkflowRuntime {
     if (result.negotiationRound !== undefined) {
       patch.negotiationRound = result.negotiationRound;
     }
+    if (result.negotiationFollowUpCount !== undefined) {
+      patch.negotiationFollowUpCount = result.negotiationFollowUpCount;
+    }
     if (Object.prototype.hasOwnProperty.call(result, "dueAt")) {
       patch.dueAt = result.dueAt ?? null;
     }
