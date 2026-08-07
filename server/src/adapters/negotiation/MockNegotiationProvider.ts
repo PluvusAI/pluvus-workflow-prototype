@@ -178,6 +178,8 @@ export class MockNegotiationProvider implements NegotiationProvider {
           ].join("\n"),
         };
 
+      // PLU-110: a negotiation nudge reads like a plain follow-up in the mock.
+      case "negotiation_follow_up":
       case "follow_up": {
         const n = req.round ?? 1;
         return {

@@ -292,6 +292,7 @@ export class AgentProviderAdapter implements IAgentProvider {
     purpose:
       | "initial_outreach"
       | "follow_up"
+      | "negotiation_follow_up"
       | "counter_offer"
       | "acceptance"
       | "onboarding"
