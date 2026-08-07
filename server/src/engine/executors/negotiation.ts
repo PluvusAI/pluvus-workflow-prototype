@@ -769,7 +769,7 @@ async function executeNegotiationFollowUp(
   agent: IAgentProvider,
   config: Record<string, unknown>,
 ): Promise<NodeResult> {
-  const { instance, node, nodeGraph, creator } = ctx;
+  const { instance, node, creator } = ctx;
 
   // Disabled (or legacy stale-dueAt instance): quiesce, clear the timer.
   if (!negotiationFollowUpEnabled(config)) {
