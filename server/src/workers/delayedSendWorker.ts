@@ -13,7 +13,62 @@ import {
   claimInitialOutreachSlot,
   completeQueuedInitialOutreach,
   findMessageById,
+  findInstanceById,
+  scheduleNegotiationFollowUpAfterSend,
 } from "../db/index.js";
+import { findVersionById, findWorkflowById } from "../db/workflows.js";
+import { findCampaignById } from "../db/campaigns.js";
+import { mergeCampaignFallback } from "../engine/campaignContext.js";
+import {
+  negotiationFollowUpEnabled,
+  resolveNegotiationFollowUpIntervalMs,
+} from "../engine/executors/negotiation.js";
+import type { NodeSnapshot } from "../engine/types.js";
+
+const NEGOTIATION_OUTBOUND_PREFIXES = ["negotiation:present:", "negotiation:counter_offer:"];
+const NEGOTIATION_FOLLOWUP_PREFIX = "negotiation-followup:";
+
+// PLU-110: the NEGOTIATION node config (+ campaign fallback) for an instance, so
+// the flush hook can read the follow-up enable/intervals. Best-effort: any lookup
+// gap ⇒ null ⇒ no follow-up armed.
+async function loadNegotiationNodeConfig(
+  instanceId: string,
+): Promise<Record<string, unknown> | null> {
+  const instance = await findInstanceById(instanceId);
+  if (!instance) return null;
+  const version = await findVersionById(instance.workflowVersionId);
+  if (!version) return null;
+  const nodeGraph = version.nodeGraph as unknown as NodeSnapshot[];
+  const negotiationNode = nodeGraph.find((n) => n.type === "NEGOTIATION");
+  if (!negotiationNode) return null;
+  let campaign = null;
+  try {
+    const workflow = await findWorkflowById(version.workflowId);
+    if (workflow?.campaignId) campaign = await findCampaignById(workflow.campaignId);
+  } catch {
+    campaign = null;
+  }
+  return mergeCampaignFallback(negotiationNode.config, campaign);
+}
+
+// PLU-110: after a negotiation send confirms, arm the next follow-up deadline.
+// A present/counter arms the FIRST follow-up (index 0); a follow-up send arms the
+// NEXT (index = the freshly-read, post-increment negotiationFollowUpCount).
+async function armNegotiationFollowUp(instanceId: string, messageId: string, key: string): Promise<void> {
+  const config = await loadNegotiationNodeConfig(instanceId);
+  if (!config || !negotiationFollowUpEnabled(config)) return;
+
+  let attemptIndex = 0;
+  if (key.startsWith(NEGOTIATION_FOLLOWUP_PREFIX)) {
+    const instance = await findInstanceById(instanceId);
+    if (!instance) return;
+    attemptIndex = instance.negotiationFollowUpCount;
+  }
+
+  const intervalMs = resolveNegotiationFollowUpIntervalMs(config, attemptIndex);
+  const result = await scheduleNegotiationFollowUpAfterSend(messageId, intervalMs);
+  console.log(`[delayed-send] negotiation follow-up arm ${messageId} → ${result}`);
+}
 
 // ---------------------------------------------------------------------------
 // DelayedSend worker (Randomized Send Delay — §4.2, §6.6)
@@ -44,7 +99,11 @@ async function handleDelayedSend(job: Job<DelayedSendJobData>): Promise<void> {
   const { messageId } = job.data;
   const startedAt = Date.now();
   const message = await findMessageById(messageId);
-  const isInitialOutreach = message?.idempotencyKey?.startsWith("outreach:") ?? false;
+  const key = message?.idempotencyKey ?? "";
+  const isInitialOutreach = key.startsWith("outreach:");
+  const isNegotiationSend =
+    NEGOTIATION_OUTBOUND_PREFIXES.some((p) => key.startsWith(p)) ||
+    key.startsWith(NEGOTIATION_FOLLOWUP_PREFIX);
 
   if (isInitialOutreach) {
     // The campaign row lock inside this claim serializes all concurrent workers
@@ -93,6 +152,21 @@ async function handleDelayedSend(job: Job<DelayedSendJobData>): Promise<void> {
       console.log(
         `[delayed-send] outreach ${messageId} delivered; queued follow-up lifecycle ` +
           `(instance ${message!.instanceId})`,
+      );
+    }
+  }
+
+  // PLU-110: a confirmed negotiation send (present/counter/follow-up) arms the
+  // next inactivity deadline from sentAt. Runs on retries too — the DB helper's
+  // sentAt/dueAt gates make it idempotent. Best-effort: a failure never fails the
+  // send.
+  if (isNegotiationSend && message) {
+    try {
+      await armNegotiationFollowUp(message.instanceId, messageId, key);
+    } catch (err) {
+      console.error(
+        `[delayed-send] negotiation follow-up arm failed for ${messageId}:`,
+        err instanceof Error ? err.message : err,
       );
     }
   }
