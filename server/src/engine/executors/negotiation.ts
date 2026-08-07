@@ -121,6 +121,39 @@ async function reserveAiReply(
   };
 }
 
+// PLU-110: negotiation-follow-up config helpers (NEGOTIATION node config).
+// Distinct keys from the FOLLOW_UP node's intervals/maxCount. Missing config ⇒
+// disabled, so legacy published nodes never start nudging after a deploy.
+export function negotiationFollowUpEnabled(config: Record<string, unknown>): boolean {
+  return config["negotiationFollowUpEnabled"] === true;
+}
+
+export function negotiationFollowUpMaxCount(config: Record<string, unknown>): number {
+  return typeof config["negotiationFollowUpMaxCount"] === "number"
+    ? config["negotiationFollowUpMaxCount"]
+    : 2;
+}
+
+export function resolveNegotiationFollowUpIntervalMs(
+  config: Record<string, unknown>,
+  attemptIndex: number,
+): number {
+  const intervals = Array.isArray(config["negotiationFollowUpIntervals"])
+    ? (config["negotiationFollowUpIntervals"] as number[])
+    : [2, 4];
+  const unit =
+    typeof config["negotiationFollowUpIntervalUnit"] === "string"
+      ? config["negotiationFollowUpIntervalUnit"]
+      : "days";
+  const value = intervals[attemptIndex] ?? intervals[intervals.length - 1] ?? 2;
+  const multiplier =
+    unit === "seconds" ? 1_000 :
+    unit === "minutes" ? 60 * 1_000 :
+    unit === "hours"   ? 60 * 60 * 1_000 :
+    24 * 60 * 60 * 1_000; // days (default)
+  return value * multiplier;
+}
+
 // PLU-81 §6.1 (Calvin review #3): fold the two sanitized observability records
 // (PLU-82 `knowledge`, PLU-81 `context`) onto a post-build NodeResult's
 // NEGOTIATION_TURN eventPayload. Pure + exported so the fold contract is

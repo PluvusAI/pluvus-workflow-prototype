@@ -77,6 +77,13 @@ export interface NegotiationConfig {
    * higher still escalates to a human. V1 applies only to the fixed fee.
    */
   overCeilingTolerance?: number;
+  // PLU-110: automatic follow-ups for unanswered negotiation messages. Missing ⇒
+  // off (legacy nodes never start nudging).
+  negotiationFollowUpEnabled?: boolean;
+  negotiationFollowUpIntervals?: number[];
+  negotiationFollowUpIntervalUnit?: "seconds" | "minutes" | "hours" | "days";
+  negotiationFollowUpMaxCount?: number;
+  negotiationFollowUpBodyTemplate?: string;
 }
 
 // Reward Setup finalizes the agreement after a successful negotiation. The final
