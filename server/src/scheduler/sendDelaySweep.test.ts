@@ -20,6 +20,7 @@ import {
   committingEventType,
   BRAND_REJECT_CLOSE_PREFIX,
   INITIAL_OUTREACH_PREFIX,
+  NEGOTIATION_FOLLOWUP_PREFIX,
   type SendDelaySweepDeps,
 } from "./sendDelaySweep.js";
 import type { Message } from "../db/schema.js";
@@ -209,6 +210,30 @@ test("committingEventType: a negotiation reservation maps to NEGOTIATION_TURN", 
 test("committingEventType: initial outreach maps to OUTREACH_DRAFTED", () => {
   const outreach = reservation({ idempotencyKey: `${INITIAL_OUTREACH_PREFIX}i1` });
   assert.equal(committingEventType(outreach), "OUTREACH_DRAFTED");
+});
+
+// PLU-110: a negotiation follow-up send commits FOLLOW_UP_DUE, not NEGOTIATION_TURN.
+// Without this the orphan guard would query the wrong event, misread a committed
+// follow-up as rolled-back, and silently drop the nudge forever.
+test("committingEventType: a negotiation follow-up maps to FOLLOW_UP_DUE", () => {
+  const followUp = reservation({ idempotencyKey: `${NEGOTIATION_FOLLOWUP_PREFIX}i1:0` });
+  assert.equal(committingEventType(followUp), "FOLLOW_UP_DUE");
+});
+
+test("orphan guard: a committed negotiation follow-up is reclaimed, not skipped", async () => {
+  const followUp = reservation({ id: "mFU", idempotencyKey: `${NEGOTIATION_FOLLOWUP_PREFIX}i1:0` });
+  let sawFollowUp = false;
+  const { deps, enqueued } = makeDeps({
+    stranded: [followUp],
+    turnCommitted: async (row: Message) => {
+      if (committingEventType(row) === "FOLLOW_UP_DUE") sawFollowUp = true;
+      return true;
+    },
+  });
+  const res = await sweepStrandedSends(deps);
+  assert.equal(sawFollowUp, true, "the guard keyed on FOLLOW_UP_DUE for the follow-up row");
+  assert.equal(res.reclaimed, 1, "a committed follow-up's nudge is recovered");
+  assert.equal(enqueued[0]!.jobId, "send|mFU|redrive-1");
 });
 
 test("orphan guard: a brand-reject close reservation is re-driven when its commit event is queried", async () => {
