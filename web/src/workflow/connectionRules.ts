@@ -39,7 +39,8 @@ export function canConnect(
   // `source` would have been caught as a duplicate above).
   const existingParent = def.edges.find((e) => e.target === target)?.source;
   if (existingParent && existingParent !== source) {
-    const targetLabel = labelForType(typeOf(def, target) ?? ("" as never));
+    const tt = typeOf(def, target);
+    const targetLabel = tt ? labelForType(tt) : target;
     return {
       ok: false,
       code: "INVALID_MERGE",

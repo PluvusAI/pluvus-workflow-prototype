@@ -226,7 +226,7 @@ export function validateGraph(def: WorkflowDefinition): ValidationResult {
     if (e.source === e.target) {
       push({
         code: "SELF_LOOP",
-        message: `Node "${e.source}" is connected to itself.`,
+        message: `Node "${labelFor(byId, e.source)}" is connected to itself.`,
         nodeId: e.source,
         edgeId: e.id,
         severity: "error",
@@ -537,7 +537,7 @@ export function phaseMessage(source: NodeType, target: NodeType): string {
     return `Content Brief can't come before the creator accepts (it follows the negotiation).`;
   if (target === "NEGOTIATION" && phaseOf(source) > phaseOf("NEGOTIATION"))
     return `Negotiation can't come after the deal is already finalized.`;
-  return `"${TYPE_LABEL[target]}" can't come after "${TYPE_LABEL[source]}" — it belongs earlier in the workflow.`;
+  return `"${TYPE_LABEL[target] ?? target}" can't come after "${TYPE_LABEL[source] ?? source}" — it belongs earlier in the workflow.`;
 }
 
 function isNonEmptyString(v: unknown): boolean {

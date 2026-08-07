@@ -109,6 +109,11 @@ function GraphCanvasInner({
   const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null);
   const reconnectingEdgeId = useRef<string | null>(null);
 
+  const definitionRef = useRef(definition);
+  definitionRef.current = definition;
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
   // Node-id → label lookup for edge toolbars.
   const labelById = useMemo(() => {
     const m = new Map<string, string>();
@@ -168,10 +173,11 @@ function GraphCanvasInner({
   const disconnectEdge = useCallback(
     (edgeIdToRemove: string) => {
       if (readOnly) return;
-      onChange({ ...definition, edges: applyDisconnect(definition, edgeIdToRemove) });
+      const def = definitionRef.current;
+      onChangeRef.current({ ...def, edges: applyDisconnect(def, edgeIdToRemove) });
       setSelectedEdgeId((cur) => (cur === edgeIdToRemove ? null : cur));
     },
-    [definition, onChange, readOnly],
+    [readOnly],
   );
 
   const buildRfEdges = useCallback(
