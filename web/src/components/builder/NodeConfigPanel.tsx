@@ -22,6 +22,7 @@ import type {
   ContentBriefConfig,
 } from "../../api/builderTypes";
 import { uploadFile, generateOutreachTemplate } from "../../api/builderClient";
+import { defaultConfigFor } from "../../workflow/nodeDefaults";
 import {
   REQUIRED_OUTREACH_VARIABLE_NAMES,
   type OutreachVariable,
@@ -1204,10 +1205,14 @@ function NegotiationForm({
   // maxBudget:0 (no fee band). Deriving instead of persisting means legacy
   // workflows render correctly with zero migration (backward-compat AC).
   const [includeFixedFee, setIncludeFixedFee] = useState((config.maxBudget ?? 0) > 0);
+  const [overCeilingTolerance, setOverCeilingTolerance] = useState(
+    config.overCeilingTolerance ?? 0,
+  );
   const minId = useId();
   const maxId = useId();
   const roundsId = useId();
   const commissionId = useId();
+  const fixedFeeId = useId();
 
   useEffect(() => {
     setMinBudget(config.minBudget ?? 0);
@@ -1215,6 +1220,7 @@ function NegotiationForm({
     setMaxRounds(config.maxRounds ?? 3);
     setCommissionRate(config.commissionRate ?? 0);
     setIncludeFixedFee((config.maxBudget ?? 0) > 0);
+    setOverCeilingTolerance(config.overCeilingTolerance ?? 0);
   }, [nodeId]);
 
   // commissionRate is only included when > 0 (0 is the omitted default = no
@@ -1237,7 +1243,7 @@ function NegotiationForm({
     const nextMin = over?.minBudget ?? minBudget;
     const nextMax = over?.maxBudget ?? maxBudget;
     const rate = over?.commissionRate ?? commissionRate;
-    const savedTolerance = config.overCeilingTolerance;
+    const savedTolerance = overCeilingTolerance;
     const persistedMin = feeOn ? nextMin : 0;
     const persistedMax = feeOn ? nextMax : 0;
     // approvalMode is no longer written: it had no consumer (the engine always
@@ -1266,9 +1272,12 @@ function NegotiationForm({
   function selectIncludeFixedFee(next: boolean) {
     setIncludeFixedFee(next);
     if (next && minBudget <= 0 && maxBudget <= 0) {
-      setMinBudget(200);
-      setMaxBudget(500);
-      flush({ includeFixedFee: true, minBudget: 200, maxBudget: 500 });
+      const seed = defaultConfigFor("NEGOTIATION") as NegotiationConfig;
+      const seedMin = seed.minBudget ?? 0;
+      const seedMax = seed.maxBudget ?? 0;
+      setMinBudget(seedMin);
+      setMaxBudget(seedMax);
+      flush({ includeFixedFee: true, minBudget: seedMin, maxBudget: seedMax });
     } else {
       flush({ includeFixedFee: next });
     }
@@ -1287,9 +1296,11 @@ function NegotiationForm({
       <Section title="Compensation">
         <FormField
           label="Include fixed fee"
+          htmlFor={fixedFeeId}
           hint="On: negotiate an upfront fee (fixed-fee or hybrid). Off: commission-only — no upfront fee."
         >
           <Toggle
+            id={fixedFeeId}
             checked={includeFixedFee}
             onChange={selectIncludeFixedFee}
             label={includeFixedFee ? "Fixed fee on" : "Commission-only"}
