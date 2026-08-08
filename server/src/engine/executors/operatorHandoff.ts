@@ -15,7 +15,7 @@ import {
   type SourceLabel,
 } from "../knowledgePrecedence.js";
 import { resolveBand } from "../band.js";
-import { resolveBrandName, type CampaignBrandFields } from "../campaignContext.js";
+import { resolveBrandName, toCampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
 
@@ -52,14 +52,14 @@ export async function executeOperatorHandoff(
   ctx: ExecutionContext,
   email: IEmailProvider,
 ): Promise<NodeResult> {
-  const { instance, node, nodeGraph, creator, campaign } = ctx;
+  const { instance, node, nodeGraph, creator, campaign, campaignDetails } = ctx;
   const config = node.config;
-  // PLU-135 (1a): deliverables/timeline/paymentTerms/rewardDescription moved off
-  // Campaign onto CampaignDetails. `campaign` structurally satisfies
-  // CampaignBrandFields with those fields simply absent, so this degrades to "no
-  // campaign-level default" rather than erroring — wiring an actual
-  // CampaignDetails lookup in here is Issue 1c's job, not this one.
-  const campaignFields: CampaignBrandFields | null = campaign ?? null;
+  // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
+  // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
+  // loads CampaignDetails alongside Campaign into ExecutionContext specifically
+  // so this fallback tier keeps working instead of silently resolving to
+  // nothing for every campaign.
+  const campaignFields = toCampaignBrandFields(campaign, campaignDetails);
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(

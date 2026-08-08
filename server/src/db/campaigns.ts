@@ -155,6 +155,35 @@ export async function deleteInstanceCascade(
 }
 
 /**
+ * PLU-135 (1a) code-review fix (Ayush): launchCampaign()'s precondition
+ * failures are real, actionable, user-facing states (fix your campaign, then
+ * retry) — not internal errors. Typed so routes/campaigns.ts can map them to
+ * a real 4xx instead of every failure path collapsing into a generic 500.
+ */
+export class CampaignNotFoundError extends Error {
+  constructor(id: string) {
+    super(`Campaign ${id} not found`);
+    this.name = "CampaignNotFoundError";
+  }
+}
+
+export class CampaignDetailsMissingError extends Error {
+  constructor(id: string) {
+    super(`Campaign ${id} has no CampaignDetails to snapshot`);
+    this.name = "CampaignDetailsMissingError";
+  }
+}
+
+export class NegotiationPolicyMissingError extends Error {
+  constructor(id: string) {
+    super(
+      `Campaign ${id} has no NegotiationPolicy — cannot launch without negotiation bounds`,
+    );
+    this.name = "NegotiationPolicyMissingError";
+  }
+}
+
+/**
  * PLU-135 (1a): THE launch transition — Draft → Active. Creates the ONE
  * immutable CampaignTermsSnapshot and NegotiationPolicySnapshot this campaign
  * will ever have (Calvin review, 2026-08-08: never at enrollment, which could
@@ -173,7 +202,7 @@ export async function launchCampaign(id: string): Promise<CampaignTermsSnapshot>
       .where(eq(campaigns.id, id))
       .limit(1);
     if (!campaign) {
-      throw new Error(`Campaign ${id} not found`);
+      throw new CampaignNotFoundError(id);
     }
 
     if (campaign.status === "ACTIVE") {
@@ -201,7 +230,7 @@ export async function launchCampaign(id: string): Promise<CampaignTermsSnapshot>
     // migration's backfill. An absent row is a data-integrity bug, not a
     // valid empty-draft state, so this fails loud instead of snapshotting {}.
     if (!details) {
-      throw new Error(`Campaign ${id} has no CampaignDetails to snapshot`);
+      throw new CampaignDetailsMissingError(id);
     }
 
     // Schema review §2.3 (Calvin, 2026-08-08): refuse to launch without a
@@ -215,9 +244,7 @@ export async function launchCampaign(id: string): Promise<CampaignTermsSnapshot>
       .where(eq(negotiationPolicies.campaignId, id))
       .limit(1);
     if (!policy) {
-      throw new Error(
-        `Campaign ${id} has no NegotiationPolicy — cannot launch without negotiation bounds`,
-      );
+      throw new NegotiationPolicyMissingError(id);
     }
 
     // Schema review §2.1: the snapshot's fallback pointer is whichever

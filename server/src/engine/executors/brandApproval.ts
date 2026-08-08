@@ -17,7 +17,7 @@ import {
 } from "./brandApprovalToken.js";
 import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
 import { resolveBand } from "../band.js";
-import { resolveBrandName, type CampaignBrandFields } from "../campaignContext.js";
+import { resolveBrandName, toCampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
 
@@ -52,12 +52,14 @@ export async function executeBrandApproval(
   ctx: ExecutionContext,
   email: IEmailProvider,
 ): Promise<NodeResult> {
-  const { instance, node, nodeGraph, creator, campaign } = ctx;
+  const { instance, node, nodeGraph, creator, campaign, campaignDetails } = ctx;
   const config = node.config;
-  // PLU-135 (1a): deliverables/timeline/paymentTerms/rewardDescription moved
-  // off Campaign onto CampaignDetails — see campaignContext.ts's
-  // CampaignBrandFields doc comment.
-  const campaignFields: CampaignBrandFields | null = campaign ?? null;
+  // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
+  // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
+  // loads CampaignDetails alongside Campaign into ExecutionContext specifically
+  // so this fallback tier keeps working instead of silently resolving to
+  // nothing for every campaign.
+  const campaignFields = toCampaignBrandFields(campaign, campaignDetails);
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(

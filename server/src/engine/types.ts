@@ -2,6 +2,7 @@ import type {
   ExecutionInstance,
   Creator,
   Campaign,
+  CampaignDetails,
   InstanceState,
   EventType,
   ReplyIntent,
@@ -34,11 +35,20 @@ export interface ExecutionContext {
   nodeGraph: NodeSnapshot[];
   creator: Creator;
   // H5: the parent campaign, when the workflow is linked to one. Used as a
-  // FALLBACK source of brand context (brandDescription/deliverables/timeline/
-  // rewardDescription/senderName) for the LLM when a node's config wasn't stamped
-  // with them (e.g. imported/legacy workflows). Null for seeded/legacy workflows
-  // that predate campaigns (campaignId is null) — those rely on node config.
+  // FALLBACK source of brand context (senderName/brandName) for the LLM when a
+  // node's config wasn't stamped with them (e.g. imported/legacy workflows).
+  // Null for seeded/legacy workflows that predate campaigns (campaignId is
+  // null) — those rely on node config.
   campaign?: Campaign | null;
+  // PLU-135 (1a) code-review fix: brandDescription/deliverables/timeline/
+  // rewardDescription/paymentTerms/usageRights/exclusivity/attributionWindow
+  // moved off Campaign onto CampaignDetails when the campaign schema was
+  // split — this is the fallback source for THOSE fields now. Loaded
+  // alongside `campaign` in runtime.ts#loadContext with the same best-effort
+  // degrade-to-null semantics. Nullable for the same reasons `campaign` is,
+  // plus: a campaign that predates PLU-135's migration backfill edge case, or
+  // any lookup failure.
+  campaignDetails?: CampaignDetails | null;
 }
 
 // NodeResult — what a node executor returns

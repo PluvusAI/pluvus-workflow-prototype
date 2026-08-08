@@ -236,13 +236,12 @@ async function main(): Promise<void> {
     assert.equal(handoff!.commissionRate, COMMISSION);
     assert.equal(handoff!.deliverables, DELIVERABLES);
     assert.equal(handoff!.timeline, TIMELINE);
-    // PLU-135 (1a) KNOWN GAP: paymentTerms has no node-config source in this
-    // harness's graph (unlike deliverables/timeline above) — it relies
-    // entirely on the campaign-level fallback, which now lives in
-    // CampaignDetails rather than on Campaign itself. executeOperatorHandoff
-    // still reads ctx.campaign (the raw, trimmed Campaign row), so this
-    // fallback is temporarily unavailable until Issue 1c wires
-    // CampaignDetails into ExecutionContext. Expected to fail here until then.
+    // PLU-135 (1a) code-review fix (Ayush): paymentTerms has no node-config
+    // source in this harness's graph (unlike deliverables/timeline above) —
+    // it relies entirely on the campaign-level fallback, which moved from
+    // Campaign to CampaignDetails. runtime.ts#loadContext now loads
+    // CampaignDetails into ExecutionContext alongside Campaign specifically
+    // so this fallback keeps resolving instead of silently going dead.
     assert.equal(handoff!.paymentTerms, PAYMENT_TERMS, "payment terms fall back to the campaign");
     assert.match(handoff!.acceptanceMessage ?? "", /works for me/i);
     assert.equal(handoff!.status, "AWAITING_FINALIZATION");

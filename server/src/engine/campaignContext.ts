@@ -1,4 +1,4 @@
-import type { Campaign } from "../db/schema.js";
+import type { Campaign, CampaignDetails } from "../db/schema.js";
 
 // ---------------------------------------------------------------------------
 // Campaign → node-config brand-context fallback (H5)
@@ -132,6 +132,37 @@ export function mergeCampaignFallback(
  * normally always sets brandName, so undefined only happens for a genuinely
  * mis-stamped / orphaned instance that a human should fix.
  */
+/**
+ * PLU-135 (1a) code-review fix (Ayush): builds the CampaignBrandFields shape
+ * from the two rows it's actually split across now — Campaign (just `brand`)
+ * and CampaignDetails (everything else). Before this, callers cast `campaign`
+ * directly to CampaignBrandFields, which type-checked (every field beyond
+ * `brand` is optional) but meant the campaign-level fallback silently
+ * resolved to "nothing" for every campaign, because those fields no longer
+ * live on Campaign at all. One merge function, reused by every executor that
+ * needs this shape, so the field mapping (rewardDescription <-
+ * productOrOffer, paymentTerms <- publicPaymentTerms) can't drift between
+ * call sites.
+ */
+export function toCampaignBrandFields(
+  campaign: Campaign | null | undefined,
+  details: CampaignDetails | null | undefined,
+): CampaignBrandFields | null {
+  if (!campaign) return null;
+  return {
+    brand: campaign.brand,
+    brandDescription: details?.brandDescription ?? null,
+    deliverables: details?.deliverables ?? null,
+    timeline: details?.timeline ?? null,
+    rewardDescription: details?.productOrOffer ?? null,
+    shipsPhysicalProduct: details?.shipsPhysicalProduct ?? false,
+    usageRights: details?.usageRights ?? null,
+    exclusivity: details?.exclusivity ?? null,
+    paymentTerms: details?.publicPaymentTerms ?? null,
+    attributionWindow: details?.attributionWindow ?? null,
+  };
+}
+
 export function resolveBrandName(
   config: Record<string, unknown>,
   campaign: Campaign | null | undefined,

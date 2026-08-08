@@ -8,6 +8,9 @@ import {
   findCampaignById,
   deleteCampaign,
   launchCampaign,
+  CampaignNotFoundError,
+  CampaignDetailsMissingError,
+  NegotiationPolicyMissingError,
 } from "../db/campaigns.js";
 import {
   CampaignLockedError,
@@ -513,6 +516,17 @@ router.post("/:id/launch", async (req: Request, res: Response) => {
       launchedAt: snapshot.launchedAt.toISOString(),
     });
   } catch (err) {
+    // PLU-135 (1a) code-review fix (Ayush): launchCampaign()'s precondition
+    // failures are real, actionable states — surface them as such instead of
+    // collapsing every failure into an opaque 500.
+    if (err instanceof CampaignNotFoundError) {
+      res.status(404).json({ error: err.message });
+      return;
+    }
+    if (err instanceof CampaignDetailsMissingError || err instanceof NegotiationPolicyMissingError) {
+      res.status(422).json({ error: err.message });
+      return;
+    }
     console.error("[campaigns] launch error:", err);
     res.status(500).json({ error: "internal server error" });
   }

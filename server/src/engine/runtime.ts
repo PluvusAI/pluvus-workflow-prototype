@@ -25,6 +25,7 @@ import {
 } from "../db/index.js";
 import type { Db, DbTx } from "../db/drizzle.js";
 import { findCampaignById } from "../db/campaigns.js";
+import { getCampaignDetails } from "../db/campaignDetails.js";
 import { isTerminal, assertTransition } from "./stateMachine.js";
 import type { IEmailProvider, IAgentProvider } from "./providers.js";
 import type { ExecutionContext, NodeSnapshot, NodeResult } from "./types.js";
@@ -191,17 +192,31 @@ export class WorkflowRuntime {
     // workflow → campaign. Best-effort: a missing/unlinked campaign is normal
     // (seeded/legacy workflows have campaignId=null) and must not break
     // execution, so any lookup failure degrades to "no campaign fallback".
+    //
+    // PLU-135 (1a) code-review fix: brandDescription/deliverables/timeline/
+    // rewardDescription/paymentTerms/etc. moved off Campaign onto
+    // CampaignDetails when the campaign schema was split. Without also
+    // loading CampaignDetails here, that fallback tier silently went dead for
+    // every campaign — the executors that read it (operatorHandoff.ts,
+    // brandApproval.ts) compiled fine against the widened CampaignBrandFields
+    // shape but had nothing left to actually fall back to. Same best-effort
+    // semantics as the campaign lookup above.
     let campaign = null;
+    let campaignDetails = null;
     try {
       const workflow = await findWorkflowById(version.workflowId);
       if (workflow?.campaignId) {
         campaign = await findCampaignById(workflow.campaignId);
+        if (campaign) {
+          campaignDetails = await getCampaignDetails(campaign.id);
+        }
       }
     } catch {
       campaign = null;
+      campaignDetails = null;
     }
 
-    return { instance, node, nodeGraph, creator, campaign };
+    return { instance, node, nodeGraph, creator, campaign, campaignDetails };
   }
 
   // -------------------------------------------------------------------------
