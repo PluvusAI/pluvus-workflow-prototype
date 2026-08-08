@@ -14,6 +14,14 @@ import type { Campaign } from "../db/schema.js";
 // ONLY for keys the config doesn't already carry. Node config always WINS (it is
 // the stamped, workflow-specific value); the campaign only fills genuine gaps.
 // A null/absent campaign (seeded/legacy workflows) is a no-op.
+//
+// PLU-135 (1a): these fields moved off the Campaign row onto CampaignDetails.
+// This function now accepts CampaignBrandFields — a shape decoupled from both
+// Campaign and CampaignDetails — rather than Campaign directly, so every
+// existing call site (which threads a plain Campaign through ctx.campaign)
+// keeps compiling unchanged and degrades gracefully to "no fallback available"
+// instead of erroring. Wiring an actual CampaignDetails lookup into that
+// fallback is Issue 1c's job (precedence wiring), not this one.
 
 // The brand-context keys the LLM reads, mapped from Campaign columns.
 const BRAND_KEYS = [
@@ -33,7 +41,30 @@ const BRAND_KEYS = [
   "attributionWindow",
 ] as const;
 
-function campaignValueFor(campaign: Campaign, key: (typeof BRAND_KEYS)[number]): unknown {
+// The subset of brand-context fields this module reads, under their node-config
+// key names (which is why paymentTerms/rewardDescription keep those exact
+// names here even though the underlying CampaignDetails columns are named
+// publicPaymentTerms/productOrOffer — those are the wire-format keys stamped
+// into node config throughout the engine, unrelated to the DB column rename).
+// `Campaign` (post-PLU-135) satisfies this structurally with every optional
+// field simply absent, which is exactly the graceful-degradation behavior
+// this fallback is meant to have for a campaign it can't find brand data for.
+export type CampaignBrandFields = Pick<Campaign, "brand"> & {
+  brandDescription?: string | null;
+  deliverables?: string | null;
+  timeline?: string | null;
+  rewardDescription?: string | null;
+  shipsPhysicalProduct?: boolean;
+  usageRights?: string | null;
+  exclusivity?: string | null;
+  paymentTerms?: string | null;
+  attributionWindow?: string | null;
+};
+
+function campaignValueFor(
+  campaign: CampaignBrandFields,
+  key: (typeof BRAND_KEYS)[number],
+): unknown {
   switch (key) {
     // The campaign's brand name is the sender/brand identity for the emails.
     case "senderName":
@@ -78,7 +109,7 @@ function configHasValue(config: Record<string, unknown>, key: string): boolean {
  */
 export function mergeCampaignFallback(
   config: Record<string, unknown>,
-  campaign: Campaign | null | undefined,
+  campaign: CampaignBrandFields | null | undefined,
 ): Record<string, unknown> {
   const merged: Record<string, unknown> = { ...config };
   if (!campaign) return merged;

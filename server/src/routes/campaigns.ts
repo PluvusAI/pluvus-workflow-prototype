@@ -7,7 +7,14 @@ import {
   getCampaignWithWorkflows,
   findCampaignById,
   deleteCampaign,
+  launchCampaign,
 } from "../db/campaigns.js";
+import {
+  CampaignLockedError,
+  getCampaignDetails,
+  getCampaignDetailsByCampaignIds,
+  upsertCampaignDetails,
+} from "../db/campaignDetails.js";
 import {
   createWorkflow,
   updateWorkflow,
@@ -19,33 +26,59 @@ import {
   validateCreateSendingSettings,
   validatePatchSendingSettings,
 } from "../validation/campaignSendingSettings.js";
+import type { Campaign, CampaignDetails } from "../db/schema.js";
 
 const router = Router();
+
+// PLU-135 (1a): the API's JSON contract is unchanged — creator-facing fields
+// still appear flat on the campaign object even though they now live in a
+// separate CampaignDetails row underneath. One flatten function, reused by
+// every handler that returns a campaign, so the merge shape can't drift
+// between list/get/create/patch responses.
+function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
+  return {
+    id: campaign.id,
+    name: campaign.name,
+    brand: campaign.brand,
+    // PLU-135 (1a): DRAFT | ACTIVE. ACTIVE means launched — CampaignDetails
+    // below reflects the frozen CampaignTermsSnapshot in every practical
+    // sense (writes are rejected once ACTIVE), not the "live draft" language
+    // above literally implies once a campaign reaches this state.
+    status: campaign.status,
+    objective: details?.objective ?? null,
+    notes: campaign.notes,
+    notifyEmail: campaign.notifyEmail,
+    brandDescription: details?.brandDescription ?? null,
+    deliverables: details?.deliverables ?? null,
+    timeline: details?.timeline ?? null,
+    rewardDescription: details?.productOrOffer ?? null,
+    shipsPhysicalProduct: details?.shipsPhysicalProduct ?? false,
+    usageRights: details?.usageRights ?? null,
+    exclusivity: details?.exclusivity ?? null,
+    paymentTerms: details?.publicPaymentTerms ?? null,
+    attributionWindow: details?.attributionWindow ?? null,
+    targetUrl: campaign.targetUrl,
+    hiddenParamKey: campaign.hiddenParamKey,
+    postAcceptanceMode: campaign.postAcceptanceMode,
+    dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
+    outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
+    outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
+    negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
+    negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
+    emailAccountId: campaign.emailAccountId,
+  };
+}
 
 // GET /campaigns — list all campaigns with workflow counts
 router.get("/", async (_req: Request, res: Response) => {
   try {
     const campaigns = await listCampaigns();
+    const detailsByCampaignId = await getCampaignDetailsByCampaignIds(
+      campaigns.map((c) => c.id),
+    );
     res.json(
       campaigns.map((c) => ({
-        id: c.id,
-        name: c.name,
-        brand: c.brand,
-        objective: c.objective,
-        notes: c.notes,
-        notifyEmail: c.notifyEmail,
-        brandDescription: c.brandDescription,
-        deliverables: c.deliverables,
-        timeline: c.timeline,
-        rewardDescription: c.rewardDescription,
-        shipsPhysicalProduct: c.shipsPhysicalProduct,
-        postAcceptanceMode: c.postAcceptanceMode,
-        dailyInitialOutreachLimit: c.dailyInitialOutreachLimit,
-        outreachPacingMinMinutes: c.outreachPacingMinMinutes,
-        outreachPacingMaxMinutes: c.outreachPacingMaxMinutes,
-        negotiationReplyPacingMinMinutes: c.negotiationReplyPacingMinMinutes,
-        negotiationReplyPacingMaxMinutes: c.negotiationReplyPacingMaxMinutes,
-        emailAccountId: c.emailAccountId,
+        ...flattenCampaign(c, detailsByCampaignId.get(c.id) ?? null),
         createdAt: c.createdAt.toISOString(),
         updatedAt: c.updatedAt.toISOString(),
         workflowCount: c._count.workflows,
@@ -173,25 +206,14 @@ router.post("/", async (req: Request, res: Response) => {
       }
     }
 
+    // PLU-135 (1a): execution-level fields go to Campaign; every creator-facing
+    // field below goes to its CampaignDetails row instead — see flattenCampaign
+    // for the merge back into one JSON response.
     const campaign = await createCampaign({
       name: name.trim(),
       brand: brand.trim(),
-      objective: typeof objective === "string" ? objective.trim() || null : null,
       notes: typeof notes === "string" ? notes.trim() || null : null,
       notifyEmail: trimmedNotify || null,
-      brandDescription: typeof brandDescription === "string" ? brandDescription.trim() || null : null,
-      deliverables: typeof deliverables === "string" ? deliverables.trim() || null : null,
-      timeline: typeof timeline === "string" ? timeline.trim() || null : null,
-      rewardDescription:
-        typeof rewardDescription === "string" ? rewardDescription.trim() || null : null,
-      shipsPhysicalProduct: shipsPhysicalProduct === true,
-      // HARD-K1 knowledge fields — stated as fact by the agent when the creator
-      // asks, deferred honestly when blank.
-      usageRights: typeof usageRights === "string" ? usageRights.trim() || null : null,
-      exclusivity: typeof exclusivity === "string" ? exclusivity.trim() || null : null,
-      paymentTerms: typeof paymentTerms === "string" ? paymentTerms.trim() || null : null,
-      attributionWindow:
-        typeof attributionWindow === "string" ? attributionWindow.trim() || null : null,
       targetUrl: typeof targetUrl === "string" ? targetUrl.trim() || null : null,
       hiddenParamKey:
         typeof hiddenParamKey === "string" && hiddenParamKey.trim()
@@ -205,22 +227,25 @@ router.post("/", async (req: Request, res: Response) => {
       // to the default connected account.
       ...(trimmedAccountId ? { emailAccountId: trimmedAccountId } : {}),
     });
+    const details = await upsertCampaignDetails(campaign.id, {
+      objective: typeof objective === "string" ? objective.trim() || null : null,
+      brandDescription: typeof brandDescription === "string" ? brandDescription.trim() || null : null,
+      deliverables: typeof deliverables === "string" ? deliverables.trim() || null : null,
+      timeline: typeof timeline === "string" ? timeline.trim() || null : null,
+      productOrOffer:
+        typeof rewardDescription === "string" ? rewardDescription.trim() || null : null,
+      shipsPhysicalProduct: shipsPhysicalProduct === true,
+      // HARD-K1 knowledge fields — stated as fact by the agent when the creator
+      // asks, deferred honestly when blank.
+      usageRights: typeof usageRights === "string" ? usageRights.trim() || null : null,
+      exclusivity: typeof exclusivity === "string" ? exclusivity.trim() || null : null,
+      publicPaymentTerms:
+        typeof paymentTerms === "string" ? paymentTerms.trim() || null : null,
+      attributionWindow:
+        typeof attributionWindow === "string" ? attributionWindow.trim() || null : null,
+    });
     res.status(201).json({
-      id: campaign.id,
-      name: campaign.name,
-      brand: campaign.brand,
-      objective: campaign.objective,
-      notes: campaign.notes,
-      notifyEmail: campaign.notifyEmail,
-      brandDescription: campaign.brandDescription,
-      deliverables: campaign.deliverables,
-      timeline: campaign.timeline,
-      rewardDescription: campaign.rewardDescription,
-      shipsPhysicalProduct: campaign.shipsPhysicalProduct,
-      usageRights: campaign.usageRights,
-      exclusivity: campaign.exclusivity,
-      paymentTerms: campaign.paymentTerms,
-      attributionWindow: campaign.attributionWindow,
+      ...flattenCampaign(campaign, details),
       targetUrl: campaign.targetUrl,
       hiddenParamKey: campaign.hiddenParamKey,
       postAcceptanceMode: campaign.postAcceptanceMode,
@@ -246,25 +271,9 @@ router.get("/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
+    const details = await getCampaignDetails(campaign.id);
     res.json({
-      id: campaign.id,
-      name: campaign.name,
-      brand: campaign.brand,
-      objective: campaign.objective,
-      notes: campaign.notes,
-      notifyEmail: campaign.notifyEmail,
-      brandDescription: campaign.brandDescription,
-      deliverables: campaign.deliverables,
-      timeline: campaign.timeline,
-      rewardDescription: campaign.rewardDescription,
-      shipsPhysicalProduct: campaign.shipsPhysicalProduct,
-      postAcceptanceMode: campaign.postAcceptanceMode,
-      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
-      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
-      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
-      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
-      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
-      emailAccountId: campaign.emailAccountId,
+      ...flattenCampaign(campaign, details),
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
       workflows: campaign.workflows.map((w) => ({
@@ -312,6 +321,7 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
+    const details = await getCampaignDetails(campaign.id);
 
     // Stamp brandName/senderName into every node's config so {{brandName}}
     // resolves correctly when draft() is called at send time.
@@ -321,11 +331,11 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
         config: {
           brandName: campaign.brand,
           senderName: campaign.brand,
-          ...(campaign.brandDescription ? { brandDescription: campaign.brandDescription } : {}),
-          ...(campaign.deliverables ? { deliverables: campaign.deliverables } : {}),
-          ...(campaign.timeline ? { timeline: campaign.timeline } : {}),
-          ...(campaign.rewardDescription ? { rewardDescription: campaign.rewardDescription } : {}),
-          ...(campaign.shipsPhysicalProduct ? { shipsPhysicalProduct: true } : {}),
+          ...(details?.brandDescription ? { brandDescription: details.brandDescription } : {}),
+          ...(details?.deliverables ? { deliverables: details.deliverables } : {}),
+          ...(details?.timeline ? { timeline: details.timeline } : {}),
+          ...(details?.productOrOffer ? { rewardDescription: details.productOrOffer } : {}),
+          ...(details?.shipsPhysicalProduct ? { shipsPhysicalProduct: true } : {}),
           ...node.config,
         },
       }),
@@ -380,6 +390,9 @@ router.patch("/:id", async (req: Request, res: Response) => {
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
+  // PLU-135 (1a): the creator-facing fields below now live in CampaignDetails,
+  // patched separately from the Campaign row itself.
+  const detailsPatch: Parameters<typeof upsertCampaignDetails>[1] = {};
 
   const sendingSettings = validatePatchSendingSettings(
     req.body as Record<string, unknown>,
@@ -399,26 +412,28 @@ router.patch("/:id", async (req: Request, res: Response) => {
     patch.notifyEmail = trimmed || null;
   }
   if (objective !== undefined) {
-    patch.objective = typeof objective === "string" ? objective.trim() || null : null;
+    detailsPatch.objective = typeof objective === "string" ? objective.trim() || null : null;
   }
   if (notes !== undefined) {
     patch.notes = typeof notes === "string" ? notes.trim() || null : null;
   }
   if (brandDescription !== undefined) {
-    patch.brandDescription = typeof brandDescription === "string" ? brandDescription.trim() || null : null;
+    detailsPatch.brandDescription =
+      typeof brandDescription === "string" ? brandDescription.trim() || null : null;
   }
   if (deliverables !== undefined) {
-    patch.deliverables = typeof deliverables === "string" ? deliverables.trim() || null : null;
+    detailsPatch.deliverables =
+      typeof deliverables === "string" ? deliverables.trim() || null : null;
   }
   if (timeline !== undefined) {
-    patch.timeline = typeof timeline === "string" ? timeline.trim() || null : null;
+    detailsPatch.timeline = typeof timeline === "string" ? timeline.trim() || null : null;
   }
   if (rewardDescription !== undefined) {
-    patch.rewardDescription =
+    detailsPatch.productOrOffer =
       typeof rewardDescription === "string" ? rewardDescription.trim() || null : null;
   }
   if (shipsPhysicalProduct !== undefined) {
-    patch.shipsPhysicalProduct = shipsPhysicalProduct === true;
+    detailsPatch.shipsPhysicalProduct = shipsPhysicalProduct === true;
   }
   if (postAcceptanceMode !== undefined) {
     if (!isPostAcceptanceMode(postAcceptanceMode)) {
@@ -457,35 +472,54 @@ router.patch("/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const campaign = await updateCampaign(req.params["id"]!, patch);
+    const campaign =
+      Object.keys(patch).length > 0
+        ? await updateCampaign(req.params["id"]!, patch)
+        : existing;
+    const details =
+      Object.keys(detailsPatch).length > 0
+        ? await upsertCampaignDetails(req.params["id"]!, detailsPatch)
+        : await getCampaignDetails(req.params["id"]!);
     res.json({
-      id: campaign.id,
-      name: campaign.name,
-      brand: campaign.brand,
-      objective: campaign.objective,
-      notes: campaign.notes,
-      notifyEmail: campaign.notifyEmail,
-      brandDescription: campaign.brandDescription,
-      deliverables: campaign.deliverables,
-      timeline: campaign.timeline,
-      rewardDescription: campaign.rewardDescription,
-      shipsPhysicalProduct: campaign.shipsPhysicalProduct,
-      postAcceptanceMode: campaign.postAcceptanceMode,
-      dailyInitialOutreachLimit: campaign.dailyInitialOutreachLimit,
-      outreachPacingMinMinutes: campaign.outreachPacingMinMinutes,
-      outreachPacingMaxMinutes: campaign.outreachPacingMaxMinutes,
-      negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
-      negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
-      emailAccountId: campaign.emailAccountId,
+      ...flattenCampaign(campaign, details),
       updatedAt: campaign.updatedAt.toISOString(),
     });
   } catch (err) {
+    if (err instanceof CampaignLockedError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
     console.error("[campaigns] update error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });
 
+// POST /campaigns/:id/launch — PLU-135 (1a): the ONE-WAY Draft → Active
+// transition. Freezes the current CampaignDetails/NegotiationPolicy into
+// CampaignTermsSnapshot/NegotiationPolicySnapshot and locks both read-only.
+// Idempotent: launching an already-ACTIVE campaign returns its existing
+// snapshot rather than erroring.
+router.post("/:id/launch", async (req: Request, res: Response) => {
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const snapshot = await launchCampaign(req.params["id"]!);
+    res.json({
+      campaignId: snapshot.campaignId,
+      campaignTermsSnapshotId: snapshot.id,
+      launchedAt: snapshot.launchedAt.toISOString(),
+    });
+  } catch (err) {
+    console.error("[campaigns] launch error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
 // DELETE /campaigns/:id — delete a campaign and all its workflows/instances
+// (or archive it, if already launched — see deleteCampaign's doc comment)
 router.delete("/:id", async (req: Request, res: Response) => {
   try {
     const campaign = await findCampaignById(req.params["id"]!);

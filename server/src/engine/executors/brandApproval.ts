@@ -17,7 +17,7 @@ import {
 } from "./brandApprovalToken.js";
 import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
 import { resolveBand } from "../band.js";
-import { resolveBrandName } from "../campaignContext.js";
+import { resolveBrandName, type CampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
 
@@ -54,6 +54,10 @@ export async function executeBrandApproval(
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator, campaign } = ctx;
   const config = node.config;
+  // PLU-135 (1a): deliverables/timeline/paymentTerms/rewardDescription moved
+  // off Campaign onto CampaignDetails — see campaignContext.ts's
+  // CampaignBrandFields doc comment.
+  const campaignFields: CampaignBrandFields | null = campaign ?? null;
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
@@ -96,18 +100,18 @@ export async function executeBrandApproval(
   const deliverables = firstString(
     config["deliverables"],
     negotiationConfig["deliverables"],
-    campaign?.deliverables,
+    campaignFields?.deliverables,
   );
   const timeline = firstString(
     config["timeline"],
     negotiationConfig["timeline"],
-    campaign?.timeline,
+    campaignFields?.timeline,
   );
-  const paymentTerms = firstString(config["paymentTerms"], campaign?.paymentTerms);
+  const paymentTerms = firstString(config["paymentTerms"], campaignFields?.paymentTerms);
   const rewardDescription = firstString(
     config["rewardDescription"],
     negotiationConfig["rewardDescription"],
-    campaign?.rewardDescription,
+    campaignFields?.rewardDescription,
   );
   const { floor: negotiationFloor, ceiling: negotiationCeiling } =
     resolveBand(negotiationConfig);

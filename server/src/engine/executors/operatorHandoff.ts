@@ -15,7 +15,7 @@ import {
   type SourceLabel,
 } from "../knowledgePrecedence.js";
 import { resolveBand } from "../band.js";
-import { resolveBrandName } from "../campaignContext.js";
+import { resolveBrandName, type CampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
 
@@ -54,6 +54,12 @@ export async function executeOperatorHandoff(
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator, campaign } = ctx;
   const config = node.config;
+  // PLU-135 (1a): deliverables/timeline/paymentTerms/rewardDescription moved off
+  // Campaign onto CampaignDetails. `campaign` structurally satisfies
+  // CampaignBrandFields with those fields simply absent, so this degrades to "no
+  // campaign-level default" rather than erroring — wiring an actual
+  // CampaignDetails lookup in here is Issue 1c's job, not this one.
+  const campaignFields: CampaignBrandFields | null = campaign ?? null;
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
@@ -100,14 +106,14 @@ export async function executeOperatorHandoff(
   const deliverablesR = resolveKnowledgeField("deliverables", {
     workflowConfig: config["deliverables"],
     negotiationState: negotiationConfig["deliverables"],
-    campaignDefault: campaign?.deliverables,
+    campaignDefault: campaignFields?.deliverables,
   });
   const deliverables = deliverablesR.value as string | undefined;
   resolvedSources["deliverables"] = deliverablesR.source;
   const timelineR = resolveKnowledgeField("timeline", {
     workflowConfig: config["timeline"],
     negotiationState: negotiationConfig["timeline"],
-    campaignDefault: campaign?.timeline,
+    campaignDefault: campaignFields?.timeline,
   });
   const timeline = timelineR.value as string | undefined;
   resolvedSources["timeline"] = timelineR.source;
@@ -115,7 +121,7 @@ export async function executeOperatorHandoff(
   // preserved inconsistency, §7 / invariant #3).
   const paymentTermsR = resolveKnowledgeField("paymentTerms", {
     workflowConfig: config["paymentTerms"],
-    campaignDefault: campaign?.paymentTerms,
+    campaignDefault: campaignFields?.paymentTerms,
   });
   const paymentTerms = paymentTermsR.value as string | undefined;
   resolvedSources["paymentTerms"] = paymentTermsR.source;
@@ -133,7 +139,7 @@ export async function executeOperatorHandoff(
   const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
     workflowConfig: config["rewardDescription"],
     negotiationState: negotiationConfig["rewardDescription"],
-    campaignDefault: campaign?.rewardDescription,
+    campaignDefault: campaignFields?.rewardDescription,
   });
   const rewardDescription = rewardDescriptionR.value as string | undefined;
   resolvedSources["rewardDescription"] = rewardDescriptionR.source;

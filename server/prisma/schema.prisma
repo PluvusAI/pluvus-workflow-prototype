@@ -226,14 +226,66 @@ enum WorkflowStatus {
 // Definition models
 // ---------------------------------------------------------------------------
 
+/// PLU-135 (1a): status of a rendered CampaignBrief document.
+enum CampaignBriefRenderStatus {
+  GENERATING
+  READY
+  FAILED
+}
+
+/// PLU-135 (1a): how a BrandIdentity's values were populated.
+enum BrandIdentityExtractionSource {
+  EXTRACTED
+  MANUAL
+  DEFAULT
+}
+
+/// PLU-135 (1a): the append-only CampaignAuditEvent event catalogue.
+enum CampaignAuditEventType {
+  CREATED
+  EDITED
+  LAUNCHED
+  SNAPSHOT_CREATED
+  DUPLICATED
+  BRIEF_RENDERED
+  POLICY_CHANGED
+  ARCHIVED
+}
+
+/// PLU-135 (1a): a campaign's launch lifecycle. DRAFT is freely editable;
+/// ACTIVE means it has launched — CampaignTermsSnapshot and
+/// NegotiationPolicySnapshot exist, CampaignDetails and NegotiationPolicy are
+/// locked read-only, and no second snapshot is ever created for this campaign.
+/// A material change after launch means duplicating into a NEW Campaign, never
+/// editing this one (Calvin review, 2026-08-08).
+///
+/// CLOSING / ARCHIVED are declared now, RESERVED for PLU-133 (dependent on
+/// PLU-110) — no transition INTO either value is written anywhere in this
+/// codebase yet. Declaring them costs nothing (an unused enum value) and
+/// avoids a second migration touching this column later; what they actually
+/// mean — whether ARCHIVED here subsumes Campaign.archivedAt below, whether
+/// CLOSING is even a stored state vs. a computed one — is explicitly NOT
+/// decided by this schema and must not be inferred from it. Campaign.archivedAt
+/// (a DIFFERENT, already-implemented concept: manual delete-of-a-launched-
+/// campaign) is untouched by this widening and keeps working exactly as before.
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  CLOSING
+  ARCHIVED
+}
+
 /// A brand campaign. The top-level container created by brands in the wizard.
 /// One Campaign can own multiple Workflows (e.g. different strategies for the same campaign).
+///
+/// PLU-135 (1a): trimmed to execution-level settings only. Every creator-facing
+/// term (objective, deliverables, usage rights, payment terms, etc.) moved to
+/// CampaignDetails — see that model for why. This model owns tenancy, sending,
+/// pacing, and lifecycle (status, archivedAt) — never a second copy of deal terms.
 model Campaign {
-  id        String  @id @default(cuid())
-  name      String
-  brand     String
-  objective String?
-  notes     String?
+  id    String @id @default(cuid())
+  name  String
+  brand String
 
   /// Brand contact email that receives manual-queue escalation notices.
   /// When a creator is escalated to MANUAL_REVIEW, the brand is emailed here so
@@ -242,51 +294,19 @@ model Campaign {
   /// (env) and finally the platform operator address (see notifications/escalation).
   notifyEmail String?
 
-  /// Short description of what the brand does / sells. Fed to the LLM so it
-  /// can answer creator questions like "what does your brand do?" without
-  /// hallucinating. Stamped into every node's config as brandDescription.
-  brandDescription String?
+  /// Internal operator notes about the campaign. NOT creator-facing (never
+  /// stamped into node config or shown to a creator anywhere) — that's exactly
+  /// why it stays here rather than moving to CampaignDetails with the other
+  /// PLU-135 fields, which are all creator-facing by definition.
+  notes String?
 
-  /// What the creator is expected to produce (e.g. "3 IG Reels + 1 YouTube
-  /// integration"). Free text supplied by the brand. Stamped into every node's
-  /// config as `deliverables` so outreach/negotiation copy can state real scope
-  /// instead of "to be finalized". Nullable: brands may leave it blank.
-  deliverables String?
+  /// PLU-135 (1a): Draft → Active is the ONE-WAY launch transition that creates
+  /// CampaignTermsSnapshot + NegotiationPolicySnapshot and locks CampaignDetails
+  /// + NegotiationPolicy. See CampaignStatus and launchCampaign() (db/campaigns.ts).
+  status CampaignStatus @default(DRAFT)
 
-  /// When the content should go live (e.g. "content live by Sept 15, 2026").
-  /// Free text supplied by the brand. Stamped into node config as `timeline`.
-  /// The AI states it only when present, and never invents one when absent.
-  timeline String?
-
-  /// Free-text description of a product/sample the brand gives the creator as
-  /// part of the reward (e.g. "a free pair of our running shoes"). Stamped into
-  /// every node's config as `rewardDescription` so outreach/negotiation/reward
-  /// copy can mention it. Nullable: cash-only campaigns leave it blank.
-  rewardDescription String?
-
-  /// Whether the reward includes a physical product that must be shipped. When
-  /// true, the hosted Payment Info form also collects a shipping address.
-  /// Stamped into every node's config as `shipsPhysicalProduct`.
-  shipsPhysicalProduct Boolean @default(false)
-
-  /// HARD-K1 knowledge fields — the campaign terms creators most often ask about
-  /// that the agent previously had NOWHERE to source, so it hallucinated them by
-  /// construction (see hard.md HARD-K1 / HARD-P2). All free text supplied by the
-  /// brand and stamped into every node's config so /negotiate + /draft can state
-  /// them as fact when present and DEFER honestly when absent (never invent).
-  ///
-  /// usageRights — how the brand may reuse the creator's content (e.g. "6-month
-  /// paid social usage on the brand's handles").
-  usageRights       String?
-  /// exclusivity — any category exclusivity the creator must honor (e.g. "no
-  /// competing footwear brands for 30 days after go-live").
-  exclusivity       String?
-  /// paymentTerms — when/how the creator is paid (e.g. "net-30 after content is
-  /// approved, paid via bank transfer").
-  paymentTerms      String?
-  /// attributionWindow — the affiliate cookie/attribution window (e.g. "30-day
-  /// last-click cookie").
-  attributionWindow String?
+  targetUrl      String?
+  hiddenParamKey String  @default("_from")
 
   /// PLU-70: what happens once a creator accepts. This is the campaign-level
   /// DEFAULT only — enrollment stamps the effective mode onto each
@@ -310,6 +330,13 @@ model Campaign {
   /// whose account was disconnected, falls back to the default ConnectedEmailAccount.
   emailAccountId String?
 
+  /// PLU-135 (1a): null = active (visible). Set when an already-launched
+  /// (ACTIVE) campaign is deleted — deleteCampaign() archives instead of
+  /// destroying so the snapshot/audit/brief history stays intact. A DRAFT
+  /// campaign (no snapshot exists yet) still hard-deletes as before.
+  /// listCampaigns() filters these out; direct lookup by id is unaffected.
+  archivedAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -317,7 +344,347 @@ model Campaign {
   outreachDays CampaignOutreachDay[]
   emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
 
+  /// PLU-135 (1a) additions — see each model's own doc comment. termsSnapshot /
+  /// negotiationPolicySnapshot are singular (0 or 1): a campaign launches at
+  /// most once, ever — enforced by the unique campaignId on each snapshot table.
+  details                   CampaignDetails?
+  termsSnapshot             CampaignTermsSnapshot?
+  briefExtractions          CampaignBriefExtraction[]
+  negotiationPolicy         NegotiationPolicy?
+  negotiationPolicySnapshot NegotiationPolicySnapshot?
+  brandIdentity             BrandIdentity?
+  creatorRequirement        CreatorRequirement?
+  briefs                    CampaignBrief[]
+  auditEvents               CampaignAuditEvent[]
+
   @@index([emailAccountId])
+}
+
+/// PLU-135 (1a): the editable, creator-facing draft — every term that moved out
+/// of Campaign above. Freely rewritable while Campaign.status is DRAFT.
+/// launchCampaign() freezes a copy into CampaignTermsSnapshot and the
+/// application layer (db/campaignDetails.ts) rejects further writes once
+/// status is ACTIVE — a material change means duplicating into a new Campaign,
+/// never editing this one post-launch. One per campaign.
+model CampaignDetails {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  objective String?
+  /// Maps to the old Campaign.rewardDescription ("a free pair of our running
+  /// shoes") — PLU-135 names this field productOrOffer; same free-text
+  /// product/sample description, carried forward by the migration's backfill,
+  /// not a new empty field.
+  productOrOffer String?
+  keyMessages    String?
+  deliverables        String?
+  timeline            String?
+  contentRequirements String?
+  usageRights         String?
+  exclusivity         String?
+  /// Not in PLU-135's literal field list, but carried forward anyway: the old
+  /// Campaign.attributionWindow was one of the same HARD-K1 creator-facing
+  /// fields as usageRights/exclusivity right next to it, and is still actively
+  /// read by executors. Dropping it silently would be a real regression, not a
+  /// simplification.
+  attributionWindow   String?
+  /// New — no existing column covers this. Flagged as a genuine gap by the
+  /// vault's own "Decision - Persist Full Extraction" note (prohibited claims
+  /// was never persisted even when extracted from a brief).
+  prohibitedClaims    String?
+  /// Only when compensation is genuinely fixed and non-negotiable. Negotiable
+  /// bounds live in NegotiationPolicy instead, never here.
+  fixedCompensationCents Int?
+  publicPaymentTerms     String?
+  shipsPhysicalProduct   Boolean @default(false)
+  brandDescription       String?
+
+  /// PLU-135 schema review §2.1 (Calvin, 2026-08-08): the missing link in the
+  /// extraction → confirmation → snapshot chain. Without this, launchCampaign()
+  /// had to guess which extraction the confirmed values above actually came
+  /// from by picking "the newest one" — wrong if a brief was re-uploaded after
+  /// confirmation but before launch, and silently wrong forever once frozen.
+  /// Nullable throughout: a campaign typed by hand with no PDF ever uploaded is
+  /// a normal case. onDelete Restrict: an extraction a confirmation points to
+  /// must outlive that confirmation.
+  confirmedFromExtractionId String?
+  confirmedFromExtraction   CampaignBriefExtraction? @relation(fields: [confirmedFromExtractionId], references: [id], onDelete: Restrict)
+  confirmedAt               DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// PLU-135 (1a): THE immutable public-terms snapshot — what the campaign
+/// actually offered at launch (e.g. "$300"), NOT what any individual creator
+/// negotiated (e.g. "$450" — that lives in Partnership / PartnershipTerms,
+/// PLU-119, tied to the creator's own execution). This is deliberately NOT
+/// named "Revision": there is exactly one per campaign, ever — enforced by the
+/// unique campaignId below, not just an application convention. Written once,
+/// by launchCampaign(), at the Draft→Active transition — never at enrollment,
+/// because conversations could already be in flight against live data by then.
+/// A brand wanting to change material terms after launch must duplicate the
+/// campaign, not touch this row. Never updated after creation. ON DELETE
+/// RESTRICT everywhere it's referenced: this row must outlive the campaign
+/// that made it (Calvin review, 2026-08-08).
+model CampaignTermsSnapshot {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  /// Full copy of CampaignDetails' fields at the moment of launch. JSON blob
+  /// (matching how WorkflowVersion.nodeGraph already does immutable snapshots)
+  /// rather than individual columns — revisit only if a later issue needs to
+  /// query into individual snapshot fields.
+  detailsSnapshot Json
+
+  /// Which CampaignBriefExtraction was current at launch — the fallback brief
+  /// text this snapshot is consistent with. This is NOT part of the confirmed
+  /// terms above; it's a pointer to which AI reading was in effect, kept only
+  /// so the fallback tier (Field Precedence) never silently drifts. Nullable: a
+  /// campaign can launch with no brief uploaded at all. Once set, never changed.
+  briefExtractionId String?
+
+  launchedAt DateTime @default(now())
+  /// Informational operator/system marker — not an authorization check.
+  createdBy  String?
+  createdAt  DateTime @default(now())
+
+  campaign        Campaign                 @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  briefExtraction CampaignBriefExtraction? @relation(fields: [briefExtractionId], references: [id], onDelete: Restrict)
+  executionInstances ExecutionInstance[]
+  briefs             CampaignBrief[]
+
+  @@index([briefExtractionId])
+  /// Enables the composite FK from CampaignBrief(campaignTermsSnapshotId,
+  /// campaignId) — the mechanism that makes "a brief can't reference another
+  /// campaign's snapshot" a real database constraint instead of an
+  /// application-level check.
+  @@unique([id, campaignId])
+}
+
+/// PLU-135 (1a): a single reading of the uploaded brief PDF. Immutable — never
+/// updated or overwritten. No version *number*; ordering is purely by
+/// createdAt, so "the current reading" (used by anything before a campaign has
+/// launched) is just the newest row for a campaignId. Once
+/// CampaignTermsSnapshot freezes a pointer to one of these at launch, that
+/// pairing never changes. This is the AI's CANDIDATE reading — not itself the
+/// source of truth. A human confirming or editing what it found is what
+/// actually writes to CampaignDetails; only CampaignDetails (and, after
+/// launch, its frozen copy) is authoritative. Does not replace the in-process
+/// parse cache in briefKnowledge.ts (PLU-82/PLU-107) — that remains the fast
+/// path for pre-launch preview; this is the durable record behind it.
+model CampaignBriefExtraction {
+  id         String @id @default(cuid())
+  campaignId String
+
+  flatText           String
+  /// Typed section map — same shape briefKnowledge.ts already produces
+  /// (type/text/pageStart/extractionConfidence/sourceFileReference/parserVersion
+  /// per entry).
+  sections           Json
+  /// Uncategorised remainder — nothing extracted is discarded.
+  other              Json?
+  sourceFileReference String
+  parserVersion       String
+
+  createdAt DateTime @default(now())
+
+  campaign       Campaign                @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  termsSnapshots CampaignTermsSnapshot[]
+  /// PLU-135 schema review §2.1: back-relation for CampaignDetails.
+  /// confirmedFromExtraction — which confirmations (there is only ever one
+  /// live CampaignDetails row per campaign, but the relation is plural because
+  /// Prisma requires it) point at this reading.
+  confirmedDetails CampaignDetails[]
+
+  @@index([campaignId])
+  /// Backs the "most recent reading for this campaign" read before launch.
+  @@index([campaignId, createdAt])
+}
+
+/// PLU-135 (1a): the private negotiation-bounds table. Standalone — per both
+/// the vault ("private policy lives only in NegotiationPolicy") and this
+/// issue's own text, never merged into CampaignDetails or
+/// CampaignTermsSnapshot, which a creator-facing agent may read from.
+/// preferredFeeCents / negotiationGuidance / negotiableTerms / nonNegotiableTerms
+/// are new — nothing in the codebase tracks them today, only floor/ceiling and
+/// the other fields below. Freely editable while Campaign.status is DRAFT;
+/// launchCampaign() freezes a copy into NegotiationPolicySnapshot and further
+/// writes are rejected once ACTIVE — an in-flight negotiation must never see
+/// its bounds change mid-conversation (Calvin review, 2026-08-08).
+model NegotiationPolicy {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  floorCents           Int?
+  ceilingCents         Int?
+  preferredFeeCents    Int?
+  commissionRate       Float?
+  maxRounds            Int?
+  openingOfferPosition Float?
+  overCeilingTolerance Float?
+  negotiationGuidance  String?
+  /// String list stored as JSON — no Postgres native array precedent exists
+  /// elsewhere in this schema, so this follows the established Json-for-lists
+  /// convention (metadata/socialLinks/etc.) instead of introducing a new one.
+  negotiableTerms    Json?
+  nonNegotiableTerms Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// PLU-135 (1a): the immutable freeze of NegotiationPolicy at launch — same
+/// mechanism and same reason as CampaignTermsSnapshot, kept as its OWN table
+/// (rather than folded into CampaignTermsSnapshot's JSON blob) because private
+/// policy must never share a row with anything a creator-facing agent might
+/// read from. Explicit typed columns mirroring NegotiationPolicy exactly
+/// (rather than a JSON blob like detailsSnapshot) since these are stable
+/// scalar fields, not a growing free-form document — a later precedence
+/// resolver can query a specific bound directly. Written once, by
+/// launchCampaign(), never updated after.
+model NegotiationPolicySnapshot {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  floorCents           Int?
+  ceilingCents         Int?
+  preferredFeeCents    Int?
+  commissionRate       Float?
+  maxRounds            Int?
+  openingOfferPosition Float?
+  overCeilingTolerance Float?
+  negotiationGuidance  String?
+  negotiableTerms      Json?
+  nonNegotiableTerms   Json?
+
+  launchedAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  campaign           Campaign            @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  executionInstances ExecutionInstance[]
+}
+
+/// PLU-135 (1a): brand logo/colors/typography for anything rendered on the
+/// campaign's behalf (e.g. CampaignBrief). One per campaign.
+model BrandIdentity {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  logoRef          String?
+  primaryColor     String?
+  secondaryColor   String?
+  typography       String?
+  extractionSource BrandIdentityExtractionSource?
+  extractedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// PLU-135 (1a): informational-only criteria for what kind of creator a
+/// campaign wants. Explicitly must NOT drive matching/ranking/outreach in this
+/// issue — display/edit only. No existing table covers this; built empty, with
+/// nothing to backfill (Creator.niche/platform/location describe one real
+/// creator's own profile, a different concept entirely).
+model CreatorRequirement {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  platforms     Json?
+  niches        Json?
+  geography     Json?
+  languages     Json?
+  minFollowers  Int?
+  audienceNotes String?
+  contentStyle  String?
+  brandSafety   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// PLU-135 (1a): redefined as a pointer to the RENDERED brief document handed
+/// to a creator — not the uploaded source PDF (that stays referenced from
+/// workflow node config for now; CampaignBriefExtraction above is its durable
+/// reading, unrelated to this table). The actual rendering logic is Issue 3's
+/// job; this is just the receipt. The composite FK to
+/// CampaignTermsSnapshot(id, campaignId) makes "a brief can never reference a
+/// different campaign's snapshot" a real database constraint.
+///
+/// Required invariant for whoever builds Issue 3: re-rendering a brief must
+/// always create a NEW CampaignBrief row, never overwrite an existing row's
+/// renderedAssetRef — an already-generated brief must never retroactively
+/// change because BrandIdentity (logo/colors) was edited afterward (Calvin
+/// review, 2026-08-08). Not enforced by this schema; recorded here so it isn't
+/// lost before Issue 3 starts.
+model CampaignBrief {
+  id                     String @id @default(cuid())
+  campaignId             String
+  campaignTermsSnapshotId String
+
+  renderedAssetRef String?
+  status           CampaignBriefRenderStatus @default(GENERATING)
+  generatedAt      DateTime?
+
+  /// PLU-135 schema review §2.2 (Calvin, 2026-08-08) — named in review as the
+  /// most important open concern. BrandIdentity is deliberately NOT locked at
+  /// launch (unlike CampaignDetails/NegotiationPolicy), so a logo/colour edit
+  /// is live today — a doc comment telling Issue 3 to "always insert a new
+  /// row" does not protect an already-rendered brief, because even a new row
+  /// would re-resolve the CURRENT identity. The rendered brief has to carry
+  /// the identity it actually used, as a point-in-time copy — NOT a version
+  /// pointer to BrandIdentity, which would mean a second snapshot table and a
+  /// lock discussion for something review explicitly wants kept simple and
+  /// freely editable.
+  brandIdentitySnapshot Json
+  /// Which renderer template produced this row.
+  templateVersion        String
+  renderedAt              DateTime  @default(now())
+  /// Set when a newer render replaces this one. The row is NEVER deleted —
+  /// staleness is tracked here, not by removal, so a creator who already
+  /// received this exact brief can still be shown what they actually got.
+  /// Staleness is keyed to campaignTermsSnapshotId ALONE: a BrandIdentity edit
+  /// must never mark an existing brief stale, or a logo change would trigger
+  /// exactly the retroactive re-render this field exists to prevent.
+  supersededAt            DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign      Campaign              @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+  termsSnapshot CampaignTermsSnapshot @relation(fields: [campaignTermsSnapshotId, campaignId], references: [id, campaignId], onDelete: Restrict)
+
+  @@index([campaignId])
+  @@index([campaignTermsSnapshotId])
+  @@index([campaignId, renderedAt])
+}
+
+/// PLU-135 (1a): append-only campaign history. No updatedAt by design — nothing
+/// should ever revise a diary entry. Kept separate from ExecutionInstance's
+/// per-creator Event log and the workflow-graph validation log, which record
+/// different things.
+model CampaignAuditEvent {
+  id         String @id @default(cuid())
+  campaignId String
+
+  eventType CampaignAuditEventType
+  payload   Json?
+  actorId   String?
+
+  createdAt DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Restrict)
+
+  @@index([campaignId])
 }
 
 /// PLU-122: one UTC calendar-day counter/pacing cursor per campaign. This is
@@ -583,14 +950,34 @@ model ExecutionInstance {
   /// NULL: pre-existing runs are backfilled to the default account by the migration.
   emailAccountId String?
 
+  /// BUG-E1: monotonic OCC counter (added by the 20260719150000_bug_e1_instance_version
+  /// migration). Was missing from this file even though the column has existed in
+  /// every database since that migration — schema.prisma had drifted from the real
+  /// schema. Declared here now so this file is actually truthful again; not a new
+  /// field, no new migration needed for it. Every conditional write predicates on
+  /// (currentState AND version) and bumps version, so two concurrent writes —
+  /// including an X→X self-transition — can never both commit.
+  version Int @default(0)
+
   enrolledAt  DateTime  @default(now())
   completedAt DateTime?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
+  /// PLU-135 (1a): the CampaignTermsSnapshot this execution is PINNED to,
+  /// stamped once at enrollment and never rewritten — same mechanism as
+  /// postAcceptanceMode/emailAccountId above. Nullable: executions enrolled
+  /// before this migration have no snapshot to point at.
+  campaignTermsSnapshotId String?
+  /// PLU-135 (1a): same pinning, for the private negotiation bounds. A
+  /// negotiation must never see its bounds change mid-conversation.
+  negotiationPolicySnapshotId String?
+
   workflowVersion    WorkflowVersion     @relation(fields: [workflowVersionId], references: [id])
   creator            Creator             @relation(fields: [creatorId], references: [id])
   emailAccount       ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
+  campaignTermsSnapshot     CampaignTermsSnapshot?     @relation(fields: [campaignTermsSnapshotId], references: [id], onDelete: Restrict)
+  negotiationPolicySnapshot NegotiationPolicySnapshot? @relation(fields: [negotiationPolicySnapshotId], references: [id], onDelete: Restrict)
   messages           Message[]
   events             Event[]
   brandNotifications BrandNotification[]
@@ -605,6 +992,8 @@ model ExecutionInstance {
   /// index-backed as the instance table grows instead of degrading to full scans.
   @@index([currentState, dueAt])
   @@index([emailAccountId])
+  @@index([campaignTermsSnapshotId])
+  @@index([negotiationPolicySnapshotId])
 }
 
 /// Every outbound and inbound email tied to an ExecutionInstance.
