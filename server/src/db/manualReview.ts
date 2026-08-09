@@ -1,16 +1,7 @@
-// ---------------------------------------------------------------------------
-// Manual-review case resolution + timeout — DB layer (PLU-154)
-// ---------------------------------------------------------------------------
-// A MANUAL_REVIEW "case" is the ExecutionInstance itself while it is parked for a
-// human. There is NO new case table: identity/reason/entered-at reconstruct from
-// the append-only Event log, the deadline reuses the instance's dueAt column, and
-// final approved terms reuse the existing DealHandoff side table. This mirrors the
-// audit-on-events + OCC-CAS pattern PLU-153 established for campaign lifecycle.
-//
-// resolveManualReviewCase is the ONE atomic write for every terminal outcome
-// (approve / reject / opt-out / timeout): it does the state transition, the
-// optional DealHandoff insert, and both audit events in a single transaction, so
-// a lost OCC race rolls the whole thing back. Only one terminal resolution can win.
+// PLU-154 manual-review resolution DB layer. A "case" is the ExecutionInstance
+// while parked for a human — no new table: deadline reuses dueAt, audit reuses the
+// Event log, approved terms reuse DealHandoff. resolveManualReviewCase is the one
+// atomic write for every terminal outcome (approve/reject/opt-out/timeout).
 
 import { and, asc, eq, isNotNull, lte } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
@@ -69,12 +60,8 @@ export interface ResolveInput {
   source?: "operator" | "system";
 }
 
-/**
- * Thrown when the OCC-CAS lost the race — the case was already resolved (or
- * concurrently resolved) by another actor. The route/sweep catches it and reports
- * the existing outcome; inside the tx it forces a rollback so no orphan
- * DealHandoff is left behind.
- */
+/** OCC-CAS lost the race — the case was already resolved. Rolls back the tx (no
+ *  orphan DealHandoff); the route/sweep catches it and reports the existing outcome. */
 export class ManualReviewRaceError extends Error {
   constructor(public readonly instanceId: string) {
     super(`Manual-review case ${instanceId} was already resolved (OCC race)`);
@@ -82,9 +69,8 @@ export class ManualReviewRaceError extends Error {
   }
 }
 
-/** Thrown when an approve's final fee falls outside the pinned band and no
- *  approvedDeviation was passed. Validated BEFORE the tx opens, so a bad request
- *  never starts a transaction. */
+/** Approve fee outside the pinned band with no approvedDeviation. Validated before
+ *  the tx opens, so a bad request never starts a transaction. */
 export class BandViolationError extends Error {
   constructor(
     public readonly fixedFee: number,
@@ -99,8 +85,7 @@ export class BandViolationError extends Error {
   }
 }
 
-/** Load the pinned negotiation-policy snapshot (READ-ONLY — never written, so the
- *  snapshot stays immutable during MR). Null when the instance has none pinned. */
+/** Load the pinned negotiation-policy snapshot by id (read-only → stays immutable). */
 export async function findNegotiationPolicySnapshotById(
   id: string,
   client: Db | DbTx = db,
@@ -113,12 +98,8 @@ export async function findNegotiationPolicySnapshotById(
   return rows[0] ?? null;
 }
 
-/**
- * Validate a final approved fee against the pinned band. Throws BandViolationError
- * when the fee is outside [floor, ceiling] (either bound in cents; null = open on
- * that side) unless terms.approvedDeviation is set. No band pinned / no fee → no-op.
- * Pure given the snapshot, so the route validates before opening any transaction.
- */
+/** Throw BandViolationError if the approve fee is outside [floorCents, ceilingCents]
+ *  (null bound = open) unless approvedDeviation. No band/no fee → no-op. Pure. */
 export function assertFeeWithinBand(
   terms: ResolvedTerms | undefined,
   snapshot: NegotiationPolicySnapshot | null,
@@ -136,17 +117,9 @@ export function assertFeeWithinBand(
   }
 }
 
-/**
- * The ONE atomic resolution write. Transitions MANUAL_REVIEW → `to`, optionally
- * inserts the DealHandoff (approve), and appends MANUAL_REVIEW_RESOLVED +
- * STATE_TRANSITION — all in one transaction.
- *
- * Returns the resolved instance. Throws ManualReviewRaceError if the OCC-CAS lost
- * (case already left MANUAL_REVIEW) so the tx rolls back.
- *
- * NOTE: band validation is the caller's job (call assertFeeWithinBand first) — it
- * needs the snapshot loaded and must run before the tx opens.
- */
+/** The one atomic resolution write: MANUAL_REVIEW → `to` + optional DealHandoff +
+ *  MANUAL_REVIEW_RESOLVED + STATE_TRANSITION, in one tx. Throws ManualReviewRaceError
+ *  if the OCC-CAS lost. Caller runs assertFeeWithinBand first (needs the snapshot). */
 export async function resolveManualReviewCase(
   instanceId: string,
   input: ResolveInput,
@@ -161,12 +134,10 @@ export async function resolveManualReviewCase(
       throw new Error("approve requires creator identity for the DealHandoff");
     }
 
-    // OCC-CAS FIRST — only advances a row STILL in MANUAL_REVIEW. A lost race
-    // throws here, rolling the whole tx back BEFORE any DealHandoff write, so a
-    // concurrent/retried approve leaves no orphan handoff. (Insert-first would trip
-    // the DealHandoff unique constraint on a retry, which aborts the Postgres tx and
-    // makes the idempotent catch's fallback SELECT unrunnable — so order matters.)
-    // All four targets are terminal, so completedAt is stamped and dueAt cleared.
+    // OCC-CAS FIRST, then DealHandoff. A lost race throws before any handoff write
+    // (no orphan). Order matters: insert-first would trip the DealHandoff unique
+    // constraint on a retry, aborting the PG tx so the idempotent fallback SELECT
+    // can't run. Targets are terminal → completedAt stamped, dueAt cleared.
     const updated = await updateInstanceStateConditional(
       instanceId,
       "MANUAL_REVIEW",
@@ -175,9 +146,7 @@ export async function resolveManualReviewCase(
     );
     if (!updated) throw new ManualReviewRaceError(instanceId);
 
-    // Approve → write the final creator-specific terms to DealHandoff (still inside
-    // the tx, only on the winning path). The case just left MANUAL_REVIEW, so this
-    // is the first and only handoff insert; a retry never reaches here.
+    // Approve → final terms to DealHandoff (winning path only; first & only insert).
     if (input.to === "NEEDS_DEAL_FINALIZATION") {
       await createDealHandoffOnce(
         {
@@ -231,16 +200,13 @@ export async function resolveManualReviewCase(
 // ---------------------------------------------------------------------------
 
 export interface ManualReviewCaseMeta {
-  /** The case deadline (instance.dueAt); null when the timeout feature is off. */
   deadline: Date | null;
-  /** Count of brand nudges sent — MANUAL_REVIEW_NUDGED events ONLY (never
-   *  BRAND_NOTIFIED, which the original escalation notice also emits). */
+  /** Nudges sent — MANUAL_REVIEW_NUDGED only (NOT BRAND_NOTIFIED, which the
+   *  original escalation notice also emits, so it would over-count). */
   nudgeCount: number;
 }
 
-/** Case metadata for the queue list/detail. `events` is the instance's log
- *  (caller already loads it for deriveEscalation); deadline comes from the
- *  instance row. Pure counting, so no extra query. */
+/** Case meta for the queue row — deadline + nudge count. Pure (no extra query). */
 export function getManualReviewCaseMeta(
   instance: Pick<ExecutionInstance, "dueAt">,
   events: Event[],

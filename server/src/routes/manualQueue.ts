@@ -687,11 +687,9 @@ router.post(
         });
         return;
       }
-      // V1 scope: approve → operator onboarding, which only makes sense for an
-      // operator_handoff execution. A local_payment creator routed to
-      // NEEDS_DEAL_FINALIZATION would strand (no brief / payout is ever sent from
-      // there) — reject or resolve via the payment flow instead. Full mode-branching
-      // is PLU-155's onboarding job.
+      // V1: approve → operator onboarding, so only valid for operator_handoff. A
+      // local_payment creator in NEEDS_DEAL_FINALIZATION would strand (no brief/
+      // payout sent) — full mode-branching is PLU-155's job.
       if (inst.postAcceptanceMode !== "operator_handoff") {
         res.status(422).json({
           error:

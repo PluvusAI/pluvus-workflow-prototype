@@ -15,22 +15,13 @@ import { notifyBrandOfEscalation } from "../notifications/escalation.js";
 import { emailProvider } from "../engine/providerFactory.js";
 import type { IEmailProvider } from "../engine/providers.js";
 
-// ---------------------------------------------------------------------------
-// Manual-review timeout + nudge sweep (PLU-154)
-// ---------------------------------------------------------------------------
-// Runs on the poller cadence under the leader lease. Two jobs:
-//   1. EXPIRE cases whose deadline (instance.dueAt) has passed → EXPIRED, a
-//      distinguishable timeout terminal (never NO_RESPONSE). The transition is the
-//      SAME OCC-CAS resolveManualReviewCase a human uses, so if a human just
-//      resolved the case the CAS loses the race and the sweep no-ops — deterministic:
-//      human wins, sweep skips.
-//   2. NUDGE the brand before the deadline: re-fire the existing (idempotent)
-//      escalation notice with a per-nudge discriminator so each nudge sends once.
-//      The notice targets the BRAND/operator (campaign notifyEmail → BRAND_NOTIFY_
-//      EMAIL → operator), never the creator — creator-facing closure is PLU-155.
-//
-// The timeout is mandatory — every MANUAL_REVIEW case is stamped with a deadline on
-// entry, so this sweep always runs and no case can sit unresolved forever.
+// PLU-154 manual-review timeout + nudge sweep. Runs each poll under the leader lease:
+//   1. EXPIRE past-deadline cases → EXPIRED (distinct from NO_RESPONSE) via the same
+//      OCC-CAS a human uses, so a human who just resolved wins the race and the sweep
+//      no-ops.
+//   2. NUDGE the brand pre-deadline: re-fire the escalation notice with a per-nudge
+//      discriminator (each sends once). Brand/operator only, never the creator (PLU-155).
+// The timeout is mandatory, so this sweep always has work to do.
 
 export interface ManualReviewSweepDeps {
   listExpiredManualReviewCases(args: { now: Date; limit?: number }): Promise<ExecutionInstance[]>;
@@ -51,9 +42,7 @@ const defaultDeps: ManualReviewSweepDeps = {
   notifyBrandOfEscalation,
   appendEvent,
   email: emailProvider,
-  // Date.now() is fine in app code (only Workflow scripts forbid it); wrapped so
-  // tests can inject a fixed clock.
-  now: () => new Date(),
+  now: () => new Date(), // wrapped so tests can inject a fixed clock
 };
 
 export interface ManualReviewSweepResult {
@@ -87,9 +76,7 @@ export async function sweepManualReviewTimeouts(
         reason: "manual_review_timeout",
         source: "system",
       });
-      // The resolution appended MANUAL_REVIEW_RESOLVED + STATE_TRANSITION; add the
-      // distinguishing timeout marker so the timeline reads unambiguously as a
-      // brand-inactivity expiry (not a creator no-response).
+      // Add the timeout marker so the timeline reads as a brand-inactivity expiry.
       await deps.appendEvent({
         instanceId: inst.id,
         type: "MANUAL_REVIEW_EXPIRED",
