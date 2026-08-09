@@ -8,19 +8,12 @@ import { manualReviewDueAt, nudgeDueAt } from "./manualReviewConfig.js";
 
 const DAY = 24 * 60 * 60_000;
 
-test("manualReviewDueAt returns null when the timeout feature is off", () => {
-  delete process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"];
-  assert.equal(manualReviewDueAt(new Date()), null);
-});
-
-test("manualReviewDueAt stamps now + timeout when enabled", () => {
-  process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"] = "true";
+test("manualReviewDueAt always stamps now + timeout (mandatory, not flag-gated)", () => {
   const now = new Date("2026-08-09T00:00:00.000Z");
   const due = manualReviewDueAt(now);
   assert.ok(due, "expected a deadline");
   // Default 7d (module-level const captured at import; env not overridden here).
-  assert.equal(due!.getTime(), now.getTime() + 7 * DAY);
-  delete process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"];
+  assert.equal(due.getTime(), now.getTime() + 7 * DAY);
 });
 
 test("nudgeDueAt: fires the Nth nudge once its offset has passed, in order", () => {

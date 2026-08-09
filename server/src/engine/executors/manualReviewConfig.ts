@@ -6,12 +6,11 @@
 // entry) and a set of pre-deadline brand NUDGES, and a timeout sweep that expires
 // the case if no human acts.
 //
-// The whole timeout mechanism is OFF by default (repo convention: every new
-// behavior ships dark). With MANUAL_REVIEW_TIMEOUT_ENABLED unset, manualReviewDueAt
-// returns null → no deadline is stamped → the sweep finds nothing → today's
-// behavior (a case sits in MANUAL_REVIEW until a human acts) is byte-identical.
-// Enabling it in staging/prod is what makes the "no creator remains indefinitely
-// in MANUAL_REVIEW" acceptance criterion hold live.
+// The timeout is MANDATORY, not flag-gated: every case entering MANUAL_REVIEW is
+// stamped with a deadline and WILL be expired if unresolved. This is what makes the
+// "no creator remains indefinitely in MANUAL_REVIEW" acceptance criterion hold
+// unconditionally rather than only when a flag is on. The DURATIONS stay
+// env-tunable (timeout length + nudge offsets); only the on/off switch is gone.
 
 /** Non-negative integer env var, else fallback. Mirrors brandApprovalSweep.envInt. */
 function envInt(name: string, fallback: number): number {
@@ -19,11 +18,6 @@ function envInt(name: string, fallback: number): number {
   if (raw === undefined || raw.trim() === "") return fallback;
   const n = Number(raw);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
-}
-
-/** Dark by default. Read at MR-entry (dueAt stamping) and in the sweep. */
-export function manualReviewTimeoutEnabled(): boolean {
-  return process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"] === "true";
 }
 
 /** How long a case may sit in MANUAL_REVIEW before the sweep expires it. 7d default. */
@@ -56,12 +50,11 @@ function parseNudgeOffsets(raw: string | undefined): number[] {
 }
 
 /**
- * The deadline to stamp when an instance enters MANUAL_REVIEW: now + timeout, or
- * null when the timeout feature is off (leaving dueAt null = no timeout, exactly
- * today's behavior). Both MR write paths in runtime.ts call this.
+ * The deadline to stamp when an instance enters MANUAL_REVIEW: now + timeout.
+ * Always returns a deadline — the timeout is mandatory, so every MR case is bounded.
+ * Both MR write paths in runtime.ts call this.
  */
-export function manualReviewDueAt(now: Date): Date | null {
-  if (!manualReviewTimeoutEnabled()) return null;
+export function manualReviewDueAt(now: Date): Date {
   return new Date(now.getTime() + manualReviewTimeoutMs);
 }
 

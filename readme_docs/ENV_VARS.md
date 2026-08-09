@@ -47,15 +47,13 @@ Two audiences:
 ### Manual-review timeout (PLU-154)
 
 The poller sweep that expires unresolved `MANUAL_REVIEW` cases and nudges the brand
-before the deadline. OFF by default — with `MANUAL_REVIEW_TIMEOUT_ENABLED` unset no
-deadline is ever stamped, so the sweep is a no-op and a case sits in MANUAL_REVIEW
-until a human acts (today's behavior). Enable in staging/prod so no creator can sit
-in MANUAL_REVIEW indefinitely.
+before the deadline. **Mandatory — there is no on/off flag:** every case entering
+MANUAL_REVIEW is stamped with a deadline, so no creator can sit in MANUAL_REVIEW
+indefinitely. Only the durations are tunable.
 
 | Var | Req? | Default | Purpose |
 |---|---|---|---|
-| `MANUAL_REVIEW_TIMEOUT_ENABLED` | ⬜ | `false` | Master switch. `true` = stamp a deadline on MR entry, nudge, and expire (→ `EXPIRED`, distinct from `NO_RESPONSE`). |
-| `MANUAL_REVIEW_TIMEOUT_MS` | ⬜ | `604800000` | How long (ms) a case may sit in MANUAL_REVIEW before the sweep expires it. Default 7 days. |
+| `MANUAL_REVIEW_TIMEOUT_MS` | ⬜ | `604800000` | How long (ms) a case may sit in MANUAL_REVIEW before the sweep expires it (→ `EXPIRED`, distinct from `NO_RESPONSE`). Default 7 days. |
 | `MANUAL_REVIEW_NUDGE_OFFSETS_MS` | ⬜ | `259200000,86400000` | Comma list of "ms before deadline" to nudge the brand (default 3d, 1d). Nudges target the brand/operator, never the creator. |
 
 ## 4. Randomized send delay

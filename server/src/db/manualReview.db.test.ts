@@ -21,6 +21,7 @@ import {
   assertFeeWithinBand,
   findNegotiationPolicySnapshotById,
   listExpiredManualReviewCases,
+  listManualReviewCasesForNudge,
   countNudges,
   getManualReviewCaseMeta,
   ManualReviewRaceError,
@@ -341,7 +342,6 @@ test("concurrent approve vs reject: exactly one wins (OCC), the other gets a rac
 test("timeout sweep expires a past-deadline case to EXPIRED; leaves a future one; human wins the race", async () => {
   const { db, pg } = await freshDb();
   try {
-    process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"] = "true";
     const now = new Date("2026-08-09T00:00:00.000Z");
     const past = await makeManualReviewCase(db, { dueAt: new Date(now.getTime() - 1000) });
     const future = await makeManualReviewCase(db, { dueAt: new Date(now.getTime() + 86400000) });
@@ -377,18 +377,30 @@ test("timeout sweep expires a past-deadline case to EXPIRED; leaves a future one
     const second = await sweepManualReviewTimeouts(later as never);
     assert.equal(second.expired, 0, "human-resolved case is not re-expired");
     assert.equal(await stateOf(db, future.instanceId), "REJECTED");
-
-    delete process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"];
   } finally {
     await pg.close();
   }
 });
 
-test("sweep is a no-op when the timeout feature is off", async () => {
+test("sweep is a no-op when no case is due (empty queue)", async () => {
   const { db, pg } = await freshDb();
   try {
-    delete process.env["MANUAL_REVIEW_TIMEOUT_ENABLED"];
-    const result = await sweepManualReviewTimeouts();
+    const now = new Date("2026-08-09T00:00:00.000Z");
+    // A case whose deadline is well in the future — not due to expire OR nudge.
+    await makeManualReviewCase(db, { dueAt: new Date(now.getTime() + 30 * 86400000) });
+    const deps = {
+      listExpiredManualReviewCases: (a: { now: Date; limit?: number }) => listExpiredManualReviewCases(a, db),
+      listManualReviewCasesForNudge: (a: { now: Date; limit?: number }) => listManualReviewCasesForNudge(a, db),
+      countNudges: (id: string) => countNudges(id, db),
+      resolveManualReviewCase: (id: string, input: Parameters<typeof resolveManualReviewCase>[1]) =>
+        resolveManualReviewCase(id, input, db),
+      notifyBrandOfEscalation: async () => ({}),
+      appendEvent: (data: Parameters<typeof import("./events.js").appendEvent>[0]) =>
+        db.insert(schema.events).values(data).returning().then((r) => r[0]!),
+      email: () => ({}) as never,
+      now: () => now,
+    };
+    const result = await sweepManualReviewTimeouts(deps as never);
     assert.deepEqual(result, { expired: 0, nudged: 0 });
   } finally {
     await pg.close();

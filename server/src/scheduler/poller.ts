@@ -86,9 +86,10 @@ async function poll(): Promise<void> {
   }
 
   // PLU-154: expire MANUAL_REVIEW cases the brand never resolved before their
-  // deadline (→ EXPIRED) and send the pre-deadline brand nudges. OFF by default
-  // (MANUAL_REVIEW_TIMEOUT_ENABLED) — a no-op until enabled. Runs under the leader
-  // lease; wrapped so a sweep DB/email blip can never disturb the due-instance path.
+  // deadline (→ EXPIRED) and send the pre-deadline brand nudges. The timeout is
+  // mandatory (every MR case is stamped with a deadline on entry). Runs under the
+  // leader lease; wrapped so a sweep DB/email blip can never disturb the
+  // due-instance path.
   try {
     await sweepManualReviewTimeouts();
   } catch (err) {

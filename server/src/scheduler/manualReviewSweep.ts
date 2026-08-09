@@ -8,7 +8,6 @@ import {
 } from "../db/index.js";
 import type { ExecutionInstance } from "../db/schema.js";
 import {
-  manualReviewTimeoutEnabled,
   manualReviewNudgeOffsetsMs,
   nudgeDueAt,
 } from "../engine/executors/manualReviewConfig.js";
@@ -30,9 +29,8 @@ import type { IEmailProvider } from "../engine/providers.js";
 //      The notice targets the BRAND/operator (campaign notifyEmail → BRAND_NOTIFY_
 //      EMAIL → operator), never the creator — creator-facing closure is PLU-155.
 //
-// The whole sweep is OFF unless MANUAL_REVIEW_TIMEOUT_ENABLED (dark default): with
-// it off no deadline is ever stamped, so both queries return nothing anyway; the
-// early return just avoids the work.
+// The timeout is mandatory — every MANUAL_REVIEW case is stamped with a deadline on
+// entry, so this sweep always runs and no case can sit unresolved forever.
 
 export interface ManualReviewSweepDeps {
   listExpiredManualReviewCases(args: { now: Date; limit?: number }): Promise<ExecutionInstance[]>;
@@ -66,8 +64,6 @@ export interface ManualReviewSweepResult {
 export async function sweepManualReviewTimeouts(
   deps: ManualReviewSweepDeps = defaultDeps,
 ): Promise<ManualReviewSweepResult> {
-  if (!manualReviewTimeoutEnabled()) return { expired: 0, nudged: 0 };
-
   const now = deps.now();
   let expired = 0;
   let nudged = 0;
