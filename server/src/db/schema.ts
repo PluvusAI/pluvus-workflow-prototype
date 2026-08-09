@@ -237,6 +237,7 @@ export const campaignAuditEventTypeEnum = pgEnum("CampaignAuditEventType", [
   "BRIEF_RENDERED",
   "POLICY_CHANGED",
   "ARCHIVED",
+  "CLOSING", // PLU-153: ACTIVE → CLOSING transition
 ]);
 
 // PLU-135 (1a): a campaign's launch lifecycle. DRAFT is freely editable;

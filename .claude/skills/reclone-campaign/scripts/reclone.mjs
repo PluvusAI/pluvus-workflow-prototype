@@ -239,7 +239,8 @@ async function main() {
   if (keepOriginal) {
     console.log("> Skipping delete (--keep): original left in place.");
   } else {
-    await req("DELETE", `/campaigns/${original.id}`);
+    // PLU-153: a launched campaign 409s on a plain DELETE — dev-reset forces it.
+    await req("DELETE", `/campaigns/${original.id}?force=true`);
     console.log(`> Deleted original ${original.id}`);
   }
 

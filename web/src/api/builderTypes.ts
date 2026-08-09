@@ -144,10 +144,17 @@ export interface DraftNode {
 // Campaign
 // ---------------------------------------------------------------------------
 
+/** PLU-135/153: a campaign's lifecycle state. */
+export type CampaignStatus = "DRAFT" | "ACTIVE" | "CLOSING" | "ARCHIVED";
+
 export interface CampaignListItem {
   id: string;
   name: string;
   brand: string;
+  /** PLU-153: lifecycle state; drives the status badge + End-campaign action. */
+  status: CampaignStatus;
+  /** PLU-153: set only by the later CLOSING→ARCHIVED reconciliation (PLU-156). */
+  archivedAt: string | null;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;
@@ -201,6 +208,17 @@ export interface CampaignDetail {
   id: string;
   name: string;
   brand: string;
+  /** PLU-153: lifecycle state. */
+  status: CampaignStatus;
+  archivedAt: string | null;
+  /** PLU-153: closing metadata, read off the CLOSING audit event. Null until closed. */
+  closingInitiatedAt: string | null;
+  closingInitiatedBy: string | null;
+  closingReason: string | null;
+  /** PLU-153: coarse creator-journey counts for the Closing dashboard (display only). */
+  totalCreatorCount: number;
+  inProgressCreatorCount: number;
+  manualReviewCount: number;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;

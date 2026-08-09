@@ -8,6 +8,9 @@ import {
   findCampaignById,
   deleteCampaign,
   launchCampaign,
+  transitionCampaignToClosing,
+  getCampaignClosingMetadata,
+  getCampaignLifecycleCounts,
   CampaignNotFoundError,
   CampaignDetailsMissingError,
   NegotiationPolicyMissingError,
@@ -48,6 +51,8 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     // sense (writes are rejected once ACTIVE), not the "live draft" language
     // above literally implies once a campaign reaches this state.
     status: campaign.status,
+    // PLU-153: null = live; a CLOSING→ARCHIVED reconciliation (PLU-156) stamps it.
+    archivedAt: campaign.archivedAt ? campaign.archivedAt.toISOString() : null,
     objective: details?.objective ?? null,
     notes: campaign.notes,
     notifyEmail: campaign.notifyEmail,
@@ -275,8 +280,18 @@ router.get("/:id", async (req: Request, res: Response) => {
       return;
     }
     const details = await getCampaignDetails(campaign.id);
+    // PLU-153: lifecycle metadata for the Closing dashboard — who/when initiated
+    // Closing (read off the CLOSING audit event) + coarse creator-journey counts.
+    const [closing, counts] = await Promise.all([
+      getCampaignClosingMetadata(campaign.id),
+      getCampaignLifecycleCounts(campaign.id),
+    ]);
     res.json({
       ...flattenCampaign(campaign, details),
+      closingInitiatedAt: closing?.closingInitiatedAt ?? null,
+      closingInitiatedBy: closing?.closingInitiatedBy ?? null,
+      closingReason: closing?.closingReason ?? null,
+      ...counts,
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
       workflows: campaign.workflows.map((w) => ({
@@ -532,13 +547,61 @@ router.post("/:id/launch", async (req: Request, res: Response) => {
   }
 });
 
-// DELETE /campaigns/:id — delete a campaign and all its workflows/instances
-// (or archive it, if already launched — see deleteCampaign's doc comment)
+// POST /campaigns/:id/close — PLU-153: the intentional ACTIVE → CLOSING
+// transition ("End campaign"). Stops new creator intake + initial outreach;
+// existing creator journeys keep running. Idempotent: already-Closing → 200.
+// archivedAt is NOT touched here (PLU-156 owns CLOSING → ARCHIVED).
+router.post("/:id/close", async (req: Request, res: Response) => {
+  const { reason } = req.body as { reason?: unknown };
+  const cleanReason =
+    typeof reason === "string" && reason.trim() ? reason.trim() : null;
+  try {
+    const result = await transitionCampaignToClosing(req.params["id"]!, {
+      actorId: "operator",
+      reason: cleanReason,
+    });
+    if (result === null) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    if (result.status === "invalid") {
+      res.status(409).json({
+        error: `cannot move a ${result.from.toLowerCase()} campaign to Closing; only an Active campaign can be closed`,
+      });
+      return;
+    }
+    // Both "closed" and "already_closing" → 200 with the current lifecycle.
+    const details = await getCampaignDetails(result.campaign.id);
+    res.json({
+      ...flattenCampaign(result.campaign, details),
+      updatedAt: result.campaign.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    console.error("[campaigns] close error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// DELETE /campaigns/:id — PLU-153: hard-delete gated by status. A DRAFT
+// (unlaunched) campaign hard-deletes as before. A launched campaign (ACTIVE/
+// CLOSING/ARCHIVED) is NOT deletable through the normal action — 409 telling
+// the operator to use End campaign instead — UNLESS ?force=true is passed
+// (reclone / dev-reset), which hard-deletes regardless of status. This route
+// never sets archivedAt: ending a campaign uses POST /:id/close, and archival
+// is PLU-156's job.
 router.delete("/:id", async (req: Request, res: Response) => {
   try {
     const campaign = await findCampaignById(req.params["id"]!);
     if (!campaign) {
       res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const force = req.query["force"] === "true";
+    if (campaign.status !== "DRAFT" && !force) {
+      res.status(409).json({
+        error:
+          "cannot delete a launched campaign; use End campaign to move it to Closing (or pass ?force=true to hard-delete)",
+      });
       return;
     }
     await deleteCampaign(req.params["id"]!);
