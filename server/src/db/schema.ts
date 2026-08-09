@@ -125,6 +125,11 @@ export const instanceStateEnum = pgEnum("InstanceState", [
   // PLU-122. Appended by ALTER TYPE; queued initial outreach has a durable
   // Message reservation but has not yet been accepted for provider dispatch.
   "OUTREACH_QUEUED",
+  // PLU-154. Appended by ALTER TYPE. A MANUAL_REVIEW case the brand never
+  // resolved before its deadline — a DISTINGUISHABLE terminal outcome for a
+  // timed-out human-review case (deliberately NOT NO_RESPONSE, which is the
+  // creator-inactivity terminal). Reached only by the manual-review timeout sweep.
+  "EXPIRED",
 ]);
 
 // DB member order differs from schema.prisma's declaration order for the
@@ -199,6 +204,14 @@ export const eventTypeEnum = pgEnum("EventType", [
   "BRAND_APPROVAL_REQUESTED",
   "BRAND_APPROVED",
   "BRAND_REJECTED",
+  // PLU-154 manual-review resolution. Appended to mirror the DB's ALTER TYPE
+  // ADD VALUE order. RESOLVED carries the human outcome (approve/reject/opt-out)
+  // + resolver + reason + final terms; EXPIRED is the timeout terminal; NUDGED is
+  // one brand nudge before the deadline (the nudge count reads from THIS type only,
+  // never BRAND_NOTIFIED which the original escalation notice also emits).
+  "MANUAL_REVIEW_RESOLVED",
+  "MANUAL_REVIEW_EXPIRED",
+  "MANUAL_REVIEW_NUDGED",
 ]);
 
 // PLU-70: what happens after a negotiation is accepted. local_payment is the

@@ -194,4 +194,33 @@ test("AWAITING_BRAND_APPROVAL cannot jump straight to a success terminal", () =>
   );
 });
 
+// ---------------------------------------------------------------------------
+// PLU-154 — manual-review resolution + timeout
+// ---------------------------------------------------------------------------
+
+console.log("\nstate machine — PLU-154 manual-review resolution\n");
+
+test("MANUAL_REVIEW opens the four resolution edges", () => {
+  assert.doesNotThrow(() => assertTransition("MANUAL_REVIEW", "NEEDS_DEAL_FINALIZATION"));
+  assert.doesNotThrow(() => assertTransition("MANUAL_REVIEW", "REJECTED"));
+  assert.doesNotThrow(() => assertTransition("MANUAL_REVIEW", "OPTED_OUT"));
+  assert.doesNotThrow(() => assertTransition("MANUAL_REVIEW", "EXPIRED"));
+});
+
+test("MANUAL_REVIEW STAYS terminal (inbound reply to a parked case is dropped, not routed)", () => {
+  // Regression guard for the plan's CRITICAL defect 1: TRANSITIONS and
+  // TERMINAL_STATES are independent, so adding outbound edges must NOT flip
+  // isTerminal — else a reply to a parked case falls through to an invalid
+  // REPLY_RECEIVED edge and dead-letters.
+  assert.equal(isTerminal("MANUAL_REVIEW"), true);
+  assert.throws(() => assertTransition("MANUAL_REVIEW", "REPLY_RECEIVED"), InvalidTransitionError);
+  assert.throws(() => assertTransition("MANUAL_REVIEW", "NEGOTIATING"), InvalidTransitionError);
+});
+
+test("EXPIRED is a terminal outcome with no outgoing edges", () => {
+  assert.equal(isTerminal("EXPIRED"), true);
+  assert.throws(() => assertTransition("EXPIRED", "NEGOTIATING"), InvalidTransitionError);
+  assert.throws(() => assertTransition("EXPIRED", "MANUAL_REVIEW"), InvalidTransitionError);
+});
+
 console.log(`\n${n} passed\n`);

@@ -109,8 +109,20 @@ const TRANSITIONS: Record<InstanceState, InstanceState[]> = {
   REJECTED: [],
   OPTED_OUT: [],
   NO_RESPONSE: [],
-  // Human review queue — terminal until a human re-routes the instance.
-  MANUAL_REVIEW: [],
+  // Human review queue. PLU-154 opens the resolution edges a human (or the
+  // timeout sweep) takes a parked case out through:
+  //   NEEDS_DEAL_FINALIZATION — approve/finalize (operator onboarding, PLU-155)
+  //   REJECTED                — brand reject/close
+  //   OPTED_OUT               — creator withdrew
+  //   EXPIRED                 — brand never resolved before the deadline (sweep)
+  // MANUAL_REVIEW STAYS in TERMINAL_STATES below even with these outbound edges:
+  // TRANSITIONS and TERMINAL_STATES are independent (assertTransition reads only
+  // TRANSITIONS), and keeping it terminal preserves the inbound-worker contract —
+  // a creator reply to a parked human-review case is dropped, not force-transitioned
+  // into an invalid REPLY_RECEIVED edge (escalationTraps.test.ts).
+  MANUAL_REVIEW: ["NEEDS_DEAL_FINALIZATION", "REJECTED", "OPTED_OUT", "EXPIRED"],
+  // PLU-154: the timeout terminal of a MANUAL_REVIEW case the brand let expire.
+  EXPIRED: [],
 };
 
 // ---------------------------------------------------------------------------
@@ -135,6 +147,9 @@ const TERMINAL_STATES: InstanceState[] = [
   "OPTED_OUT",
   "NO_RESPONSE",
   "MANUAL_REVIEW",
+  // PLU-154: a timed-out MANUAL_REVIEW case. Terminal like the other closed
+  // outcomes — the inbound worker drops a late reply rather than resurrecting it.
+  "EXPIRED",
 ];
 
 export function isTerminal(state: InstanceState): boolean {

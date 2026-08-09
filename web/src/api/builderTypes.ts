@@ -528,11 +528,11 @@ export interface ManualQueueHandoff {
 export interface ManualQueueItem {
   instanceId: string;
   /**
-   * Which kind of "a human must act" this row is: an AI escalation, or a closed
-   * deal awaiting operator onboarding. They share one queue because they share
-   * one question — who picks this up?
+   * Which kind of "a human must act" this row is: an AI escalation, a closed deal
+   * awaiting operator onboarding, or a timed-out (EXPIRED) case shown read-only.
+   * They share one queue because they share one question — who picks this up?
    */
-  kind: "escalation" | "handoff";
+  kind: "escalation" | "handoff" | "expired";
   creatorId: string;
   creatorName: string;
   creatorEmail: string;
@@ -553,6 +553,13 @@ export interface ManualQueueItem {
   submittedUrls: string[];
   /** Convenience count of submittedUrls (0 for non-content-links escalations). */
   linkCount: number;
+  /** PLU-154: the manual-review timeout deadline (ISO), or null when the timeout
+   *  feature is off. The row shows a countdown when present. */
+  deadline: string | null;
+  /** PLU-154: how many pre-deadline brand nudges have been sent. */
+  nudgeCount: number;
+  /** PLU-154: true for an EXPIRED (timed-out) case. */
+  timedOut: boolean;
   notification: ManualQueueNotification | null;
   handoff: ManualQueueHandoff | null;
 }

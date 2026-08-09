@@ -4,6 +4,9 @@ import {
   useManualQueue,
   notifyBrand,
   completeHandoff,
+  approveManualReview,
+  rejectManualReview,
+  optOutManualReview,
   useBuilderInvalidator,
 } from "../../api/builderClient";
 import { POLL_INTERVAL_MS } from "../../api/client";
@@ -176,6 +179,11 @@ export function ManualQueueTab({ workflow }: Props) {
                   onNotify={() => void handleNotify(item)}
                   completing={completing === item.instanceId}
                   onComplete={() => void handleComplete(item)}
+                  onResolved={(msg) => {
+                    toast.success(msg);
+                    void inv.invalidateManualQueue();
+                  }}
+                  onResolveError={(msg) => toast.error(msg)}
                 />
               ))}
             </div>
@@ -214,6 +222,8 @@ function QueueRow({
   onNotify,
   completing,
   onComplete,
+  onResolved,
+  onResolveError,
 }: {
   item: ManualQueueItem;
   selected: boolean;
@@ -222,12 +232,17 @@ function QueueRow({
   onNotify: () => void;
   completing: boolean;
   onComplete: () => void;
+  onResolved: (message: string) => void;
+  onResolveError: (message: string) => void;
 }) {
   const notify = item.notification;
   const meta = notifyMeta[notify?.status ?? "NONE"];
   // PLU-70: a handoff row answers "what did we agree, and when?" — an escalation
   // row answers "why did the AI stop?". Same shell, different middle.
   const handoff = item.kind === "handoff" ? item.handoff : null;
+  // PLU-154: a live escalation row can be resolved by a human. An expired row is
+  // read-only (the case timed out); a handoff has its own "mark completed" action.
+  const resolvable = item.kind === "escalation";
 
   return (
     <div
@@ -345,6 +360,20 @@ function QueueRow({
                 <span style={{ fontSize: font.size.sm, color: colors.textDim }}>
                   · round {item.negotiationRound}
                 </span>
+              )}
+              {/* PLU-154: deadline countdown + nudge count. Only when the timeout
+                  feature is on (deadline present). An expired row says so. */}
+              {item.timedOut ? (
+                <span style={{ fontSize: font.size.sm, color: colors.danger }}>
+                  · timed out
+                </span>
+              ) : (
+                item.deadline && (
+                  <span style={{ fontSize: font.size.sm, color: colors.textDim }}>
+                    · resolve by {relativeTime(item.deadline)}
+                    {item.nudgeCount > 0 && ` · ${item.nudgeCount} nudge${item.nudgeCount === 1 ? "" : "s"} sent`}
+                  </span>
+                )
               )}
             </>
           )}
@@ -495,7 +524,172 @@ function QueueRow({
             ? "Resend"
             : "Notify brand"}
       </button>
+
+      {/* PLU-154: human resolution actions — approve/finalize, reject/close,
+          creator opted-out. Full-width strip below the row (flexBasis 100%). Only
+          on a live escalation; a handoff/expired row shows its own affordance. */}
+      {resolvable && (
+        <ResolutionPanel
+          item={item}
+          onResolved={onResolved}
+          onResolveError={onResolveError}
+        />
+      )}
     </div>
   );
 }
+
+// PLU-154: the resolve-a-case controls. Self-contained (its own form + in-flight
+// state) so QueueRow stays a display component. Approve opens a small terms form;
+// reject/opt-out take an optional reason. Buttons disable while in-flight (the OCC
+// on the server also guards a double-click).
+function ResolutionPanel({
+  item,
+  onResolved,
+  onResolveError,
+}: {
+  item: ManualQueueItem;
+  onResolved: (message: string) => void;
+  onResolveError: (message: string) => void;
+}) {
+  const [mode, setMode] = useState<null | "approve" | "reject" | "opt-out">(null);
+  const [busy, setBusy] = useState(false);
+  const [resolvedBy, setResolvedBy] = useState("");
+  const [reason, setReason] = useState("");
+  const [fee, setFee] = useState("");
+  const [commission, setCommission] = useState("");
+  const [deliverables, setDeliverables] = useState("");
+  const [approvedDeviation, setApprovedDeviation] = useState(false);
+
+  async function submit() {
+    if (!resolvedBy.trim()) {
+      onResolveError("Enter your name (resolvedBy) before resolving.");
+      return;
+    }
+    setBusy(true);
+    try {
+      if (mode === "approve") {
+        await approveManualReview(item.instanceId, {
+          resolvedBy: resolvedBy.trim(),
+          reason: reason.trim() || undefined,
+          terms: {
+            fixedFee: fee.trim() ? Number(fee) : undefined,
+            commissionRate: commission.trim() ? Number(commission) : undefined,
+            deliverables: deliverables.trim() || undefined,
+            approvedDeviation: approvedDeviation || undefined,
+          },
+        });
+        onResolved(`${item.creatorName} approved → ready for onboarding.`);
+      } else if (mode === "reject") {
+        await rejectManualReview(item.instanceId, {
+          resolvedBy: resolvedBy.trim(),
+          reason: reason.trim() || undefined,
+        });
+        onResolved(`${item.creatorName} rejected.`);
+      } else if (mode === "opt-out") {
+        await optOutManualReview(item.instanceId, {
+          resolvedBy: resolvedBy.trim(),
+          reason: reason.trim() || undefined,
+        });
+        onResolved(`${item.creatorName} recorded as opted out.`);
+      }
+      setMode(null);
+    } catch (err) {
+      onResolveError(err instanceof Error ? err.message : "Could not resolve the case.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const inputStyle = {
+    fontSize: font.size.sm,
+    color: colors.text,
+    background: colors.panel,
+    border: `1px solid ${colors.border}`,
+    borderRadius: radii.sm,
+    padding: "5px 8px",
+  } as const;
+
+  return (
+    <div style={{ flexBasis: "100%", marginTop: 4 }}>
+      {mode === null ? (
+        <div style={{ display: "flex", gap: 8 }}>
+          <button className="ds-focusable ds-btn ds-btn-secondary" style={resolveBtnStyle} onClick={() => setMode("approve")}>
+            Approve / finalize
+          </button>
+          <button className="ds-focusable ds-btn ds-btn-secondary" style={resolveBtnStyle} onClick={() => setMode("reject")}>
+            Reject / close
+          </button>
+          <button className="ds-focusable ds-btn ds-btn-secondary" style={resolveBtnStyle} onClick={() => setMode("opt-out")}>
+            Creator opted out
+          </button>
+        </div>
+      ) : (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+            padding: "10px 12px",
+            border: `1px solid ${colors.border}`,
+            borderRadius: radii.sm,
+            background: "#14151b",
+          }}
+        >
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input
+              style={{ ...inputStyle, flex: "1 1 160px" }}
+              placeholder="Your name (required)"
+              value={resolvedBy}
+              onChange={(e) => setResolvedBy(e.target.value)}
+            />
+            <input
+              style={{ ...inputStyle, flex: "2 1 220px" }}
+              placeholder={mode === "approve" ? "Note (optional)" : "Reason (optional)"}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+            />
+          </div>
+          {mode === "approve" && (
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <input style={{ ...inputStyle, width: 120 }} placeholder="Fee ($)" value={fee} onChange={(e) => setFee(e.target.value)} />
+              <input style={{ ...inputStyle, width: 140 }} placeholder="Commission (0–1)" value={commission} onChange={(e) => setCommission(e.target.value)} />
+              <input style={{ ...inputStyle, flex: "1 1 200px" }} placeholder="Deliverables (optional)" value={deliverables} onChange={(e) => setDeliverables(e.target.value)} />
+              <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: font.size.xs, color: colors.textDim }}>
+                <input type="checkbox" checked={approvedDeviation} onChange={(e) => setApprovedDeviation(e.target.checked)} />
+                Approve out-of-band fee
+              </label>
+            </div>
+          )}
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              className="ds-focusable ds-btn ds-btn-primary"
+              style={{ ...resolveBtnStyle, background: colors.accent, color: "#fff", border: "1px solid transparent" }}
+              disabled={busy}
+              onClick={() => void submit()}
+            >
+              {busy ? "Saving…" : mode === "approve" ? "Confirm approve" : mode === "reject" ? "Confirm reject" : "Confirm opt-out"}
+            </button>
+            <button className="ds-focusable ds-btn ds-btn-secondary" style={resolveBtnStyle} disabled={busy} onClick={() => setMode(null)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const resolveBtnStyle = {
+  fontSize: font.size.sm,
+  fontWeight: font.weight.medium,
+  color: colors.text,
+  background: colors.panel,
+  border: `1px solid ${colors.borderStrong}`,
+  borderRadius: radii.sm + 1,
+  padding: "0 12px",
+  height: 30,
+  cursor: "pointer",
+  whiteSpace: "nowrap",
+} as const;
 

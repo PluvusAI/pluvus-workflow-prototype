@@ -70,6 +70,10 @@ enum InstanceState {
   NO_RESPONSE
   // Requires human review (low-confidence classification, Phase 7)
   MANUAL_REVIEW
+  // PLU-154: a MANUAL_REVIEW case the brand never resolved before its deadline.
+  // A distinguishable timeout terminal (NOT NO_RESPONSE, which is creator
+  // inactivity). Reached only by the manual-review timeout sweep.
+  EXPIRED
 }
 
 /// The node types that make up the in-scope linear workflow.
@@ -162,6 +166,14 @@ enum EventType {
   DEAL_HANDOFF_REPLY
   // Operator handoff: an operator marked the handoff complete.
   DEAL_HANDOFF_COMPLETED
+  // PLU-154 manual-review resolution audit. RESOLVED carries the human outcome
+  // (approve → NEEDS_DEAL_FINALIZATION / reject → REJECTED / opt-out → OPTED_OUT)
+  // + resolver + reason + final creator-specific terms. EXPIRED is written by the
+  // timeout sweep. NUDGED is one pre-deadline brand nudge (the nudge count reads
+  // from THIS type only, never BRAND_NOTIFIED which the escalation notice emits).
+  MANUAL_REVIEW_RESOLVED
+  MANUAL_REVIEW_EXPIRED
+  MANUAL_REVIEW_NUDGED
 }
 
 /// What happens to an execution after the negotiation is accepted (PLU-70).

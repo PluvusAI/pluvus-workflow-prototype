@@ -55,6 +55,7 @@ import {
   executeEnd,
 } from "./executors/index.js";
 import { brandApprovalGateEnabled } from "./executors/brandApprovalConfig.js";
+import { manualReviewDueAt } from "./executors/manualReviewConfig.js";
 import { reserveBrandRejectCloseEmail } from "./executors/brandRejectEmail.js";
 import { markPaymentReceived } from "../db/index.js";
 import type { PayoutMethod } from "../db/schema.js";
@@ -275,6 +276,19 @@ export class WorkflowRuntime {
     }
 
     const now = new Date();
+
+    // PLU-154: stamp the manual-review DEADLINE on a FRESH transition into
+    // MANUAL_REVIEW. manualReviewDueAt returns null when the timeout feature is
+    // off (dark default), leaving dueAt null = no timeout = today's behavior. This
+    // is the executor-escalation write path (negotiation over-ceiling, output
+    // guard, missing brand name, content-links, …); the brand-reject direct-OCC
+    // path stamps the same way (see rejectViaBrandApproval below).
+    if (
+      result.nextState === "MANUAL_REVIEW" &&
+      instance.currentState !== "MANUAL_REVIEW"
+    ) {
+      patch.dueAt = manualReviewDueAt(now);
+    }
 
     // Attribute the transition. Explicit caller source wins; otherwise infer
     // the responsible agent from the domain event type so the timeline/logs can
@@ -1062,7 +1076,10 @@ export class WorkflowRuntime {
           currentState: "MANUAL_REVIEW",
           currentNodeId: instance.currentNodeId ?? null,
           completedAt: now,
-          dueAt: null,
+          // PLU-154: this is a FRESH entry into MANUAL_REVIEW (from
+          // AWAITING_BRAND_APPROVAL), so stamp the timeout deadline here too. Null
+          // when the timeout feature is off (dark default) = today's behavior.
+          dueAt: manualReviewDueAt(now),
         },
         tx,
         instance.version, // BUG-E1: version-guarded OCC.

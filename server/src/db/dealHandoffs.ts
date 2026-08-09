@@ -1,5 +1,5 @@
 import { and, eq, inArray } from "drizzle-orm";
-import { db } from "./drizzle.js";
+import { db, type Db, type DbTx } from "./drizzle.js";
 import { isUniqueViolation } from "./errors.js";
 import {
   dealHandoffs,
@@ -21,15 +21,20 @@ import {
  * Insert the acceptance snapshot, or return the existing row if one is already
  * there. Never throws on a duplicate — a retried handoff step is a no-op.
  */
+// `client` is injectable (defaults to the top-level `db`) so the insert can enlist
+// in an open transaction — PLU-154 writes the DealHandoff in the SAME tx as the
+// MANUAL_REVIEW→NEEDS_DEAL_FINALIZATION OCC transition, so a lost race rolls back
+// the handoff too (no orphan row). Existing callers pass nothing → unchanged.
 export async function createDealHandoffOnce(
   data: DealHandoffInsert,
+  client: Db | DbTx = db,
 ): Promise<DealHandoff> {
   try {
-    const rows = await db.insert(dealHandoffs).values(data).returning();
+    const rows = await client.insert(dealHandoffs).values(data).returning();
     return rows[0]!;
   } catch (err) {
     if (isUniqueViolation(err)) {
-      const existing = await findDealHandoffByInstance(data.instanceId);
+      const existing = await findDealHandoffByInstance(data.instanceId, client);
       if (existing) return existing;
     }
     throw err;
@@ -38,8 +43,9 @@ export async function createDealHandoffOnce(
 
 export async function findDealHandoffByInstance(
   instanceId: string,
+  client: Db | DbTx = db,
 ): Promise<DealHandoff | null> {
-  const rows = await db
+  const rows = await client
     .select()
     .from(dealHandoffs)
     .where(eq(dealHandoffs.instanceId, instanceId))
