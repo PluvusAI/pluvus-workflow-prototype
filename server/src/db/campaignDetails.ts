@@ -1,5 +1,5 @@
 import { eq, inArray } from "drizzle-orm";
-import { db } from "./drizzle.js";
+import { db, type Db, type DbTx } from "./drizzle.js";
 import {
   campaignDetails,
   campaigns,
@@ -22,8 +22,8 @@ export class CampaignLockedError extends Error {
   }
 }
 
-async function assertCampaignIsDraft(campaignId: string): Promise<void> {
-  const [campaign] = await db
+async function assertCampaignIsDraft(campaignId: string, client: Db | DbTx): Promise<void> {
+  const [campaign] = await client
     .select({ status: campaigns.status })
     .from(campaigns)
     .where(eq(campaigns.id, campaignId))
@@ -35,8 +35,9 @@ async function assertCampaignIsDraft(campaignId: string): Promise<void> {
 
 export async function getCampaignDetails(
   campaignId: string,
+  client: Db | DbTx = db,
 ): Promise<CampaignDetails | null> {
-  const rows = await db
+  const rows = await client
     .select()
     .from(campaignDetails)
     .where(eq(campaignDetails.campaignId, campaignId))
@@ -47,9 +48,10 @@ export async function getCampaignDetails(
 /** Batch lookup for list views — avoids one query per campaign. */
 export async function getCampaignDetailsByCampaignIds(
   campaignIds: string[],
+  client: Db | DbTx = db,
 ): Promise<Map<string, CampaignDetails>> {
   if (campaignIds.length === 0) return new Map();
-  const rows = await db
+  const rows = await client
     .select()
     .from(campaignDetails)
     .where(inArray(campaignDetails.campaignId, campaignIds));
@@ -68,9 +70,10 @@ export async function getCampaignDetailsByCampaignIds(
 export async function upsertCampaignDetails(
   campaignId: string,
   data: Omit<Partial<CampaignDetailsInsert>, "id" | "campaignId">,
+  client: Db | DbTx = db,
 ): Promise<CampaignDetails> {
-  await assertCampaignIsDraft(campaignId);
-  const rows = await db
+  await assertCampaignIsDraft(campaignId, client);
+  const rows = await client
     .insert(campaignDetails)
     .values({ campaignId, ...data })
     .onConflictDoUpdate({
