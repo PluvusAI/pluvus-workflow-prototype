@@ -12,7 +12,11 @@
 // unconditionally rather than only when a flag is on. The DURATIONS stay
 // env-tunable (timeout length + nudge offsets); only the on/off switch is gone.
 
-/** Non-negative integer env var, else fallback. Mirrors brandApprovalSweep.envInt. */
+// Non-negative integer env var, else fallback. Kept local (not shared) on purpose:
+// the one exported envInt (middleware/rateLimit.ts) takes a value not a name AND
+// drags in express-rate-limit, so importing it here would pollute this config
+// module's dep graph. Mirrors brandApprovalSweep.envInt / sendDelay.envInt — a
+// 5-line pure helper the repo already duplicates per-module by convention.
 function envInt(name: string, fallback: number): number {
   const raw = process.env[name];
   if (raw === undefined || raw.trim() === "") return fallback;
@@ -20,8 +24,9 @@ function envInt(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
 }
 
-/** How long a case may sit in MANUAL_REVIEW before the sweep expires it. 7d default. */
-export const manualReviewTimeoutMs: number = envInt(
+// How long a case may sit in MANUAL_REVIEW before the sweep expires it. 7d default.
+// Module-private: only manualReviewDueAt (below) reads it — no external caller.
+const manualReviewTimeoutMs: number = envInt(
   "MANUAL_REVIEW_TIMEOUT_MS",
   7 * 24 * 60 * 60_000,
 );
