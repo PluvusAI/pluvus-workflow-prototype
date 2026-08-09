@@ -144,4 +144,38 @@ test("moving a node (position only) preserves all edges through serialize", () =
   assert.deepEqual(b?.position, { x: 999, y: 42 });
 });
 
+// -- PLU-129: MISSING_COMPENSATION mirrored on the web validator --------------
+
+// A minimal valid pipeline whose NEGOTIATION node carries the config under test.
+function draftWithNegotiation(negConfig: Record<string, unknown>): DraftNode[] {
+  return [
+    { id: "a", type: "INITIAL_OUTREACH", order: 0, config: { subjectTemplate: "Hi", bodyTemplate: "B" } },
+    { id: "c", type: "NEGOTIATION", order: 1, config: negConfig },
+    { id: "d", type: "REWARD_SETUP", order: 2, config: {} },
+  ];
+}
+
+test("PLU-129 (web): no fee band AND no commission is rejected (neither)", () => {
+  const g = linearNodesToGraph(draftWithNegotiation({ minBudget: 0, maxBudget: 0 }));
+  const res = validateGraph(g);
+  assert.equal(res.valid, false);
+  assert.ok(res.errors.some((e) => e.code === "MISSING_COMPENSATION"));
+});
+
+test("PLU-129 (web): commission-only (0/0 + positive commission) is valid", () => {
+  const g = linearNodesToGraph(
+    draftWithNegotiation({ minBudget: 0, maxBudget: 0, commissionRate: 15 }),
+  );
+  const res = validateGraph(g);
+  assert.equal(res.valid, true, JSON.stringify(res.errors));
+});
+
+test("PLU-129 (web): fee-on node with a $0 floor still fails INVALID_ZERO_FLOOR (not MISSING_COMPENSATION)", () => {
+  const g = linearNodesToGraph(draftWithNegotiation({ minBudget: 0, maxBudget: 500 }));
+  const res = validateGraph(g);
+  assert.equal(res.valid, false);
+  assert.ok(res.errors.some((e) => e.code === "INVALID_ZERO_FLOOR"));
+  assert.ok(!res.errors.some((e) => e.code === "MISSING_COMPENSATION"));
+});
+
 console.log(`\n${passed} passed\n`);

@@ -752,6 +752,15 @@ export async function executeNegotiation(
   // accept/counter logic is already inert there and there's no money exposure to
   // guard, so that case falls through unchanged.) This is the runtime backstop for
   // the invariant the parent enforces at campaign-publish time.
+  // PLU-129: a commission-only campaign is the canonical 0/0 shape — resolveBand
+  // returns floor === 0 AND ceiling === 0 (both DEFINED, not undefined), so it
+  // does NOT trip this backstop. That is intentional: 0/0 is a VALID configured
+  // state (no fee band to negotiate), unlike a floor WITHOUT a ceiling. It
+  // proceeds to the agent, which — with the explicit-zero-ceiling fix in
+  // negotiate.py (PLU-129) — treats ceiling 0 as a real cap and ESCALATES any
+  // upfront-fee ask rather than negotiating an unbounded fee. We deliberately do
+  // NOT unconditionally escalate at 0/0 here: a creator who just asks "what's the
+  // commission?" must proceed, not be paged.
   const { floor, ceiling } = resolveBand(config);
   if (floor !== undefined && ceiling === undefined) {
     return escalateNoCeiling({ round: instance.negotiationRound });

@@ -72,8 +72,14 @@ export function defaultConfigFor(type: NodeType): NodeConfig {
       // defaults were dead.)
       return {};
     case "NEGOTIATION":
+      // PLU-129: a freshly dragged Negotiation node defaults to a VALID
+      // fixed-fee-on band. The old default (minBudget:0, maxBudget:500) was a $0
+      // floor with a positive ceiling, which fails INVALID_ZERO_FLOOR the moment
+      // it's dropped — a stale sharp edge. A positive floor makes the new node
+      // coherent with the "Include fixed fee = on" default the builder shows, and
+      // the operator can turn the toggle off for a commission-only campaign.
       return {
-        minBudget: 0,
+        minBudget: 200,
         maxBudget: 500,
         maxRounds: 3,
         // No approvalMode: the engine always auto-accepts within budget; the old

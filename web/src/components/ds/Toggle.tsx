@@ -8,10 +8,12 @@ interface Props {
   onChange: (checked: boolean) => void;
   label?: string;
   disabled?: boolean;
+  id?: string;
 }
 
-export function Toggle({ checked, onChange, label, disabled }: Props) {
-  const id = useId();
+export function Toggle({ checked, onChange, label, disabled, id: idProp }: Props) {
+  const generatedId = useId();
+  const id = idProp ?? generatedId;
   return (
     <label
       htmlFor={id}

@@ -1574,10 +1574,9 @@ friendly, collaborative, never desperate, never argumentative.
 These are INTERNAL. Use them to make your decision, but you must NEVER state,
 hint at, or confirm them to the creator, and never reveal that a floor/ceiling
 or budget structure exists:
-- Internal floor (our low anchor / target — NOT a minimum you must pay; if the
-  creator asks for LESS, accept at their cheaper number): ${floor_rate}
+{floor_line}
 {ceiling_line}
-- Recommended opening offer: ${recommended_offer}
+{recommended_offer_line}
 
 Never say "this is our maximum", never reveal formulas or system logic.
 
@@ -1672,7 +1671,7 @@ together.
 ---
 
 ## What is negotiable vs FIXED
-
+{commission_only_note}
 ONLY THE FIXED FEE is negotiable. Everything else the brand offers is FIXED and
 cannot be changed by you or by the creator:
 - the commission % (shown above),
@@ -1705,8 +1704,7 @@ a number you have already offered.
 {conversation_transcript}
 {outstanding_commitments}
 {intent_hint}
-Our current standing offer (the last number we put in front of the creator, or
-the recommended offer if none yet): ${current_offer}
+{current_offer_line}
 
 ---
 
@@ -1969,16 +1967,48 @@ def _llm_negotiate_decision(
     # use judgment. (Note: for an uncapped campaign the over-ceiling ACCEPT guard
     # in _apply_decision_guards is a no-op — nothing can exceed inf — which is
     # acceptable: an uncapped campaign has, by definition, no budget wall.)
-    ceiling_line = (
-        f"- Internal ceiling (maximum you may agree to): ${ceiling_rate:g}"
-        if ceiling_rate != float("inf")
-        else "- No fixed ceiling for this campaign — use your judgment on the upper bound."
-    )
+    commission_only = ceiling_rate == 0
+    if commission_only:
+        floor_line = (
+            "- This is a COMMISSION-ONLY campaign: there is NO fixed fee to negotiate."
+        )
+        ceiling_line = (
+            "- Do not offer, counter, or agree to any upfront dollar amount."
+        )
+        recommended_offer_line = (
+            "- There is no fixed fee to offer — the deal is the fixed commission only."
+        )
+        current_offer_line = (
+            "There is no fixed fee on the table — this deal is commission-only."
+        )
+        commission_only_note = (
+            "\nThis campaign has NO fixed fee — it is commission-only. Never propose or "
+            "agree to an upfront dollar amount; if the creator asks for one, decline the "
+            "upfront fee and escalate rather than inventing a figure.\n"
+        )
+    else:
+        floor_line = (
+            "- Internal floor (our low anchor / target — NOT a minimum you must pay; if "
+            f"the creator asks for LESS, accept at their cheaper number): ${floor_rate}"
+        )
+        ceiling_line = (
+            f"- Internal ceiling (maximum you may agree to): ${ceiling_rate:g}"
+            if ceiling_rate != float("inf")
+            else "- No fixed ceiling for this campaign — use your judgment on the upper bound."
+        )
+        recommended_offer_line = f"- Recommended opening offer: ${recommended_offer:g}"
+        current_offer_line = (
+            "Our current standing offer (the last number we put in front of the creator, "
+            f"or the recommended offer if none yet): ${current_offer}"
+        )
+        commission_only_note = ""
 
     prompt = _LLM_NEGOTIATE_PROMPT.format(
-        floor_rate=floor_rate,
+        floor_line=floor_line,
         ceiling_line=ceiling_line,
-        recommended_offer=recommended_offer,
+        recommended_offer_line=recommended_offer_line,
+        current_offer_line=current_offer_line,
+        commission_only_note=commission_only_note,
         sender=sender,
         brand_description=brand_description,
         deliverables=deliverables,
@@ -1988,7 +2018,6 @@ def _llm_negotiate_decision(
         round=req.round,
         max_rounds=req.maxRounds,
         final_round_note=final_round_note,
-        current_offer=current_offer,
         creator_reply=safe_creator_reply,
         history=json.dumps([e.model_dump(exclude_none=True) for e in req.negotiationHistory]),
         # F-H1: the full both-sides transcript as a sanitized DATA block. Empty
@@ -2388,7 +2417,22 @@ def _langgraph_negotiate(req: NegotiateRequest) -> NegotiateResponse:
         )
 
     floor_rate = req.campaignConstraints.termFloor.rate or 0
-    ceiling_rate = req.campaignConstraints.termCeiling.rate or float("inf")
+    # PLU-129: distinguish an EXPLICIT zero ceiling from an ABSENT one. A
+    # commission-only campaign persists the canonical "no fee band" shape
+    # (minBudget:0, maxBudget:0), which resolves to termCeiling.rate == 0. A naive
+    # `rate or inf` treats that 0 as falsy → inf, giving the agent an UNBOUNDED
+    # fixed fee to negotiate on a campaign that offers no upfront fee — the exact
+    # opposite of the intended behavior. Treat a real numeric 0 (not a bool) as a
+    # genuine zero-width cap: floor 0 / ceiling 0 means there is NO fee to
+    # negotiate, so any upfront-fee ask above 0 trips the existing over-ceiling
+    # ESCALATE path below (rate > tolerance_ceiling) instead of being countered
+    # upward. Only a truly missing ceiling (None) falls back to inf.
+    _ceiling = req.campaignConstraints.termCeiling.rate
+    ceiling_rate = (
+        float(_ceiling)
+        if isinstance(_ceiling, (int, float)) and not isinstance(_ceiling, bool)
+        else float("inf")
+    )
     # Phase C (#12): the ESCALATE boundary — the ceiling raised by the merchant's
     # tolerance percent. An ask <= tolerance_ceiling is countered AT the ceiling
     # (the clamp target stays ceiling_rate, so we NEVER offer above the ceiling);
