@@ -195,8 +195,11 @@ export class NegotiationPolicyMissingError extends Error {
  * one. Idempotent: launching an already-ACTIVE campaign is a no-op that
  * returns the existing snapshot rather than erroring or duplicating.
  */
-export async function launchCampaign(id: string): Promise<CampaignTermsSnapshot> {
-  return await db.transaction(async (tx) => {
+export async function launchCampaign(
+  id: string,
+  client: Db | DbTx = db,
+): Promise<CampaignTermsSnapshot> {
+  return await client.transaction(async (tx) => {
     const [campaign] = await tx
       .select()
       .from(campaigns)
@@ -239,6 +242,27 @@ export async function launchCampaign(id: string): Promise<CampaignTermsSnapshot>
     // campaign could go permanently Active with no fee bounds at all — and
     // because launch is one-way, campaign duplication would be the only fix.
     // Failing here instead leaves the campaign in Draft, still fixable.
+    //
+    // Code review note (Ayush, 2026-08-09): this is unconditional — EVERY
+    // campaign must have a NegotiationPolicy to launch, no exceptions. That's
+    // correct for today's product, where every workflow template has a
+    // negotiation node and every campaign negotiates; there's no "fixed /
+    // non-negotiated" campaign type yet for this to wrongly block. Both the
+    // 1a and 1b tickets do mention that type as future work, though — once it
+    // exists, this check will need to become type-aware (skip the guard for a
+    // campaign that was never meant to negotiate) rather than staying a blanket
+    // requirement. Not a problem today; just don't read this as permanent.
+    //
+    // Also worth naming: this guard cannot currently be satisfied by ANY
+    // campaign, because nothing populates NegotiationPolicy yet.
+    // upsertNegotiationPolicy (negotiationPolicy.ts) has zero callers — no
+    // DRAFT-time policy editor exists — while the negotiation bounds actually
+    // in live use today (floor/ceiling/rounds) still live in the workflow
+    // node's config and are read via resolveBand() by negotiation.ts, the
+    // output guard, providers.ts, and the accept-path executors. Bridging that
+    // old (node-config) source into this new (campaign-level) one is Issue
+    // 1c/1d's job, not this one — this guard is correct as written, it just
+    // has nothing to satisfy it until that bridge is built.
     const [policy] = await tx
       .select()
       .from(negotiationPolicies)
