@@ -1,8 +1,11 @@
-import { count, desc, eq, inArray } from "drizzle-orm";
-import { db, type DbTx } from "./drizzle.js";
+import { and, count, desc, eq, inArray, isNull } from "drizzle-orm";
+import { db, type Db, type DbTx } from "./drizzle.js";
 import {
   brandApprovals,
   brandNotifications,
+  campaignAuditEvents,
+  campaignDetails,
+  campaignTermsSnapshots,
   campaigns,
   clicks,
   conversationObligations,
@@ -12,6 +15,8 @@ import {
   executionInstances,
   llmCalls,
   messages,
+  negotiationPolicies,
+  negotiationPolicySnapshots,
   obligations,
   outboxJobs,
   partnerships,
@@ -21,6 +26,7 @@ import {
   workflowVersions,
   type Campaign,
   type CampaignInsert,
+  type CampaignTermsSnapshot,
   type WorkflowStatus,
 } from "./schema.js";
 
@@ -33,10 +39,15 @@ export async function listCampaigns(): Promise<
   (Campaign & { _count: { workflows: number } })[]
 > {
   // Prisma's include._count, expressed as a LEFT JOIN + GROUP BY on the pk.
+  // PLU-135 (1a): excludes archived campaigns — deleteCampaign() archives
+  // rather than deletes a launched campaign, so this filter is what keeps
+  // them out of the normal browse list. Direct lookup by id (findCampaignById)
+  // is deliberately unaffected.
   const rows = await db
     .select({ campaign: campaigns, workflowCount: count(workflows.id) })
     .from(campaigns)
     .leftJoin(workflows, eq(workflows.campaignId, campaigns.id))
+    .where(isNull(campaigns.archivedAt))
     .groupBy(campaigns.id)
     .orderBy(desc(campaigns.createdAt));
   return rows.map((r) => ({ ...r.campaign, _count: { workflows: r.workflowCount } }));
@@ -143,7 +154,208 @@ export async function deleteInstanceCascade(
     .where(inArray(executionInstances.id, instanceIds));
 }
 
+/**
+ * PLU-135 (1a) code-review fix (Ayush): launchCampaign()'s precondition
+ * failures are real, actionable, user-facing states (fix your campaign, then
+ * retry) — not internal errors. Typed so routes/campaigns.ts can map them to
+ * a real 4xx instead of every failure path collapsing into a generic 500.
+ */
+export class CampaignNotFoundError extends Error {
+  constructor(id: string) {
+    super(`Campaign ${id} not found`);
+    this.name = "CampaignNotFoundError";
+  }
+}
+
+export class CampaignDetailsMissingError extends Error {
+  constructor(id: string) {
+    super(`Campaign ${id} has no CampaignDetails to snapshot`);
+    this.name = "CampaignDetailsMissingError";
+  }
+}
+
+export class NegotiationPolicyMissingError extends Error {
+  constructor(id: string) {
+    super(
+      `Campaign ${id} has no NegotiationPolicy — cannot launch without negotiation bounds`,
+    );
+    this.name = "NegotiationPolicyMissingError";
+  }
+}
+
+/**
+ * PLU-135 (1a): THE launch transition — Draft → Active. Creates the ONE
+ * immutable CampaignTermsSnapshot and NegotiationPolicySnapshot this campaign
+ * will ever have (Calvin review, 2026-08-08: never at enrollment, which could
+ * already be too late — conversations may already be in flight against live
+ * data by then). After this call, campaignDetails/negotiationPolicies are
+ * locked read-only (enforced in their own upsert functions, not here) — a
+ * material change means duplicating into a new campaign, never editing this
+ * one. Idempotent: launching an already-ACTIVE campaign is a no-op that
+ * returns the existing snapshot rather than erroring or duplicating.
+ */
+export async function launchCampaign(
+  id: string,
+  client: Db | DbTx = db,
+): Promise<CampaignTermsSnapshot> {
+  return await client.transaction(async (tx) => {
+    const [campaign] = await tx
+      .select()
+      .from(campaigns)
+      .where(eq(campaigns.id, id))
+      .limit(1);
+    if (!campaign) {
+      throw new CampaignNotFoundError(id);
+    }
+
+    if (campaign.status === "ACTIVE") {
+      const [existing] = await tx
+        .select()
+        .from(campaignTermsSnapshots)
+        .where(eq(campaignTermsSnapshots.campaignId, id))
+        .limit(1);
+      if (!existing) {
+        // Should be unreachable — status flips to ACTIVE only inside this same
+        // transaction, alongside the snapshot insert below. Fail loud rather
+        // than silently re-launching if it ever happens.
+        throw new Error(`Campaign ${id} is ACTIVE but has no CampaignTermsSnapshot`);
+      }
+      return existing;
+    }
+
+    const [details] = await tx
+      .select()
+      .from(campaignDetails)
+      .where(eq(campaignDetails.campaignId, id))
+      .limit(1);
+    // detailsSnapshot always has a row to copy — every campaign gets a
+    // CampaignDetails row at creation (routes/campaigns.ts) or via the 1a
+    // migration's backfill. An absent row is a data-integrity bug, not a
+    // valid empty-draft state, so this fails loud instead of snapshotting {}.
+    if (!details) {
+      throw new CampaignDetailsMissingError(id);
+    }
+
+    // Schema review §2.3 (Calvin, 2026-08-08): refuse to launch without a
+    // NegotiationPolicy row, checked BEFORE any write below. Without this, a
+    // campaign could go permanently Active with no fee bounds at all — and
+    // because launch is one-way, campaign duplication would be the only fix.
+    // Failing here instead leaves the campaign in Draft, still fixable.
+    //
+    // Code review note (Ayush, 2026-08-09): this is unconditional — EVERY
+    // campaign must have a NegotiationPolicy to launch, no exceptions. That's
+    // correct for today's product, where every workflow template has a
+    // negotiation node and every campaign negotiates; there's no "fixed /
+    // non-negotiated" campaign type yet for this to wrongly block. Both the
+    // 1a and 1b tickets do mention that type as future work, though — once it
+    // exists, this check will need to become type-aware (skip the guard for a
+    // campaign that was never meant to negotiate) rather than staying a blanket
+    // requirement. Not a problem today; just don't read this as permanent.
+    //
+    // Also worth naming: this guard cannot currently be satisfied by ANY
+    // campaign, because nothing populates NegotiationPolicy yet.
+    // upsertNegotiationPolicy (negotiationPolicy.ts) has zero callers — no
+    // DRAFT-time policy editor exists — while the negotiation bounds actually
+    // in live use today (floor/ceiling/rounds) still live in the workflow
+    // node's config and are read via resolveBand() by negotiation.ts, the
+    // output guard, providers.ts, and the accept-path executors. Bridging that
+    // old (node-config) source into this new (campaign-level) one is Issue
+    // 1c/1d's job, not this one — this guard is correct as written, it just
+    // has nothing to satisfy it until that bridge is built.
+    const [policy] = await tx
+      .select()
+      .from(negotiationPolicies)
+      .where(eq(negotiationPolicies.campaignId, id))
+      .limit(1);
+    if (!policy) {
+      throw new NegotiationPolicyMissingError(id);
+    }
+
+    // Schema review §2.1: the snapshot's fallback pointer is whichever
+    // extraction these details were actually CONFIRMED from (set by whoever
+    // reviewed the AI's parse), never "the newest extraction for the
+    // campaign" — a brief re-uploaded after confirmation but before launch
+    // must not silently swap the fallback source underneath the confirmed
+    // terms. Nullable: a campaign typed by hand with no PDF is normal, and a
+    // confirmedFromExtractionId left unset behaves the same way — no fallback
+    // pointer, not an error.
+    const {
+      id: _detailsId,
+      campaignId: _detailsCampaignId,
+      confirmedFromExtractionId,
+      confirmedAt: _detailsConfirmedAt,
+      createdAt: _dc,
+      updatedAt: _du,
+      ...detailsSnapshot
+    } = details;
+
+    const [snapshot] = await tx
+      .insert(campaignTermsSnapshots)
+      .values({
+        campaignId: id,
+        detailsSnapshot,
+        briefExtractionId: confirmedFromExtractionId,
+      })
+      .returning();
+
+    await tx.insert(negotiationPolicySnapshots).values({
+      campaignId: id,
+      floorCents: policy.floorCents,
+      ceilingCents: policy.ceilingCents,
+      preferredFeeCents: policy.preferredFeeCents,
+      commissionRate: policy.commissionRate,
+      maxRounds: policy.maxRounds,
+      openingOfferPosition: policy.openingOfferPosition,
+      overCeilingTolerance: policy.overCeilingTolerance,
+      negotiationGuidance: policy.negotiationGuidance,
+      negotiableTerms: policy.negotiableTerms,
+      nonNegotiableTerms: policy.nonNegotiableTerms,
+    });
+
+    await tx.update(campaigns).set({ status: "ACTIVE" }).where(eq(campaigns.id, id));
+    await tx.insert(campaignAuditEvents).values({
+      campaignId: id,
+      eventType: "LAUNCHED",
+    });
+    await tx.insert(campaignAuditEvents).values({
+      campaignId: id,
+      eventType: "SNAPSHOT_CREATED",
+      payload: { campaignTermsSnapshotId: snapshot!.id },
+    });
+
+    return snapshot!;
+  });
+}
+
+/**
+ * PLU-135 (1a): a launched campaign (Campaign.status === "ACTIVE") is never
+ * hard-deleted — its CampaignTermsSnapshot, and everything RESTRICT-tied to
+ * it (briefs, audit events, pinned executions), is retained for historical
+ * recordkeeping per this project's "never lose the snapshot" invariant. This
+ * archives instead: `archivedAt` is stamped, nothing underneath is touched,
+ * and listCampaigns() stops surfacing it. A DRAFT campaign has no history
+ * worth protecting, so it still hard-deletes exactly as before.
+ */
 export async function deleteCampaign(id: string): Promise<void> {
+  const campaign = await findCampaignById(id);
+  if (!campaign) {
+    throw new Error(`Campaign ${id} not found`);
+  }
+
+  if (campaign.status === "ACTIVE") {
+    await db.transaction(async (tx) => {
+      await tx
+        .update(campaigns)
+        .set({ archivedAt: new Date() })
+        .where(and(eq(campaigns.id, id), isNull(campaigns.archivedAt)));
+      await tx.insert(campaignAuditEvents).values({
+        campaignId: id,
+        eventType: "ARCHIVED",
+      });
+    });
+    return;
+  }
+
   // W-7: the whole cascade runs in ONE transaction. Previously each DELETE was a
   // separate statement, so a crash partway through left orphaned rows (e.g.
   // instances deleted but their workflow/campaign still present, or events
@@ -184,6 +396,9 @@ export async function deleteCampaign(id: string): Promise<void> {
       await tx.delete(workflows).where(inArray(workflows.id, workflowIds));
     }
 
+    // CampaignDetails/NegotiationPolicy/BrandIdentity/CreatorRequirement all
+    // cascade-delete with Campaign at the database level (they're draft state,
+    // not history) — no explicit cleanup needed here.
     await tx.delete(campaigns).where(eq(campaigns.id, id));
   });
 }

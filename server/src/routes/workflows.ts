@@ -16,6 +16,7 @@ import {
 } from "../db/instances.js";
 import { listCreators } from "../db/creators.js";
 import { findCampaignById } from "../db/campaigns.js";
+import { getCampaignDetails } from "../db/campaignDetails.js";
 import {
   EmailAccountUnavailableError,
   resolveAccountForCampaign,
@@ -372,6 +373,9 @@ router.post("/:id/outreach/template", async (req: Request, res: Response) => {
       return;
     }
     const { workflow: wf, campaign } = found;
+    // PLU-135 (1a): brandDescription/deliverables/timeline/rewardDescription
+    // moved out of the Campaign row into CampaignDetails.
+    const details = campaign ? await getCampaignDetails(campaign.id) : null;
 
     // The client may pass ONLY an instruction and the current copy it is revising.
     // Everything factual (brand/campaign/deal) is assembled here so a client can't
@@ -387,7 +391,16 @@ router.post("/:id/outreach/template", async (req: Request, res: Response) => {
 
     // Assemble brand/campaign/deal context server-side (trust boundary).
     const { brandContext, allowedPlaceholders } = buildOutreachTemplateContext(
-      campaign,
+      campaign
+        ? {
+            brand: campaign.brand,
+            name: campaign.name,
+            brandDescription: details?.brandDescription ?? null,
+            deliverables: details?.deliverables ?? null,
+            timeline: details?.timeline ?? null,
+            rewardDescription: details?.productOrOffer ?? null,
+          }
+        : null,
       wf.draftNodes,
     );
 
@@ -478,14 +491,15 @@ router.put("/:id/draft", async (req: Request, res: Response) => {
     if (wf.campaignId) {
       const campaign = await findCampaignById(wf.campaignId);
       if (campaign) {
+        const details = await getCampaignDetails(campaign.id);
         nodesToSave = restampBrand(
           nodes,
           campaign.brand,
-          campaign.brandDescription,
-          campaign.deliverables,
-          campaign.timeline,
-          campaign.rewardDescription,
-          campaign.shipsPhysicalProduct,
+          details?.brandDescription,
+          details?.deliverables,
+          details?.timeline,
+          details?.productOrOffer,
+          details?.shipsPhysicalProduct,
         );
         // PLU-117: stamp campaignName + deal-shape sources onto the outreach node
         // so the builder palette/preview/AI see their real values (or hide them
@@ -566,14 +580,15 @@ router.post("/:id/publish", async (req: Request, res: Response) => {
     if (wf.campaignId) {
       const campaign = await findCampaignById(wf.campaignId);
       if (campaign) {
+        const details = await getCampaignDetails(campaign.id);
         nodeGraphToPublish = restampBrand(
           wf.draftNodes,
           campaign.brand,
-          campaign.brandDescription,
-          campaign.deliverables,
-          campaign.timeline,
-          campaign.rewardDescription,
-          campaign.shipsPhysicalProduct,
+          details?.brandDescription,
+          details?.deliverables,
+          details?.timeline,
+          details?.productOrOffer,
+          details?.shipsPhysicalProduct,
         ) as InputJsonValue;
         // PLU-117: freeze the derived outreach placeholder sources (campaignName +
         // deal shape) onto the immutable version, matching what the builder showed.

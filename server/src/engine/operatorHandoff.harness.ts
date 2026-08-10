@@ -41,6 +41,7 @@ import {
   workflows,
   workflowVersions,
 } from "../db/schema.js";
+import { upsertCampaignDetails } from "../db/campaignDetails.js";
 import {
   appendEvent,
   findInstanceById,
@@ -138,11 +139,15 @@ async function main(): Promise<void> {
     name: `Handoff Harness ${stamp}`,
     brand: "Acme",
     notifyEmail: NOTIFY_EMAIL,
-    deliverables: DELIVERABLES,
-    timeline: TIMELINE,
-    paymentTerms: PAYMENT_TERMS,
     postAcceptanceMode: "operator_handoff",
   }).returning())[0]!;
+  // PLU-135 (1a): deliverables/timeline/paymentTerms moved off Campaign onto
+  // CampaignDetails.
+  await upsertCampaignDetails(campaign.id, {
+    deliverables: DELIVERABLES,
+    timeline: TIMELINE,
+    publicPaymentTerms: PAYMENT_TERMS,
+  });
 
   const workflow = (await db.insert(workflows).values({
     name: `Handoff Harness ${stamp}`,
@@ -231,6 +236,12 @@ async function main(): Promise<void> {
     assert.equal(handoff!.commissionRate, COMMISSION);
     assert.equal(handoff!.deliverables, DELIVERABLES);
     assert.equal(handoff!.timeline, TIMELINE);
+    // PLU-135 (1a) code-review fix (Ayush): paymentTerms has no node-config
+    // source in this harness's graph (unlike deliverables/timeline above) —
+    // it relies entirely on the campaign-level fallback, which moved from
+    // Campaign to CampaignDetails. runtime.ts#loadContext now loads
+    // CampaignDetails into ExecutionContext alongside Campaign specifically
+    // so this fallback keeps resolving instead of silently going dead.
     assert.equal(handoff!.paymentTerms, PAYMENT_TERMS, "payment terms fall back to the campaign");
     assert.match(handoff!.acceptanceMessage ?? "", /works for me/i);
     assert.equal(handoff!.status, "AWAITING_FINALIZATION");

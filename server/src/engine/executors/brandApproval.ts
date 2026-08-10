@@ -17,7 +17,7 @@ import {
 } from "./brandApprovalToken.js";
 import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
 import { resolveBand } from "../band.js";
-import { resolveBrandName } from "../campaignContext.js";
+import { resolveBrandName, toCampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
 
@@ -52,8 +52,14 @@ export async function executeBrandApproval(
   ctx: ExecutionContext,
   email: IEmailProvider,
 ): Promise<NodeResult> {
-  const { instance, node, nodeGraph, creator, campaign } = ctx;
+  const { instance, node, nodeGraph, creator, campaign, campaignDetails } = ctx;
   const config = node.config;
+  // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
+  // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
+  // loads CampaignDetails alongside Campaign into ExecutionContext specifically
+  // so this fallback tier keeps working instead of silently resolving to
+  // nothing for every campaign.
+  const campaignFields = toCampaignBrandFields(campaign, campaignDetails);
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
@@ -96,18 +102,18 @@ export async function executeBrandApproval(
   const deliverables = firstString(
     config["deliverables"],
     negotiationConfig["deliverables"],
-    campaign?.deliverables,
+    campaignFields?.deliverables,
   );
   const timeline = firstString(
     config["timeline"],
     negotiationConfig["timeline"],
-    campaign?.timeline,
+    campaignFields?.timeline,
   );
-  const paymentTerms = firstString(config["paymentTerms"], campaign?.paymentTerms);
+  const paymentTerms = firstString(config["paymentTerms"], campaignFields?.paymentTerms);
   const rewardDescription = firstString(
     config["rewardDescription"],
     negotiationConfig["rewardDescription"],
-    campaign?.rewardDescription,
+    campaignFields?.rewardDescription,
   );
   const { floor: negotiationFloor, ceiling: negotiationCeiling } =
     resolveBand(negotiationConfig);

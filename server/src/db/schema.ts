@@ -27,6 +27,7 @@
 import {
   boolean,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -212,6 +213,55 @@ export const dealHandoffStatusEnum = pgEnum("DealHandoffStatus", [
   "COMPLETED",
 ]);
 
+// PLU-135 (1a): status of a rendered CampaignBrief document.
+export const campaignBriefRenderStatusEnum = pgEnum("CampaignBriefRenderStatus", [
+  "GENERATING",
+  "READY",
+  "FAILED",
+]);
+
+// PLU-135 (1a): how a BrandIdentity's values were populated.
+export const brandIdentityExtractionSourceEnum = pgEnum("BrandIdentityExtractionSource", [
+  "EXTRACTED",
+  "MANUAL",
+  "DEFAULT",
+]);
+
+// PLU-135 (1a): the append-only CampaignAuditEvent event catalogue.
+export const campaignAuditEventTypeEnum = pgEnum("CampaignAuditEventType", [
+  "CREATED",
+  "EDITED",
+  "LAUNCHED",
+  "SNAPSHOT_CREATED",
+  "DUPLICATED",
+  "BRIEF_RENDERED",
+  "POLICY_CHANGED",
+  "ARCHIVED",
+]);
+
+// PLU-135 (1a): a campaign's launch lifecycle. DRAFT is freely editable;
+// ACTIVE means it has launched — campaignTermsSnapshots and
+// negotiationPolicySnapshots exist, campaignDetails and negotiationPolicies
+// are locked read-only, and no second snapshot is ever created for this
+// campaign. A material change after launch means duplicating into a NEW
+// campaign, never editing this one (Calvin review, 2026-08-08).
+//
+// CLOSING / ARCHIVED are declared now, RESERVED for PLU-133 (dependent on
+// PLU-110) — no transition INTO either value is written anywhere in this
+// codebase yet. Declaring them costs nothing (an unused enum value) and
+// avoids a second migration touching this column later; what they actually
+// mean — whether ARCHIVED here subsumes campaigns.archivedAt below, whether
+// CLOSING is even a stored state vs. a computed one — is explicitly NOT
+// decided by this schema and must not be inferred from it. campaigns.archivedAt
+// (a DIFFERENT, already-implemented concept: manual delete-of-a-launched-
+// campaign) is untouched by this widening and keeps working exactly as before.
+export const campaignStatusEnum = pgEnum("CampaignStatus", [
+  "DRAFT",
+  "ACTIVE",
+  "CLOSING",
+  "ARCHIVED",
+]);
+
 // Brand-approval gate: lifecycle of the brand's Approve/Reject decision on a
 // creator the AI closed. AWAITING_APPROVAL until the brand clicks a magic link;
 // PROCESSING is a short-lived intermediate claim held ONLY while the workflow
@@ -378,6 +428,15 @@ export type MemoryFactStatus = (typeof memoryFactStatusEnum.enumValues)[number];
 export type MemoryRevisionSource =
   (typeof memoryRevisionSourceEnum.enumValues)[number];
 
+// PLU-135 (1a)
+export type CampaignBriefRenderStatus =
+  (typeof campaignBriefRenderStatusEnum.enumValues)[number];
+export type BrandIdentityExtractionSource =
+  (typeof brandIdentityExtractionSourceEnum.enumValues)[number];
+export type CampaignAuditEventType =
+  (typeof campaignAuditEventTypeEnum.enumValues)[number];
+export type CampaignStatus = (typeof campaignStatusEnum.enumValues)[number];
+
 // ---------------------------------------------------------------------------
 // Definition models
 // ---------------------------------------------------------------------------
@@ -411,24 +470,25 @@ export const connectedEmailAccounts = pgTable(
   ],
 );
 
+// PLU-135 (1a): trimmed to execution-level settings only. Every creator-facing
+// term (objective, deliverables, usage rights, payment terms, etc.) moved to
+// campaignDetails — see that table for why. This table owns tenancy, sending,
+// pacing, and lifecycle (status, archivedAt) — never a second copy of deal terms.
 export const campaigns = pgTable(
   "Campaign",
   {
     id: cuidId("id"),
     name: text("name").notNull(),
     brand: text("brand").notNull(),
-    objective: text("objective"),
+    // Internal operator notes. NOT creator-facing (never stamped into node
+    // config or shown to a creator) — that's why it stays here rather than
+    // moving to campaignDetails with the other PLU-135 fields.
     notes: text("notes"),
+    // PLU-135 (1a): Draft → Active is the ONE-WAY launch transition that
+    // creates campaignTermsSnapshots + negotiationPolicySnapshots and locks
+    // campaignDetails + negotiationPolicies. See launchCampaign() (db/campaigns.ts).
+    status: campaignStatusEnum("status").notNull().default("DRAFT"),
     notifyEmail: text("notifyEmail"),
-    brandDescription: text("brandDescription"),
-    deliverables: text("deliverables"),
-    timeline: text("timeline"),
-    rewardDescription: text("rewardDescription"),
-    shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
-    usageRights: text("usageRights"),
-    exclusivity: text("exclusivity"),
-    paymentTerms: text("paymentTerms"),
-    attributionWindow: text("attributionWindow"),
     targetUrl: text("targetUrl"),
     hiddenParamKey: text("hiddenParamKey").notNull().default("_from"),
     // PLU-70: the campaign-level DEFAULT only. Enrollment stamps the effective
@@ -450,10 +510,329 @@ export const campaigns = pgTable(
     outreachPacingMaxMinutes: integer("outreachPacingMaxMinutes"),
     negotiationReplyPacingMinMinutes: integer("negotiationReplyPacingMinMinutes"),
     negotiationReplyPacingMaxMinutes: integer("negotiationReplyPacingMaxMinutes"),
+    // PLU-135 (1a): null = active (visible). Set when an already-launched
+    // (ACTIVE) campaign is deleted — deleteCampaign() archives instead of
+    // destroying so the snapshot/audit/brief history stays intact. A DRAFT
+    // campaign still hard-deletes as before. listCampaigns() filters these
+    // out; direct lookup by id is unaffected.
+    archivedAt: ts("archivedAt"),
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },
   (table) => [index("Campaign_emailAccountId_idx").on(table.emailAccountId)],
+);
+
+// PLU-135 (1a): the editable, creator-facing draft — every term that moved out
+// of `campaigns` above. Freely rewritable while campaigns.status is DRAFT.
+// launchCampaign() freezes a copy into campaignTermsSnapshots and the
+// application layer (db/campaignDetails.ts) rejects further writes once
+// ACTIVE — a material change means duplicating into a new campaign, never
+// editing this one post-launch. One per campaign.
+export const campaignDetails = pgTable("CampaignDetails", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  objective: text("objective"),
+  // Maps to the old campaigns.rewardDescription ("a free pair of our running
+  // shoes") — PLU-135 names this field productOrOffer; same free-text
+  // product/sample description, carried forward by the migration's backfill.
+  productOrOffer: text("productOrOffer"),
+  keyMessages: text("keyMessages"),
+  deliverables: text("deliverables"),
+  timeline: text("timeline"),
+  contentRequirements: text("contentRequirements"),
+  usageRights: text("usageRights"),
+  exclusivity: text("exclusivity"),
+  // Not in PLU-135's literal field list, but carried forward anyway: this was
+  // one of the same HARD-K1 creator-facing fields as usageRights/exclusivity,
+  // still actively read by executors — dropping it would be a regression.
+  attributionWindow: text("attributionWindow"),
+  // New — no existing column covered this (flagged as a gap by the vault's
+  // "Decision - Persist Full Extraction" note).
+  prohibitedClaims: text("prohibitedClaims"),
+  // Only when compensation is genuinely fixed and non-negotiable. Negotiable
+  // bounds live in negotiationPolicies instead, never here.
+  fixedCompensationCents: integer("fixedCompensationCents"),
+  publicPaymentTerms: text("publicPaymentTerms"),
+  shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
+  brandDescription: text("brandDescription"),
+  // PLU-135 schema review §2.1 (Calvin, 2026-08-08): which extraction the
+  // fields above were actually confirmed from — the missing link in the
+  // extraction -> confirmation -> snapshot chain. Without this,
+  // launchCampaign() had to guess by picking "the newest extraction," which
+  // is wrong if a brief was re-uploaded after confirmation but before launch.
+  // Nullable: a campaign typed by hand with no PDF ever uploaded is normal.
+  confirmedFromExtractionId: text("confirmedFromExtractionId").references(
+    () => campaignBriefExtractions.id,
+    { onDelete: "restrict" },
+  ),
+  confirmedAt: ts("confirmedAt"),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
+
+// PLU-135 (1a): THE immutable public-terms snapshot — what the campaign
+// actually offered at launch (e.g. "$300"), NOT what any individual creator
+// negotiated (e.g. "$450" — that lives in partnerships/partnership terms,
+// PLU-119, tied to the creator's own execution). Deliberately NOT named
+// "Revision": there is exactly one per campaign, ever — enforced by the
+// unique campaignId below. Written once, by launchCampaign(), at the
+// Draft→Active transition — never at enrollment, because conversations could
+// already be in flight against live data by then. A brand wanting to change
+// material terms after launch must duplicate the campaign, not touch this
+// row. Never updated after creation. onDelete "restrict" everywhere it's
+// referenced: this row must outlive the campaign that made it (Calvin
+// review, 2026-08-08).
+export const campaignTermsSnapshots = pgTable(
+  "CampaignTermsSnapshot",
+  {
+    id: cuidId("id"),
+    campaignId: text("campaignId")
+      .notNull()
+      .unique()
+      .references(() => campaigns.id, { onDelete: "restrict" }),
+    // Full copy of campaignDetails' fields at the moment of launch. JSON blob
+    // (matching how WorkflowVersion.nodeGraph already does immutable
+    // snapshots) rather than individual columns.
+    detailsSnapshot: jsonb("detailsSnapshot").$type<JsonValue>().notNull(),
+    // Which campaignBriefExtraction was current at launch — the fallback
+    // brief text this snapshot is consistent with. NOT part of the confirmed
+    // terms above; just a pointer to which AI reading was in effect, so the
+    // fallback tier never silently drifts. Nullable: a campaign can launch
+    // with no brief uploaded at all. Once set, never changed.
+    briefExtractionId: text("briefExtractionId").references(
+      () => campaignBriefExtractions.id,
+      { onDelete: "restrict" },
+    ),
+    launchedAt: tsNow("launchedAt"),
+    // Informational operator/system marker — not an authorization check.
+    createdBy: text("createdBy"),
+    createdAt: tsNow("createdAt"),
+  },
+  (table) => [
+    index("CampaignTermsSnapshot_briefExtractionId_idx").on(table.briefExtractionId),
+    // Enables the composite FK from campaignBriefs(campaignTermsSnapshotId,
+    // campaignId) — the mechanism that makes "a brief can't reference another
+    // campaign's snapshot" a real database constraint instead of an
+    // app-level check.
+    uniqueIndex("CampaignTermsSnapshot_id_campaignId_key").on(
+      table.id,
+      table.campaignId,
+    ),
+  ],
+);
+
+// PLU-135 (1a): a single reading of the uploaded brief PDF. Immutable — never
+// updated or overwritten. No version *number*; ordering is purely by
+// createdAt, so "the current reading" (used before a campaign has launched)
+// is just the newest row for a campaignId. This is the AI's CANDIDATE
+// reading — not itself the source of truth. A human confirming or editing
+// what it found is what actually writes to campaignDetails; only
+// campaignDetails (and, after launch, its frozen copy) is authoritative.
+// Does not replace the in-process parse cache in briefKnowledge.ts
+// (PLU-82/PLU-107) — that remains the fast path for pre-launch preview; this
+// is the durable record behind it.
+export const campaignBriefExtractions = pgTable(
+  "CampaignBriefExtraction",
+  {
+    id: cuidId("id"),
+    campaignId: text("campaignId")
+      .notNull()
+      .references(() => campaigns.id, { onDelete: "restrict" }),
+    flatText: text("flatText").notNull(),
+    // Typed section map — same shape briefKnowledge.ts already produces.
+    sections: jsonb("sections").$type<JsonValue>().notNull(),
+    // Uncategorised remainder — nothing extracted is discarded.
+    other: jsonb("other").$type<JsonValue>(),
+    sourceFileReference: text("sourceFileReference").notNull(),
+    parserVersion: text("parserVersion").notNull(),
+    createdAt: tsNow("createdAt"),
+  },
+  (table) => [
+    index("CampaignBriefExtraction_campaignId_idx").on(table.campaignId),
+    // Backs the "most recent reading for this campaign" read before launch.
+    index("CampaignBriefExtraction_campaignId_createdAt_idx").on(
+      table.campaignId,
+      table.createdAt,
+    ),
+  ],
+);
+
+// PLU-135 (1a): the private negotiation-bounds table. Standalone — private
+// policy lives only here, never merged into campaignDetails or
+// campaignTermsSnapshots, which a creator-facing agent may read from.
+// preferredFeeCents / negotiationGuidance / negotiableTerms /
+// nonNegotiableTerms are new — nothing in the codebase tracks them today,
+// only floor/ceiling and the other fields below (scattered across ~15 files
+// pre-migration). Freely editable while campaigns.status is DRAFT;
+// launchCampaign() freezes a copy into negotiationPolicySnapshots and further
+// writes are rejected once ACTIVE — an in-flight negotiation must never see
+// its bounds change mid-conversation (Calvin review, 2026-08-08).
+export const negotiationPolicies = pgTable("NegotiationPolicy", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  floorCents: integer("floorCents"),
+  ceilingCents: integer("ceilingCents"),
+  preferredFeeCents: integer("preferredFeeCents"),
+  commissionRate: doublePrecision("commissionRate"),
+  maxRounds: integer("maxRounds"),
+  openingOfferPosition: doublePrecision("openingOfferPosition"),
+  overCeilingTolerance: doublePrecision("overCeilingTolerance"),
+  negotiationGuidance: text("negotiationGuidance"),
+  // String lists stored as JSON — no Postgres native array precedent exists
+  // elsewhere in this schema, so this follows the established Json-for-lists
+  // convention (metadata/socialLinks/etc.) instead of introducing a new one.
+  negotiableTerms: jsonb("negotiableTerms").$type<JsonValue>(),
+  nonNegotiableTerms: jsonb("nonNegotiableTerms").$type<JsonValue>(),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
+
+// PLU-135 (1a): the immutable freeze of negotiationPolicies at launch — same
+// mechanism and reason as campaignTermsSnapshots, kept as its OWN table
+// (rather than folded into campaignTermsSnapshots.detailsSnapshot) because
+// private policy must never share a row with anything a creator-facing agent
+// might read from. Explicit typed columns mirroring negotiationPolicies
+// exactly (rather than a JSON blob) since these are stable scalar fields, not
+// a growing free-form document. Written once, by launchCampaign(), never
+// updated after.
+export const negotiationPolicySnapshots = pgTable("NegotiationPolicySnapshot", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "restrict" }),
+  floorCents: integer("floorCents"),
+  ceilingCents: integer("ceilingCents"),
+  preferredFeeCents: integer("preferredFeeCents"),
+  commissionRate: doublePrecision("commissionRate"),
+  maxRounds: integer("maxRounds"),
+  openingOfferPosition: doublePrecision("openingOfferPosition"),
+  overCeilingTolerance: doublePrecision("overCeilingTolerance"),
+  negotiationGuidance: text("negotiationGuidance"),
+  negotiableTerms: jsonb("negotiableTerms").$type<JsonValue>(),
+  nonNegotiableTerms: jsonb("nonNegotiableTerms").$type<JsonValue>(),
+  launchedAt: tsNow("launchedAt"),
+  createdAt: tsNow("createdAt"),
+});
+
+// PLU-135 (1a): brand logo/colors/typography for anything rendered on the
+// campaign's behalf (e.g. campaignBriefs). One per campaign.
+export const brandIdentities = pgTable("BrandIdentity", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  logoRef: text("logoRef"),
+  primaryColor: text("primaryColor"),
+  secondaryColor: text("secondaryColor"),
+  typography: text("typography"),
+  extractionSource: brandIdentityExtractionSourceEnum("extractionSource"),
+  extractedAt: ts("extractedAt"),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
+
+// PLU-135 (1a): informational-only criteria for what kind of creator a
+// campaign wants. Explicitly must NOT drive matching/ranking/outreach in this
+// issue — display/edit only. No existing table covers this; built empty, with
+// nothing to backfill (creators.niche/platform/location describe one real
+// creator's own profile, a different concept entirely).
+export const creatorRequirements = pgTable("CreatorRequirement", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  platforms: jsonb("platforms").$type<JsonValue>(),
+  niches: jsonb("niches").$type<JsonValue>(),
+  geography: jsonb("geography").$type<JsonValue>(),
+  languages: jsonb("languages").$type<JsonValue>(),
+  minFollowers: integer("minFollowers"),
+  audienceNotes: text("audienceNotes"),
+  contentStyle: text("contentStyle"),
+  brandSafety: text("brandSafety"),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
+
+// PLU-135 (1a): redefined as a pointer to the RENDERED brief document handed
+// to a creator — not the uploaded source PDF (that stays referenced from
+// workflow node config for now; campaignBriefExtractions above is its durable
+// reading, unrelated to this table). The actual rendering logic is Issue 3's
+// job; this is just the receipt. The composite FK to
+// campaignTermsSnapshots(id, campaignId) makes "a brief can never reference a
+// different campaign's snapshot" a real database constraint.
+//
+// PLU-135 schema review §2.2 (Calvin, 2026-08-08) — named in review as the
+// most important open concern. BrandIdentity is deliberately NOT locked at
+// launch, so a logo/colour edit is live today — a doc comment telling Issue 3
+// to "always insert a new row" does not protect an already-rendered brief,
+// because even a new row would re-resolve the CURRENT identity. The rendered
+// brief has to carry the identity it actually used, as a point-in-time copy
+// (brandIdentitySnapshot) — NOT a version pointer to BrandIdentity, which
+// would mean a second snapshot table and a lock discussion for something
+// review explicitly wants kept simple and freely editable. supersededAt marks
+// a newer render superseding an older one — the row is NEVER deleted, so a
+// creator who already received this exact brief can still be shown what they
+// actually got. Staleness stays keyed to campaignTermsSnapshotId ALONE: a
+// BrandIdentity edit must never mark an existing brief stale.
+export const campaignBriefs = pgTable(
+  "CampaignBrief",
+  {
+    id: cuidId("id"),
+    campaignId: text("campaignId").notNull(),
+    campaignTermsSnapshotId: text("campaignTermsSnapshotId").notNull(),
+    renderedAssetRef: text("renderedAssetRef"),
+    status: campaignBriefRenderStatusEnum("status").notNull().default("GENERATING"),
+    generatedAt: ts("generatedAt"),
+    brandIdentitySnapshot: jsonb("brandIdentitySnapshot").$type<JsonValue>().notNull(),
+    templateVersion: text("templateVersion").notNull(),
+    renderedAt: tsNow("renderedAt"),
+    supersededAt: ts("supersededAt"),
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    index("CampaignBrief_campaignId_idx").on(table.campaignId),
+    index("CampaignBrief_campaignTermsSnapshotId_idx").on(table.campaignTermsSnapshotId),
+    index("CampaignBrief_campaignId_renderedAt_idx").on(table.campaignId, table.renderedAt),
+    foreignKey({
+      columns: [table.campaignId],
+      foreignColumns: [campaigns.id],
+      name: "CampaignBrief_campaignId_fkey",
+    }).onDelete("restrict"),
+    foreignKey({
+      columns: [table.campaignTermsSnapshotId, table.campaignId],
+      foreignColumns: [campaignTermsSnapshots.id, campaignTermsSnapshots.campaignId],
+      name: "CampaignBrief_campaignTermsSnapshotId_campaignId_fkey",
+    }).onDelete("restrict"),
+  ],
+);
+
+// PLU-135 (1a): append-only campaign history. No updatedAt by design — nothing
+// should ever revise a diary entry. Kept separate from ExecutionInstance's
+// per-creator Event log and the workflow-graph validation log, which record
+// different things.
+export const campaignAuditEvents = pgTable(
+  "CampaignAuditEvent",
+  {
+    id: cuidId("id"),
+    campaignId: text("campaignId")
+      .notNull()
+      .references(() => campaigns.id, { onDelete: "restrict" }),
+    eventType: campaignAuditEventTypeEnum("eventType").notNull(),
+    payload: jsonb("payload").$type<JsonValue>(),
+    actorId: text("actorId"),
+    createdAt: tsNow("createdAt"),
+  },
+  (table) => [index("CampaignAuditEvent_campaignId_idx").on(table.campaignId)],
 );
 
 // PLU-122: per-campaign UTC-day quota + pacing cursor. Email payloads remain in
@@ -637,6 +1016,20 @@ export const executionInstances = pgTable(
     emailAccountId: text("emailAccountId").references(() => connectedEmailAccounts.id, {
       onDelete: "set null",
     }),
+    // PLU-135 (1a): the campaignTermsSnapshot this execution is PINNED to,
+    // stamped once at enrollment and never rewritten — same mechanism as
+    // postAcceptanceMode/emailAccountId above. Nullable: executions enrolled
+    // before this migration have no snapshot to point at.
+    campaignTermsSnapshotId: text("campaignTermsSnapshotId").references(
+      () => campaignTermsSnapshots.id,
+      { onDelete: "restrict" },
+    ),
+    // PLU-135 (1a): same pinning, for the private negotiation bounds. A
+    // negotiation must never see its bounds change mid-conversation.
+    negotiationPolicySnapshotId: text("negotiationPolicySnapshotId").references(
+      () => negotiationPolicySnapshots.id,
+      { onDelete: "restrict" },
+    ),
     dueAt: ts("dueAt"),
     enrolledAt: tsNow("enrolledAt"),
     completedAt: ts("completedAt"),
@@ -654,6 +1047,12 @@ export const executionInstances = pgTable(
       table.dueAt,
     ),
     index("ExecutionInstance_emailAccountId_idx").on(table.emailAccountId),
+    index("ExecutionInstance_campaignTermsSnapshotId_idx").on(
+      table.campaignTermsSnapshotId,
+    ),
+    index("ExecutionInstance_negotiationPolicySnapshotId_idx").on(
+      table.negotiationPolicySnapshotId,
+    ),
   ],
 );
 
@@ -1480,6 +1879,17 @@ export type Obligation = typeof obligations.$inferSelect;
 export type Payout = typeof payouts.$inferSelect;
 export type LlmCall = typeof llmCalls.$inferSelect;
 
+// PLU-135 (1a)
+export type CampaignDetails = typeof campaignDetails.$inferSelect;
+export type CampaignTermsSnapshot = typeof campaignTermsSnapshots.$inferSelect;
+export type CampaignBriefExtraction = typeof campaignBriefExtractions.$inferSelect;
+export type NegotiationPolicy = typeof negotiationPolicies.$inferSelect;
+export type NegotiationPolicySnapshot = typeof negotiationPolicySnapshots.$inferSelect;
+export type BrandIdentity = typeof brandIdentities.$inferSelect;
+export type CreatorRequirement = typeof creatorRequirements.$inferSelect;
+export type CampaignBrief = typeof campaignBriefs.$inferSelect;
+export type CampaignAuditEvent = typeof campaignAuditEvents.$inferSelect;
+
 export type InsertCampaign = z.infer<typeof insertCampaignSchema>;
 export type InsertWorkflow = z.infer<typeof insertWorkflowSchema>;
 export type InsertWorkflowVersion = z.infer<typeof insertWorkflowVersionSchema>;
@@ -1539,3 +1949,15 @@ export type ConversionInsert = typeof conversions.$inferInsert;
 export type ObligationInsert = typeof obligations.$inferInsert;
 export type PayoutInsert = typeof payouts.$inferInsert;
 export type LlmCallInsert = typeof llmCalls.$inferInsert;
+
+// PLU-135 (1a)
+export type CampaignDetailsInsert = typeof campaignDetails.$inferInsert;
+export type CampaignTermsSnapshotInsert = typeof campaignTermsSnapshots.$inferInsert;
+export type CampaignBriefExtractionInsert = typeof campaignBriefExtractions.$inferInsert;
+export type NegotiationPolicyInsert = typeof negotiationPolicies.$inferInsert;
+export type NegotiationPolicySnapshotInsert =
+  typeof negotiationPolicySnapshots.$inferInsert;
+export type BrandIdentityInsert = typeof brandIdentities.$inferInsert;
+export type CreatorRequirementInsert = typeof creatorRequirements.$inferInsert;
+export type CampaignBriefInsert = typeof campaignBriefs.$inferInsert;
+export type CampaignAuditEventInsert = typeof campaignAuditEvents.$inferInsert;
