@@ -69,6 +69,11 @@ import { describeDeal } from "../dealDescription.js";
 import { extractReplyText } from "./replyText.js";
 import { mergeCampaignFallback } from "../campaignContext.js";
 import { resolveBand } from "../band.js";
+// PLU-138 (1d): the read-side snapshot cutover. The pinned launch snapshots
+// (loaded by buildConversationContext) overlay the merged node config so the
+// agent decision, the output guard, and the offer/counter copy read the
+// authoritative band + public terms instead of stale nodeGraph values.
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 // HARD-A2: the output-guard-blocked MANUAL_REVIEW result is the SAME shape used
 // by other executors, so it lives in one place (guardEscalation.ts) rather than
 // being duplicated inline here. Previously negotiation.ts and guardEscalation.ts
@@ -803,28 +808,12 @@ export async function executeNegotiation(
     );
   }
 
-  // H1: a money-path campaign MUST have a ceiling. Resolve the band from the same
-  // config the agent would see; if there's a floor but no ceiling, the over-ceiling
-  // ACCEPT guard downstream is a no-op (nothing exceeds +inf) — the model's prompt
-  // would be the ONLY cap between the creator and an unbounded agree. Escalate to a
-  // human here, as a pure-config PRECONDITION (before any DB load or agent call),
-  // rather than risk it. (No floor + no ceiling = an unconfigured band; the
-  // accept/counter logic is already inert there and there's no money exposure to
-  // guard, so that case falls through unchanged.) This is the runtime backstop for
-  // the invariant the parent enforces at campaign-publish time.
-  // PLU-129: a commission-only campaign is the canonical 0/0 shape — resolveBand
-  // returns floor === 0 AND ceiling === 0 (both DEFINED, not undefined), so it
-  // does NOT trip this backstop. That is intentional: 0/0 is a VALID configured
-  // state (no fee band to negotiate), unlike a floor WITHOUT a ceiling. It
-  // proceeds to the agent, which — with the explicit-zero-ceiling fix in
-  // negotiate.py (PLU-129) — treats ceiling 0 as a real cap and ESCALATES any
-  // upfront-fee ask rather than negotiating an unbounded fee. We deliberately do
-  // NOT unconditionally escalate at 0/0 here: a creator who just asks "what's the
-  // commission?" must proceed, not be paged.
-  const { floor, ceiling } = resolveBand(config);
-  if (floor !== undefined && ceiling === undefined) {
-    return escalateNoCeiling({ round: instance.negotiationRound });
-  }
+  // PLU-138 (1d): the H1 no-ceiling backstop MOVED below the context build so it
+  // reads the EFFECTIVE band (snapshot-overlaid), not the raw nodeGraph config. A
+  // legacy config with a floor but no ceiling that is pinned to a policy snapshot
+  // WITH a valid ceiling is a bounded, valid journey — escalating it here on the
+  // stale config would let a legacy copy override a valid snapshot (the exact
+  // thing 1d forbids). See the relocated check after `effectiveConfig` is resolved.
 
   // When a downstream node owns the post-acceptance email, the negotiation ACCEPT
   // must NOT also send its own onboarding/acceptance email, or the creator gets
@@ -843,13 +832,12 @@ export async function executeNegotiation(
     nodeGraph.some((n) => n.type === "REWARD_SETUP" || n.type === "CONTENT_BRIEF") ||
     instance.postAcceptanceMode === "operator_handoff";
 
+  // Pacing (maxRounds) is a WORKFLOW-owned behavior field (ticket: node pacing
+  // stays node-owned), so the pre-build round-ceiling hard-stop reads it from the
+  // node config as before. The snapshot's maxRounds (when present) is applied to
+  // the EFFECTIVE config below for the agent; the pre-build stop only guards the
+  // wasted-context-assembly case and is conservative on the config value.
   const maxRounds = typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5;
-
-  // Describe the deal structure (fixed fee / commission / both) from THIS
-  // (NEGOTIATION) node's config, exactly as outreach/follow-up do. Threading it
-  // into the offer/counter copy lets the email explain WHAT KIND of deal this is
-  // (e.g. "hybrid — fixed fee plus commission") instead of only quoting a fee.
-  const dealDescription = describeDeal(config);
 
   // Hard stop — enforce maxRounds before calling the agent (and BEFORE the full
   // context build — §5.2). This prevents the agent from even being consulted past
@@ -947,6 +935,40 @@ export async function executeNegotiation(
     },
   );
 
+  // PLU-138 (1d) — THE READ-SIDE CUTOVER. PLU-137 loaded the pinned snapshots into
+  // `cc` but the decision still read the band + public terms from the (legacy) node
+  // config. Overlay the snapshots onto the config so a VALID SNAPSHOT ALWAYS WINS:
+  // the agent request, the output guard, the H1 no-ceiling backstop, and the
+  // offer/counter email copy all read `effectiveConfig` from here on. A no-snapshot
+  // journey ⇒ zero overlay ⇒ effectiveConfig is shape-identical to `config`
+  // (byte-identical prompts, golden matrix). `policyAuthority` is present only for
+  // this NEGOTIATION_DECISION (authorized) purpose; `termsSnapshot` carries the
+  // public terms. Both are undefined for legacy journeys → observable legacy path.
+  const decision = toDecisionContext(cc);
+  const effective = resolveEffectiveNegotiationConfig({
+    policyAuthority: decision.policyAuthority,
+    termsSnapshot: cc.termsSnapshot,
+    config,
+  });
+  const effectiveConfig = effective.config;
+
+  // Relocated H1 no-ceiling backstop (moved here from pre-build so it reads the
+  // EFFECTIVE band). A floor with no ceiling means the over-ceiling ACCEPT guard is
+  // a no-op (nothing exceeds +inf) and the model's prompt is the only cap — escalate
+  // rather than risk an unbounded agree. The commission-only 0/0 shape (ceiling === 0,
+  // both DEFINED) does NOT trip this: 0 is a real cap the agent honors (PLU-129). No
+  // floor + no ceiling = an unconfigured band, already inert downstream → falls
+  // through unchanged.
+  const { floor: effFloor, ceiling: effCeiling } = resolveBand(effectiveConfig);
+  if (effFloor !== undefined && effCeiling === undefined) {
+    return escalateNoCeiling({ round: instance.negotiationRound });
+  }
+
+  // Describe the deal structure (fixed fee / commission / both) from the EFFECTIVE
+  // config so the offer/counter email copy matches the snapshot-sourced decision
+  // (e.g. "hybrid — fixed fee plus commission"), not a stale nodeGraph value.
+  const dealDescription = describeDeal(effectiveConfig);
+
   // Names the branches below already use, sourced from the builder (§6). The
   // builder derived `latestInbound`/`creatorReply` with the SAME logic (§5.4), so
   // the present-offer idempotency key + obligation sourceMessageId are unchanged.
@@ -983,7 +1005,7 @@ export async function executeNegotiation(
   // by the projection ONLY when non-empty (§5.7 emptiness contract). The band is NOT
   // on this object; buildNegotiationRequest resolves it from `config` at request-build
   // time (§5.3 / §5.7). This is byte-identical to the old inline assembly (§10).
-  const negotiationContext: PriorNegotiationContext = toDecisionContext(cc).decisionHistory;
+  const negotiationContext: PriorNegotiationContext = decision.decisionHistory;
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
   // (the creator's questions + which fixed terms they pushed), threaded across
@@ -998,7 +1020,7 @@ export async function executeNegotiation(
   // APPROVE records as the deal rate). The regex remains a fallback for copy
   // acknowledgment and guard allowlisting only.
   const { outcome, message, proposedRate, creatorQuestions, pushedFixedTerms, creatorRequestedRate, escalationReason, isFinalRound, negotiatorAnswers, creatorFacts } =
-    await agent.negotiate(instance.negotiationRound, config, creatorReply, negotiationContext);
+    await agent.negotiate(instance.negotiationRound, effectiveConfig, creatorReply, negotiationContext);
 
   // For acknowledgment copy + the output-guard allowlist (NOT the money path):
   // prefer the agent's validated comprehension, fall back to the regex read.
@@ -1346,7 +1368,7 @@ export async function executeNegotiation(
       // not a leak even if it coincides with a bound).
       const guard = scanOutboundDraft(
         draft,
-        guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
+        guardConstraintsFromConfig(effectiveConfig, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
         return withContextRecord({ ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
@@ -1472,7 +1494,7 @@ export async function executeNegotiation(
       // (their number == a bound) must be able to state that number.
       const guard = scanOutboundDraft(
         draft,
-        guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
+        guardConstraintsFromConfig(effectiveConfig, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
         return withContextRecord({ ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
@@ -1627,7 +1649,7 @@ export async function executeNegotiation(
       // a leak, so a legitimate at-bound negotiation isn't forced to MANUAL_REVIEW.
       const guard = scanOutboundDraft(
         draft,
-        guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
+        guardConstraintsFromConfig(effectiveConfig, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
         return withContextRecord({ ...blockedByGuard(newRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
