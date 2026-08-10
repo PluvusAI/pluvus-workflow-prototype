@@ -150,7 +150,8 @@ const KNOWN_TYPES: ReadonlySet<NodeType> = new Set<NodeType>([
   "END",
 ]);
 
-function phaseOf(type: NodeType): number {
+// Exported (PLU-130): connectionRules.ts derives its phase check from this.
+export function phaseOf(type: NodeType): number {
   return NODE_PHASE[type] ?? 99;
 }
 
@@ -225,7 +226,7 @@ export function validateGraph(def: WorkflowDefinition): ValidationResult {
     if (e.source === e.target) {
       push({
         code: "SELF_LOOP",
-        message: `Node "${e.source}" is connected to itself.`,
+        message: `Node "${labelFor(byId, e.source)}" is connected to itself.`,
         nodeId: e.source,
         edgeId: e.id,
         severity: "error",
@@ -524,7 +525,8 @@ function hasCycle(nodes: GraphNode[], outMap: Map<string, string[]>): boolean {
 // Message helpers
 // ---------------------------------------------------------------------------
 
-const TYPE_LABEL: Record<NodeType, string> = {
+// Exported (PLU-130): reused by connectionRules.ts for node-naming in messages.
+export const TYPE_LABEL: Record<NodeType, string> = {
   IMPORT_CREATOR_LIST: "Import Creators",
   INITIAL_OUTREACH: "Initial Outreach",
   FOLLOW_UP: "Follow-Up",
@@ -536,12 +538,18 @@ const TYPE_LABEL: Record<NodeType, string> = {
   END: "End",
 };
 
+/** Human label for a node type (PLU-130). */
+export function labelForType(type: NodeType): string {
+  return TYPE_LABEL[type] ?? type;
+}
+
 function labelFor(byId: Map<string, GraphNode>, id: string): string {
   const n = byId.get(id);
   return n ? TYPE_LABEL[n.type] ?? n.type : id;
 }
 
-function phaseMessage(source: NodeType, target: NodeType): string {
+// Exported (PLU-130): shared so the connect-time block and the validator agree.
+export function phaseMessage(source: NodeType, target: NodeType): string {
   // Friendly, specific messages for the flagship ordering rules.
   if (target === "PAYMENT_INFO")
     return `Payment Info can't come before the agreement is approved (it follows Reward Setup).`;
@@ -549,7 +557,7 @@ function phaseMessage(source: NodeType, target: NodeType): string {
     return `Content Brief can't come before the creator accepts (it follows the negotiation).`;
   if (target === "NEGOTIATION" && phaseOf(source) > phaseOf("NEGOTIATION"))
     return `Negotiation can't come after the deal is already finalized.`;
-  return `"${TYPE_LABEL[target]}" can't come after "${TYPE_LABEL[source]}" — it belongs earlier in the workflow.`;
+  return `"${TYPE_LABEL[target] ?? target}" can't come after "${TYPE_LABEL[source] ?? source}" — it belongs earlier in the workflow.`;
 }
 
 function isNonEmptyString(v: unknown): boolean {

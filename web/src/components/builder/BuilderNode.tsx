@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, type CSSProperties } from "react";
 import { Handle, Position } from "reactflow";
 import { colors, radii, font, shadow } from "../../theme";
 import type { DraftNode } from "../../api/builderTypes";
@@ -75,33 +75,36 @@ export const BuilderNodeComponent = memo(function BuilderNodeComponent({
         position: "relative",
       }}
     >
-      {/* Connection handles — VISIBLE dots so drag-to-connect is discoverable.
-          Top = incoming (target), bottom = outgoing (source). Drag from a
-          node's bottom dot to another node's top dot to link them. The
-          .rf-handle CSS enlarges them on hover for an easy grab target. */}
+      {/* Connection handles (PLU-130): a 24px transparent hit target with the
+          visible 11px dot painted via CSS (.rf-handle::after), centred on the
+          node edge. RF hit-tests the element box, so the large box makes
+          connecting forgiving. --dot-* vars colour each handle's dot. Top =
+          target (incoming), bottom = source (outgoing). */}
       <Handle
         type="target"
         position={Position.Top}
-        className="rf-handle"
-        style={{
-          background: colors.panel,
-          border: `2px solid ${typeColor}`,
-          width: 11,
-          height: 11,
-          top: -6,
-        }}
+        className="rf-handle rf-handle-target"
+        aria-label="Connection target (incoming)"
+        style={
+          {
+            top: -12,
+            "--dot-bg": colors.panel,
+            "--dot-border": typeColor,
+          } as CSSProperties
+        }
       />
       <Handle
         type="source"
         position={Position.Bottom}
-        className="rf-handle"
-        style={{
-          background: typeColor,
-          border: `2px solid ${colors.panel}`,
-          width: 11,
-          height: 11,
-          bottom: -6,
-        }}
+        className="rf-handle rf-handle-source"
+        aria-label="Drag to connect (outgoing)"
+        style={
+          {
+            bottom: -12,
+            "--dot-bg": typeColor,
+            "--dot-border": colors.panel,
+          } as CSSProperties
+        }
       />
 
       {/* Accent rail — fades out so it reads as a highlight, not a border */}
