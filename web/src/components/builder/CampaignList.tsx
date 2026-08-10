@@ -1,6 +1,12 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Trash2, ChevronDown, FolderOpen, AlertTriangle } from "lucide-react";
-import { useCampaigns, useCampaign, deleteCampaign } from "../../api/builderClient";
+import {
+  useCampaigns,
+  useCampaign,
+  deleteCampaign,
+  closeCampaign,
+} from "../../api/builderClient";
 import { colors, radii, font, text, formatTimestamp } from "../../theme";
 import {
   Button,
@@ -14,7 +20,16 @@ import {
   useToast,
 } from "../ds";
 import { CampaignWizard } from "./CampaignWizard";
-import type { CampaignListItem } from "../../api/builderTypes";
+import type { CampaignListItem, CampaignStatus } from "../../api/builderTypes";
+
+// PLU-153: campaign lifecycle badge colors. Do NOT route through StatusBadge —
+// it only maps workflow statuses (draft/published/archived/invalid).
+const STATUS_COLOR: Record<CampaignStatus, string> = {
+  DRAFT: colors.textMuted,
+  ACTIVE: colors.success,
+  CLOSING: colors.warning,
+  ARCHIVED: colors.textMuted,
+};
 
 interface Props {
   onSelectWorkflow: (workflowId: string) => void;
@@ -126,10 +141,19 @@ function CampaignCard({
   const [expanded, setExpanded] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [closing, setClosing] = useState(false);
+  const [confirmClose, setConfirmClose] = useState(false);
+  // PLU-153: who is ending it + why — recorded on the audit event so the
+  // ClosingSummary attribution is real, not a hardcoded "operator".
+  const [closedBy, setClosedBy] = useState("");
+  const [closeReason, setCloseReason] = useState("");
   const toast = useToast();
+  const queryClient = useQueryClient();
 
-  // Lazy-load detail via the existing hook (cached by React Query) once expanded.
-  const detail = useCampaign(expanded ? campaign.id : null);
+  // Lazy-load detail via the existing hook (cached by React Query) once expanded
+  // OR when the card is Closing (so the winding-down summary + counts show
+  // without the operator having to expand workflows).
+  const detail = useCampaign(expanded || campaign.status === "CLOSING" ? campaign.id : null);
 
   async function handleDelete() {
     setDeleting(true);
@@ -137,10 +161,33 @@ function CampaignCard({
       await deleteCampaign(campaign.id);
       toast.success(`Deleted “${campaign.name}”.`);
       onDeleted();
-    } catch {
-      toast.error("Failed to delete campaign.");
+    } catch (e) {
+      // N3: surface the server message (e.g. the 409 telling the operator to
+      // End the campaign instead of deleting a launched one).
+      toast.error(e instanceof Error ? e.message : "Failed to delete campaign.");
       setDeleting(false);
       setConfirmDelete(false);
+    }
+  }
+
+  async function handleClose() {
+    if (!closedBy.trim()) {
+      toast.error("Enter your name before ending the campaign.");
+      return;
+    }
+    setClosing(true);
+    try {
+      await closeCampaign(campaign.id, closedBy.trim(), closeReason.trim() || undefined);
+      toast.success(`“${campaign.name}” is now winding down.`);
+      setConfirmClose(false);
+      setClosedBy("");
+      setCloseReason("");
+      void queryClient.invalidateQueries({ queryKey: ["campaigns"] });
+      void queryClient.invalidateQueries({ queryKey: ["campaign", campaign.id] });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to end campaign.");
+    } finally {
+      setClosing(false);
     }
   }
 
@@ -158,6 +205,10 @@ function CampaignCard({
               <Badge color={colors.textMuted} small>
                 {campaign.brand}
               </Badge>
+              {/* PLU-153: lifecycle badge. */}
+              <Badge color={STATUS_COLOR[campaign.status]} small>
+                {campaign.status}
+              </Badge>
             </div>
             <div
               style={{
@@ -174,15 +225,32 @@ function CampaignCard({
               {campaign.objective || "No objective set"}
             </div>
           </div>
-          <IconButton
-            label="Delete campaign"
-            icon={<Trash2 size={15} strokeWidth={1.75} />}
-            onClick={() => setConfirmDelete(true)}
-            disabled={deleting}
-            className="ds-danger-hover"
-            style={{ color: colors.textDim, opacity: 0.75, flexShrink: 0 }}
-          />
+          <div style={{ display: "flex", alignItems: "center", gap: 4, flexShrink: 0 }}>
+            {/* PLU-153: End campaign = ACTIVE → CLOSING. Only when Active. */}
+            {campaign.status === "ACTIVE" && (
+              <Button
+                variant="secondary"
+                onClick={() => setConfirmClose(true)}
+                disabled={closing}
+              >
+                End campaign
+              </Button>
+            )}
+            <IconButton
+              label="Delete campaign"
+              icon={<Trash2 size={15} strokeWidth={1.75} />}
+              onClick={() => setConfirmDelete(true)}
+              disabled={deleting}
+              className="ds-danger-hover"
+              style={{ color: colors.textDim, opacity: 0.75 }}
+            />
+          </div>
         </div>
+
+        {/* PLU-153: winding-down summary when Closing. */}
+        {campaign.status === "CLOSING" && (
+          <ClosingSummary detail={detail.data} />
+        )}
 
         {/* Stat row (derived from data we already have) */}
         <div style={{ display: "flex", alignItems: "center", gap: 24, marginTop: 16 }}>
@@ -299,7 +367,97 @@ function CampaignCard({
           onConfirm={() => void handleDelete()}
         />
       )}
+
+      {/* PLU-153: End-campaign confirmation lists the consequences verbatim, and
+          captures who is ending it (+ optional reason) so the audit trail records
+          the real operator — same name-required pattern as PLU-154's resolve panel. */}
+      {confirmClose && (
+        <ConfirmDialog
+          title="End this campaign?"
+          message={
+            <>
+              End <strong>{campaign.name}</strong> and move it to <strong>Closing</strong>?
+              <ul style={{ margin: "10px 0 0", paddingLeft: 18, lineHeight: 1.6 }}>
+                <li>No new creators will be enrolled.</li>
+                <li>No new initial outreach will be sent (queued outreach that hasn’t begun is dropped).</li>
+                <li>Creators already in progress continue uninterrupted.</li>
+                <li>The campaign auto-archives only later, after those journeys conclude.</li>
+              </ul>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
+                <input
+                  style={closeInputStyle}
+                  placeholder="Your name (required)"
+                  value={closedBy}
+                  onChange={(e) => setClosedBy(e.target.value)}
+                  autoFocus
+                />
+                <input
+                  style={closeInputStyle}
+                  placeholder="Reason (optional)"
+                  value={closeReason}
+                  onChange={(e) => setCloseReason(e.target.value)}
+                />
+              </div>
+            </>
+          }
+          confirmLabel="End campaign"
+          busy={closing}
+          onCancel={() => {
+            setConfirmClose(false);
+            setClosedBy("");
+            setCloseReason("");
+          }}
+          onConfirm={() => void handleClose()}
+        />
+      )}
     </Card>
+  );
+}
+
+// PLU-153: shared input style for the End-campaign confirm form.
+const closeInputStyle = {
+  fontSize: font.size.sm,
+  color: colors.text,
+  background: colors.panel,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radii.sm,
+  padding: "6px 9px",
+  width: "100%",
+} as const;
+
+// PLU-153: the winding-down dashboard panel shown while a campaign is Closing.
+function ClosingSummary({
+  detail,
+}: {
+  detail: import("../../api/builderTypes").CampaignDetail | undefined;
+}) {
+  const initiated = detail?.closingInitiatedAt
+    ? `initiated ${formatTimestamp(detail.closingInitiatedAt)}` +
+      (detail.closingInitiatedBy ? ` by ${detail.closingInitiatedBy}` : "")
+    : "winding down";
+  const inProgress = detail?.inProgressCreatorCount ?? null;
+  const manualReview = detail?.manualReviewCount ?? null;
+  return (
+    <div
+      style={{
+        marginTop: 14,
+        padding: "10px 12px",
+        background: colors.panel,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radii.sm,
+        fontSize: font.size.sm,
+        color: colors.textMuted,
+        lineHeight: 1.5,
+      }}
+    >
+      <strong style={{ color: colors.warning }}>Winding down</strong> — {initiated}.{" "}
+      {inProgress ?? "…"} creator journey{inProgress === 1 ? "" : "s"} in progress
+      {manualReview != null && manualReview > 0
+        ? `, ${manualReview} in Manual Review`
+        : ""}
+      . No new creators will enter; existing creators continue.
+      {detail?.closingReason ? <> Reason: {detail.closingReason}.</> : null}
+    </div>
   );
 }
 

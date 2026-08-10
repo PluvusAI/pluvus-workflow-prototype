@@ -42,7 +42,10 @@ function randomSpacingMs(minMinutes: number, maxMinutes: number, random: () => n
 
 export type InitialOutreachClaim =
   | { status: "send"; quotaDay: Date | null; nextEligibleAt: Date | null }
-  | { status: "defer"; reason: "daily_cap" | "pacing"; retryAt: Date };
+  | { status: "defer"; reason: "daily_cap" | "pacing"; retryAt: Date }
+  // PLU-153: a CLOSING/ARCHIVED campaign suppresses NEW initial outreach.
+  // Terminal-drop (NOT defer/retry): the message stays reserved-unsent.
+  | { status: "suppress"; reason: "campaign_closing" };
 
 /**
  * Atomically claim one campaign initial-outreach dispatch.
@@ -101,6 +104,18 @@ export async function claimInitialOutreachSlot(
       .limit(1);
     const campaign = campaignRows[0];
     if (!campaign) return { status: "send", quotaDay: null, nextEligibleAt: null };
+
+    // PLU-153: suppress NEW initial outreach for a Closing/Archived campaign.
+    // This is the single send-time chokepoint — every send path (primary
+    // delayed-send job, stranded-sweep re-drive, reconcile-driven ENROLLED
+    // re-run) converges here — so blocking the claim blocks the send on all of
+    // them. It MUST sit before the all-null-legacy early return below, or a
+    // legacy campaign with null pacing/cap would still send. A message that
+    // already claimed a slot on a prior day (early-return above) is in-flight,
+    // not new intake, and is deliberately left alone.
+    if (campaign.status === "CLOSING" || campaign.status === "ARCHIVED") {
+      return { status: "suppress", reason: "campaign_closing" };
+    }
 
     const hasCap = campaign.dailyInitialOutreachLimit !== null;
     const hasPacing =

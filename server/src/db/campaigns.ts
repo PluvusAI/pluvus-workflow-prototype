@@ -1,4 +1,4 @@
-import { and, count, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
 import {
   brandApprovals,
@@ -26,6 +26,7 @@ import {
   workflowVersions,
   type Campaign,
   type CampaignInsert,
+  type CampaignStatus,
   type CampaignTermsSnapshot,
   type WorkflowStatus,
 } from "./schema.js";
@@ -328,32 +329,21 @@ export async function launchCampaign(
 }
 
 /**
- * PLU-135 (1a): a launched campaign (Campaign.status === "ACTIVE") is never
- * hard-deleted — its CampaignTermsSnapshot, and everything RESTRICT-tied to
- * it (briefs, audit events, pinned executions), is retained for historical
- * recordkeeping per this project's "never lose the snapshot" invariant. This
- * archives instead: `archivedAt` is stamped, nothing underneath is touched,
- * and listCampaigns() stops surfacing it. A DRAFT campaign has no history
- * worth protecting, so it still hard-deletes exactly as before.
+ * PLU-153: `deleteCampaign` is now the HARD-DELETE cascade only. The
+ * ACTIVE-campaign archive branch PLU-135 (1a) added here is REMOVED — the
+ * PLU-153/133 product rule forbids `ACTIVE → ARCHIVED` through the normal
+ * delete action (the PLU-135 enum comment reserved exactly this decision for
+ * PLU-133). `archivedAt` is now written ONLY by PLU-156's CLOSING→ARCHIVED
+ * reconciliation. The DELETE route (routes/campaigns.ts) owns the gate: DRAFT
+ * hard-deletes, a launched (non-DRAFT) campaign 409s unless the operator passes
+ * `?force=true` (reclone/dev-reset), and either path lands here to run this
+ * cascade. Ending a launched campaign uses `transitionCampaignToClosing`, not
+ * this.
  */
 export async function deleteCampaign(id: string): Promise<void> {
   const campaign = await findCampaignById(id);
   if (!campaign) {
     throw new Error(`Campaign ${id} not found`);
-  }
-
-  if (campaign.status === "ACTIVE") {
-    await db.transaction(async (tx) => {
-      await tx
-        .update(campaigns)
-        .set({ archivedAt: new Date() })
-        .where(and(eq(campaigns.id, id), isNull(campaigns.archivedAt)));
-      await tx.insert(campaignAuditEvents).values({
-        campaignId: id,
-        eventType: "ARCHIVED",
-      });
-    });
-    return;
   }
 
   // W-7: the whole cascade runs in ONE transaction. Previously each DELETE was a
@@ -401,6 +391,165 @@ export async function deleteCampaign(id: string): Promise<void> {
     // not history) — no explicit cleanup needed here.
     await tx.delete(campaigns).where(eq(campaigns.id, id));
   });
+}
+
+/**
+ * PLU-153: the single new-intake gate. Only an ACTIVE campaign accepts new
+ * creators / new initial outreach. Returns an actionable "winding down" error
+ * string for CLOSING/ARCHIVED (and DRAFT — an unlaunched campaign has no intake
+ * either), or null to allow. A null campaign (orphan/legacy workflow with no
+ * campaign) is allowed — preserve the pre-lifecycle behavior rather than strand.
+ */
+export function campaignIntakeError(
+  campaign: { status: CampaignStatus } | null,
+): string | null {
+  if (!campaign) return null;
+  return campaign.status === "ACTIVE"
+    ? null
+    : `campaign is ${campaign.status.toLowerCase()} and is not accepting new creators`;
+}
+
+// PLU-153: the ACTIVE → CLOSING transition.
+export type CampaignClosingResult =
+  | { status: "closed"; campaign: Campaign } // ACTIVE → CLOSING happened
+  | { status: "already_closing"; campaign: Campaign } // idempotent no-op
+  | { status: "invalid"; from: CampaignStatus }; // DRAFT/ARCHIVED → reject
+
+/**
+ * PLU-153: THE authoritative ACTIVE → CLOSING transition. One row-locked CAS
+ * plus one CLOSING audit event, in one transaction, so concurrent close
+ * requests serialize and produce exactly one transition + one event. Actor,
+ * timestamp (event.createdAt) and optional structured reason live entirely on
+ * the audit event — no closing columns on Campaign. Idempotent: an
+ * already-CLOSING campaign returns BEFORE any write, so no second event.
+ * Rejects DRAFT/ARCHIVED with the current status so the route can build an
+ * actionable error. Returns null when the campaign does not exist.
+ *
+ * Only `status` moves forward here — CLOSING never touches money, negotiation,
+ * follow-ups, or post-acceptance work; those paths have no campaign-status gate
+ * and keep running (the "preserve existing creator work" guarantee).
+ */
+export async function transitionCampaignToClosing(
+  id: string,
+  opts: { actorId: string; reason?: string | null },
+  client: Db = db,
+): Promise<CampaignClosingResult | null> {
+  return client.transaction(async (tx) => {
+    // Row-lock so concurrent close requests serialize (same FOR UPDATE pattern
+    // as outboundPacing's campaign lock).
+    await tx.execute(sql`SELECT "id" FROM "Campaign" WHERE "id" = ${id} FOR UPDATE`);
+    const rows = await tx.select().from(campaigns).where(eq(campaigns.id, id)).limit(1);
+    const current = rows[0];
+    if (!current) return null;
+    if (current.status === "CLOSING") {
+      return { status: "already_closing", campaign: current };
+    }
+    if (current.status !== "ACTIVE") {
+      return { status: "invalid", from: current.status };
+    }
+    const updated = await tx
+      .update(campaigns)
+      .set({ status: "CLOSING" })
+      .where(and(eq(campaigns.id, id), eq(campaigns.status, "ACTIVE")))
+      .returning();
+    await tx.insert(campaignAuditEvents).values({
+      campaignId: id,
+      eventType: "CLOSING",
+      actorId: opts.actorId,
+      payload: opts.reason ? { reason: opts.reason } : null,
+    });
+    return { status: "closed", campaign: updated[0]! };
+  });
+}
+
+export type CampaignClosingMetadata = {
+  closingInitiatedAt: string;
+  closingInitiatedBy: string | null;
+  closingReason: string | null;
+} | null;
+
+/**
+ * PLU-153: read the closing metadata off the latest CLOSING audit event (the
+ * audit event IS the record — no columns on Campaign). Null when the campaign
+ * was never closed.
+ */
+export async function getCampaignClosingMetadata(
+  id: string,
+  client: Db = db,
+): Promise<CampaignClosingMetadata> {
+  const rows = await client
+    .select()
+    .from(campaignAuditEvents)
+    .where(
+      and(
+        eq(campaignAuditEvents.campaignId, id),
+        eq(campaignAuditEvents.eventType, "CLOSING"),
+      ),
+    )
+    .orderBy(desc(campaignAuditEvents.createdAt))
+    .limit(1);
+  const event = rows[0];
+  if (!event) return null;
+  const payload = event.payload as { reason?: string } | null;
+  return {
+    closingInitiatedAt: event.createdAt.toISOString(),
+    closingInitiatedBy: event.actorId,
+    closingReason: payload?.reason ?? null,
+  };
+}
+
+export type CampaignLifecycleCounts = {
+  totalCreatorCount: number;
+  inProgressCreatorCount: number;
+  manualReviewCount: number;
+};
+
+// PLU-153 dashboard: a COARSE count for display only. "in progress or
+// unresolved" = every instance NOT in this terminal set. This can over-report
+// (an instance parked at an END node still counts) — acceptable for V1; PLU-156
+// owns the authoritative finished-creator classifier.
+const CLOSED_INSTANCE_STATES = [
+  "REJECTED",
+  "OPTED_OUT",
+  "NO_RESPONSE",
+  "HANDOFF_COMPLETE",
+] as const;
+
+/**
+ * PLU-153: creator-journey counts for the Closing dashboard, over the same
+ * campaign→workflow→version→instance join outboundPacing uses. One grouped
+ * pass; no per-instance work.
+ */
+export async function getCampaignLifecycleCounts(
+  id: string,
+  client: Db = db,
+): Promise<CampaignLifecycleCounts> {
+  const rows = await client
+    .select({ state: executionInstances.currentState, n: count() })
+    .from(executionInstances)
+    .innerJoin(
+      workflowVersions,
+      eq(executionInstances.workflowVersionId, workflowVersions.id),
+    )
+    .innerJoin(workflows, eq(workflowVersions.workflowId, workflows.id))
+    .where(eq(workflows.campaignId, id))
+    .groupBy(executionInstances.currentState);
+
+  let total = 0;
+  let inProgress = 0;
+  let manualReview = 0;
+  for (const row of rows) {
+    total += row.n;
+    if (!(CLOSED_INSTANCE_STATES as readonly string[]).includes(row.state)) {
+      inProgress += row.n;
+    }
+    if (row.state === "MANUAL_REVIEW") manualReview += row.n;
+  }
+  return {
+    totalCreatorCount: total,
+    inProgressCreatorCount: inProgress,
+    manualReviewCount: manualReview,
+  };
 }
 
 export async function getCampaignWithWorkflows(id: string): Promise<

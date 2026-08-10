@@ -15,7 +15,7 @@ import {
   findInstanceByCreatorAndVersion,
 } from "../db/instances.js";
 import { listCreators } from "../db/creators.js";
-import { findCampaignById } from "../db/campaigns.js";
+import { campaignIntakeError, findCampaignById } from "../db/campaigns.js";
 import { getCampaignDetails } from "../db/campaignDetails.js";
 import {
   EmailAccountUnavailableError,
@@ -733,6 +733,16 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
     // mode default and (PLU-121) the connected mailbox these runs are pinned to.
     const campaign = wf.campaignId ? await findCampaignById(wf.campaignId) : null;
 
+    // PLU-153: a Closing/Archived (or unlaunched Draft) campaign stops new
+    // creator intake. This is the enroll chokepoint — CSV import has no enroll
+    // of its own, it only upserts to the roster, so gating here also covers the
+    // import→enroll path.
+    const intakeErr = campaignIntakeError(campaign);
+    if (intakeErr) {
+      res.status(409).json({ error: intakeErr });
+      return;
+    }
+
     // Resolve the effective mode ONCE for this batch:
     //   explicit override → the campaign's default → local_payment.
     // Stamping it onto each instance is what locks it: editing the campaign
@@ -810,6 +820,15 @@ router.post("/:id/launch", async (req: Request, res: Response) => {
     const latestVersion = await findLatestVersion(wf.id);
     if (!latestVersion) {
       res.status(422).json({ error: "no published version to launch" });
+      return;
+    }
+
+    // PLU-153: launching starts initial outreach for ENROLLED instances = new
+    // intake, so a Closing/Archived campaign must not launch.
+    const campaign = wf.campaignId ? await findCampaignById(wf.campaignId) : null;
+    const intakeErr = campaignIntakeError(campaign);
+    if (intakeErr) {
+      res.status(409).json({ error: intakeErr });
       return;
     }
 

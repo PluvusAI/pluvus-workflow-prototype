@@ -52,6 +52,16 @@ async function handleDelayedSend(job: Job<DelayedSendJobData>): Promise<void> {
     // it consumes one daily slot before the provider call, and Message's claim
     // marker makes provider retries idempotent.
     const claim = await claimInitialOutreachSlot(messageId);
+    if (claim.status === "suppress") {
+      // PLU-153: campaign is Closing/Archived — drop the job, never send. The
+      // Message row stays reserved-but-unsent (no externalMessageId) and the
+      // instance parks in OUTREACH_QUEUED. Terminal, not a retry: PLU-156
+      // reconciles these instances. Returning completes the job cleanly.
+      console.log(
+        `[delayed-send] suppressed initial outreach ${messageId} — campaign ${claim.reason} (job ${job.id})`,
+      );
+      return;
+    }
     if (claim.status === "defer") {
       const retryAt = Math.max(Date.now() + 1_000, claim.retryAt.getTime());
       await job.moveToDelayed(retryAt, job.token);

@@ -162,8 +162,22 @@ export function updateCampaign(
   });
 }
 
-export function deleteCampaign(id: string): Promise<void> {
-  return apiFetch<void>(`/api/campaigns/${id}`, { method: "DELETE" });
+export function deleteCampaign(id: string, force = false): Promise<void> {
+  // PLU-153: a launched campaign 409s on a plain DELETE (surface the server
+  // message). force=true hard-deletes regardless of status (dev-reset only).
+  const query = force ? "?force=true" : "";
+  return apiFetch<void>(`/api/campaigns/${id}${query}`, { method: "DELETE" });
+}
+
+// PLU-153: the ACTIVE → CLOSING transition ("End campaign"). Idempotent on the
+// server; both closed and already-closing return 200. actorId is the operator's
+// name — captured in the confirm form so the audit event records who actually
+// closed it, not a hardcoded "operator" (same pattern as PLU-154's resolve panel).
+export function closeCampaign(id: string, actorId: string, reason?: string) {
+  return postJson<CampaignDetail>(`/api/campaigns/${id}/close`, {
+    actorId,
+    reason: reason ?? null,
+  });
 }
 
 // ---------------------------------------------------------------------------
