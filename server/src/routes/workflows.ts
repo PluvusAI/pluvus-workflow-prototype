@@ -15,7 +15,13 @@ import {
   findInstanceByCreatorAndVersion,
 } from "../db/instances.js";
 import { listCreators } from "../db/creators.js";
-import { findCampaignById } from "../db/campaigns.js";
+import {
+  findCampaignById,
+  resolveCampaignLaunchContext,
+  CampaignNotActiveError,
+  CampaignNotFoundError,
+  CampaignSnapshotMissingError,
+} from "../db/campaigns.js";
 import { getCampaignDetails } from "../db/campaignDetails.js";
 import {
   EmailAccountUnavailableError,
@@ -753,6 +759,16 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
     // replies — on the same mailbox even if the campaign default is later changed.
     const pinnedAccount = await resolveAccountForCampaign(campaign?.emailAccountId);
 
+    // PLU-136 (1b) step 3: pin every new instance to the campaign's immutable
+    // launch snapshots. Resolved ONCE for the batch (same pattern as
+    // effectiveMode/pinnedAccount above) — every creator in this call enrolls
+    // under the same campaign, so the check and the ids don't vary per row.
+    // A workflow with no campaign at all (`wf.campaignId` null — legacy/seeded
+    // workflows) skips this entirely and enrolls exactly as it does today.
+    const launchContext = wf.campaignId
+      ? await resolveCampaignLaunchContext(wf.campaignId)
+      : null;
+
     let enrolled = 0;
     let skipped = 0;
 
@@ -763,6 +779,12 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
           workflowVersionId: latestVersion.id,
           postAcceptanceMode: effectiveMode,
           ...(pinnedAccount ? { emailAccountId: pinnedAccount.id } : {}),
+          ...(launchContext
+            ? {
+                campaignTermsSnapshotId: launchContext.campaignTermsSnapshotId,
+                negotiationPolicySnapshotId: launchContext.negotiationPolicySnapshotId,
+              }
+            : {}),
         });
         enrolled++;
       } catch (err) {
@@ -786,8 +808,20 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
       postAcceptanceMode: effectiveMode,
     });
   } catch (err) {
-    if (err instanceof EmailAccountUnavailableError) {
+    if (err instanceof EmailAccountUnavailableError || err instanceof CampaignNotActiveError) {
       res.status(409).json({ error: err.message });
+      return;
+    }
+    if (err instanceof CampaignNotFoundError) {
+      res.status(404).json({ error: err.message });
+      return;
+    }
+    if (err instanceof CampaignSnapshotMissingError) {
+      // Integrity failure, not a user-fixable input problem — an ACTIVE
+      // campaign should never lack its snapshot (Calvin review posture, same
+      // as launchCampaign()'s own unreachable-state guard).
+      console.error("[workflows] enroll integrity error:", err);
+      res.status(500).json({ error: err.message });
       return;
     }
     console.error("[workflows] enroll error:", err);

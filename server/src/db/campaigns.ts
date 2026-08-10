@@ -1,7 +1,9 @@
-import { and, count, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
+import { isUniqueViolation } from "./errors.js";
 import {
   brandApprovals,
+  brandIdentities,
   brandNotifications,
   campaignAuditEvents,
   campaignDetails,
@@ -10,6 +12,7 @@ import {
   clicks,
   conversationObligations,
   conversions,
+  creatorRequirements,
   dealHandoffs,
   events,
   executionInstances,
@@ -199,6 +202,16 @@ export async function launchCampaign(
   client: Db | DbTx = db,
 ): Promise<CampaignTermsSnapshot> {
   return await client.transaction(async (tx) => {
+    // PLU-136 (1b) step 2: lock the Campaign row FIRST, before reading status.
+    // Two near-simultaneous launch calls would otherwise both read DRAFT, both
+    // pass every guard below, and both reach the snapshot insert — one wins,
+    // one hits a raw 23505 nothing here used to catch. Locking makes the
+    // SECOND caller block until the first commits, then re-read ACTIVE and
+    // take the idempotent branch below — same pattern as payouts.ts /
+    // outboundPacing.ts (`SELECT … FOR UPDATE` via a raw sql fragment,
+    // version-independent of the Drizzle client).
+    await tx.execute(sql`SELECT "id" FROM "Campaign" WHERE "id" = ${id} FOR UPDATE`);
+
     const [campaign] = await tx
       .select()
       .from(campaigns)
@@ -289,41 +302,227 @@ export async function launchCampaign(
       ...detailsSnapshot
     } = details;
 
-    const [snapshot] = await tx
-      .insert(campaignTermsSnapshots)
+    // Second layer behind the FOR UPDATE lock above (belt and suspenders,
+    // same posture as payouts.ts): run the writes in a nested transaction
+    // (real SAVEPOINT) so a unique violation here — some other process
+    // winning a race the lock should have prevented — can be swallowed
+    // without aborting the outer transaction, and we fall through to the
+    // same idempotent "return the existing snapshot" behavior as above.
+    try {
+      const [snapshot] = await tx.transaction(async (tx2) => {
+        const [inserted] = await tx2
+          .insert(campaignTermsSnapshots)
+          .values({
+            campaignId: id,
+            detailsSnapshot,
+            briefExtractionId: confirmedFromExtractionId,
+          })
+          .returning();
+
+        await tx2.insert(negotiationPolicySnapshots).values({
+          campaignId: id,
+          floorCents: policy.floorCents,
+          ceilingCents: policy.ceilingCents,
+          preferredFeeCents: policy.preferredFeeCents,
+          commissionRate: policy.commissionRate,
+          maxRounds: policy.maxRounds,
+          openingOfferPosition: policy.openingOfferPosition,
+          overCeilingTolerance: policy.overCeilingTolerance,
+          negotiationGuidance: policy.negotiationGuidance,
+          negotiableTerms: policy.negotiableTerms,
+          nonNegotiableTerms: policy.nonNegotiableTerms,
+        });
+
+        await tx2.update(campaigns).set({ status: "ACTIVE" }).where(eq(campaigns.id, id));
+        await tx2.insert(campaignAuditEvents).values({
+          campaignId: id,
+          eventType: "LAUNCHED",
+        });
+        await tx2.insert(campaignAuditEvents).values({
+          campaignId: id,
+          eventType: "SNAPSHOT_CREATED",
+          payload: { campaignTermsSnapshotId: inserted!.id },
+        });
+
+        return [inserted!];
+      });
+      return snapshot;
+    } catch (err) {
+      if (!isUniqueViolation(err)) throw err;
+      const [existing] = await tx
+        .select()
+        .from(campaignTermsSnapshots)
+        .where(eq(campaignTermsSnapshots.campaignId, id))
+        .limit(1);
+      if (!existing) throw err;
+      return existing;
+    }
+  });
+}
+
+export class CampaignNotActiveError extends Error {
+  constructor(id: string) {
+    super(`Campaign ${id} is not ACTIVE — enroll only after launching it`);
+    this.name = "CampaignNotActiveError";
+  }
+}
+
+export class CampaignSnapshotMissingError extends Error {
+  constructor(id: string) {
+    super(`Campaign ${id} is ACTIVE but has no CampaignTermsSnapshot — data integrity error`);
+    this.name = "CampaignSnapshotMissingError";
+  }
+}
+
+/**
+ * PLU-136 (1b) step 3: the single place enrollment resolves which immutable
+ * snapshots a new ExecutionInstance pins to. Every enrollment call site must
+ * go through this — not just the one caller today — so a future path (bulk
+ * import, API-driven enrollment) can't accidentally skip the ACTIVE check.
+ * `negotiationPolicySnapshotId` is typed nullable because the DB column is,
+ * but in practice it's always present for a campaign that reached ACTIVE —
+ * launchCampaign()'s guard requires NegotiationPolicy unconditionally.
+ */
+export async function resolveCampaignLaunchContext(
+  campaignId: string,
+  client: Db | DbTx = db,
+): Promise<{
+  campaignTermsSnapshotId: string;
+  negotiationPolicySnapshotId: string | null;
+}> {
+  const [campaign] = await client
+    .select()
+    .from(campaigns)
+    .where(eq(campaigns.id, campaignId))
+    .limit(1);
+  if (!campaign) {
+    throw new CampaignNotFoundError(campaignId);
+  }
+  if (campaign.status !== "ACTIVE") {
+    throw new CampaignNotActiveError(campaignId);
+  }
+
+  const [termsSnapshot] = await client
+    .select()
+    .from(campaignTermsSnapshots)
+    .where(eq(campaignTermsSnapshots.campaignId, campaignId))
+    .limit(1);
+  if (!termsSnapshot) {
+    throw new CampaignSnapshotMissingError(campaignId);
+  }
+
+  const [policySnapshot] = await client
+    .select()
+    .from(negotiationPolicySnapshots)
+    .where(eq(negotiationPolicySnapshots.campaignId, campaignId))
+    .limit(1);
+
+  return {
+    campaignTermsSnapshotId: termsSnapshot.id,
+    negotiationPolicySnapshotId: policySnapshot?.id ?? null,
+  };
+}
+
+/**
+ * PLU-136 (1b) step 5: the only way to change material terms on an already-
+ * launched (ACTIVE) campaign — the spec's own answer to "brand wants to
+ * change the offer after launch" is duplicate into a new DRAFT, never edit
+ * the frozen one. Copies the source's execution settings, CampaignDetails,
+ * NegotiationPolicy, BrandIdentity, and CreatorRequirement (whichever of the
+ * latter three actually exist — none are required on a draft). Deliberately
+ * copies NOTHING history-shaped: no CampaignTermsSnapshot,
+ * NegotiationPolicySnapshot, CampaignBriefExtraction, CampaignBrief,
+ * ExecutionInstance, Partnership, or prior audit trail — the new campaign
+ * starts genuinely clean and must launch on its own to get its own snapshot.
+ */
+export async function duplicateCampaign(
+  sourceCampaignId: string,
+  client: Db | DbTx = db,
+): Promise<Campaign> {
+  return await client.transaction(async (tx) => {
+    const [source] = await tx
+      .select()
+      .from(campaigns)
+      .where(eq(campaigns.id, sourceCampaignId))
+      .limit(1);
+    if (!source) {
+      throw new CampaignNotFoundError(sourceCampaignId);
+    }
+
+    const [created] = await tx
+      .insert(campaigns)
       .values({
-        campaignId: id,
-        detailsSnapshot,
-        briefExtractionId: confirmedFromExtractionId,
+        name: source.name,
+        brand: source.brand,
+        notifyEmail: source.notifyEmail,
+        notes: source.notes,
+        campaignType: source.campaignType,
+        targetUrl: source.targetUrl,
+        hiddenParamKey: source.hiddenParamKey,
+        postAcceptanceMode: source.postAcceptanceMode,
+        dailyInitialOutreachLimit: source.dailyInitialOutreachLimit,
+        outreachPacingMinMinutes: source.outreachPacingMinMinutes,
+        outreachPacingMaxMinutes: source.outreachPacingMaxMinutes,
+        negotiationReplyPacingMinMinutes: source.negotiationReplyPacingMinMinutes,
+        negotiationReplyPacingMaxMinutes: source.negotiationReplyPacingMaxMinutes,
+        emailAccountId: source.emailAccountId,
+        // status omitted → column default DRAFT. Every duplicate starts as a
+        // fresh draft, never inheriting the source's ACTIVE state.
+        duplicatedFromCampaignId: sourceCampaignId,
       })
       .returning();
+    const duplicate = created!;
 
-    await tx.insert(negotiationPolicySnapshots).values({
-      campaignId: id,
-      floorCents: policy.floorCents,
-      ceilingCents: policy.ceilingCents,
-      preferredFeeCents: policy.preferredFeeCents,
-      commissionRate: policy.commissionRate,
-      maxRounds: policy.maxRounds,
-      openingOfferPosition: policy.openingOfferPosition,
-      overCeilingTolerance: policy.overCeilingTolerance,
-      negotiationGuidance: policy.negotiationGuidance,
-      negotiableTerms: policy.negotiableTerms,
-      nonNegotiableTerms: policy.nonNegotiableTerms,
-    });
+    const [sourceDetails] = await tx
+      .select()
+      .from(campaignDetails)
+      .where(eq(campaignDetails.campaignId, sourceCampaignId))
+      .limit(1);
+    if (sourceDetails) {
+      // confirmedFromExtractionId/confirmedAt reset to null — this draft
+      // hasn't been confirmed against any extraction of its own yet.
+      const { id: _id, campaignId: _cid, confirmedFromExtractionId: _cfei, confirmedAt: _ca, createdAt: _c, updatedAt: _u, ...copyable } =
+        sourceDetails;
+      await tx.insert(campaignDetails).values({ campaignId: duplicate.id, ...copyable });
+    }
 
-    await tx.update(campaigns).set({ status: "ACTIVE" }).where(eq(campaigns.id, id));
+    const [sourcePolicy] = await tx
+      .select()
+      .from(negotiationPolicies)
+      .where(eq(negotiationPolicies.campaignId, sourceCampaignId))
+      .limit(1);
+    if (sourcePolicy) {
+      const { id: _id, campaignId: _cid, createdAt: _c, updatedAt: _u, ...copyable } = sourcePolicy;
+      await tx.insert(negotiationPolicies).values({ campaignId: duplicate.id, ...copyable });
+    }
+
+    const [sourceIdentity] = await tx
+      .select()
+      .from(brandIdentities)
+      .where(eq(brandIdentities.campaignId, sourceCampaignId))
+      .limit(1);
+    if (sourceIdentity) {
+      const { id: _id, campaignId: _cid, createdAt: _c, updatedAt: _u, ...copyable } = sourceIdentity;
+      await tx.insert(brandIdentities).values({ campaignId: duplicate.id, ...copyable });
+    }
+
+    const [sourceRequirement] = await tx
+      .select()
+      .from(creatorRequirements)
+      .where(eq(creatorRequirements.campaignId, sourceCampaignId))
+      .limit(1);
+    if (sourceRequirement) {
+      const { id: _id, campaignId: _cid, createdAt: _c, updatedAt: _u, ...copyable } = sourceRequirement;
+      await tx.insert(creatorRequirements).values({ campaignId: duplicate.id, ...copyable });
+    }
+
     await tx.insert(campaignAuditEvents).values({
-      campaignId: id,
-      eventType: "LAUNCHED",
-    });
-    await tx.insert(campaignAuditEvents).values({
-      campaignId: id,
-      eventType: "SNAPSHOT_CREATED",
-      payload: { campaignTermsSnapshotId: snapshot!.id },
+      campaignId: sourceCampaignId,
+      eventType: "DUPLICATED",
+      payload: { newCampaignId: duplicate.id },
     });
 
-    return snapshot!;
+    return duplicate;
   });
 }
 

@@ -275,6 +275,20 @@ enum CampaignStatus {
   ARCHIVED
 }
 
+/// PLU-136 (1b): classification of how the creator is compensated —
+/// display/analytics/template-selection only. Does NOT gate whether
+/// NegotiationPolicy is required at launch: every campaign type negotiates
+/// (deliverables, timeline, usage rights, exclusivity, and — unless
+/// NegotiationPolicy marks it non-negotiable — the fee itself). A fixed-fee
+/// (PAID) campaign is still a negotiated one; "fixed" describes the
+/// compensation mechanism, not an exemption from negotiation.
+enum CampaignType {
+  GIFT
+  PAID
+  AFFILIATE
+  HYBRID
+}
+
 /// A brand campaign. The top-level container created by brands in the wizard.
 /// One Campaign can own multiple Workflows (e.g. different strategies for the same campaign).
 ///
@@ -304,6 +318,10 @@ model Campaign {
   /// CampaignTermsSnapshot + NegotiationPolicySnapshot and locks CampaignDetails
   /// + NegotiationPolicy. See CampaignStatus and launchCampaign() (db/campaigns.ts).
   status CampaignStatus @default(DRAFT)
+
+  /// PLU-136 (1b): classification only — see CampaignType's doc comment. Does
+  /// not gate the launch guard.
+  campaignType CampaignType @default(PAID)
 
   targetUrl      String?
   hiddenParamKey String  @default("_from")
@@ -337,12 +355,21 @@ model Campaign {
   /// listCampaigns() filters these out; direct lookup by id is unaffected.
   archivedAt DateTime?
 
+  /// PLU-136 (1b): set by duplicateCampaign() on the NEW row, pointing at the
+  /// campaign it was copied from. Traceability/UI context only — never read
+  /// by authorization/resolution logic. onDelete SetNull: a duplicate must
+  /// never be blocked or cascade-deleted just because its (DRAFT-only-
+  /// deletable) source was later hard-deleted.
+  duplicatedFromCampaignId String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   workflows    Workflow[]
   outreachDays CampaignOutreachDay[]
   emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
+  duplicatedFrom Campaign?  @relation("CampaignDuplication", fields: [duplicatedFromCampaignId], references: [id], onDelete: SetNull)
+  duplicates     Campaign[] @relation("CampaignDuplication")
 
   /// PLU-135 (1a) additions — see each model's own doc comment. termsSnapshot /
   /// negotiationPolicySnapshot are singular (0 or 1): a campaign launches at
@@ -392,8 +419,12 @@ model CampaignDetails {
   /// vault's own "Decision - Persist Full Extraction" note (prohibited claims
   /// was never persisted even when extracted from a brief).
   prohibitedClaims    String?
-  /// Only when compensation is genuinely fixed and non-negotiable. Negotiable
-  /// bounds live in NegotiationPolicy instead, never here.
+  /// PLU-136 (1b): the agreed/offered upfront amount, when Campaign.campaignType
+  /// includes one (PAID/HYBRID). NOT a signal for whether this campaign
+  /// negotiates — every campaign type negotiates (deliverables, timeline,
+  /// usage rights, exclusivity, and — unless NegotiationPolicy marks it
+  /// non-negotiable — the fee itself too). NegotiationPolicy is required for
+  /// every campaign at launch, unconditionally.
   fixedCompensationCents Int?
   publicPaymentTerms     String?
   shipsPhysicalProduct   Boolean @default(false)

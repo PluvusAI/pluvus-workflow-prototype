@@ -37,6 +37,7 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
@@ -262,6 +263,20 @@ export const campaignStatusEnum = pgEnum("CampaignStatus", [
   "ARCHIVED",
 ]);
 
+// PLU-136 (1b): classification of how the creator is compensated —
+// display/analytics/template-selection only. Does NOT gate whether
+// NegotiationPolicy is required at launch: every campaign type negotiates
+// (deliverables, timeline, usage rights, exclusivity, and — unless
+// NegotiationPolicy marks it non-negotiable — the fee itself). A fixed-fee
+// (PAID) campaign is still a negotiated one. Same precedent as
+// postAcceptanceModeEnum: an operational/behavioral enum on campaigns.
+export const campaignTypeEnum = pgEnum("CampaignType", [
+  "GIFT",
+  "PAID",
+  "AFFILIATE",
+  "HYBRID",
+]);
+
 // Brand-approval gate: lifecycle of the brand's Approve/Reject decision on a
 // creator the AI closed. AWAITING_APPROVAL until the brand clicks a magic link;
 // PROCESSING is a short-lived intermediate claim held ONLY while the workflow
@@ -436,6 +451,7 @@ export type BrandIdentityExtractionSource =
 export type CampaignAuditEventType =
   (typeof campaignAuditEventTypeEnum.enumValues)[number];
 export type CampaignStatus = (typeof campaignStatusEnum.enumValues)[number];
+export type CampaignType = (typeof campaignTypeEnum.enumValues)[number];
 
 // ---------------------------------------------------------------------------
 // Definition models
@@ -488,6 +504,8 @@ export const campaigns = pgTable(
     // creates campaignTermsSnapshots + negotiationPolicySnapshots and locks
     // campaignDetails + negotiationPolicies. See launchCampaign() (db/campaigns.ts).
     status: campaignStatusEnum("status").notNull().default("DRAFT"),
+    // PLU-136 (1b): classification only. See campaignTypeEnum's doc comment.
+    campaignType: campaignTypeEnum("campaignType").notNull().default("PAID"),
     notifyEmail: text("notifyEmail"),
     targetUrl: text("targetUrl"),
     hiddenParamKey: text("hiddenParamKey").notNull().default("_from"),
@@ -516,10 +534,22 @@ export const campaigns = pgTable(
     // campaign still hard-deletes as before. listCampaigns() filters these
     // out; direct lookup by id is unaffected.
     archivedAt: ts("archivedAt"),
+    // PLU-136 (1b): set by duplicateCampaign() on the NEW row, pointing at
+    // the campaign it was copied from — traceability/UI context only, never
+    // read by authorization/resolution logic. onDelete "set null": a
+    // duplicate must never be blocked or cascade-deleted just because its
+    // (DRAFT-only-deletable) source was later hard-deleted.
+    duplicatedFromCampaignId: text("duplicatedFromCampaignId").references(
+      (): AnyPgColumn => campaigns.id,
+      { onDelete: "set null" },
+    ),
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },
-  (table) => [index("Campaign_emailAccountId_idx").on(table.emailAccountId)],
+  (table) => [
+    index("Campaign_emailAccountId_idx").on(table.emailAccountId),
+    index("Campaign_duplicatedFromCampaignId_idx").on(table.duplicatedFromCampaignId),
+  ],
 );
 
 // PLU-135 (1a): the editable, creator-facing draft — every term that moved out
@@ -552,8 +582,11 @@ export const campaignDetails = pgTable("CampaignDetails", {
   // New — no existing column covered this (flagged as a gap by the vault's
   // "Decision - Persist Full Extraction" note).
   prohibitedClaims: text("prohibitedClaims"),
-  // Only when compensation is genuinely fixed and non-negotiable. Negotiable
-  // bounds live in negotiationPolicies instead, never here.
+  // PLU-136 (1b): the agreed/offered upfront amount, when campaigns.campaignType
+  // includes one (PAID/HYBRID). NOT a signal for whether this campaign
+  // negotiates — every campaign type does (see campaignTypeEnum's doc
+  // comment). negotiationPolicies is required for every campaign at launch,
+  // unconditionally.
   fixedCompensationCents: integer("fixedCompensationCents"),
   publicPaymentTerms: text("publicPaymentTerms"),
   shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),

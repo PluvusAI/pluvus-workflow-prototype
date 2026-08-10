@@ -1,18 +1,23 @@
 /**
- * DB-backed tests for launchCampaign() (PLU-135 / 1a) — the Draft → Active
- * transition. Runs against a REAL Postgres (PGlite, embedded) with the REAL
- * schema (every migration applied verbatim, including the 1a campaign-schema
- * migration), so the new tables/constraints/FKs are byte-identical to what a
- * real deploy would have.
+ * DB-backed tests for launchCampaign() and the rest of the launch lifecycle
+ * (PLU-135 / 1a, extended by PLU-136 / 1b). Runs against a REAL Postgres
+ * (PGlite, embedded) with the REAL schema (every migration applied verbatim),
+ * so the new tables/constraints/FKs are byte-identical to what a real deploy
+ * would have.
  *
- * Scope, deliberately minimal (code review, Ayush, 2026-08-09): this proves
- * the happy path the schema change actually shipped — launch once, launch
- * again is a no-op, and the post-launch lock fires. It is NOT the fuller
- * concurrency/duplication/idempotency-under-load suite (two racing launch
- * calls, campaign duplication, etc.) — that belongs to Issue 1b, which owns
- * the rest of the launch lifecycle. Before this file, launchCampaign() and
- * POST /campaigns/:id/launch had exactly one caller in the whole codebase
- * (the route itself) and zero test coverage.
+ * 1a scope (code review, Ayush, 2026-08-09): the happy path — launch once,
+ * launch again is a no-op, the post-launch lock fires.
+ *
+ * 1b additions: concurrent launch convergence (step 2), campaignType never
+ * gating the NegotiationPolicy guard (step 1's correction),
+ * resolveCampaignLaunchContext()'s ACTIVE-only gate (step 3), and
+ * duplicateCampaign()'s copy/exclude behavior (step 5).
+ *
+ * Note on the concurrency test: PGlite is a single embedded connection, so
+ * `Promise.all` on it proves launchCampaign()'s convergence/idempotency logic
+ * (the re-check-after-lock code path) but not genuine multi-connection lock
+ * contention — proving that would need a two-real-connection harness against
+ * dev Postgres, same caveat documented in engine/payouts.harness.ts.
  *
  * Run:  npx tsx --test src/db/campaigns.launch.db.test.ts   (or via npm test)
  */
@@ -23,7 +28,13 @@ import { drizzle } from "drizzle-orm/pglite";
 import { eq } from "drizzle-orm";
 import * as schema from "./schema.js";
 import type { Db } from "./drizzle.js";
-import { launchCampaign } from "./campaigns.js";
+import {
+  launchCampaign,
+  duplicateCampaign,
+  resolveCampaignLaunchContext,
+  NegotiationPolicyMissingError,
+  CampaignNotActiveError,
+} from "./campaigns.js";
 import { upsertCampaignDetails, CampaignLockedError } from "./campaignDetails.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
@@ -157,6 +168,159 @@ async function main(): Promise<void> {
         .from(schema.campaignDetails)
         .where(eq(schema.campaignDetails.campaignId, campaignId));
       assert.equal(details!.objective, "Drive signups", "unchanged — the write never landed");
+    },
+  );
+
+  await test(
+    "two concurrent launchCampaign() calls converge on exactly one snapshot and one LAUNCHED event",
+    async () => {
+      const campaignId = await seedLaunchableCampaign(pgdb, "concurrent");
+
+      const [a, b] = await Promise.all([
+        launchCampaign(campaignId, pgdb),
+        launchCampaign(campaignId, pgdb),
+      ]);
+      assert.equal(a.id, b.id, "both concurrent calls return the same snapshot");
+
+      const termsSnapshots = await pgdb
+        .select()
+        .from(schema.campaignTermsSnapshots)
+        .where(eq(schema.campaignTermsSnapshots.campaignId, campaignId));
+      assert.equal(termsSnapshots.length, 1, "exactly one snapshot, not two");
+
+      const auditEvents = await pgdb
+        .select()
+        .from(schema.campaignAuditEvents)
+        .where(eq(schema.campaignAuditEvents.campaignId, campaignId));
+      const launchedCount = auditEvents.filter((e) => e.eventType === "LAUNCHED").length;
+      assert.equal(launchedCount, 1, "exactly one LAUNCHED event despite two concurrent calls");
+    },
+  );
+
+  await test(
+    "NegotiationPolicy is still required to launch regardless of campaignType — campaignType never gates the guard",
+    async () => {
+      const [campaign] = await pgdb
+        .insert(schema.campaigns)
+        .values({ name: "Gift, no policy", brand: "Acme", campaignType: "GIFT" })
+        .returning();
+      await pgdb.insert(schema.campaignDetails).values({
+        campaignId: campaign!.id,
+        objective: "Send a free product for review",
+      });
+
+      await assert.rejects(
+        () => launchCampaign(campaign!.id, pgdb),
+        NegotiationPolicyMissingError,
+        "GIFT alone does not exempt a campaign from the NegotiationPolicy guard",
+      );
+
+      // Same campaignType, now WITH a policy — launches fine. Proves the guard
+      // reacts to policy presence alone, never to campaignType.
+      await pgdb.insert(schema.negotiationPolicies).values({
+        campaignId: campaign!.id,
+        floorCents: 0,
+        ceilingCents: 0,
+        maxRounds: 1,
+      });
+      const snapshot = await launchCampaign(campaign!.id, pgdb);
+      assert.equal(snapshot.campaignId, campaign!.id);
+    },
+  );
+
+  await test(
+    "resolveCampaignLaunchContext rejects a DRAFT campaign and returns pinned snapshot ids for an ACTIVE one",
+    async () => {
+      const campaignId = await seedLaunchableCampaign(pgdb, "enroll");
+
+      await assert.rejects(
+        () => resolveCampaignLaunchContext(campaignId, pgdb),
+        CampaignNotActiveError,
+        "enrollment must be rejected before the campaign has launched",
+      );
+
+      const snapshot = await launchCampaign(campaignId, pgdb);
+      const context = await resolveCampaignLaunchContext(campaignId, pgdb);
+      assert.equal(context.campaignTermsSnapshotId, snapshot.id);
+
+      const [policySnapshot] = await pgdb
+        .select()
+        .from(schema.negotiationPolicySnapshots)
+        .where(eq(schema.negotiationPolicySnapshots.campaignId, campaignId));
+      assert.equal(context.negotiationPolicySnapshotId, policySnapshot!.id);
+    },
+  );
+
+  await test(
+    "duplicateCampaign copies details/policy into a fresh DRAFT and copies no history",
+    async () => {
+      const campaignId = await seedLaunchableCampaign(pgdb, "dup-source");
+
+      // A confirmed extraction — proves confirmedFromExtractionId resets on
+      // the duplicate rather than carrying over a pointer the new draft
+      // hasn't earned yet.
+      const [extraction] = await pgdb
+        .insert(schema.campaignBriefExtractions)
+        .values({
+          campaignId,
+          flatText: "raw brief text",
+          sections: {},
+          sourceFileReference: "brief.pdf",
+          parserVersion: "v1",
+        })
+        .returning();
+      await pgdb
+        .update(schema.campaignDetails)
+        .set({ confirmedFromExtractionId: extraction!.id, confirmedAt: new Date() })
+        .where(eq(schema.campaignDetails.campaignId, campaignId));
+
+      // Source launches — has a snapshot and audit history the duplicate
+      // must NOT inherit.
+      await launchCampaign(campaignId, pgdb);
+
+      const duplicate = await duplicateCampaign(campaignId, pgdb);
+      assert.equal(duplicate.status, "DRAFT");
+      assert.equal(duplicate.duplicatedFromCampaignId, campaignId);
+
+      const [dupDetails] = await pgdb
+        .select()
+        .from(schema.campaignDetails)
+        .where(eq(schema.campaignDetails.campaignId, duplicate.id));
+      assert.equal(dupDetails!.objective, "Drive signups", "creator-facing fields copied");
+      assert.equal(
+        dupDetails!.confirmedFromExtractionId,
+        null,
+        "confirmation provenance resets — this draft hasn't been confirmed against anything yet",
+      );
+
+      const [dupPolicy] = await pgdb
+        .select()
+        .from(schema.negotiationPolicies)
+        .where(eq(schema.negotiationPolicies.campaignId, duplicate.id));
+      assert.equal(dupPolicy!.floorCents, 20000, "negotiation policy copied as a fresh draft starting point");
+
+      const dupSnapshots = await pgdb
+        .select()
+        .from(schema.campaignTermsSnapshots)
+        .where(eq(schema.campaignTermsSnapshots.campaignId, duplicate.id));
+      assert.equal(dupSnapshots.length, 0, "no snapshot copied — the duplicate must launch on its own");
+
+      const dupAuditEvents = await pgdb
+        .select()
+        .from(schema.campaignAuditEvents)
+        .where(eq(schema.campaignAuditEvents.campaignId, duplicate.id));
+      assert.equal(dupAuditEvents.length, 0, "no audit history copied onto the duplicate");
+
+      const sourceAuditEvents = await pgdb
+        .select()
+        .from(schema.campaignAuditEvents)
+        .where(eq(schema.campaignAuditEvents.campaignId, campaignId));
+      const duplicatedEvents = sourceAuditEvents.filter((e) => e.eventType === "DUPLICATED");
+      assert.equal(duplicatedEvents.length, 1, "exactly one DUPLICATED event on the source");
+      assert.equal(
+        (duplicatedEvents[0]!.payload as Record<string, unknown>)["newCampaignId"],
+        duplicate.id,
+      );
     },
   );
 

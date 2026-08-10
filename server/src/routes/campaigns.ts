@@ -8,6 +8,7 @@ import {
   findCampaignById,
   deleteCampaign,
   launchCampaign,
+  duplicateCampaign,
   CampaignNotFoundError,
   CampaignDetailsMissingError,
   NegotiationPolicyMissingError,
@@ -48,6 +49,10 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     // sense (writes are rejected once ACTIVE), not the "live draft" language
     // above literally implies once a campaign reaches this state.
     status: campaign.status,
+    // PLU-136 (1b): classification only — see CampaignType's doc comment in
+    // schema.prisma. Never gates launch/negotiation.
+    campaignType: campaign.campaignType,
+    duplicatedFromCampaignId: campaign.duplicatedFromCampaignId,
     objective: details?.objective ?? null,
     notes: campaign.notes,
     notifyEmail: campaign.notifyEmail,
@@ -528,6 +533,34 @@ router.post("/:id/launch", async (req: Request, res: Response) => {
       return;
     }
     console.error("[campaigns] launch error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// POST /campaigns/:id/duplicate — PLU-136 (1b): the material-change path for
+// an already-launched campaign. Copies the source's settings/details/policy/
+// brand-identity/creator-requirement into a fresh DRAFT; copies no history
+// (no snapshots, executions, or prior audit trail). See duplicateCampaign's
+// doc comment (db/campaigns.ts) for the exact copy/exclude list.
+router.post("/:id/duplicate", async (req: Request, res: Response) => {
+  try {
+    const source = await findCampaignById(req.params["id"]!);
+    if (!source) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const duplicate = await duplicateCampaign(req.params["id"]!);
+    const details = await getCampaignDetails(duplicate.id);
+    res.status(201).json({
+      ...flattenCampaign(duplicate, details),
+      createdAt: duplicate.createdAt.toISOString(),
+    });
+  } catch (err) {
+    if (err instanceof CampaignNotFoundError) {
+      res.status(404).json({ error: err.message });
+      return;
+    }
+    console.error("[campaigns] duplicate error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });
