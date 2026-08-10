@@ -28,8 +28,10 @@ import {
   workflows,
   workflowVersions,
   type Campaign,
+  type CampaignDetails,
   type CampaignInsert,
   type CampaignTermsSnapshot,
+  type NegotiationPolicy,
   type WorkflowStatus,
 } from "./schema.js";
 
@@ -187,6 +189,117 @@ export class NegotiationPolicyMissingError extends Error {
 }
 
 /**
+ * PLU-136: every campaign predating the compensation-contract migration has
+ * compensationReviewStatus NEEDS_REVIEW only because that's the column
+ * default on backfill, never because anyone verified the classification —
+ * see CompensationReviewStatus's doc comment in schema.prisma. The actual
+ * review UI/queue is PLU-144's job; this is only the launch gate.
+ */
+export class CompensationReviewPendingError extends Error {
+  constructor(id: string) {
+    super(
+      `Campaign ${id} compensation structure needs operator review (compensationReviewStatus=NEEDS_REVIEW) before it can launch`,
+    );
+    this.name = "CompensationReviewPendingError";
+  }
+}
+
+export class CompensationIncompleteError extends Error {
+  readonly missing: string[];
+  constructor(id: string, missing: string[]) {
+    super(`Campaign ${id} compensation terms incomplete for launch: ${missing.join(", ")}`);
+    this.name = "CompensationIncompleteError";
+    this.missing = missing;
+  }
+}
+
+/**
+ * PLU-136: a policy category is only "handled" if there's either private
+ * flexibility bounds set for it, OR it's explicitly marked non-negotiable —
+ * "a campaign whose public terms are intended to remain fixed still has a
+ * policy explicitly marking the relevant categories non-negotiable," per the
+ * compensation-contract spec. `nonNegotiableTerms` had no established shape
+ * before this (its own doc comment says nothing in the codebase reads it
+ * yet) — this is the first reader, and establishes the convention: an array
+ * of category strings ("fee" | "commission" | "gift").
+ */
+function isMarkedNonNegotiable(
+  nonNegotiableTerms: unknown,
+  category: "fee" | "commission" | "gift",
+): boolean {
+  if (!Array.isArray(nonNegotiableTerms)) return false;
+  return nonNegotiableTerms.some((t) => typeof t === "string" && t.toLowerCase() === category);
+}
+
+/**
+ * PLU-136: structure-specific launch-readiness rules. launchCampaign() only
+ * checked that CampaignDetails/NegotiationPolicy rows EXIST before this —
+ * nothing validated their fields were actually complete for the chosen
+ * campaignType. Returns the list of missing requirements (empty = ready).
+ *
+ *   PAID:      priceStrategy set; publicStartingFeeCents set when
+ *              PROPOSE_STARTING_FEE; private fee authority present.
+ *   AFFILIATE: publicCommissionRate set; private commission authority
+ *              present. Fee fields are NOT required (PLU-129's existing
+ *              0/0-is-valid convention for commission-only campaigns).
+ *   HYBRID:    both PAID and AFFILIATE rules apply.
+ *   GIFT_ONLY: productOrOffer + giftDisposition set; private gift authority
+ *              present. No fee or commission required.
+ *   Any structure with includesGifting: also requires productOrOffer +
+ *   giftDisposition + private gift authority, on top of its primary rules.
+ */
+export function validateCompensationReadiness(
+  details: CampaignDetails,
+  policy: NegotiationPolicy,
+): string[] {
+  const missing: string[] = [];
+
+  const needsFee = details.campaignType === "PAID" || details.campaignType === "HYBRID";
+  const needsCommission =
+    details.campaignType === "AFFILIATE" || details.campaignType === "HYBRID";
+  const needsGift = details.campaignType === "GIFT_ONLY" || details.includesGifting;
+
+  if (needsFee) {
+    if (!details.priceStrategy) missing.push("CampaignDetails.priceStrategy");
+    if (details.priceStrategy === "PROPOSE_STARTING_FEE" && details.publicStartingFeeCents == null) {
+      missing.push("CampaignDetails.publicStartingFeeCents (required when priceStrategy is PROPOSE_STARTING_FEE)");
+    }
+    const hasFeeAuthority =
+      policy.floorCents != null ||
+      policy.ceilingCents != null ||
+      isMarkedNonNegotiable(policy.nonNegotiableTerms, "fee");
+    if (!hasFeeAuthority) {
+      missing.push("NegotiationPolicy fee bounds (floorCents/ceilingCents) or an explicit non-negotiable fee marker");
+    }
+  }
+
+  if (needsCommission) {
+    if (details.publicCommissionRate == null) missing.push("CampaignDetails.publicCommissionRate");
+    const hasCommissionAuthority =
+      policy.commissionFloorRate != null ||
+      policy.commissionCeilingRate != null ||
+      isMarkedNonNegotiable(policy.nonNegotiableTerms, "commission");
+    if (!hasCommissionAuthority) {
+      missing.push("NegotiationPolicy commission bounds (commissionFloorRate/commissionCeilingRate) or an explicit non-negotiable commission marker");
+    }
+  }
+
+  if (needsGift) {
+    if (!details.productOrOffer) missing.push("CampaignDetails.productOrOffer");
+    if (!details.giftDisposition) missing.push("CampaignDetails.giftDisposition");
+    const hasGiftAuthority =
+      policy.giftSubstitutionAllowed != null ||
+      policy.giftValueFlexibilityCents != null ||
+      isMarkedNonNegotiable(policy.nonNegotiableTerms, "gift");
+    if (!hasGiftAuthority) {
+      missing.push("NegotiationPolicy gift flexibility fields or an explicit non-negotiable gift marker");
+    }
+  }
+
+  return missing;
+}
+
+/**
  * PLU-135 (1a): THE launch transition — Draft → Active. Creates the ONE
  * immutable CampaignTermsSnapshot and NegotiationPolicySnapshot this campaign
  * will ever have (Calvin review, 2026-08-08: never at enrollment, which could
@@ -255,15 +368,17 @@ export async function launchCampaign(
     // because launch is one-way, campaign duplication would be the only fix.
     // Failing here instead leaves the campaign in Draft, still fixable.
     //
-    // Code review note (Ayush, 2026-08-09): this is unconditional — EVERY
-    // campaign must have a NegotiationPolicy to launch, no exceptions. That's
-    // correct for today's product, where every workflow template has a
-    // negotiation node and every campaign negotiates; there's no "fixed /
-    // non-negotiated" campaign type yet for this to wrongly block. Both the
-    // 1a and 1b tickets do mention that type as future work, though — once it
-    // exists, this check will need to become type-aware (skip the guard for a
-    // campaign that was never meant to negotiate) rather than staying a blanket
-    // requirement. Not a problem today; just don't read this as permanent.
+    // Code review note (Ayush, 2026-08-09), reaffirmed by the PLU-136
+    // compensation-contract revision: this is unconditional — EVERY campaign
+    // must have a NegotiationPolicy to launch, no exceptions, regardless of
+    // campaignType. That's correct on purpose, not a placeholder waiting for
+    // campaignType to exist (it now does, on CampaignDetails): every
+    // structure negotiates SOMETHING (fee, commission, gift terms, or at
+    // minimum deliverables/timeline/rights), so a policy row — even one that
+    // marks everything explicitly non-negotiable — is always required.
+    // validateCompensationReadiness() below is what became "type-aware":
+    // it checks the RIGHT fields for the chosen campaignType, not whether a
+    // policy exists at all.
     //
     // Also worth naming: this guard cannot currently be satisfied by ANY
     // campaign, because nothing populates NegotiationPolicy yet.
@@ -282,6 +397,24 @@ export async function launchCampaign(
       .limit(1);
     if (!policy) {
       throw new NegotiationPolicyMissingError(id);
+    }
+
+    // PLU-136: no unverified compensation structure ever reaches ACTIVE — a
+    // campaign backfilled by the compensation-contract migration (or any
+    // future ambiguous-mapping case) starts NEEDS_REVIEW and stays blocked
+    // until an operator confirms it. Checked before field-completeness below
+    // since it's a blanket "not yet verified" gate independent of whether
+    // the fields happen to already look complete.
+    if (details.compensationReviewStatus !== "CONFIRMED") {
+      throw new CompensationReviewPendingError(id);
+    }
+
+    // PLU-136: structure-specific field completeness — see
+    // validateCompensationReadiness's doc comment for the exact rules per
+    // campaignType.
+    const missingCompensationFields = validateCompensationReadiness(details, policy);
+    if (missingCompensationFields.length > 0) {
+      throw new CompensationIncompleteError(id, missingCompensationFields);
     }
 
     // Schema review §2.1: the snapshot's fallback pointer is whichever
@@ -324,11 +457,15 @@ export async function launchCampaign(
           floorCents: policy.floorCents,
           ceilingCents: policy.ceilingCents,
           preferredFeeCents: policy.preferredFeeCents,
-          commissionRate: policy.commissionRate,
+          commissionFloorRate: policy.commissionFloorRate,
+          commissionCeilingRate: policy.commissionCeilingRate,
+          preferredCommissionRate: policy.preferredCommissionRate,
           maxRounds: policy.maxRounds,
           openingOfferPosition: policy.openingOfferPosition,
           overCeilingTolerance: policy.overCeilingTolerance,
           negotiationGuidance: policy.negotiationGuidance,
+          giftSubstitutionAllowed: policy.giftSubstitutionAllowed,
+          giftValueFlexibilityCents: policy.giftValueFlexibilityCents,
           negotiableTerms: policy.negotiableTerms,
           nonNegotiableTerms: policy.nonNegotiableTerms,
         });
@@ -427,7 +564,10 @@ export async function resolveCampaignLaunchContext(
  * PLU-136 (1b) step 5: the only way to change material terms on an already-
  * launched (ACTIVE) campaign — the spec's own answer to "brand wants to
  * change the offer after launch" is duplicate into a new DRAFT, never edit
- * the frozen one. Copies the source's execution settings, CampaignDetails,
+ * the frozen one. Copies the source's execution settings, CampaignDetails
+ * (which now includes campaignType and every compensation field — no
+ * special-casing needed, they copy along with everything else on that
+ * table, except compensationReviewStatus, explicitly reset to NEEDS_REVIEW),
  * NegotiationPolicy, BrandIdentity, and CreatorRequirement (whichever of the
  * latter three actually exist — none are required on a draft). Deliberately
  * copies NOTHING history-shaped: no CampaignTermsSnapshot,
@@ -456,7 +596,6 @@ export async function duplicateCampaign(
         brand: source.brand,
         notifyEmail: source.notifyEmail,
         notes: source.notes,
-        campaignType: source.campaignType,
         targetUrl: source.targetUrl,
         hiddenParamKey: source.hiddenParamKey,
         postAcceptanceMode: source.postAcceptanceMode,
@@ -483,7 +622,14 @@ export async function duplicateCampaign(
       // hasn't been confirmed against any extraction of its own yet.
       const { id: _id, campaignId: _cid, confirmedFromExtractionId: _cfei, confirmedAt: _ca, createdAt: _c, updatedAt: _u, ...copyable } =
         sourceDetails;
-      await tx.insert(campaignDetails).values({ campaignId: duplicate.id, ...copyable });
+      await tx.insert(campaignDetails).values({
+        campaignId: duplicate.id,
+        ...copyable,
+        // PLU-136: a duplicate is a new draft with its own terms to
+        // re-verify, never an inherited confirmation — reset even if the
+        // source was already CONFIRMED.
+        compensationReviewStatus: "NEEDS_REVIEW",
+      });
     }
 
     const [sourcePolicy] = await tx

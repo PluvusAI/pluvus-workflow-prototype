@@ -60,6 +60,12 @@ async function seedLaunchableCampaign(pgdb: Db, suffix: string): Promise<string>
     objective: "Drive signups",
     deliverables: "1 IG Reel",
     usageRights: "90-day paid social",
+    // PLU-136: campaignType defaults PAID (unset here — matches the
+    // default). priceStrategy + compensationReviewStatus are required by
+    // launchCampaign()'s compensation-readiness gate — REQUEST_RATE_CARD
+    // avoids also needing publicStartingFeeCents.
+    priceStrategy: "REQUEST_RATE_CARD",
+    compensationReviewStatus: "CONFIRMED",
   });
   await pgdb.insert(schema.negotiationPolicies).values({
     campaignId: campaign!.id,
@@ -202,26 +208,34 @@ async function main(): Promise<void> {
     async () => {
       const [campaign] = await pgdb
         .insert(schema.campaigns)
-        .values({ name: "Gift, no policy", brand: "Acme", campaignType: "GIFT" })
+        .values({ name: "Gift, no policy", brand: "Acme" })
         .returning();
+      // PLU-136: campaignType now lives on CampaignDetails. GIFT_ONLY needs
+      // productOrOffer/giftDisposition/compensationReviewStatus=CONFIRMED to
+      // pass validateCompensationReadiness — set here so the ONLY thing
+      // missing is the NegotiationPolicy row itself, keeping this test's
+      // original point isolated (campaignType never gates the guard).
       await pgdb.insert(schema.campaignDetails).values({
         campaignId: campaign!.id,
         objective: "Send a free product for review",
+        campaignType: "GIFT_ONLY",
+        productOrOffer: "A pair of running shoes",
+        giftDisposition: "KEEP",
+        compensationReviewStatus: "CONFIRMED",
       });
 
       await assert.rejects(
         () => launchCampaign(campaign!.id, pgdb),
         NegotiationPolicyMissingError,
-        "GIFT alone does not exempt a campaign from the NegotiationPolicy guard",
+        "GIFT_ONLY alone does not exempt a campaign from the NegotiationPolicy guard",
       );
 
-      // Same campaignType, now WITH a policy — launches fine. Proves the guard
-      // reacts to policy presence alone, never to campaignType.
+      // Same campaignType, now WITH a policy (including the gift-flexibility
+      // authority GIFT_ONLY requires) — launches fine. Proves the guard
+      // reacts to policy presence/completeness alone, never to campaignType.
       await pgdb.insert(schema.negotiationPolicies).values({
         campaignId: campaign!.id,
-        floorCents: 0,
-        ceilingCents: 0,
-        maxRounds: 1,
+        giftSubstitutionAllowed: false,
       });
       const snapshot = await launchCampaign(campaign!.id, pgdb);
       assert.equal(snapshot.campaignId, campaign!.id);

@@ -12,6 +12,8 @@ import {
   CampaignNotFoundError,
   CampaignDetailsMissingError,
   NegotiationPolicyMissingError,
+  CompensationReviewPendingError,
+  CompensationIncompleteError,
 } from "../db/campaigns.js";
 import {
   CampaignLockedError,
@@ -49,9 +51,19 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     // sense (writes are rejected once ACTIVE), not the "live draft" language
     // above literally implies once a campaign reaches this state.
     status: campaign.status,
-    // PLU-136 (1b): classification only — see CampaignType's doc comment in
-    // schema.prisma. Never gates launch/negotiation.
-    campaignType: campaign.campaignType,
+    // PLU-136: lives on CampaignDetails (moved from Campaign so it's
+    // captured by CampaignTermsSnapshot) — classification only, never gates
+    // launch/negotiation by itself; see validateCompensationReadiness for
+    // what actually gates launch per structure.
+    campaignType: details?.campaignType ?? null,
+    includesGifting: details?.includesGifting ?? false,
+    giftDisposition: details?.giftDisposition ?? null,
+    priceStrategy: details?.priceStrategy ?? null,
+    publicStartingFeeCents: details?.publicStartingFeeCents ?? null,
+    publicCommissionRate: details?.publicCommissionRate ?? null,
+    commissionDurationDays: details?.commissionDurationDays ?? null,
+    commissionConditions: details?.commissionConditions ?? null,
+    compensationReviewStatus: details?.compensationReviewStatus ?? null,
     duplicatedFromCampaignId: campaign.duplicatedFromCampaignId,
     objective: details?.objective ?? null,
     notes: campaign.notes,
@@ -115,6 +127,35 @@ function isPostAcceptanceMode(v: unknown): v is PostAcceptanceModeValue {
   return typeof v === "string" && (POST_ACCEPTANCE_MODES as readonly string[]).includes(v);
 }
 
+// PLU-136 compensation contract: same reject-unrecognized-value-loudly
+// pattern as isPostAcceptanceMode above, for each new enum field.
+const CAMPAIGN_TYPES = ["PAID", "AFFILIATE", "HYBRID", "GIFT_ONLY"] as const;
+type CampaignTypeValue = (typeof CAMPAIGN_TYPES)[number];
+function isCampaignType(v: unknown): v is CampaignTypeValue {
+  return typeof v === "string" && (CAMPAIGN_TYPES as readonly string[]).includes(v);
+}
+
+const GIFT_DISPOSITIONS = ["KEEP", "LOAN", "RETURN"] as const;
+type GiftDispositionValue = (typeof GIFT_DISPOSITIONS)[number];
+function isGiftDisposition(v: unknown): v is GiftDispositionValue {
+  return typeof v === "string" && (GIFT_DISPOSITIONS as readonly string[]).includes(v);
+}
+
+const PRICE_STRATEGIES = ["REQUEST_RATE_CARD", "PROPOSE_STARTING_FEE"] as const;
+type PriceStrategyValue = (typeof PRICE_STRATEGIES)[number];
+function isPriceStrategy(v: unknown): v is PriceStrategyValue {
+  return typeof v === "string" && (PRICE_STRATEGIES as readonly string[]).includes(v);
+}
+
+// Accepted on create/patch so a future explicit-selection UI can set
+// CONFIRMED directly — the review UI/queue itself is PLU-144's job, this
+// route only needs to not block the field existing.
+const COMPENSATION_REVIEW_STATUSES = ["NEEDS_REVIEW", "CONFIRMED"] as const;
+type CompensationReviewStatusValue = (typeof COMPENSATION_REVIEW_STATUSES)[number];
+function isCompensationReviewStatus(v: unknown): v is CompensationReviewStatusValue {
+  return typeof v === "string" && (COMPENSATION_REVIEW_STATUSES as readonly string[]).includes(v);
+}
+
 // POST /campaigns — create a campaign
 router.post("/", async (req: Request, res: Response) => {
   const {
@@ -136,6 +177,15 @@ router.post("/", async (req: Request, res: Response) => {
     hiddenParamKey,
     postAcceptanceMode,
     emailAccountId,
+    campaignType,
+    includesGifting,
+    giftDisposition,
+    priceStrategy,
+    publicStartingFeeCents,
+    publicCommissionRate,
+    commissionDurationDays,
+    commissionConditions,
+    compensationReviewStatus,
   } = req.body as {
     name?: string;
     brand?: string;
@@ -157,6 +207,16 @@ router.post("/", async (req: Request, res: Response) => {
     postAcceptanceMode?: string;
     // PLU-121: the campaign's default sending mailbox (a ConnectedEmailAccount id).
     emailAccountId?: string;
+    // PLU-136 compensation contract fields.
+    campaignType?: string;
+    includesGifting?: boolean;
+    giftDisposition?: string;
+    priceStrategy?: string;
+    publicStartingFeeCents?: number;
+    publicCommissionRate?: number;
+    commissionDurationDays?: number;
+    commissionConditions?: string;
+    compensationReviewStatus?: string;
   };
 
   if (!name || typeof name !== "string" || !name.trim()) {
@@ -188,6 +248,34 @@ router.post("/", async (req: Request, res: Response) => {
   if (postAcceptanceMode !== undefined && !isPostAcceptanceMode(postAcceptanceMode)) {
     res.status(400).json({
       error: `postAcceptanceMode must be one of: ${POST_ACCEPTANCE_MODES.join(", ")}`,
+    });
+    return;
+  }
+
+  // PLU-136: same reject-unrecognized-value-loudly posture for every new
+  // compensation-contract enum.
+  if (campaignType !== undefined && !isCampaignType(campaignType)) {
+    res.status(400).json({ error: `campaignType must be one of: ${CAMPAIGN_TYPES.join(", ")}` });
+    return;
+  }
+  if (giftDisposition !== undefined && !isGiftDisposition(giftDisposition)) {
+    res.status(400).json({
+      error: `giftDisposition must be one of: ${GIFT_DISPOSITIONS.join(", ")}`,
+    });
+    return;
+  }
+  if (priceStrategy !== undefined && !isPriceStrategy(priceStrategy)) {
+    res.status(400).json({
+      error: `priceStrategy must be one of: ${PRICE_STRATEGIES.join(", ")}`,
+    });
+    return;
+  }
+  if (
+    compensationReviewStatus !== undefined &&
+    !isCompensationReviewStatus(compensationReviewStatus)
+  ) {
+    res.status(400).json({
+      error: `compensationReviewStatus must be one of: ${COMPENSATION_REVIEW_STATUSES.join(", ")}`,
     });
     return;
   }
@@ -251,6 +339,24 @@ router.post("/", async (req: Request, res: Response) => {
         typeof paymentTerms === "string" ? paymentTerms.trim() || null : null,
       attributionWindow:
         typeof attributionWindow === "string" ? attributionWindow.trim() || null : null,
+      // PLU-136 compensation contract — omitted fields fall back to their
+      // column defaults (campaignType: PAID, includesGifting: false,
+      // compensationReviewStatus: NEEDS_REVIEW).
+      ...(isCampaignType(campaignType) ? { campaignType } : {}),
+      includesGifting: includesGifting === true,
+      ...(isGiftDisposition(giftDisposition) ? { giftDisposition } : {}),
+      ...(isPriceStrategy(priceStrategy) ? { priceStrategy } : {}),
+      publicStartingFeeCents:
+        typeof publicStartingFeeCents === "number" ? publicStartingFeeCents : null,
+      publicCommissionRate:
+        typeof publicCommissionRate === "number" ? publicCommissionRate : null,
+      commissionDurationDays:
+        typeof commissionDurationDays === "number" ? commissionDurationDays : null,
+      commissionConditions:
+        typeof commissionConditions === "string" ? commissionConditions.trim() || null : null,
+      ...(isCompensationReviewStatus(compensationReviewStatus)
+        ? { compensationReviewStatus }
+        : {}),
     });
     res.status(201).json({
       ...flattenCampaign(campaign, details),
@@ -384,6 +490,15 @@ router.patch("/:id", async (req: Request, res: Response) => {
     shipsPhysicalProduct,
     postAcceptanceMode,
     emailAccountId,
+    campaignType,
+    includesGifting,
+    giftDisposition,
+    priceStrategy,
+    publicStartingFeeCents,
+    publicCommissionRate,
+    commissionDurationDays,
+    commissionConditions,
+    compensationReviewStatus,
   } = req.body as {
     notifyEmail?: string | null;
     objective?: string | null;
@@ -395,6 +510,16 @@ router.patch("/:id", async (req: Request, res: Response) => {
     shipsPhysicalProduct?: boolean;
     postAcceptanceMode?: string;
     emailAccountId?: string | null;
+    // PLU-136 compensation contract fields.
+    campaignType?: string;
+    includesGifting?: boolean;
+    giftDisposition?: string | null;
+    priceStrategy?: string | null;
+    publicStartingFeeCents?: number | null;
+    publicCommissionRate?: number | null;
+    commissionDurationDays?: number | null;
+    commissionConditions?: string | null;
+    compensationReviewStatus?: string;
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
@@ -454,6 +579,63 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // already running carry their own stamped mode and are untouched.
     patch.postAcceptanceMode = postAcceptanceMode;
   }
+
+  // PLU-136 compensation contract fields — all live on CampaignDetails, same
+  // reject-unrecognized-value-loudly posture as postAcceptanceMode above.
+  // NOTE: once a campaign is ACTIVE these all get rejected downstream by
+  // CampaignLockedError (upsertCampaignDetails) exactly like every other
+  // CampaignDetails field — no special-casing needed here.
+  if (campaignType !== undefined) {
+    if (!isCampaignType(campaignType)) {
+      res.status(400).json({ error: `campaignType must be one of: ${CAMPAIGN_TYPES.join(", ")}` });
+      return;
+    }
+    detailsPatch.campaignType = campaignType;
+  }
+  if (includesGifting !== undefined) {
+    detailsPatch.includesGifting = includesGifting === true;
+  }
+  if (giftDisposition !== undefined) {
+    if (giftDisposition !== null && !isGiftDisposition(giftDisposition)) {
+      res.status(400).json({
+        error: `giftDisposition must be one of: ${GIFT_DISPOSITIONS.join(", ")}`,
+      });
+      return;
+    }
+    detailsPatch.giftDisposition = giftDisposition;
+  }
+  if (priceStrategy !== undefined) {
+    if (priceStrategy !== null && !isPriceStrategy(priceStrategy)) {
+      res.status(400).json({
+        error: `priceStrategy must be one of: ${PRICE_STRATEGIES.join(", ")}`,
+      });
+      return;
+    }
+    detailsPatch.priceStrategy = priceStrategy;
+  }
+  if (publicStartingFeeCents !== undefined) {
+    detailsPatch.publicStartingFeeCents = publicStartingFeeCents;
+  }
+  if (publicCommissionRate !== undefined) {
+    detailsPatch.publicCommissionRate = publicCommissionRate;
+  }
+  if (commissionDurationDays !== undefined) {
+    detailsPatch.commissionDurationDays = commissionDurationDays;
+  }
+  if (commissionConditions !== undefined) {
+    detailsPatch.commissionConditions =
+      typeof commissionConditions === "string" ? commissionConditions.trim() || null : null;
+  }
+  if (compensationReviewStatus !== undefined) {
+    if (!isCompensationReviewStatus(compensationReviewStatus)) {
+      res.status(400).json({
+        error: `compensationReviewStatus must be one of: ${COMPENSATION_REVIEW_STATUSES.join(", ")}`,
+      });
+      return;
+    }
+    detailsPatch.compensationReviewStatus = compensationReviewStatus;
+  }
+
   try {
     if (emailAccountId !== undefined) {
       // PLU-121: null/"" clears the default sender (back to the default account);
@@ -530,6 +712,16 @@ router.post("/:id/launch", async (req: Request, res: Response) => {
     }
     if (err instanceof CampaignDetailsMissingError || err instanceof NegotiationPolicyMissingError) {
       res.status(422).json({ error: err.message });
+      return;
+    }
+    // PLU-136: compensation-contract preconditions — same posture as the two
+    // checks above (fix your campaign, then retry).
+    if (err instanceof CompensationReviewPendingError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    if (err instanceof CompensationIncompleteError) {
+      res.status(422).json({ error: err.message, missing: err.missing });
       return;
     }
     console.error("[campaigns] launch error:", err);

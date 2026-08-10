@@ -275,18 +275,58 @@ enum CampaignStatus {
   ARCHIVED
 }
 
-/// PLU-136 (1b): classification of how the creator is compensated —
-/// display/analytics/template-selection only. Does NOT gate whether
-/// NegotiationPolicy is required at launch: every campaign type negotiates
-/// (deliverables, timeline, usage rights, exclusivity, and — unless
-/// NegotiationPolicy marks it non-negotiable — the fee itself). A fixed-fee
-/// (PAID) campaign is still a negotiated one; "fixed" describes the
-/// compensation mechanism, not an exemption from negotiation.
+/// PLU-136: the four canonical compensation structures. Does NOT gate
+/// whether NegotiationPolicy is required at launch: every campaign type
+/// negotiates (deliverables, timeline, usage rights, exclusivity, and —
+/// unless NegotiationPolicy marks it non-negotiable — the fee/commission
+/// itself). A fixed-fee (PAID) campaign is still a negotiated one; "fixed"
+/// describes the compensation mechanism, not an exemption from negotiation.
+/// Lives on CampaignDetails (not Campaign — moved there in the compensation-
+/// contract revision) so it's captured by CampaignTermsSnapshot automatically
+/// and locked read-only post-launch like every other public promise.
+/// GIFT_ONLY: renamed from GIFT — "Gift-only" is unambiguous that no fee or
+/// commission component exists; product gifting for the other three
+/// structures is CampaignDetails.includesGifting instead, an orthogonal flag
+/// (not a fifth enum value), since gifting composes with any of them.
 enum CampaignType {
-  GIFT
   PAID
   AFFILIATE
   HYBRID
+  GIFT_ONLY
+}
+
+/// PLU-136: whether a supplied/shipped product is itself part of the
+/// compensation offer, and if so what happens to it. Distinct from
+/// CampaignDetails.shipsPhysicalProduct, which only ever means "the payout
+/// form must collect a shipping address" — a content-creation sample the
+/// creator does NOT keep as a reward still ships, but is not gifting
+/// compensation. Only meaningful when CampaignDetails.includesGifting is
+/// true or campaignType is GIFT_ONLY.
+enum GiftDisposition {
+  KEEP
+  LOAN
+  RETURN
+}
+
+/// PLU-136: for a PAID or HYBRID campaign, whether the brand requests the
+/// creator's own rate card or proposes a starting fee up front. Governs
+/// whether CampaignDetails.publicStartingFeeCents is required at launch
+/// (REQUEST_RATE_CARD campaigns have nothing to propose yet).
+enum PriceStrategy {
+  REQUEST_RATE_CARD
+  PROPOSE_STARTING_FEE
+}
+
+/// PLU-136: every campaign created before this migration has
+/// campaignType = PAID only because that's the column default, never
+/// because anyone verified it — do not read that as a confirmed
+/// classification. NEEDS_REVIEW is the default for the pre-existing backfill;
+/// launchCampaign() refuses to launch a NEEDS_REVIEW campaign until an
+/// operator flips it to CONFIRMED. The review UI/queue itself is PLU-144's
+/// job — this is only the flag and the launch gate that enforces it.
+enum CompensationReviewStatus {
+  NEEDS_REVIEW
+  CONFIRMED
 }
 
 /// A brand campaign. The top-level container created by brands in the wizard.
@@ -318,10 +358,6 @@ model Campaign {
   /// CampaignTermsSnapshot + NegotiationPolicySnapshot and locks CampaignDetails
   /// + NegotiationPolicy. See CampaignStatus and launchCampaign() (db/campaigns.ts).
   status CampaignStatus @default(DRAFT)
-
-  /// PLU-136 (1b): classification only — see CampaignType's doc comment. Does
-  /// not gate the launch guard.
-  campaignType CampaignType @default(PAID)
 
   targetUrl      String?
   hiddenParamKey String  @default("_from")
@@ -397,6 +433,24 @@ model CampaignDetails {
   id         String @id @default(cuid())
   campaignId String @unique
 
+  /// PLU-136: moved here from Campaign — see CampaignType's doc comment for
+  /// why (must be inside the frozen snapshot; a mutable Campaign column
+  /// alone is not sufficient).
+  campaignType CampaignType @default(PAID)
+  /// PLU-136: product/non-cash gifting composing with PAID/AFFILIATE/HYBRID.
+  /// Always implicitly true for GIFT_ONLY (not separately required to be set
+  /// — validated at launch, see validateCompensationReadiness).
+  includesGifting Boolean @default(false)
+  /// PLU-136: only meaningful when includesGifting is true or campaignType
+  /// is GIFT_ONLY. See GiftDisposition's doc comment for the distinction
+  /// from shipsPhysicalProduct.
+  giftDisposition GiftDisposition?
+  /// PLU-136: which review state this campaign's compensation structure is
+  /// in — see CompensationReviewStatus's doc comment. Defaults NEEDS_REVIEW;
+  /// a campaign created through an explicit-selection flow should set
+  /// CONFIRMED directly rather than relying on this default.
+  compensationReviewStatus CompensationReviewStatus @default(NEEDS_REVIEW)
+
   objective String?
   /// Maps to the old Campaign.rewardDescription ("a free pair of our running
   /// shoes") — PLU-135 names this field productOrOffer; same free-text
@@ -419,13 +473,28 @@ model CampaignDetails {
   /// vault's own "Decision - Persist Full Extraction" note (prohibited claims
   /// was never persisted even when extracted from a brief).
   prohibitedClaims    String?
-  /// PLU-136 (1b): the agreed/offered upfront amount, when Campaign.campaignType
-  /// includes one (PAID/HYBRID). NOT a signal for whether this campaign
-  /// negotiates — every campaign type negotiates (deliverables, timeline,
-  /// usage rights, exclusivity, and — unless NegotiationPolicy marks it
-  /// non-negotiable — the fee itself too). NegotiationPolicy is required for
-  /// every campaign at launch, unconditionally.
-  fixedCompensationCents Int?
+  /// PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
+  /// proposed fee shown to the creator before negotiation, when priceStrategy
+  /// is PROPOSE_STARTING_FEE (required then) or null when REQUEST_RATE_CARD.
+  /// Only applicable to PAID/HYBRID. NOT a signal for whether this campaign
+  /// negotiates — every campaign type negotiates. NegotiationPolicy's
+  /// floor/ceiling/preferredFeeCents are the PRIVATE flexibility around this
+  /// public number, not a duplicate source of truth.
+  publicStartingFeeCents Int?
+  /// PLU-136: only applicable to PAID/HYBRID — governs whether
+  /// publicStartingFeeCents is required. Null for AFFILIATE/GIFT_ONLY.
+  priceStrategy PriceStrategy?
+  /// PLU-136: the PUBLIC commission rate shown to the creator, applicable to
+  /// AFFILIATE/HYBRID. NegotiationPolicy's commissionFloorRate/
+  /// commissionCeilingRate/preferredCommissionRate are the PRIVATE
+  /// flexibility around this number — the private policy owns how far the
+  /// agent may move it, not a second place a rate independently exists.
+  publicCommissionRate Float?
+  /// How long the commission window runs (e.g. 30-day attribution).
+  commissionDurationDays Int?
+  /// Free-text commission terms not worth a structured field yet — same
+  /// pattern as negotiationGuidance elsewhere in this schema.
+  commissionConditions String?
   publicPaymentTerms     String?
   shipsPhysicalProduct   Boolean @default(false)
   brandDescription       String?
@@ -552,11 +621,25 @@ model NegotiationPolicy {
   floorCents           Int?
   ceilingCents         Int?
   preferredFeeCents    Int?
-  commissionRate       Float?
+  /// PLU-136: replaces the old bare `commissionRate` scalar, which had no
+  /// documented meaning (offer? floor? ceiling?) and mixed public/private
+  /// concerns awkwardly. These three mirror the fee fields above exactly —
+  /// the PRIVATE flexibility around CampaignDetails.publicCommissionRate,
+  /// the public number.
+  commissionFloorRate    Float?
+  commissionCeilingRate  Float?
+  preferredCommissionRate Float?
   maxRounds            Int?
   openingOfferPosition Float?
   overCeilingTolerance Float?
   negotiationGuidance  String?
+  /// PLU-136: whether a substitute product may be offered in place of the
+  /// one described in CampaignDetails.productOrOffer. Only meaningful when
+  /// CampaignDetails.includesGifting is true or campaignType is GIFT_ONLY.
+  giftSubstitutionAllowed Boolean?
+  /// How far the value of the offered product may move if a substitute is
+  /// offered. Same applicability as giftSubstitutionAllowed.
+  giftValueFlexibilityCents Int?
   /// String list stored as JSON — no Postgres native array precedent exists
   /// elsewhere in this schema, so this follows the established Json-for-lists
   /// convention (metadata/socialLinks/etc.) instead of introducing a new one.
@@ -585,11 +668,17 @@ model NegotiationPolicySnapshot {
   floorCents           Int?
   ceilingCents         Int?
   preferredFeeCents    Int?
-  commissionRate       Float?
+  /// PLU-136: mirrors NegotiationPolicy's own commission restructure.
+  commissionFloorRate    Float?
+  commissionCeilingRate  Float?
+  preferredCommissionRate Float?
   maxRounds            Int?
   openingOfferPosition Float?
   overCeilingTolerance Float?
   negotiationGuidance  String?
+  /// PLU-136: mirrors NegotiationPolicy's gift-flexibility fields.
+  giftSubstitutionAllowed   Boolean?
+  giftValueFlexibilityCents Int?
   negotiableTerms      Json?
   nonNegotiableTerms   Json?
 
