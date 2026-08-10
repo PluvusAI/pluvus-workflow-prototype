@@ -4,6 +4,7 @@ import {
   listOpenObligationsByInstance,
 } from "../../db/index.js";
 import type { Campaign, ConversationObligation, Message } from "../../db/schema.js";
+import type { Db, DbTx } from "../../db/drizzle.js";
 import type { ExecutionContext, NodeResult, NegotiationHistoryEntryLite, PriorNegotiationContext, EmailDraft } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import {
@@ -26,7 +27,17 @@ import {
   toDecisionContext,
   toDraftContext,
   buildContextRecord,
+  isAuthorizedDecisionPurpose,
+  type SnapshotLoadResult,
+  type ContextPurpose,
 } from "../conversationContext.js";
+// PLU-137 (1c): read the two immutable launch snapshots this execution is PINNED to,
+// BY the ids stamped on the instance at enrollment. tx-aware so they load inside the
+// context builder's read-tx.
+import {
+  getCampaignTermsSnapshotById,
+  getNegotiationPolicySnapshotById,
+} from "../../db/campaignSnapshots.js";
 // PLU-112: rolling summary loader + pure draft windowing. The flag lives inside the
 // loader, so off ⇒ no summary ⇒ the window step is a no-op and the draft prompt is
 // byte-identical.
@@ -469,6 +480,55 @@ export function escalateNoCeiling(args: { round: number }): NodeResult {
   };
 }
 
+// PLU-137 (1c) §2b — the ContextDeps.loadSnapshots implementation: load the two
+// pinned launch snapshots BY the ids stamped on the instance at enrollment, gate the
+// PRIVATE policy load on the authorized-decision purpose, and detect an integrity
+// failure WITHOUT throwing (Defect 1 — a throw at the build call site dead-letters the
+// job; the executor returns MANUAL_REVIEW on the returned flag instead).
+//
+// `expectedCampaignId` is the instance's campaign (loaded once by the executor and
+// closed over at the call site — ExecutionInstance has no direct campaignId column, it
+// links via workflowVersion→workflow→campaign). A pinned snapshot whose campaignId ≠
+// this is a cross-campaign integrity failure (E9). Exported for the executor test.
+export async function loadPinnedSnapshots(
+  instance: { campaignTermsSnapshotId: string | null; negotiationPolicySnapshotId: string | null },
+  purpose: ContextPurpose,
+  client: Db | DbTx,
+  expectedCampaignId: string | null | undefined,
+): Promise<SnapshotLoadResult> {
+  const result: SnapshotLoadResult = {};
+
+  if (instance.campaignTermsSnapshotId) {
+    const terms = await getCampaignTermsSnapshotById(instance.campaignTermsSnapshotId, client);
+    // E9: a pinned id set but the row is missing, or it belongs to another campaign.
+    if (!terms) {
+      return { integrityFailure: { reason: "terms_snapshot_missing" } };
+    }
+    if (expectedCampaignId && terms.campaignId !== expectedCampaignId) {
+      return { integrityFailure: { reason: "terms_snapshot_cross_campaign" } };
+    }
+    result.terms = terms;
+  }
+
+  // E4/E12: the PRIVATE policy snapshot loads ONLY for an authorized decision purpose.
+  // The gate reads `purpose` only — no fee field decides whether it loads.
+  if (instance.negotiationPolicySnapshotId && isAuthorizedDecisionPurpose(purpose)) {
+    const policy = await getNegotiationPolicySnapshotById(
+      instance.negotiationPolicySnapshotId,
+      client,
+    );
+    if (!policy) {
+      return { integrityFailure: { reason: "policy_snapshot_missing" } };
+    }
+    if (expectedCampaignId && policy.campaignId !== expectedCampaignId) {
+      return { integrityFailure: { reason: "policy_snapshot_cross_campaign" } };
+    }
+    result.policy = policy;
+  }
+
+  return result;
+}
+
 // PLU-111 (§4.4 / O5): a light, best-effort category bucket for a creator
 // question, keyword-detected from the text. Optional metadata only (never a
 // control-flow input) — an unmatched question gets `undefined`, which is fine.
@@ -878,6 +938,12 @@ export async function executeNegotiation(
         const rows = await listLiveCreatorMemory(instanceId);
         return buildCreatorMemoryBlock(rows) ?? undefined;
       },
+      // PLU-137 §2b/§8 — the pinned-snapshot loader (the CRITICAL wire-in: a loader
+      // defined but never injected is dead code). Closes over the instance's campaign
+      // id (loaded once as ctx.campaign) for the cross-campaign integrity check — the
+      // instance row has no campaignId column. Runs INSIDE the builder's read-tx.
+      loadSnapshots: (inst, purpose, client) =>
+        loadPinnedSnapshots(inst, purpose, client, ctx.campaign?.id),
     },
   );
 
@@ -1055,6 +1121,34 @@ export async function executeNegotiation(
     const folded = foldObservabilityRecords(result, knowledgeRecord, contextRecord);
     return memoryWrites ? { ...folded, memoryWrites } : folded;
   };
+
+  // PLU-137 §3d (Defect 1) — a missing/mismatched/cross-campaign pinned snapshot is an
+  // explicit integrity failure: RETURN a terminal MANUAL_REVIEW NodeResult (the same
+  // shape as escalateOverCeiling/escalateNoCeiling) so a human takes over, and NEVER
+  // throw across the executor boundary — the buildConversationContext call site has no
+  // try/catch, so a throw would dead-letter the job and record no ContextRecord. The
+  // integrityFailureReason rides the folded context record (§4a). NEGOTIATING →
+  // MANUAL_REVIEW is a legal transition (stateMachine.ts). Placed before the agent is
+  // consulted: a broken pin must never reach the model or invent a permissive default.
+  if (cc.integrityFailure) {
+    return withContextRecord({
+      nextState: "MANUAL_REVIEW",
+      nextNodeId: null,
+      completedAt: new Date(),
+      eventType: "NEGOTIATION_TURN",
+      eventPayload: {
+        outcome: "ESCALATE",
+        reason: "snapshot_integrity",
+        integrityReason: cc.integrityFailure.reason,
+        round: instance.negotiationRound,
+        message:
+          "Negotiation cannot run: the launch snapshot this journey is pinned to is " +
+          "missing or does not match this campaign. A human must review the pinning.",
+      },
+      // No obligationWrites: this is a pre-decision terminal escalation (like
+      // maxRoundsReject) — nothing new was comprehended from the creator this turn.
+    });
+  }
 
   // PLU-111: the durable obligation ledger (loaded by the builder) supersedes the
   // event-diff as the source of "what creator questions are still open". This is a

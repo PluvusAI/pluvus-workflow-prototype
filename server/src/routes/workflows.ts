@@ -779,6 +779,10 @@ router.post("/:id/enroll", async (req: Request, res: Response) => {
           workflowVersionId: latestVersion.id,
           postAcceptanceMode: effectiveMode,
           ...(pinnedAccount ? { emailAccountId: pinnedAccount.id } : {}),
+          // PLU-137 (1c) invariant: these two ids are written ONCE here at
+          // createInstance and NEVER updated anywhere else (grep: no UPDATE of these
+          // columns exists). The context builder reads them back by id at negotiation
+          // time as the canonical public/private source — so the pin cannot drift.
           ...(launchContext
             ? {
                 campaignTermsSnapshotId: launchContext.campaignTermsSnapshotId,

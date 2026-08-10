@@ -47,8 +47,14 @@ export type {
   DraftContext,
   ContextDeps,
   AssembleInputs,
+  // PLU-137 §2a — the snapshot loader result + the decision-facing policy authority.
+  SnapshotLoadResult,
+  PolicyAuthority,
 } from "./types.js";
 export { LatestMessageMismatchError } from "./types.js";
+// PLU-137 §2b (Defect 4) — the authorized-decision-purpose predicate gating the
+// PRIVATE policy load. Reads `purpose` only, never a fee field (E12).
+export { isAuthorizedDecisionPurpose } from "./types.js";
 
 // Pure assemble core (§8) + the canonical flat-knowledge projection. The latter
 // remains re-exported by negotiation.ts for compatibility, but lives only here.
@@ -59,7 +65,8 @@ export {
 } from "./assemble.js";
 
 // Pure projections (§4.2).
-export { toDecisionContext, toDraftContext } from "./projections.js";
+// PLU-137 §3b — POLICY_SNAPSHOT_KEYS is the draft-payload regression-net assert list.
+export { toDecisionContext, toDraftContext, POLICY_SNAPSHOT_KEYS } from "./projections.js";
 
 // Observability record (§7.2).
 export { buildContextRecord } from "./observability.js";

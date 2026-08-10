@@ -16,7 +16,45 @@ import type {
   ContextDebug,
   DecisionContext,
   DraftContext,
+  PolicyAuthority,
 } from "./types.js";
+
+// PLU-137 §3b — the PRIVATE policy-snapshot value keys. The regression net (mirror of
+// BAND_CONTEXT_KEYS): a payload test asserts NONE of these appear in the draft provider
+// payload. Structural exclusion is enforced by DraftContext having no policyAuthority
+// field at all; this list is the explicit assert surface behind that guarantee.
+export const POLICY_SNAPSHOT_KEYS = [
+  "floorCents",
+  "ceilingCents",
+  "preferredFeeCents",
+  "commissionRate",
+  "maxRounds",
+  "openingOfferPosition",
+  "overCeilingTolerance",
+  "negotiationGuidance",
+  "negotiableTerms",
+  "nonNegotiableTerms",
+] as const;
+
+// PLU-137 §3a — project the pinned NegotiationPolicySnapshot row to the decision-facing
+// PolicyAuthority (drops db bookkeeping cols: id/campaignId/launchedAt/createdAt). Every
+// value nullable — a GIFT/affiliate deal legitimately has null fee fields (E12 corollary).
+function toPolicyAuthority(
+  snap: NonNullable<AssembledContext["policySnapshot"]>,
+): PolicyAuthority {
+  return {
+    floorCents: snap.floorCents,
+    ceilingCents: snap.ceilingCents,
+    preferredFeeCents: snap.preferredFeeCents,
+    commissionRate: snap.commissionRate,
+    maxRounds: snap.maxRounds,
+    openingOfferPosition: snap.openingOfferPosition,
+    overCeilingTolerance: snap.overCeilingTolerance,
+    negotiationGuidance: snap.negotiationGuidance,
+    negotiableTerms: snap.negotiableTerms,
+    nonNegotiableTerms: snap.nonNegotiableTerms,
+  };
+}
 
 /** Build the shared debug block for a projected view (§7). Per-purpose (§7.3):
  *  the token estimate is computed over the projected view passed in. */
@@ -44,6 +82,8 @@ function buildDebug(
     sourcesUsed: dedupe(sources),
     estimatedTokens: estimateTokens(view),
     bandPresent: ctx.campaignConstraints.bandPresent,
+    // PLU-137 — policy-snapshot PRESENCE only (mirror of bandPresent), never values.
+    policyPresent: ctx.policySnapshot != null,
   };
 }
 
@@ -87,6 +127,9 @@ export function toDecisionContext(ctx: AssembledContext): DecisionContext {
   return {
     decisionHistory,
     campaignConstraints: ctx.campaignConstraints,
+    // PLU-137 §3a — the private policy authority, attached ONLY when a policy snapshot
+    // was loaded (emptiness contract → the no-snapshot decision payload is unchanged).
+    ...(ctx.policySnapshot ? { policyAuthority: toPolicyAuthority(ctx.policySnapshot) } : {}),
     creatorReply: ctx.creatorReply,
     round: ctx.instance.negotiationRound,
     debug,
@@ -133,6 +176,12 @@ export function toDraftContext(ctx: AssembledContext): DraftContext {
     history: ctx.recentMessages,
     openCommitments: ctx.openCommitments,
     creatorMemory: ctx.creatorMemory,
+    // PLU-137 §3b — PRESENCE only (mirror of the band's presence flag). A top-level
+    // draft-surface boolean, NOT a draftConfig key — so it never rides the provider
+    // payload. Raw policy VALUES are UNREACHABLE from this projection: the draftConfig
+    // above is built key-by-key from stripBandFromContext(mergedConfig) + brief/
+    // obligation keys and never touches ctx.policySnapshot.
+    policyPresent: ctx.policySnapshot != null,
     debug,
   };
 }
