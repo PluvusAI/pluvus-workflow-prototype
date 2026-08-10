@@ -186,6 +186,19 @@ test("public detailsSnapshot field-name mapping + override of stale config", () 
   assert.equal(r.config["usageRights"], "6 months");
 });
 
+// 11b. B2 rescue: a config with a floor but NO ceiling, pinned to a policy
+//      snapshot that HAS a ceiling → the effective band gains the ceiling, so the
+//      H1 no-ceiling escalation must NOT trip. This is why H1 was relocated to the
+//      effective band for pinned journeys (a valid snapshot rescues a stale config).
+test("floor-only config + snapshot ceiling → effective band has a ceiling (H1 rescue)", () => {
+  const r = resolveEffectiveNegotiationConfig({
+    policyAuthority: policy({ floorCents: 20000, ceilingCents: 50000 }),
+    config: { termFloor: { rate: 200 } }, // floor only, NO termCeiling/maxBudget
+  });
+  assert.deepEqual(r.config["termFloor"], { rate: 200 });
+  assert.deepEqual(r.config["termCeiling"], { rate: 500 }); // rescued from the snapshot
+});
+
 // 11. 0/0 commission-only: recommendedOfferPosition / overCeilingTolerance are
 //     NOT added even if policy carries them (template omits them on 0/0 nodes;
 //     inert anyway). Keeps byte-identical on that shape.

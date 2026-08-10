@@ -808,12 +808,26 @@ export async function executeNegotiation(
     );
   }
 
-  // PLU-138 (1d): the H1 no-ceiling backstop MOVED below the context build so it
-  // reads the EFFECTIVE band (snapshot-overlaid), not the raw nodeGraph config. A
-  // legacy config with a floor but no ceiling that is pinned to a policy snapshot
-  // WITH a valid ceiling is a bounded, valid journey — escalating it here on the
-  // stale config would let a legacy copy override a valid snapshot (the exact
-  // thing 1d forbids). See the relocated check after `effectiveConfig` is resolved.
+  // H1 no-ceiling backstop. An uncapped money-path campaign (floor, no ceiling)
+  // must ESCALATE rather than negotiate — the over-ceiling ACCEPT guard is a no-op
+  // against +inf, so the prompt would be the only cap. PLU-138 (1d) splits this by
+  // whether a launch snapshot can rescue the config:
+  //   * NO pinned policy snapshot (a legacy no-snapshot journey): the node config
+  //     IS the authority, so an uncapped config is genuinely uncapped. Escalate
+  //     HERE, pre-build — cheaply, before any DB load or agent call (the original
+  //     H1 contract; a spy-agent test proves the model is never consulted).
+  //   * A policy snapshot IS pinned: the snapshot may supply the ceiling the config
+  //     lacks, so escalating on the stale config would let a legacy copy override a
+  //     valid snapshot (1d forbids this). Defer the check to the EFFECTIVE band,
+  //     after the context build resolves the snapshot. See below.
+  // 0/0 (commission-only) does NOT trip this on either path: ceiling === 0 is a
+  // real cap the agent honors (PLU-129), not a missing ceiling.
+  if (!instance.negotiationPolicySnapshotId) {
+    const { floor: cfgFloor, ceiling: cfgCeiling } = resolveBand(config);
+    if (cfgFloor !== undefined && cfgCeiling === undefined) {
+      return escalateNoCeiling({ round: instance.negotiationRound });
+    }
+  }
 
   // When a downstream node owns the post-acceptance email, the negotiation ACCEPT
   // must NOT also send its own onboarding/acceptance email, or the creator gets
@@ -952,13 +966,12 @@ export async function executeNegotiation(
   });
   const effectiveConfig = effective.config;
 
-  // Relocated H1 no-ceiling backstop (moved here from pre-build so it reads the
-  // EFFECTIVE band). A floor with no ceiling means the over-ceiling ACCEPT guard is
-  // a no-op (nothing exceeds +inf) and the model's prompt is the only cap — escalate
-  // rather than risk an unbounded agree. The commission-only 0/0 shape (ceiling === 0,
-  // both DEFINED) does NOT trip this: 0 is a real cap the agent honors (PLU-129). No
-  // floor + no ceiling = an unconfigured band, already inert downstream → falls
-  // through unchanged.
+  // H1 no-ceiling backstop — the PINNED-SNAPSHOT arm (the no-snapshot arm ran
+  // pre-build above). For a journey pinned to a policy snapshot, the EFFECTIVE band
+  // is authoritative: escalate only if the snapshot ALSO failed to supply a ceiling
+  // (a floor with no ceiling still leaves the over-ceiling ACCEPT guard inert). A
+  // valid snapshot ceiling now correctly rescues a config that lacked one — no false
+  // escalation. 0/0 (ceiling === 0, both DEFINED) does NOT trip this (PLU-129).
   const { floor: effFloor, ceiling: effCeiling } = resolveBand(effectiveConfig);
   if (effFloor !== undefined && effCeiling === undefined) {
     return escalateNoCeiling({ round: instance.negotiationRound });
