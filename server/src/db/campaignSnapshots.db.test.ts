@@ -45,6 +45,11 @@ async function seedLaunchedCampaign(pgdb: Db): Promise<{ campaignId: string; ter
     campaignId: campaign!.id,
     objective: "Drive signups",
     usageRights: "90-day paid social",
+    // PLU-136 1b.b — launch now gates on a CONFIRMED compensation review + a
+    // PAID priceStrategy (REQUEST_RATE_CARD needs no public proposed amount).
+    campaignType: "PAID",
+    priceStrategy: "REQUEST_RATE_CARD",
+    compensationReviewStatus: "CONFIRMED",
   });
   await pgdb.insert(schema.negotiationPolicies).values({
     campaignId: campaign!.id,
@@ -129,15 +134,27 @@ async function main(): Promise<void> {
     sfx++;
     const [campaign] = await pgdb
       .insert(schema.campaigns)
-      .values({ name: `Gift ${sfx}`, brand: "Acme", campaignType: "GIFT" })
+      .values({ name: `Gift ${sfx}`, brand: "Acme" })
       .returning();
-    await pgdb.insert(schema.campaignDetails).values({ campaignId: campaign!.id, objective: "Send product" });
+    // PLU-136 1b.b — campaignType moved to campaignDetails; GIFT renamed
+    // GIFT_ONLY; launch now requires gift terms + a CONFIRMED review for it.
+    await pgdb.insert(schema.campaignDetails).values({
+      campaignId: campaign!.id,
+      objective: "Send product",
+      campaignType: "GIFT_ONLY",
+      productOrOffer: "A free pair of running shoes",
+      giftDisposition: "KEEP",
+      compensationReviewStatus: "CONFIRMED",
+    });
     await pgdb.insert(schema.negotiationPolicies).values({
       campaignId: campaign!.id,
       floorCents: null,
       ceilingCents: null,
       preferredFeeCents: null,
-      commissionRate: 0.2,
+      // Private gift authority — what satisfies GIFT_ONLY launch readiness.
+      giftSubstitutionAllowed: true,
+      // A non-fee value the loader assertion below verifies still loads.
+      commissionCeilingRate: 0.2,
       maxRounds: 1,
     });
     const terms = await launchCampaign(campaign!.id, pgdb);
@@ -152,7 +169,7 @@ async function main(): Promise<void> {
     const res = await loadPinnedSnapshots(instance, "NEGOTIATION_DECISION", pgdb, campaign!.id);
     assert.ok(res.policy, "GIFT policy loads despite null fee fields");
     assert.equal(res.policy?.floorCents, null);
-    assert.equal(res.policy?.commissionRate, 0.2);
+    assert.equal(res.policy?.commissionCeilingRate, 0.2);
   });
 
   await test("a MISSING terms snapshot (id set, row deleted) RETURNS an integrityFailure, does not throw", async () => {

@@ -136,11 +136,20 @@ export interface PolicyAuthority {
   floorCents: number | null;
   ceilingCents: number | null;
   preferredFeeCents: number | null;
-  commissionRate: number | null;
+  // PLU-136 1b.b — the bare commissionRate scalar was split into private
+  // floor/ceiling/preferred (mirroring the fee fields). publicCommissionRate
+  // is the PUBLIC number and lives on CampaignTermsSnapshot, never here.
+  commissionFloorRate: number | null;
+  commissionCeilingRate: number | null;
+  preferredCommissionRate: number | null;
   maxRounds: number | null;
   openingOfferPosition: number | null;
   overCeilingTolerance: number | null;
   negotiationGuidance: string | null;
+  // PLU-136 1b.b — private gift-negotiation authority (only meaningful when the
+  // campaign includes gifting / is GIFT_ONLY). Nullable like every other field.
+  giftSubstitutionAllowed: boolean | null;
+  giftValueFlexibilityCents: number | null;
   negotiableTerms: unknown;
   nonNegotiableTerms: unknown;
 }

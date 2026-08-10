@@ -89,11 +89,17 @@ function policySnapshot(
     floorCents: 20000,
     ceilingCents: 50000,
     preferredFeeCents: 44444,
-    commissionRate: 0.15,
+    // PLU-136 1b.b — commissionRate split into private floor/ceiling/preferred.
+    commissionFloorRate: 0.1,
+    commissionCeilingRate: 0.25,
+    preferredCommissionRate: 0.15,
     maxRounds: 3,
     openingOfferPosition: 0.6,
     overCeilingTolerance: 0.1,
     negotiationGuidance: "SECRET-GUIDANCE-55555 push hard on exclusivity",
+    // PLU-136 1b.b — private gift-negotiation authority (also never reaches draft).
+    giftSubstitutionAllowed: true,
+    giftValueFlexibilityCents: 66666,
     negotiableTerms: ["timeline"],
     nonNegotiableTerms: ["usage rights"],
     launchedAt: new Date(2026, 0, 1),
@@ -188,14 +194,14 @@ test("a GIFT/affiliate policy with NULL fee fields still projects (E12 corollary
     floorCents: null,
     ceilingCents: null,
     preferredFeeCents: null,
-    commissionRate: 0.2, // commission-only deal
+    commissionCeilingRate: 0.2, // commission-only deal
     negotiationGuidance: "gift only, no cash",
   });
   const ctx = assembleContext(baseInputs({ policySnapshot: gift }));
   const decision = toDecisionContext(ctx);
   assert.ok(decision.policyAuthority, "policyAuthority present even with null fee fields");
   assert.equal(decision.policyAuthority?.floorCents, null);
-  assert.equal(decision.policyAuthority?.commissionRate, 0.2);
+  assert.equal(decision.policyAuthority?.commissionCeilingRate, 0.2);
   assert.equal(decision.policyAuthority?.negotiationGuidance, "gift only, no cash");
 });
 
