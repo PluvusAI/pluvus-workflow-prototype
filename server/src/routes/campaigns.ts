@@ -552,12 +552,19 @@ router.post("/:id/launch", async (req: Request, res: Response) => {
 // existing creator journeys keep running. Idempotent: already-Closing → 200.
 // archivedAt is NOT touched here (PLU-156 owns CLOSING → ARCHIVED).
 router.post("/:id/close", async (req: Request, res: Response) => {
-  const { reason } = req.body as { reason?: unknown };
+  const { actorId, reason } = req.body as { actorId?: unknown; reason?: unknown };
+  // PLU-153: capture WHO closed it — same required-name contract as PLU-154's
+  // manual-review resolve. Without this the audit event (and the ClosingSummary
+  // "initiated by …") would record a hardcoded "operator" for every closure.
+  if (typeof actorId !== "string" || !actorId.trim()) {
+    res.status(400).json({ error: "actorId is required" });
+    return;
+  }
   const cleanReason =
     typeof reason === "string" && reason.trim() ? reason.trim() : null;
   try {
     const result = await transitionCampaignToClosing(req.params["id"]!, {
-      actorId: "operator",
+      actorId: actorId.trim(),
       reason: cleanReason,
     });
     if (result === null) {

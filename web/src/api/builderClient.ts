@@ -170,9 +170,12 @@ export function deleteCampaign(id: string, force = false): Promise<void> {
 }
 
 // PLU-153: the ACTIVE → CLOSING transition ("End campaign"). Idempotent on the
-// server; both closed and already-closing return 200.
-export function closeCampaign(id: string, reason?: string) {
+// server; both closed and already-closing return 200. actorId is the operator's
+// name — captured in the confirm form so the audit event records who actually
+// closed it, not a hardcoded "operator" (same pattern as PLU-154's resolve panel).
+export function closeCampaign(id: string, actorId: string, reason?: string) {
   return postJson<CampaignDetail>(`/api/campaigns/${id}/close`, {
+    actorId,
     reason: reason ?? null,
   });
 }

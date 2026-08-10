@@ -143,6 +143,10 @@ function CampaignCard({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [closing, setClosing] = useState(false);
   const [confirmClose, setConfirmClose] = useState(false);
+  // PLU-153: who is ending it + why — recorded on the audit event so the
+  // ClosingSummary attribution is real, not a hardcoded "operator".
+  const [closedBy, setClosedBy] = useState("");
+  const [closeReason, setCloseReason] = useState("");
   const toast = useToast();
   const queryClient = useQueryClient();
 
@@ -167,11 +171,17 @@ function CampaignCard({
   }
 
   async function handleClose() {
+    if (!closedBy.trim()) {
+      toast.error("Enter your name before ending the campaign.");
+      return;
+    }
     setClosing(true);
     try {
-      await closeCampaign(campaign.id);
+      await closeCampaign(campaign.id, closedBy.trim(), closeReason.trim() || undefined);
       toast.success(`“${campaign.name}” is now winding down.`);
       setConfirmClose(false);
+      setClosedBy("");
+      setCloseReason("");
       void queryClient.invalidateQueries({ queryKey: ["campaigns"] });
       void queryClient.invalidateQueries({ queryKey: ["campaign", campaign.id] });
     } catch (e) {
@@ -358,7 +368,9 @@ function CampaignCard({
         />
       )}
 
-      {/* PLU-153: End-campaign confirmation lists the consequences verbatim. */}
+      {/* PLU-153: End-campaign confirmation lists the consequences verbatim, and
+          captures who is ending it (+ optional reason) so the audit trail records
+          the real operator — same name-required pattern as PLU-154's resolve panel. */}
       {confirmClose && (
         <ConfirmDialog
           title="End this campaign?"
@@ -371,17 +383,47 @@ function CampaignCard({
                 <li>Creators already in progress continue uninterrupted.</li>
                 <li>The campaign auto-archives only later, after those journeys conclude.</li>
               </ul>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 14 }}>
+                <input
+                  style={closeInputStyle}
+                  placeholder="Your name (required)"
+                  value={closedBy}
+                  onChange={(e) => setClosedBy(e.target.value)}
+                  autoFocus
+                />
+                <input
+                  style={closeInputStyle}
+                  placeholder="Reason (optional)"
+                  value={closeReason}
+                  onChange={(e) => setCloseReason(e.target.value)}
+                />
+              </div>
             </>
           }
           confirmLabel="End campaign"
           busy={closing}
-          onCancel={() => setConfirmClose(false)}
+          onCancel={() => {
+            setConfirmClose(false);
+            setClosedBy("");
+            setCloseReason("");
+          }}
           onConfirm={() => void handleClose()}
         />
       )}
     </Card>
   );
 }
+
+// PLU-153: shared input style for the End-campaign confirm form.
+const closeInputStyle = {
+  fontSize: font.size.sm,
+  color: colors.text,
+  background: colors.panel,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radii.sm,
+  padding: "6px 9px",
+  width: "100%",
+} as const;
 
 // PLU-153: the winding-down dashboard panel shown while a campaign is Closing.
 function ClosingSummary({

@@ -141,12 +141,33 @@ test("close route: invalid transition (from DRAFT) → 409", async (t) => {
 
   const r = responseRecorder();
   await close(
-    { params: { id: "c1" }, body: {} } as unknown as Request,
+    { params: { id: "c1" }, body: { actorId: "Ayush" } } as unknown as Request,
     r.response,
     (() => undefined) as NextFunction,
   );
   assert.equal(r.result.statusCode, 409);
   assert.match((r.result.body as { error: string }).error, /only an Active campaign/);
+});
+
+test("close route: missing actorId → 400 (attribution required)", async (t) => {
+  const close = routeHandler("/:id/close", "post");
+  // The 400 short-circuits before any DB work — stub transaction to prove it's
+  // never reached.
+  const mockDb = db as unknown as { transaction: (...a: unknown[]) => unknown };
+  let txCalled = false;
+  t.mock.method(mockDb, "transaction", async () => {
+    txCalled = true;
+  });
+
+  const r = responseRecorder();
+  await close(
+    { params: { id: "c1" }, body: { reason: "no name given" } } as unknown as Request,
+    r.response,
+    (() => undefined) as NextFunction,
+  );
+  assert.equal(r.result.statusCode, 400);
+  assert.match((r.result.body as { error: string }).error, /actorId is required/);
+  assert.equal(txCalled, false, "must not touch the DB when actorId is missing");
 });
 
 test("close route: missing campaign → 404", async (t) => {
@@ -164,7 +185,7 @@ test("close route: missing campaign → 404", async (t) => {
 
   const r = responseRecorder();
   await close(
-    { params: { id: "nope" }, body: {} } as unknown as Request,
+    { params: { id: "nope" }, body: { actorId: "Ayush" } } as unknown as Request,
     r.response,
     (() => undefined) as NextFunction,
   );
