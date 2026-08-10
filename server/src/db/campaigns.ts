@@ -513,6 +513,10 @@ const CLOSED_INSTANCE_STATES = [
   "OPTED_OUT",
   "NO_RESPONSE",
   "HANDOFF_COMPLETE",
+  // PLU-154: a timed-out MANUAL_REVIEW case IS finished, so it stops counting as
+  // in-progress and stops blocking archival (PLU-156). MANUAL_REVIEW stays absent
+  // (an unresolved case still blocks). PLU-156 owns the authoritative classifier.
+  "EXPIRED",
 ] as const;
 
 /**

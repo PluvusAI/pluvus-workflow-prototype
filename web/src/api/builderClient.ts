@@ -437,6 +437,59 @@ export function completeHandoff(instanceId: string) {
   );
 }
 
+// ── PLU-154: manual-review case resolution ────────────────────────────────
+export interface ManualReviewResolveResult {
+  instanceId: string;
+  state: string;
+  outcome: string;
+  reason?: string;
+  idempotent?: boolean;
+}
+
+export interface ApproveTerms {
+  fixedFee?: number | null | undefined;
+  commissionRate?: number | null | undefined;
+  deliverables?: string | null | undefined;
+  timeline?: string | null | undefined;
+  paymentTerms?: string | null | undefined;
+  rewardDescription?: string | null | undefined;
+  approvedDeviation?: boolean | undefined;
+}
+
+/** Approve/finalize a MANUAL_REVIEW case → NEEDS_DEAL_FINALIZATION (operator
+ *  onboarding), writing the final creator-specific terms. */
+export function approveManualReview(
+  instanceId: string,
+  body: { resolvedBy: string; reason?: string | undefined; terms?: ApproveTerms },
+) {
+  return postJson<ManualReviewResolveResult>(
+    `/api/manual-queue/instances/${instanceId}/manual-review/approve`,
+    body,
+  );
+}
+
+/** Reject/close a MANUAL_REVIEW case → REJECTED. */
+export function rejectManualReview(
+  instanceId: string,
+  body: { resolvedBy: string; reason?: string | undefined },
+) {
+  return postJson<ManualReviewResolveResult>(
+    `/api/manual-queue/instances/${instanceId}/manual-review/reject`,
+    body,
+  );
+}
+
+/** Record that the creator withdrew → OPTED_OUT. */
+export function optOutManualReview(
+  instanceId: string,
+  body: { resolvedBy: string; reason?: string | undefined },
+) {
+  return postJson<ManualReviewResolveResult>(
+    `/api/manual-queue/instances/${instanceId}/manual-review/opt-out`,
+    body,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Query invalidation helpers
 // ---------------------------------------------------------------------------

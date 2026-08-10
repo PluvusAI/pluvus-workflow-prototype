@@ -33,14 +33,24 @@ import {
 } from "../db/schema.js";
 import { db } from "../db/drizzle.js";
 import { findWorkflowById, findLatestVersion } from "../db/workflows.js";
+import { findCampaignById } from "../db/campaigns.js";
 import {
   findInstanceById,
+  findCreatorById,
   listEventsByInstance,
   listLatestBrandNotificationsForInstances,
   listDealHandoffsForInstances,
   completeDealHandoff,
   updateInstanceStateConditional,
   appendEvent,
+  resolveManualReviewCase,
+  findNegotiationPolicySnapshotById,
+  getManualReviewCaseMeta,
+  assertFeeWithinBand,
+  BandViolationError,
+  ManualReviewRaceError,
+  type ManualReviewOutcome,
+  type ResolvedTerms,
 } from "../db/index.js";
 import { emailProvider } from "../engine/providerFactory.js";
 import { resendBrandApprovalRequest } from "../engine/executors/brandApprovalResend.js";
@@ -198,9 +208,12 @@ router.get("/workflows/:workflowId", async (req: Request, res: Response) => {
           // (NEEDS_DEAL_FINALIZATION). Both are "a human must act", which is
           // exactly what this surface is for, so they share one list rather than
           // spawning a second deal-management screen.
+          // PLU-154: EXPIRED (timed-out MR) stays visible as a resolved-timeout row
+          // so operators can see cases that closed on their own.
           inArray(executionInstances.currentState, [
             "MANUAL_REVIEW",
             "NEEDS_DEAL_FINALIZATION",
+            "EXPIRED",
           ]),
         ),
       )
@@ -228,6 +241,8 @@ router.get("/workflows/:workflowId", async (req: Request, res: Response) => {
               // Content-links escalation: carries the submitted URLs so the queue
               // entry can show the link count + list without a per-item read.
               "CONTENT_LINKS_SUBMITTED",
+              // PLU-154: nudge count for the deadline/nudge display.
+              "MANUAL_REVIEW_NUDGED",
             ]),
           ),
         )
@@ -287,6 +302,9 @@ router.get("/workflows/:workflowId", async (req: Request, res: Response) => {
     const items = instRows.map(({ instance: inst, creator }) => {
       const instEvents = eventsByInstance.get(inst.id) ?? [];
       const isHandoff = inst.currentState === "NEEDS_DEAL_FINALIZATION";
+      const isExpired = inst.currentState === "EXPIRED";
+      // PLU-154: deadline (dueAt) + nudge count for the queue-row countdown.
+      const { deadline, nudgeCount } = getManualReviewCaseMeta(inst, instEvents);
       const handoff = handoffs.get(inst.id) ?? null;
       const { reason, escalatedAt } = deriveEscalation(instEvents);
       const notification = notifications.get(inst.id) ?? null;
@@ -300,8 +318,13 @@ router.get("/workflows/:workflowId", async (req: Request, res: Response) => {
         instanceId: inst.id,
         // Discriminator the UI switches on: a handoff row shows the agreed
         // compensation and a "mark completed" action; an escalation row keeps
-        // the existing reason + notify-brand affordances.
-        kind: isHandoff ? ("handoff" as const) : ("escalation" as const),
+        // the existing reason + notify-brand affordances + PLU-154 resolution
+        // actions; an expired row is read-only (the case timed out).
+        kind: isHandoff
+          ? ("handoff" as const)
+          : isExpired
+            ? ("expired" as const)
+            : ("escalation" as const),
         creatorId: inst.creatorId,
         creatorName: creator.name,
         creatorEmail: creator.email,
@@ -313,6 +336,12 @@ router.get("/workflows/:workflowId", async (req: Request, res: Response) => {
         reasonLabel: reasonLabel(isHandoff ? "needs_deal_finalization" : reason),
         escalatedAt,
         updatedAt: inst.updatedAt.toISOString(),
+        // PLU-154: deadline countdown + nudge count for a live MANUAL_REVIEW case
+        // (null deadline when the timeout feature is off). timedOut marks a case
+        // the sweep already expired. Only meaningful on escalation/expired rows.
+        deadline: deadline?.toISOString() ?? null,
+        nudgeCount,
+        timedOut: isExpired,
         // E6: the thread deep-link (null when unavailable — the UI omits it).
         threadUrl,
         // Content-links: the submitted URLs + count (empty/0 for other reasons).
@@ -543,6 +572,213 @@ router.post("/instances/:instanceId/handoff/complete", async (req: Request, res:
     res.status(500).json({ error: "internal server error" });
   }
 });
+
+// ---------------------------------------------------------------------------
+// Manual-review case RESOLUTION (PLU-154)
+// ---------------------------------------------------------------------------
+// Three human actions take a MANUAL_REVIEW case to a terminal outcome. Each is a
+// single OCC-guarded transition (resolveManualReviewCase) atomic with its audit
+// events + optional DealHandoff. All three follow the handoff/complete template:
+// load → guard state → resolve → 409 on race → JSON. Idempotency: a retried request
+// against an ALREADY-resolved case returns 200 with the existing outcome (read from
+// the event log) rather than 409; a DIFFERENT terminal state is a genuine 409.
+
+/** The prior resolution outcome + reason for an already-terminal case, from the
+ *  MANUAL_REVIEW_RESOLVED event. Null when none was recorded. */
+function priorResolution(
+  events: Event[],
+): { outcome: string; reason: string | null; resolvedBy: string | null } | null {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.type !== "MANUAL_REVIEW_RESOLVED") continue;
+    const p = asRecord(e.payload);
+    return {
+      outcome: payloadString(p, "outcome") ?? "",
+      reason: payloadString(p, "reason"),
+      resolvedBy: payloadString(p, "resolvedBy"),
+    };
+  }
+  return null;
+}
+
+/** Shared handler for reject + opt-out (identical shape, different target/reason). */
+async function handleSimpleResolution(
+  req: Request,
+  res: Response,
+  to: Extract<ManualReviewOutcome, "REJECTED" | "OPTED_OUT">,
+  defaultReason: string,
+): Promise<void> {
+  try {
+    const instanceId = req.params["instanceId"]!;
+    const { resolvedBy, reason } = req.body as { resolvedBy?: unknown; reason?: unknown };
+    if (typeof resolvedBy !== "string" || !resolvedBy.trim()) {
+      res.status(400).json({ error: "resolvedBy is required" });
+      return;
+    }
+    const inst = await findInstanceById(instanceId);
+    if (!inst) {
+      res.status(404).json({ error: "instance not found" });
+      return;
+    }
+    // Idempotency: already resolved to the SAME outcome → return the existing one.
+    if (inst.currentState === to) {
+      const prior = priorResolution(await listEventsByInstance(instanceId));
+      res.json({ instanceId, state: to, outcome: to, idempotent: true, ...prior });
+      return;
+    }
+    if (inst.currentState !== "MANUAL_REVIEW") {
+      res.status(409).json({
+        error: `instance is not in manual review (state: ${inst.currentState})`,
+      });
+      return;
+    }
+
+    const resolutionReason =
+      typeof reason === "string" && reason.trim() ? reason.trim() : defaultReason;
+    const updated = await resolveManualReviewCase(instanceId, {
+      to,
+      resolvedBy: resolvedBy.trim(),
+      reason: resolutionReason,
+    });
+    res.json({ instanceId, state: updated.currentState, outcome: to, reason: resolutionReason });
+  } catch (err) {
+    if (err instanceof ManualReviewRaceError) {
+      res.status(409).json({ error: "instance was concurrently modified — reload and retry" });
+      return;
+    }
+    console.error(`[manual-queue] resolve (${to}) error:`, err);
+    res.status(500).json({ error: "internal server error" });
+  }
+}
+
+// POST /manual-queue/instances/:instanceId/manual-review/approve
+router.post(
+  "/instances/:instanceId/manual-review/approve",
+  async (req: Request, res: Response) => {
+    try {
+      const instanceId = req.params["instanceId"]!;
+      const body = req.body as { resolvedBy?: unknown; reason?: unknown; terms?: unknown };
+      if (typeof body.resolvedBy !== "string" || !body.resolvedBy.trim()) {
+        res.status(400).json({ error: "resolvedBy is required" });
+        return;
+      }
+      const terms = (body.terms ?? {}) as ResolvedTerms;
+
+      const inst = await findInstanceById(instanceId);
+      if (!inst) {
+        res.status(404).json({ error: "instance not found" });
+        return;
+      }
+      // Idempotency: already approved → return existing.
+      if (inst.currentState === "NEEDS_DEAL_FINALIZATION") {
+        const prior = priorResolution(await listEventsByInstance(instanceId));
+        res.json({
+          instanceId,
+          state: "NEEDS_DEAL_FINALIZATION",
+          outcome: "NEEDS_DEAL_FINALIZATION",
+          idempotent: true,
+          ...prior,
+        });
+        return;
+      }
+      if (inst.currentState !== "MANUAL_REVIEW") {
+        res.status(409).json({
+          error: `instance is not in manual review (state: ${inst.currentState})`,
+        });
+        return;
+      }
+      // V1: approve → operator onboarding, so only valid for operator_handoff. A
+      // local_payment creator in NEEDS_DEAL_FINALIZATION would strand (no brief/
+      // payout sent) — full mode-branching is PLU-155's job.
+      if (inst.postAcceptanceMode !== "operator_handoff") {
+        res.status(422).json({
+          error:
+            "approving a local-payment creator from Manual Review is not supported in V1 — " +
+            "reject or resolve via the payment flow",
+        });
+        return;
+      }
+
+      // Validate the final fee against the PINNED band BEFORE opening any tx. The
+      // snapshot is read-only (never written) so it stays immutable during MR.
+      let campaignName: string | null = null;
+      if (inst.negotiationPolicySnapshotId) {
+        const snapshot = await findNegotiationPolicySnapshotById(inst.negotiationPolicySnapshotId);
+        try {
+          assertFeeWithinBand(terms, snapshot);
+        } catch (err) {
+          if (err instanceof BandViolationError) {
+            res.status(422).json({
+              error: err.message,
+              hint: "pass terms.approvedDeviation:true to record an approved structured deviation",
+            });
+            return;
+          }
+          throw err;
+        }
+        if (snapshot) {
+          const campaign = await findCampaignById(snapshot.campaignId);
+          campaignName = campaign?.name ?? null;
+        }
+      }
+
+      const creator = await findCreatorById(inst.creatorId);
+      if (!creator) {
+        res.status(404).json({ error: "creator not found" });
+        return;
+      }
+
+      const resolutionReason =
+        typeof body.reason === "string" && body.reason.trim()
+          ? body.reason.trim()
+          : "approved";
+      const updated = await resolveManualReviewCase(instanceId, {
+        to: "NEEDS_DEAL_FINALIZATION",
+        resolvedBy: body.resolvedBy.trim(),
+        reason: resolutionReason,
+        terms,
+        creator: { name: creator.name, email: creator.email },
+        campaignName,
+      });
+
+      // AFTER the commit: tell the operator the deal landed in
+      // NEEDS_DEAL_FINALIZATION (stepInstance normally fires this, but this route
+      // bypasses it). Best-effort — a notify failure does NOT undo the resolution.
+      try {
+        await notifyOperatorOfDealFinalization(emailProvider(), instanceId);
+      } catch (err) {
+        console.error(
+          `[manual-queue] operator finalization notice failed for ${instanceId} (resolution stands):`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+
+      res.json({
+        instanceId,
+        state: updated.currentState,
+        outcome: "NEEDS_DEAL_FINALIZATION",
+        reason: resolutionReason,
+      });
+    } catch (err) {
+      if (err instanceof ManualReviewRaceError) {
+        res.status(409).json({ error: "instance was concurrently modified — reload and retry" });
+        return;
+      }
+      console.error("[manual-queue] approve error:", err);
+      res.status(500).json({ error: "internal server error" });
+    }
+  },
+);
+
+// POST /manual-queue/instances/:instanceId/manual-review/reject
+router.post("/instances/:instanceId/manual-review/reject", (req, res) =>
+  handleSimpleResolution(req, res, "REJECTED", "rejected"),
+);
+
+// POST /manual-queue/instances/:instanceId/manual-review/opt-out
+router.post("/instances/:instanceId/manual-review/opt-out", (req, res) =>
+  handleSimpleResolution(req, res, "OPTED_OUT", "creator_withdrew"),
+);
 
 // ---------------------------------------------------------------------------
 // GET /manual-queue/config — resolved default recipient (for the UI to display)

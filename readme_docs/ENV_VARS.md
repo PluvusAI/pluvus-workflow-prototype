@@ -44,6 +44,18 @@ Two audiences:
 |---|---|---|---|
 | `SCHEDULER_LEADER_TTL_MS` | ⬜ | `90000` | Redis leader lease so only ONE scheduler polls when several run. Irrelevant with a single `PROCESS_ROLE=all` process. |
 
+### Manual-review timeout (PLU-154)
+
+The poller sweep that expires unresolved `MANUAL_REVIEW` cases and nudges the brand
+before the deadline. **Mandatory — there is no on/off flag:** every case entering
+MANUAL_REVIEW is stamped with a deadline, so no creator can sit in MANUAL_REVIEW
+indefinitely. Only the durations are tunable.
+
+| Var | Req? | Default | Purpose |
+|---|---|---|---|
+| `MANUAL_REVIEW_TIMEOUT_MS` | ⬜ | `604800000` | How long (ms) a case may sit in MANUAL_REVIEW before the sweep expires it (→ `EXPIRED`, distinct from `NO_RESPONSE`). Default 7 days. |
+| `MANUAL_REVIEW_NUDGE_OFFSETS_MS` | ⬜ | `259200000,86400000` | Comma list of "ms before deadline" to nudge the brand (default 3d, 1d). Nudges target the brand/operator, never the creator. |
+
 ## 4. Randomized send delay
 
 Decouples "AI reply generated" from "reply sent" by a random delay so counters don't land

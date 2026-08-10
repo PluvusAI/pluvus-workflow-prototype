@@ -6,6 +6,7 @@ import { redriveInboundDeadLetters } from "./inboundRedrive.js";
 import { sweepAutoSettlePayouts } from "./payoutSweep.js";
 import { sweepStrandedSends } from "./sendDelaySweep.js";
 import { sweepStaleBrandApprovalClaims } from "./brandApprovalSweep.js";
+import { sweepManualReviewTimeouts } from "./manualReviewSweep.js";
 import { logWorkerMetrics } from "../workers/workerMetrics.js";
 import { acquireOrRenewLeadership } from "./lock.js";
 
@@ -80,6 +81,20 @@ async function poll(): Promise<void> {
   } catch (err) {
     console.error(
       "[scheduler/poller] brand-approval stale-claim sweep failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // PLU-154: expire MANUAL_REVIEW cases the brand never resolved before their
+  // deadline (→ EXPIRED) and send the pre-deadline brand nudges. The timeout is
+  // mandatory (every MR case is stamped with a deadline on entry). Runs under the
+  // leader lease; wrapped so a sweep DB/email blip can never disturb the
+  // due-instance path.
+  try {
+    await sweepManualReviewTimeouts();
+  } catch (err) {
+    console.error(
+      "[scheduler/poller] manual-review timeout sweep failed:",
       err instanceof Error ? err.message : err,
     );
   }
