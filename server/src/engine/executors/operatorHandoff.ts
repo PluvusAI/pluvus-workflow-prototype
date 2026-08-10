@@ -18,6 +18,8 @@ import { resolveBand } from "../band.js";
 import { resolveBrandName, toCampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Operator handoff executor (PLU-70)
@@ -53,7 +55,6 @@ export async function executeOperatorHandoff(
   email: IEmailProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator, campaign, campaignDetails } = ctx;
-  const config = node.config;
   // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
   // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
   // loads CampaignDetails alongside Campaign into ExecutionContext specifically
@@ -66,6 +67,30 @@ export async function executeOperatorHandoff(
       `Operator handoff expects ACCEPTED state, got ${instance.currentState}`,
     );
   }
+
+  // PLU-138 (1d): the DealHandoff + operator note restate the deal's PUBLIC terms,
+  // so overlay them from the pinned CampaignTermsSnapshot (snapshot-wins over the
+  // stale nodeGraph config). Integrity failure → MANUAL_REVIEW. No-snapshot journey
+  // → the existing 3-tier config→negotiationConfig→campaignFields chain is unchanged.
+  // The negotiation BAND stays on resolveBand(negotiationConfig) here (the private
+  // policy-snapshot band swap is a tracked follow-up, not this commit).
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, campaign?.id);
+  if (pinnedTerms.integrityFailure) {
+    return {
+      nextState: "MANUAL_REVIEW",
+      nextNodeId: null,
+      completedAt: new Date(),
+      eventType: "MANUAL_REVIEW_FLAGGED",
+      eventPayload: {
+        outcome: "ESCALATE",
+        reason: pinnedTerms.integrityFailure.reason,
+        node: node.type,
+      },
+    };
+  }
+  const config = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
+    : node.config;
 
   // 1. Resolve the brand for the creator-facing note. Same L4 contract as every
   //    other creator-facing executor: with no resolvable brand name we escalate

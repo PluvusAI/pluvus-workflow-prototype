@@ -19,6 +19,7 @@ import * as schema from "./schema.js";
 import type { Db } from "./drizzle.js";
 import { launchCampaign, resolveCampaignLaunchContext } from "./campaigns.js";
 import { loadPinnedSnapshots } from "../engine/executors/negotiation.js";
+import { loadPinnedTermsSnapshotForExecutor } from "./campaignSnapshots.js";
 import { buildConversationContext, buildContextRecord } from "../engine/conversationContext.js";
 import type { ResolvedBrief } from "../engine/executors/briefKnowledge.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
@@ -250,6 +251,55 @@ async function main(): Promise<void> {
     assert.equal(cc.legacyFallbackUsed, false, "a broken pin is NOT a silent legacy fallback");
     // And the reason rides the sanitized observability record (§4a / E11).
     assert.equal(buildContextRecord(cc).integrityFailureReason, "terms_snapshot_cross_campaign");
+  });
+
+  // -------- PLU-138 (1d): the executor-side pinned-terms loader --------
+  // The post-accept executors (contentBrief/rewardSetup/operatorHandoff/brandApproval)
+  // load PUBLIC terms through this loader; it must apply the SAME integrity discipline
+  // as loadPinnedSnapshots — a missing / cross-campaign pin is an explicit failure, a
+  // no-pin journey is a clean legacy pass, never a silent config read over a bad pin.
+
+  await test("loadPinnedTermsSnapshotForExecutor: valid pin returns the terms snapshot", async () => {
+    const { campaignId, termsId, policyId } = await seedLaunchedCampaign(pgdb);
+    const instance = await enrollInstance(pgdb, campaignId, {
+      campaignTermsSnapshotId: termsId,
+      negotiationPolicySnapshotId: policyId,
+    });
+    const res = await loadPinnedTermsSnapshotForExecutor(instance, campaignId, pgdb);
+    assert.equal(res.terms?.id, termsId);
+    assert.equal(res.integrityFailure, undefined);
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: no pin (legacy) returns empty — NOT a failure", async () => {
+    // A legacy journey has no pinned snapshot id — the loader short-circuits before
+    // any DB read, so a bare object models it (no instance row needed).
+    const res = await loadPinnedTermsSnapshotForExecutor({ campaignTermsSnapshotId: null }, null, pgdb);
+    assert.equal(res.terms, undefined);
+    assert.equal(res.integrityFailure, undefined); // legacy no-snapshot journey = clean pass
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: missing row (stale id) → integrityFailure", async () => {
+    const { campaignId } = await seedLaunchedCampaign(pgdb);
+    const res = await loadPinnedTermsSnapshotForExecutor(
+      { campaignTermsSnapshotId: "vanished-terms" },
+      campaignId,
+      pgdb,
+    );
+    assert.equal(res.integrityFailure?.reason, "terms_snapshot_missing");
+    assert.equal(res.terms, undefined);
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: cross-campaign pin → integrityFailure", async () => {
+    const a = await seedLaunchedCampaign(pgdb);
+    const b = await seedLaunchedCampaign(pgdb);
+    // Instance in campaign A pinned to campaign B's terms snapshot.
+    const res = await loadPinnedTermsSnapshotForExecutor(
+      { campaignTermsSnapshotId: b.termsId },
+      a.campaignId,
+      pgdb,
+    );
+    assert.equal(res.integrityFailure?.reason, "terms_snapshot_cross_campaign");
+    assert.equal(res.terms, undefined);
   });
 
   console.log(`\n${n} passed\n`);
