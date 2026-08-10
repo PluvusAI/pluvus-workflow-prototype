@@ -243,8 +243,15 @@ function isMarkedNonNegotiable(
  *              present. Fee fields are NOT required (PLU-129's existing
  *              0/0-is-valid convention for commission-only campaigns).
  *   HYBRID:    both PAID and AFFILIATE rules apply.
- *   GIFT_ONLY: productOrOffer + giftDisposition set; private gift authority
- *              present. No fee or commission required.
+ *   GIFT_ONLY: productOrOffer + giftDisposition=KEEP set; private gift
+ *              authority present. No fee or commission required.
+ *              giftDisposition MUST be KEEP for GIFT_ONLY specifically — the
+ *              product IS the entire compensation, so LOAN/RETURN would mean
+ *              the creator gets nothing for their work. LOAN/RETURN are only
+ *              valid on a structure that also has a fee/commission
+ *              component (PAID/AFFILIATE/HYBRID + includesGifting), where
+ *              the gift is a bonus on top of real payment, not the payment
+ *              itself.
  *   Any structure with includesGifting: also requires productOrOffer +
  *   giftDisposition + private gift authority, on top of its primary rules.
  */
@@ -287,6 +294,11 @@ export function validateCompensationReadiness(
   if (needsGift) {
     if (!details.productOrOffer) missing.push("CampaignDetails.productOrOffer");
     if (!details.giftDisposition) missing.push("CampaignDetails.giftDisposition");
+    if (details.campaignType === "GIFT_ONLY" && details.giftDisposition != null && details.giftDisposition !== "KEEP") {
+      missing.push(
+        "CampaignDetails.giftDisposition must be KEEP for GIFT_ONLY — the product is the entire compensation, so a loaned or returned product would mean no payment at all",
+      );
+    }
     const hasGiftAuthority =
       policy.giftSubstitutionAllowed != null ||
       policy.giftValueFlexibilityCents != null ||

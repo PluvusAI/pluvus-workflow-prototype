@@ -144,6 +144,25 @@ export interface DraftNode {
 // Campaign
 // ---------------------------------------------------------------------------
 
+/** PLU-136: how the creator is compensated. Never gates whether the campaign
+ *  negotiates — every structure does. */
+export type CampaignType = "PAID" | "AFFILIATE" | "HYBRID" | "GIFT_ONLY";
+
+/** PLU-136: only meaningful when includesGifting is true or campaignType is
+ *  GIFT_ONLY. GIFT_ONLY specifically requires KEEP — the product is the
+ *  entire payment, so a loaned/returned product would mean no payment. */
+export type GiftDisposition = "KEEP" | "LOAN" | "RETURN";
+
+/** PLU-136: for PAID/HYBRID — request the creator's own rate card, or
+ *  propose a starting fee up front. */
+export type PriceStrategy = "REQUEST_RATE_CARD" | "PROPOSE_STARTING_FEE";
+
+/** PLU-136: every campaign predating the compensation-contract migration
+ *  defaults NEEDS_REVIEW — never silently treated as a verified
+ *  classification. A campaign created through this wizard is CONFIRMED
+ *  automatically (an explicit, verified selection). */
+export type CompensationReviewStatus = "NEEDS_REVIEW" | "CONFIRMED";
+
 export interface CampaignListItem {
   id: string;
   name: string;
@@ -156,7 +175,9 @@ export interface CampaignListItem {
   timeline: string | null;
   /** Free-text product/sample reward blurb woven into the email copy. */
   rewardDescription: string | null;
-  /** When true, the payment form also collects a shipping address. */
+  /** When true, the payment form also collects a shipping address. Distinct
+   *  from includesGifting below — a content-creation sample the creator
+   *  ships back is not automatically compensation. */
   shipsPhysicalProduct: boolean;
   postAcceptanceMode: PostAcceptanceMode;
   dailyInitialOutreachLimit: number | null;
@@ -167,6 +188,16 @@ export interface CampaignListItem {
   /** PLU-121: the connected mailbox outreach is sent from (a
    *  ConnectedEmailAccount id), or null to use the default account. */
   emailAccountId: string | null;
+  // PLU-136: compensation data contract fields.
+  campaignType: CampaignType | null;
+  includesGifting: boolean;
+  giftDisposition: GiftDisposition | null;
+  priceStrategy: PriceStrategy | null;
+  publicStartingFeeCents: number | null;
+  publicCommissionRate: number | null;
+  commissionDurationDays: number | null;
+  commissionConditions: string | null;
+  compensationReviewStatus: CompensationReviewStatus | null;
   createdAt: string;
   updatedAt: string;
   workflowCount: number;
@@ -219,6 +250,16 @@ export interface CampaignDetail {
   negotiationReplyPacingMaxMinutes: number | null;
   /** PLU-121: the connected mailbox outreach is sent from, or null for default. */
   emailAccountId: string | null;
+  // PLU-136: compensation data contract fields.
+  campaignType: CampaignType | null;
+  includesGifting: boolean;
+  giftDisposition: GiftDisposition | null;
+  priceStrategy: PriceStrategy | null;
+  publicStartingFeeCents: number | null;
+  publicCommissionRate: number | null;
+  commissionDurationDays: number | null;
+  commissionConditions: string | null;
+  compensationReviewStatus: CompensationReviewStatus | null;
   createdAt: string;
   updatedAt: string;
   workflows: CampaignWorkflowItem[];

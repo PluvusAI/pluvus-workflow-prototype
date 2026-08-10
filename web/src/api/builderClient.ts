@@ -31,6 +31,10 @@ import type {
   PostAcceptanceMode,
   CompleteHandoffResult,
   ConnectedEmailAccount,
+  CampaignType,
+  GiftDisposition,
+  PriceStrategy,
+  CompensationReviewStatus,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -123,6 +127,18 @@ export function createCampaign(data: {
   negotiationReplyPacingMaxMinutes?: number;
   /** PLU-121: the connected mailbox to send this campaign's outreach from. */
   emailAccountId?: string;
+  // PLU-136: compensation data contract fields.
+  campaignType?: CampaignType;
+  includesGifting?: boolean;
+  giftDisposition?: GiftDisposition;
+  priceStrategy?: PriceStrategy;
+  publicStartingFeeCents?: number;
+  publicCommissionRate?: number;
+  commissionDurationDays?: number;
+  commissionConditions?: string;
+  /** Set CONFIRMED when created through an explicit-selection UI (this
+   *  wizard) — an actual brand choice, not an unverified backfill default. */
+  compensationReviewStatus?: CompensationReviewStatus;
 }) {
   return postJson<{ id: string; name: string }>("/api/campaigns", data);
 }

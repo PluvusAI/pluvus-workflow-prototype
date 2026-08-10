@@ -7,7 +7,13 @@ import {
 } from "../../api/builderClient";
 import { colors, radii, font } from "../../theme";
 import { Modal, Button, Input, Textarea, Toggle, Select, FormField, useToast } from "../ds";
-import type { PostAcceptanceMode, TemplateKey } from "../../api/builderTypes";
+import type {
+  PostAcceptanceMode,
+  TemplateKey,
+  CampaignType,
+  GiftDisposition,
+  PriceStrategy,
+} from "../../api/builderTypes";
 
 interface Props {
   onCreated: (workflowId: string) => void;
@@ -53,6 +59,15 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   const [timeline, setTimeline] = useState("");
   const [rewardDescription, setRewardDescription] = useState("");
   const [shipsPhysicalProduct, setShipsPhysicalProduct] = useState(false);
+  // PLU-136: compensation data contract fields.
+  const [campaignType, setCampaignType] = useState<CampaignType>("PAID");
+  const [priceStrategy, setPriceStrategy] = useState<PriceStrategy>("REQUEST_RATE_CARD");
+  const [publicStartingFeeCents, setPublicStartingFeeCents] = useState("");
+  const [publicCommissionRate, setPublicCommissionRate] = useState("");
+  const [commissionDurationDays, setCommissionDurationDays] = useState("");
+  const [commissionConditions, setCommissionConditions] = useState("");
+  const [includesGifting, setIncludesGifting] = useState(false);
+  const [giftDisposition, setGiftDisposition] = useState<GiftDisposition | "">("");
   const [objective, setObjective] = useState("");
   const [notes, setNotes] = useState("");
   const [targetUrl, setTargetUrl] = useState("");
@@ -80,6 +95,18 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   const [selectedTemplate, setSelectedTemplate] = useState<TemplateKey | null>(null);
   const [workflowName, setWorkflowName] = useState("");
 
+  // PLU-136: derived compensation-shape flags — drive which fields show and
+  // what's required, mirroring validateCompensationReadiness() server-side.
+  const needsFee = campaignType === "PAID" || campaignType === "HYBRID";
+  const needsCommission = campaignType === "AFFILIATE" || campaignType === "HYBRID";
+  const isGiftOnly = campaignType === "GIFT_ONLY";
+  // GIFT_ONLY never shows a disposition picker — it's locked to KEEP (the
+  // product IS the entire payment, so loan/return would mean no payment at
+  // all). The picker only applies when gifting is a BONUS on top of a real
+  // fee/commission.
+  const showsGiftDispositionPicker = includesGifting && !isGiftOnly;
+  const needsGiftDetails = isGiftOnly || includesGifting;
+
   const nameId = useId();
   const brandId = useId();
   const notifyId = useId();
@@ -99,6 +126,13 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
   const negotiationMinId = useId();
   const negotiationMaxId = useId();
   const senderId = useId();
+  const campaignTypeId = useId();
+  const priceStrategyId = useId();
+  const startingFeeId = useId();
+  const commissionRateId = useId();
+  const commissionDurationId = useId();
+  const commissionConditionsId = useId();
+  const giftDispositionId = useId();
 
   const notifyEmailInvalid =
     !!notifyEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(notifyEmail.trim());
@@ -145,6 +179,34 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
       setError("The minimum email delay cannot exceed the maximum delay");
       return;
     }
+    // PLU-136: compensation fields — mirrors validateCompensationReadiness()
+    // server-side (minus the NegotiationPolicy-authority checks, which this
+    // wizard doesn't collect; a campaign still needs a negotiation policy
+    // set separately before it can launch).
+    if (needsFee && priceStrategy === "PROPOSE_STARTING_FEE") {
+      const fee = Number(publicStartingFeeCents);
+      if (!publicStartingFeeCents.trim() || !Number.isFinite(fee) || fee <= 0) {
+        setError("Enter a starting fee amount, or switch to requesting the creator's rate card");
+        return;
+      }
+    }
+    if (needsCommission) {
+      const rate = Number(publicCommissionRate);
+      if (!publicCommissionRate.trim() || !Number.isFinite(rate) || rate <= 0 || rate > 100) {
+        setError("Enter a commission rate between 0 and 100");
+        return;
+      }
+    }
+    if (needsGiftDetails) {
+      if (!rewardDescription.trim()) {
+        setError("Describe the product being offered, in Product / Sample Reward above");
+        return;
+      }
+      if (showsGiftDispositionPicker && !giftDisposition) {
+        setError("Choose what happens to the product after the campaign");
+        return;
+      }
+    }
     setError(null);
     setWorkflowName(`${name.trim()} Outreach`);
     setStep(2);
@@ -190,6 +252,31 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
       // PLU-121: send only when a specific mailbox was chosen; empty → the server
       // leaves it null and enrollment falls back to the default account.
       if (emailAccountId) campaignData.emailAccountId = emailAccountId;
+      // PLU-136: compensation data contract fields.
+      campaignData.campaignType = campaignType;
+      if (needsFee) {
+        campaignData.priceStrategy = priceStrategy;
+        if (priceStrategy === "PROPOSE_STARTING_FEE" && publicStartingFeeCents.trim()) {
+          campaignData.publicStartingFeeCents = Math.round(Number(publicStartingFeeCents) * 100);
+        }
+      }
+      if (needsCommission && publicCommissionRate.trim()) {
+        campaignData.publicCommissionRate = Number(publicCommissionRate);
+        if (commissionDurationDays.trim())
+          campaignData.commissionDurationDays = Number(commissionDurationDays);
+        if (commissionConditions.trim())
+          campaignData.commissionConditions = commissionConditions.trim();
+      }
+      if (isGiftOnly) {
+        campaignData.includesGifting = true;
+        campaignData.giftDisposition = "KEEP";
+      } else if (includesGifting) {
+        campaignData.includesGifting = true;
+        if (giftDisposition) campaignData.giftDisposition = giftDisposition;
+      }
+      // This wizard is the explicit-selection UI PLU-136 needed — a genuine,
+      // verified brand choice, not an unverified backfill default.
+      campaignData.compensationReviewStatus = "CONFIRMED";
       const campaign = await createCampaign(campaignData);
       const workflow = await createWorkflowForCampaign(campaign.id, {
         name: workflowName.trim(),
@@ -316,9 +403,118 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
               />
             </FormField>
             <FormField
-              label="Product / Sample Reward"
+              label="Compensation structure *"
+              htmlFor={campaignTypeId}
+              hint={
+                campaignType === "PAID"
+                  ? "The creator gets an upfront fee, no commission."
+                  : campaignType === "AFFILIATE"
+                    ? "The creator earns commission on conversions, no upfront fee."
+                    : campaignType === "HYBRID"
+                      ? "The creator gets an upfront fee plus commission on conversions."
+                      : "The product/gift IS the entire payment — no cash fee or commission."
+              }
+            >
+              <Select
+                id={campaignTypeId}
+                value={campaignType}
+                onChange={(e) => setCampaignType(e.target.value as CampaignType)}
+              >
+                <option value="PAID">Paid — upfront fee</option>
+                <option value="AFFILIATE">Affiliate — commission only</option>
+                <option value="HYBRID">Hybrid — fee + commission</option>
+                <option value="GIFT_ONLY">Gift only — product is the payment</option>
+              </Select>
+            </FormField>
+            {needsFee && (
+              <FormField
+                label="Price strategy"
+                htmlFor={priceStrategyId}
+                hint={
+                  priceStrategy === "PROPOSE_STARTING_FEE"
+                    ? "You propose a starting number; the creator can still negotiate it."
+                    : "The creator shares their own rate card first — no number is proposed here."
+                }
+              >
+                <Select
+                  id={priceStrategyId}
+                  value={priceStrategy}
+                  onChange={(e) => setPriceStrategy(e.target.value as PriceStrategy)}
+                >
+                  <option value="REQUEST_RATE_CARD">Request the creator's rate card</option>
+                  <option value="PROPOSE_STARTING_FEE">Propose a starting fee</option>
+                </Select>
+              </FormField>
+            )}
+            {needsFee && priceStrategy === "PROPOSE_STARTING_FEE" && (
+              <FormField
+                label="Starting fee offer ($)"
+                htmlFor={startingFeeId}
+                hint="The public starting number shown to the creator — still negotiable unless you mark it fixed in the negotiation policy."
+              >
+                <Input
+                  id={startingFeeId}
+                  type="number"
+                  min={0}
+                  step="1"
+                  value={publicStartingFeeCents}
+                  onChange={(e) => setPublicStartingFeeCents(e.target.value)}
+                  placeholder="e.g. 500"
+                />
+              </FormField>
+            )}
+            {needsCommission && (
+              <>
+                <FormField
+                  label="Commission rate (%)"
+                  htmlFor={commissionRateId}
+                  hint="The public commission rate shown to the creator."
+                >
+                  <Input
+                    id={commissionRateId}
+                    type="number"
+                    min={0}
+                    max={100}
+                    step="0.1"
+                    value={publicCommissionRate}
+                    onChange={(e) => setPublicCommissionRate(e.target.value)}
+                    placeholder="e.g. 15"
+                  />
+                </FormField>
+                <FormField
+                  label="Commission duration (days)"
+                  htmlFor={commissionDurationId}
+                  hint="How long the commission window runs. Leave blank if not applicable."
+                >
+                  <Input
+                    id={commissionDurationId}
+                    type="number"
+                    min={1}
+                    step="1"
+                    value={commissionDurationDays}
+                    onChange={(e) => setCommissionDurationDays(e.target.value)}
+                    placeholder="e.g. 30"
+                  />
+                </FormField>
+                <FormField label="Commission conditions" htmlFor={commissionConditionsId}>
+                  <Textarea
+                    id={commissionConditionsId}
+                    value={commissionConditions}
+                    onChange={(e) => setCommissionConditions(e.target.value)}
+                    placeholder="e.g. applies to first-time customers only"
+                    rows={2}
+                  />
+                </FormField>
+              </>
+            )}
+            <FormField
+              label={isGiftOnly ? "Product / Gift *" : "Product / Sample Reward"}
               htmlFor={rewardId}
-              hint="Describe any product or free sample the creator receives. The AI mentions this across the outreach and negotiation emails. Leave blank for cash-only deals."
+              hint={
+                isGiftOnly
+                  ? "Describe the product the creator receives — this is their entire payment, so it's kept, not returned."
+                  : "Describe any product or free sample the creator receives. The AI mentions this across the outreach and negotiation emails. Leave blank for cash-only deals."
+              }
             >
               <Textarea
                 id={rewardId}
@@ -330,7 +526,7 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
             </FormField>
             <FormField
               label="Ships a physical product"
-              hint="When on, the payment form also asks the creator for a shipping address so we can send the product."
+              hint="When on, the payment form also asks the creator for a shipping address so we can send the product. Independent of gifting below — a content-creation sample the creator ships back isn't compensation."
             >
               <Toggle
                 checked={shipsPhysicalProduct}
@@ -338,6 +534,32 @@ export function CampaignWizard({ onCreated, onClose }: Props) {
                 label="Collect a shipping address on the payment form"
               />
             </FormField>
+            {!isGiftOnly && (
+              <FormField
+                label="Includes a gifted product"
+                hint="When on, the product above is part of the creator's compensation — on top of the fee/commission — not just a sample for content."
+              >
+                <Toggle
+                  checked={includesGifting}
+                  onChange={setIncludesGifting}
+                  label="This campaign includes a gift as compensation"
+                />
+              </FormField>
+            )}
+            {showsGiftDispositionPicker && (
+              <FormField label="What happens to the product?" htmlFor={giftDispositionId}>
+                <Select
+                  id={giftDispositionId}
+                  value={giftDisposition}
+                  onChange={(e) => setGiftDisposition(e.target.value as GiftDisposition)}
+                >
+                  <option value="">Choose one…</option>
+                  <option value="KEEP">Creator keeps it</option>
+                  <option value="LOAN">Loaned — creator uses it, then returns it</option>
+                  <option value="RETURN">Must be returned after the campaign</option>
+                </Select>
+              </FormField>
+            )}
             <FormField
               label="Escalation notification email"
               htmlFor={notifyId}

@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import { db } from "./drizzle.js";
+import { db, type Db, type DbTx } from "./drizzle.js";
 import { CampaignLockedError } from "./campaignDetails.js";
 import {
   campaigns,
@@ -8,8 +8,8 @@ import {
   type NegotiationPolicyInsert,
 } from "./schema.js";
 
-async function assertCampaignIsDraft(campaignId: string): Promise<void> {
-  const [campaign] = await db
+async function assertCampaignIsDraft(campaignId: string, client: Db | DbTx): Promise<void> {
+  const [campaign] = await client
     .select({ status: campaigns.status })
     .from(campaigns)
     .where(eq(campaigns.id, campaignId))
@@ -21,8 +21,9 @@ async function assertCampaignIsDraft(campaignId: string): Promise<void> {
 
 export async function getNegotiationPolicy(
   campaignId: string,
+  client: Db | DbTx = db,
 ): Promise<NegotiationPolicy | null> {
-  const rows = await db
+  const rows = await client
     .select()
     .from(negotiationPolicies)
     .where(eq(negotiationPolicies.campaignId, campaignId))
@@ -32,9 +33,12 @@ export async function getNegotiationPolicy(
 
 /**
  * Insert-or-update the one NegotiationPolicy row a campaign owns. Unlike
- * CampaignDetails, not every campaign has one yet (no route creates one
- * automatically) — this is the entry point for whichever later issue wires up
- * a negotiation-policy editor.
+ * CampaignDetails, not every campaign has one yet — until PLU-136's gap fix
+ * this had zero callers anywhere (no route ever wrote to it, which meant
+ * validateCompensationReadiness's "explicitly marked non-negotiable" branch
+ * was permanently unreachable dead code). Now called from
+ * `PATCH /campaigns/:id/negotiation-policy` (routes/campaigns.ts) — still
+ * not a full negotiation-policy editor UI, just the API seam.
  *
  * Throws CampaignLockedError once the campaign has launched (status ACTIVE):
  * an in-flight negotiation must never see its bounds change mid-conversation
@@ -44,9 +48,10 @@ export async function getNegotiationPolicy(
 export async function upsertNegotiationPolicy(
   campaignId: string,
   data: Omit<Partial<NegotiationPolicyInsert>, "id" | "campaignId">,
+  client: Db | DbTx = db,
 ): Promise<NegotiationPolicy> {
-  await assertCampaignIsDraft(campaignId);
-  const rows = await db
+  await assertCampaignIsDraft(campaignId, client);
+  const rows = await client
     .insert(negotiationPolicies)
     .values({ campaignId, ...data })
     .onConflictDoUpdate({

@@ -21,6 +21,7 @@ import {
   getCampaignDetailsByCampaignIds,
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
+import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
 import {
   createWorkflow,
   updateWorkflow,
@@ -32,7 +33,7 @@ import {
   validateCreateSendingSettings,
   validatePatchSendingSettings,
 } from "../validation/campaignSendingSettings.js";
-import type { Campaign, CampaignDetails } from "../db/schema.js";
+import type { Campaign, CampaignDetails, JsonValue } from "../db/schema.js";
 
 const router = Router();
 
@@ -680,6 +681,160 @@ router.patch("/:id", async (req: Request, res: Response) => {
       return;
     }
     console.error("[campaigns] update error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// PLU-136 gap fix: upsertNegotiationPolicy (db/negotiationPolicy.ts) had zero
+// callers anywhere in the codebase — nothing could ever set floor/ceiling/
+// commission bounds or the nonNegotiableTerms marker
+// validateCompensationReadiness()'s "explicitly marked non-negotiable"
+// branch depends on (db/campaigns.ts), making that branch permanently dead
+// code: a brand offering "$500, non-negotiable, no range" had no way to
+// express that and was forced to fake floorCents=ceilingCents=50000 instead.
+// This is NOT a negotiation-policy editor UI (that's still 1c/1d's job,
+// same posture as everywhere else in this codebase) — just the missing API
+// seam so the marker (and the rest of the policy) can actually be written.
+const NON_NEGOTIABLE_CATEGORIES = ["fee", "commission", "gift"] as const;
+function isValidCategoryList(v: unknown): v is string[] {
+  return (
+    Array.isArray(v) &&
+    v.every(
+      (x) =>
+        typeof x === "string" &&
+        (NON_NEGOTIABLE_CATEGORIES as readonly string[]).includes(x.toLowerCase()),
+    )
+  );
+}
+
+// GET /campaigns/:id/negotiation-policy — the private negotiation bounds.
+router.get("/:id/negotiation-policy", async (req: Request, res: Response) => {
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const policy = await getNegotiationPolicy(req.params["id"]!);
+    if (!policy) {
+      res.status(404).json({ error: "no NegotiationPolicy set for this campaign yet" });
+      return;
+    }
+    res.json({
+      ...policy,
+      createdAt: policy.createdAt.toISOString(),
+      updatedAt: policy.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    console.error("[campaigns] get negotiation policy error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// PATCH /campaigns/:id/negotiation-policy — insert-or-update the one
+// NegotiationPolicy row a campaign owns. Locked (409) once ACTIVE, same as
+// CampaignDetails — an in-flight negotiation must never see its bounds
+// change mid-conversation.
+router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
+  const {
+    floorCents,
+    ceilingCents,
+    preferredFeeCents,
+    commissionFloorRate,
+    commissionCeilingRate,
+    preferredCommissionRate,
+    maxRounds,
+    openingOfferPosition,
+    overCeilingTolerance,
+    negotiationGuidance,
+    giftSubstitutionAllowed,
+    giftValueFlexibilityCents,
+    negotiableTerms,
+    nonNegotiableTerms,
+  } = req.body as {
+    floorCents?: number | null;
+    ceilingCents?: number | null;
+    preferredFeeCents?: number | null;
+    commissionFloorRate?: number | null;
+    commissionCeilingRate?: number | null;
+    preferredCommissionRate?: number | null;
+    maxRounds?: number | null;
+    openingOfferPosition?: number | null;
+    overCeilingTolerance?: number | null;
+    negotiationGuidance?: string | null;
+    giftSubstitutionAllowed?: boolean | null;
+    giftValueFlexibilityCents?: number | null;
+    negotiableTerms?: unknown;
+    nonNegotiableTerms?: unknown;
+  };
+
+  // negotiableTerms/nonNegotiableTerms follow the category-list convention
+  // validateCompensationReadiness() reads (db/campaigns.ts,
+  // isMarkedNonNegotiable): an array of "fee"|"commission"|"gift". Reject
+  // anything else loudly rather than silently storing a shape the readiness
+  // check can never recognize.
+  if (
+    negotiableTerms !== undefined &&
+    negotiableTerms !== null &&
+    !isValidCategoryList(negotiableTerms)
+  ) {
+    res.status(400).json({
+      error: `negotiableTerms must be an array of: ${NON_NEGOTIABLE_CATEGORIES.join(", ")}`,
+    });
+    return;
+  }
+  if (
+    nonNegotiableTerms !== undefined &&
+    nonNegotiableTerms !== null &&
+    !isValidCategoryList(nonNegotiableTerms)
+  ) {
+    res.status(400).json({
+      error: `nonNegotiableTerms must be an array of: ${NON_NEGOTIABLE_CATEGORIES.join(", ")}`,
+    });
+    return;
+  }
+
+  const patch: Parameters<typeof upsertNegotiationPolicy>[1] = {};
+  if (floorCents !== undefined) patch.floorCents = floorCents;
+  if (ceilingCents !== undefined) patch.ceilingCents = ceilingCents;
+  if (preferredFeeCents !== undefined) patch.preferredFeeCents = preferredFeeCents;
+  if (commissionFloorRate !== undefined) patch.commissionFloorRate = commissionFloorRate;
+  if (commissionCeilingRate !== undefined) patch.commissionCeilingRate = commissionCeilingRate;
+  if (preferredCommissionRate !== undefined) patch.preferredCommissionRate = preferredCommissionRate;
+  if (maxRounds !== undefined) patch.maxRounds = maxRounds;
+  if (openingOfferPosition !== undefined) patch.openingOfferPosition = openingOfferPosition;
+  if (overCeilingTolerance !== undefined) patch.overCeilingTolerance = overCeilingTolerance;
+  if (negotiationGuidance !== undefined) {
+    patch.negotiationGuidance =
+      typeof negotiationGuidance === "string" ? negotiationGuidance.trim() || null : null;
+  }
+  if (giftSubstitutionAllowed !== undefined) patch.giftSubstitutionAllowed = giftSubstitutionAllowed;
+  if (giftValueFlexibilityCents !== undefined) {
+    patch.giftValueFlexibilityCents = giftValueFlexibilityCents;
+  }
+  if (negotiableTerms !== undefined) patch.negotiableTerms = negotiableTerms as JsonValue | null;
+  if (nonNegotiableTerms !== undefined) {
+    patch.nonNegotiableTerms = nonNegotiableTerms as JsonValue | null;
+  }
+
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const policy = await upsertNegotiationPolicy(req.params["id"]!, patch);
+    res.json({
+      ...policy,
+      createdAt: policy.createdAt.toISOString(),
+      updatedAt: policy.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    if (err instanceof CampaignLockedError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    console.error("[campaigns] update negotiation policy error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });

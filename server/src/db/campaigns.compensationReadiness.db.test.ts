@@ -24,6 +24,7 @@ import {
   CompensationReviewPendingError,
   CompensationIncompleteError,
 } from "./campaigns.js";
+import { upsertNegotiationPolicy } from "./negotiationPolicy.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
@@ -252,6 +253,55 @@ async function main(): Promise<void> {
     );
   });
 
+  await test(
+    "GIFT_ONLY with giftDisposition=RETURN is rejected — the product is the entire compensation, so it must be KEEP",
+    async () => {
+      const id = await seedCampaign(
+        pgdb,
+        "gift-only-return",
+        { campaignType: "GIFT_ONLY", productOrOffer: "A loaner camera", giftDisposition: "RETURN" },
+        { giftSubstitutionAllowed: true },
+      );
+      await assert.rejects(
+        () => launchCampaign(id, pgdb),
+        (err: unknown) =>
+          err instanceof CompensationIncompleteError &&
+          err.missing.some((m) => m.includes("must be KEEP")),
+        "a gift-only campaign claiming the creator's whole payment is a product they have to give back must not launch",
+      );
+
+      // Same campaign, disposition corrected to KEEP — launches fine.
+      await pgdb
+        .update(schema.campaignDetails)
+        .set({ giftDisposition: "KEEP" })
+        .where(eq(schema.campaignDetails.campaignId, id));
+      const snapshot = await launchCampaign(id, pgdb);
+      assert.equal(snapshot.campaignId, id);
+    },
+  );
+
+  await test(
+    "PAID + Gifting with giftDisposition=LOAN is allowed — the fee is real payment, the gift is a bonus on top",
+    async () => {
+      const id = await seedCampaign(
+        pgdb,
+        "paid-gift-loan",
+        {
+          campaignType: "PAID",
+          priceStrategy: "REQUEST_RATE_CARD",
+          includesGifting: true,
+          productOrOffer: "A camera for the shoot",
+          giftDisposition: "LOAN",
+        },
+        { floorCents: 10000, ceilingCents: 30000, giftSubstitutionAllowed: false },
+      );
+      // GIFT_ONLY's KEEP-only rule must NOT apply here — a real fee is paid
+      // separately, so a loaned bonus product is a legitimate combination.
+      const snapshot = await launchCampaign(id, pgdb);
+      assert.equal(snapshot.campaignId, id);
+    },
+  );
+
   await test("REQUEST_RATE_CARD PAID campaign does not require a public proposed amount", async () => {
     const id = await seedCampaign(
       pgdb,
@@ -442,6 +492,43 @@ async function main(): Promise<void> {
         .where(eq(schema.campaignDetails.campaignId, campaign!.id));
       const snapshot = await launchCampaign(campaign!.id, pgdb);
       assert.equal(snapshot.campaignId, campaign!.id);
+    },
+  );
+
+  await test(
+    "the nonNegotiableTerms marker actually works end-to-end via upsertNegotiationPolicy — a fixed, non-negotiable fee no longer requires faking floor=ceiling",
+    async () => {
+      const [campaign] = await pgdb
+        .insert(schema.campaigns)
+        .values({ name: "Fixed, Non-Negotiable", brand: "Acme" })
+        .returning();
+      await pgdb.insert(schema.campaignDetails).values({
+        campaignId: campaign!.id,
+        campaignType: "PAID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        publicStartingFeeCents: 50000,
+        compensationReviewStatus: "CONFIRMED",
+      });
+
+      // No floorCents/ceilingCents at all — only the marker. Written through
+      // the real upsertNegotiationPolicy(), the same function the
+      // PATCH /campaigns/:id/negotiation-policy route calls, proving the
+      // route's write path (not just a hand-inserted test row) satisfies the
+      // readiness check.
+      await upsertNegotiationPolicy(campaign!.id, { nonNegotiableTerms: ["fee"] }, pgdb);
+
+      const snapshot = await launchCampaign(campaign!.id, pgdb);
+      assert.equal(snapshot.campaignId, campaign!.id);
+
+      const [policySnapshot] = await pgdb
+        .select()
+        .from(schema.negotiationPolicySnapshots)
+        .where(eq(schema.negotiationPolicySnapshots.campaignId, campaign!.id));
+      assert.deepEqual(
+        policySnapshot!.nonNegotiableTerms,
+        ["fee"],
+        "the non-negotiable marker itself is frozen into the snapshot, same as every other policy field",
+      );
     },
   );
 
