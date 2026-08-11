@@ -37,6 +37,7 @@ import {
   text,
   timestamp,
   uniqueIndex,
+  type AnyPgColumn,
 } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
@@ -262,6 +263,54 @@ export const campaignStatusEnum = pgEnum("CampaignStatus", [
   "ARCHIVED",
 ]);
 
+// PLU-136: the four canonical compensation structures. Does NOT gate whether
+// NegotiationPolicy is required at launch: every campaign type negotiates
+// (deliverables, timeline, usage rights, exclusivity, and — unless
+// NegotiationPolicy marks it non-negotiable — the fee/commission itself). A
+// fixed-fee (PAID) campaign is still a negotiated one. Lives on
+// campaignDetails (moved from campaigns in the compensation-contract
+// revision) so it's captured by CampaignTermsSnapshot automatically and
+// locked read-only post-launch like every other public promise. GIFT_ONLY:
+// renamed from GIFT — product gifting for the other three structures is
+// campaignDetails.includesGifting instead, an orthogonal flag, not a fifth
+// enum value, since gifting composes with any of them.
+export const campaignTypeEnum = pgEnum("CampaignType", [
+  "PAID",
+  "AFFILIATE",
+  "HYBRID",
+  "GIFT_ONLY",
+]);
+
+// PLU-136: whether a supplied/shipped product is itself part of the
+// compensation offer, and if so what happens to it. Distinct from
+// campaignDetails.shipsPhysicalProduct, which only ever means "the payout
+// form must collect a shipping address." Only meaningful when
+// campaignDetails.includesGifting is true or campaignType is GIFT_ONLY.
+export const giftDispositionEnum = pgEnum("GiftDisposition", [
+  "KEEP",
+  "LOAN",
+  "RETURN",
+]);
+
+// PLU-136: for a PAID or HYBRID campaign, whether the brand requests the
+// creator's own rate card or proposes a starting fee up front. Governs
+// whether campaignDetails.publicStartingFeeCents is required at launch.
+export const priceStrategyEnum = pgEnum("PriceStrategy", [
+  "REQUEST_RATE_CARD",
+  "PROPOSE_STARTING_FEE",
+]);
+
+// PLU-136: every campaign created before this migration has
+// campaignType = PAID only because that's the column default, never because
+// anyone verified it. NEEDS_REVIEW is the default for the pre-existing
+// backfill; launchCampaign() refuses to launch a NEEDS_REVIEW campaign until
+// an operator flips it to CONFIRMED. The review UI/queue itself is PLU-144's
+// job — this is only the flag and the launch gate that enforces it.
+export const compensationReviewStatusEnum = pgEnum("CompensationReviewStatus", [
+  "NEEDS_REVIEW",
+  "CONFIRMED",
+]);
+
 // Brand-approval gate: lifecycle of the brand's Approve/Reject decision on a
 // creator the AI closed. AWAITING_APPROVAL until the brand clicks a magic link;
 // PROCESSING is a short-lived intermediate claim held ONLY while the workflow
@@ -436,6 +485,11 @@ export type BrandIdentityExtractionSource =
 export type CampaignAuditEventType =
   (typeof campaignAuditEventTypeEnum.enumValues)[number];
 export type CampaignStatus = (typeof campaignStatusEnum.enumValues)[number];
+export type CampaignType = (typeof campaignTypeEnum.enumValues)[number];
+export type GiftDisposition = (typeof giftDispositionEnum.enumValues)[number];
+export type PriceStrategy = (typeof priceStrategyEnum.enumValues)[number];
+export type CompensationReviewStatus =
+  (typeof compensationReviewStatusEnum.enumValues)[number];
 
 // ---------------------------------------------------------------------------
 // Definition models
@@ -516,10 +570,22 @@ export const campaigns = pgTable(
     // campaign still hard-deletes as before. listCampaigns() filters these
     // out; direct lookup by id is unaffected.
     archivedAt: ts("archivedAt"),
+    // PLU-136 (1b): set by duplicateCampaign() on the NEW row, pointing at
+    // the campaign it was copied from — traceability/UI context only, never
+    // read by authorization/resolution logic. onDelete "set null": a
+    // duplicate must never be blocked or cascade-deleted just because its
+    // (DRAFT-only-deletable) source was later hard-deleted.
+    duplicatedFromCampaignId: text("duplicatedFromCampaignId").references(
+      (): AnyPgColumn => campaigns.id,
+      { onDelete: "set null" },
+    ),
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },
-  (table) => [index("Campaign_emailAccountId_idx").on(table.emailAccountId)],
+  (table) => [
+    index("Campaign_emailAccountId_idx").on(table.emailAccountId),
+    index("Campaign_duplicatedFromCampaignId_idx").on(table.duplicatedFromCampaignId),
+  ],
 );
 
 // PLU-135 (1a): the editable, creator-facing draft — every term that moved out
@@ -534,6 +600,23 @@ export const campaignDetails = pgTable("CampaignDetails", {
     .notNull()
     .unique()
     .references(() => campaigns.id, { onDelete: "cascade" }),
+  // PLU-136: moved here from campaigns — see campaignTypeEnum's doc comment
+  // for why (must be inside the frozen snapshot; a mutable campaigns column
+  // alone is not sufficient).
+  campaignType: campaignTypeEnum("campaignType").notNull().default("PAID"),
+  // PLU-136: product/non-cash gifting composing with PAID/AFFILIATE/HYBRID.
+  // Always implicitly true for GIFT_ONLY (validated at launch, not
+  // separately required to be set).
+  includesGifting: boolean("includesGifting").notNull().default(false),
+  // PLU-136: only meaningful when includesGifting is true or campaignType is
+  // GIFT_ONLY. See giftDispositionEnum's doc comment.
+  giftDisposition: giftDispositionEnum("giftDisposition"),
+  // PLU-136: see compensationReviewStatusEnum's doc comment. Defaults
+  // NEEDS_REVIEW; a campaign created through an explicit-selection flow
+  // should set CONFIRMED directly rather than relying on this default.
+  compensationReviewStatus: compensationReviewStatusEnum("compensationReviewStatus")
+    .notNull()
+    .default("NEEDS_REVIEW"),
   objective: text("objective"),
   // Maps to the old campaigns.rewardDescription ("a free pair of our running
   // shoes") — PLU-135 names this field productOrOffer; same free-text
@@ -552,9 +635,24 @@ export const campaignDetails = pgTable("CampaignDetails", {
   // New — no existing column covered this (flagged as a gap by the vault's
   // "Decision - Persist Full Extraction" note).
   prohibitedClaims: text("prohibitedClaims"),
-  // Only when compensation is genuinely fixed and non-negotiable. Negotiable
-  // bounds live in negotiationPolicies instead, never here.
-  fixedCompensationCents: integer("fixedCompensationCents"),
+  // PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
+  // proposed fee shown to the creator before negotiation, when priceStrategy
+  // is PROPOSE_STARTING_FEE (required then) or null when REQUEST_RATE_CARD.
+  // Only applicable to PAID/HYBRID. negotiationPolicies' floor/ceiling/
+  // preferredFeeCents are the PRIVATE flexibility around this public number.
+  publicStartingFeeCents: integer("publicStartingFeeCents"),
+  // PLU-136: only applicable to PAID/HYBRID — governs whether
+  // publicStartingFeeCents is required. Null for AFFILIATE/GIFT_ONLY.
+  priceStrategy: priceStrategyEnum("priceStrategy"),
+  // PLU-136: the PUBLIC commission rate shown to the creator, applicable to
+  // AFFILIATE/HYBRID. negotiationPolicies' commissionFloorRate/
+  // commissionCeilingRate/preferredCommissionRate are the PRIVATE
+  // flexibility around this number.
+  publicCommissionRate: doublePrecision("publicCommissionRate"),
+  // How long the commission window runs (e.g. 30-day attribution).
+  commissionDurationDays: integer("commissionDurationDays"),
+  // Free-text commission terms not worth a structured field yet.
+  commissionConditions: text("commissionConditions"),
   publicPaymentTerms: text("publicPaymentTerms"),
   shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
   brandDescription: text("brandDescription"),
@@ -679,11 +777,24 @@ export const negotiationPolicies = pgTable("NegotiationPolicy", {
   floorCents: integer("floorCents"),
   ceilingCents: integer("ceilingCents"),
   preferredFeeCents: integer("preferredFeeCents"),
-  commissionRate: doublePrecision("commissionRate"),
+  // PLU-136: replaces the old bare commissionRate scalar, which had no
+  // documented meaning (offer? floor? ceiling?) and mixed public/private
+  // concerns awkwardly. These three mirror the fee fields above exactly —
+  // the PRIVATE flexibility around campaignDetails.publicCommissionRate.
+  commissionFloorRate: doublePrecision("commissionFloorRate"),
+  commissionCeilingRate: doublePrecision("commissionCeilingRate"),
+  preferredCommissionRate: doublePrecision("preferredCommissionRate"),
   maxRounds: integer("maxRounds"),
   openingOfferPosition: doublePrecision("openingOfferPosition"),
   overCeilingTolerance: doublePrecision("overCeilingTolerance"),
   negotiationGuidance: text("negotiationGuidance"),
+  // PLU-136: whether a substitute product may be offered in place of the one
+  // described in campaignDetails.productOrOffer. Only meaningful when
+  // campaignDetails.includesGifting is true or campaignType is GIFT_ONLY.
+  giftSubstitutionAllowed: boolean("giftSubstitutionAllowed"),
+  // How far the value of the offered product may move if a substitute is
+  // offered. Same applicability as giftSubstitutionAllowed.
+  giftValueFlexibilityCents: integer("giftValueFlexibilityCents"),
   // String lists stored as JSON — no Postgres native array precedent exists
   // elsewhere in this schema, so this follows the established Json-for-lists
   // convention (metadata/socialLinks/etc.) instead of introducing a new one.
@@ -710,11 +821,17 @@ export const negotiationPolicySnapshots = pgTable("NegotiationPolicySnapshot", {
   floorCents: integer("floorCents"),
   ceilingCents: integer("ceilingCents"),
   preferredFeeCents: integer("preferredFeeCents"),
-  commissionRate: doublePrecision("commissionRate"),
+  // PLU-136: mirrors negotiationPolicies' own commission restructure.
+  commissionFloorRate: doublePrecision("commissionFloorRate"),
+  commissionCeilingRate: doublePrecision("commissionCeilingRate"),
+  preferredCommissionRate: doublePrecision("preferredCommissionRate"),
   maxRounds: integer("maxRounds"),
   openingOfferPosition: doublePrecision("openingOfferPosition"),
   overCeilingTolerance: doublePrecision("overCeilingTolerance"),
   negotiationGuidance: text("negotiationGuidance"),
+  // PLU-136: mirrors negotiationPolicies' gift-flexibility fields.
+  giftSubstitutionAllowed: boolean("giftSubstitutionAllowed"),
+  giftValueFlexibilityCents: integer("giftValueFlexibilityCents"),
   negotiableTerms: jsonb("negotiableTerms").$type<JsonValue>(),
   nonNegotiableTerms: jsonb("nonNegotiableTerms").$type<JsonValue>(),
   launchedAt: tsNow("launchedAt"),
