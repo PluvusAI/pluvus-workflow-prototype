@@ -216,4 +216,40 @@ test("0/0 shape skips recommendedOfferPosition / overCeilingTolerance overlay", 
   assert.equal(r.config["overCeilingTolerance"], undefined);
 });
 
+// 12. present-but-null snapshot value CLEARS a stale config value (does NOT retain
+//     it). A gifting-only campaign snapshots publicCommissionRate: null (present in
+//     the blob); the resolver, request builder, and guard must NOT then expose the
+//     stale nodeGraph commissionRate: 37.
+test("present-null publicCommissionRate clears stale config commissionRate (no 37 leak)", () => {
+  const r = resolveEffectiveNegotiationConfig({
+    termsSnapshot: terms({ publicCommissionRate: null }),
+    config: { commissionRate: 37 },
+  });
+  assert.equal(r.config["commissionRate"], undefined);
+  assert.equal(r.termsLegacyFallback, false);
+});
+
+// 12b. present-blank string snapshot value clears stale config; present + valid
+//      still overrides. Same present-key = snapshot-owns rule for strings.
+test("present-blank snapshot string clears stale config; valid still overrides", () => {
+  const r = resolveEffectiveNegotiationConfig({
+    termsSnapshot: terms({ deliverables: "   ", productOrOffer: "New gift box" }),
+    config: { deliverables: "STALE deliverables", rewardDescription: "old widget" },
+  });
+  assert.equal(r.config["deliverables"], undefined); // blank snapshot cleared it
+  assert.equal(r.config["rewardDescription"], "New gift box");
+});
+
+// 12c. ABSENT snapshot key (legacy blob predating the field) preserves the config
+//      value — this is the "snapshot absent ⇒ config fallback" contract, distinct
+//      from present-null which clears.
+test("absent snapshot key preserves config value (fallback, not clear)", () => {
+  const r = resolveEffectiveNegotiationConfig({
+    termsSnapshot: terms({ deliverables: "3 reels" }), // paymentTerms key ABSENT
+    config: { paymentTerms: "Net 15 from config" },
+  });
+  assert.equal(r.config["paymentTerms"], "Net 15 from config"); // preserved
+  assert.equal(r.config["deliverables"], "3 reels");
+});
+
 console.log(`\n${n} passed\n`);

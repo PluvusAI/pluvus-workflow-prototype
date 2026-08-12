@@ -71,6 +71,25 @@ function nonEmptyString(v: unknown): string | undefined {
   return typeof v === "string" && v.trim().length > 0 ? v : undefined;
 }
 
+// Overlay a PUBLIC snapshot field onto the effective config. The snapshot OWNS the
+// field whenever the source key is PRESENT (detailsSnapshot always copies every
+// CampaignDetails column, so an unset public field arrives as an explicit null —
+// NOT an absent key). Present ⇒ write the valid value, or DELETE the target key so
+// a present-but-null/blank snapshot clears the stale node-graph value instead of
+// retaining it. Absent key (legacy blob predating the field) ⇒ leave config alone.
+function overlaySnapshotField(
+  overlay: Record<string, unknown>,
+  details: DetailsSnapshot,
+  sourceKey: string,
+  targetKey: string,
+  parse: (v: unknown) => unknown,
+): void {
+  if (!(sourceKey in details)) return;
+  const parsed = parse(details[sourceKey]);
+  if (parsed !== undefined) overlay[targetKey] = parsed;
+  else delete overlay[targetKey];
+}
+
 /**
  * Overlay the pinned launch snapshots onto the node config. Snapshot ALWAYS wins;
  * config is read per-field only when the corresponding snapshot is absent.
@@ -139,24 +158,18 @@ export function resolveEffectiveNegotiationConfig(input: EffectiveTermsInput): E
   const termsLegacyFallback = !details;
   if (details) {
     // PUBLIC commission ONLY — never the private commission triad on policyAuthority.
-    const publicCommission = finiteNumber(details["publicCommissionRate"]);
-    if (publicCommission !== undefined) overlay["commissionRate"] = publicCommission;
+    overlaySnapshotField(overlay, details, "publicCommissionRate", "commissionRate", finiteNumber);
 
-    const deliverables = nonEmptyString(details["deliverables"]);
-    if (deliverables !== undefined) overlay["deliverables"] = deliverables;
-    const timeline = nonEmptyString(details["timeline"]);
-    if (timeline !== undefined) overlay["timeline"] = timeline;
+    overlaySnapshotField(overlay, details, "deliverables", "deliverables", nonEmptyString);
+    overlaySnapshotField(overlay, details, "timeline", "timeline", nonEmptyString);
     // detailsSnapshot uses the CampaignDetails column names; the node-config wire
     // keys differ for two fields (productOrOffer→rewardDescription,
     // publicPaymentTerms→paymentTerms), matching toCampaignBrandFields.
-    const reward = nonEmptyString(details["productOrOffer"]);
-    if (reward !== undefined) overlay["rewardDescription"] = reward;
-    const paymentTerms = nonEmptyString(details["publicPaymentTerms"]);
-    if (paymentTerms !== undefined) overlay["paymentTerms"] = paymentTerms;
+    overlaySnapshotField(overlay, details, "productOrOffer", "rewardDescription", nonEmptyString);
+    overlaySnapshotField(overlay, details, "publicPaymentTerms", "paymentTerms", nonEmptyString);
 
     for (const key of ["usageRights", "exclusivity", "attributionWindow"] as const) {
-      const v = nonEmptyString(details[key]);
-      if (v !== undefined) overlay[key] = v;
+      overlaySnapshotField(overlay, details, key, key, nonEmptyString);
     }
   }
 
