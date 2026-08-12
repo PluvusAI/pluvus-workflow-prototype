@@ -485,6 +485,32 @@ export function escalateNoCeiling(args: { round: number }): NodeResult {
   };
 }
 
+// PLU-137 §3d (Defect 1) — the terminal MANUAL_REVIEW NodeResult for a
+// missing/mismatched/cross-campaign/unresolved pinned snapshot. Pure (like
+// escalateNoCeiling) and built from the integrity reason ALONE, so it can run
+// immediately after the context build — before the agent, summary refresh, or
+// memory plan (Harshit / Greptile review): a broken pin must never invoke the
+// model or persist agent-derived facts. Exported for the ordering test.
+export function escalateSnapshotIntegrity(args: { round: number; reason: string }): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "NEGOTIATION_TURN",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "snapshot_integrity",
+      integrityReason: args.reason,
+      round: args.round,
+      message:
+        "Negotiation cannot run: the launch snapshot this journey is pinned to is " +
+        "missing or does not match this campaign. A human must review the pinning.",
+    },
+    // No obligationWrites/memoryWrites: this is a pre-decision terminal escalation —
+    // nothing was comprehended from the creator this turn.
+  };
+}
+
 // PLU-137 (1c) §2b — the ContextDeps.loadSnapshots implementation: load the two
 // pinned launch snapshots BY the ids stamped on the instance at enrollment, gate the
 // PRIVATE policy load on the authorized-decision purpose, and detect an integrity
@@ -962,6 +988,28 @@ export async function executeNegotiation(
     },
   );
 
+  // PLU-137 §3d (Defect 1) — a missing/mismatched/cross-campaign/unresolved pinned
+  // snapshot is an explicit integrity failure: RETURN a terminal MANUAL_REVIEW here,
+  // IMMEDIATELY after the build and BEFORE the summary refresh, the agent call, and
+  // the memory-write plan (Harshit / Greptile review). Doing it later invoked
+  // agent.negotiate and persisted the fire-and-forget summary + agent-derived
+  // memoryWrites on an invalid pin. The two observability records are pure functions
+  // of `cc` (no agent), so we fold them here directly — but NOT memoryWrites, which
+  // is agent-derived by construction. NEGOTIATING → MANUAL_REVIEW is a legal
+  // transition (stateMachine.ts). We never throw across the executor boundary — the
+  // build call site has no try/catch, so a throw would dead-letter the job.
+  if (cc.integrityFailure) {
+    const integrityResult = escalateSnapshotIntegrity({
+      round: instance.negotiationRound,
+      reason: cc.integrityFailure.reason,
+    });
+    return foldObservabilityRecords(
+      integrityResult,
+      buildKnowledgeRecord(cc.briefAvailability, cc.brief.conflicts ?? []),
+      { context: buildContextRecord(cc) },
+    );
+  }
+
   // PLU-138 (1d) — THE READ-SIDE CUTOVER. PLU-137 loaded the pinned snapshots into
   // `cc` but the decision still read the band + public terms from the (legacy) node
   // config. Overlay the snapshots onto the config so a VALID SNAPSHOT ALWAYS WINS:
@@ -1169,34 +1217,6 @@ export async function executeNegotiation(
     const folded = foldObservabilityRecords(result, knowledgeRecord, contextRecord);
     return memoryWrites ? { ...folded, memoryWrites } : folded;
   };
-
-  // PLU-137 §3d (Defect 1) — a missing/mismatched/cross-campaign pinned snapshot is an
-  // explicit integrity failure: RETURN a terminal MANUAL_REVIEW NodeResult (the same
-  // shape as escalateOverCeiling/escalateNoCeiling) so a human takes over, and NEVER
-  // throw across the executor boundary — the buildConversationContext call site has no
-  // try/catch, so a throw would dead-letter the job and record no ContextRecord. The
-  // integrityFailureReason rides the folded context record (§4a). NEGOTIATING →
-  // MANUAL_REVIEW is a legal transition (stateMachine.ts). Placed before the agent is
-  // consulted: a broken pin must never reach the model or invent a permissive default.
-  if (cc.integrityFailure) {
-    return withContextRecord({
-      nextState: "MANUAL_REVIEW",
-      nextNodeId: null,
-      completedAt: new Date(),
-      eventType: "NEGOTIATION_TURN",
-      eventPayload: {
-        outcome: "ESCALATE",
-        reason: "snapshot_integrity",
-        integrityReason: cc.integrityFailure.reason,
-        round: instance.negotiationRound,
-        message:
-          "Negotiation cannot run: the launch snapshot this journey is pinned to is " +
-          "missing or does not match this campaign. A human must review the pinning.",
-      },
-      // No obligationWrites: this is a pre-decision terminal escalation (like
-      // maxRoundsReject) — nothing new was comprehended from the creator this turn.
-    });
-  }
 
   // PLU-111: the durable obligation ledger (loaded by the builder) supersedes the
   // event-diff as the source of "what creator questions are still open". This is a
