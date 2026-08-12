@@ -503,6 +503,19 @@ export async function loadPinnedSnapshots(
 ): Promise<SnapshotLoadResult> {
   const result: SnapshotLoadResult = {};
 
+  // Harshit review — fail CLOSED: a pin exists but the instance's campaign could
+  // not be resolved (ctx.campaign is null for a deleted campaign or a DB error).
+  // Without it the cross-campaign guards below silently no-op (their `&&
+  // expectedCampaignId` short-circuits), so we'd negotiate a pinned journey with
+  // NO campaign verification. Every other integrity check fails closed; this one
+  // must too.
+  if (
+    (instance.campaignTermsSnapshotId || instance.negotiationPolicySnapshotId) &&
+    !expectedCampaignId
+  ) {
+    return { integrityFailure: { reason: "campaign_unresolved" } };
+  }
+
   if (instance.campaignTermsSnapshotId) {
     const terms = await getCampaignTermsSnapshotById(instance.campaignTermsSnapshotId, client);
     // E9: a pinned id set but the row is missing, or it belongs to another campaign.
