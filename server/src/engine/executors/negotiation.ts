@@ -855,13 +855,16 @@ export async function executeNegotiation(
   //     IS the authority, so an uncapped config is genuinely uncapped. Escalate
   //     HERE, pre-build — cheaply, before any DB load or agent call (the original
   //     H1 contract; a spy-agent test proves the model is never consulted).
-  //   * A policy snapshot IS pinned: the snapshot may supply the ceiling the config
-  //     lacks, so escalating on the stale config would let a legacy copy override a
-  //     valid snapshot (1d forbids this). Defer the check to the EFFECTIVE band,
-  //     after the context build resolves the snapshot. See below.
+  //   * A snapshot IS pinned (policy OR terms): the snapshot may supply the ceiling
+  //     the config lacks, AND a corrupt pin must fail as an INTEGRITY error, not a
+  //     no-ceiling one. Escalating on the stale config here would (a) let a legacy
+  //     copy override a valid snapshot (1d forbids this) and (b) mask a corrupt
+  //     terms-only pin with the wrong reason before the post-build integrity guard
+  //     gets to see it (Harshit review). Defer the check to the EFFECTIVE band,
+  //     after the context build resolves the snapshot and the integrity guard runs.
   // 0/0 (commission-only) does NOT trip this on either path: ceiling === 0 is a
   // real cap the agent honors (PLU-129), not a missing ceiling.
-  if (!instance.negotiationPolicySnapshotId) {
+  if (!instance.negotiationPolicySnapshotId && !instance.campaignTermsSnapshotId) {
     const { floor: cfgFloor, ceiling: cfgCeiling } = resolveBand(config);
     if (cfgFloor !== undefined && cfgCeiling === undefined) {
       return escalateNoCeiling({ round: instance.negotiationRound });
