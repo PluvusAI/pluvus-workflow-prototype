@@ -87,21 +87,13 @@ function validateWorkflowNodes(
 // config object on save, which can drop those keys — so we re-inject them here
 // on every draft save. Existing non-empty values are preserved (a deliberate
 // per-node override is never clobbered); only missing/blank values are filled.
-// PLU-138 (1d): this used to also stamp deliverables/timeline/rewardDescription
-// (MATERIAL campaign terms) into every node config — a competing copy of the terms
-// that CampaignTermsSnapshot now owns authoritatively. Those stamps are REMOVED:
-// the pinned snapshot is the source of truth on read (negotiation + every
-// post-accept executor overlay it, snapshot-wins), so re-stamping them here only
-// re-created the stale copy 1d exists to eliminate. What remains is legitimately
-// node-owned PRESENTATION (brandName/senderName/brandDescription = BrandIdentity)
-// plus shipsPhysicalProduct, a campaign-derived boolean still read directly off
-// nodeGraph by the payout-page route (routes/payment.ts) and paymentInfo executor —
-// those readers are not yet snapshot-wired, so its stamp is RETAINED here as a
-// tracked compatibility path (removal owned by PLU-144, after those readers cut over).
-export function restampBrand(
+function restampBrand(
   nodes: unknown,
   brand: string,
   brandDescription?: string | null,
+  deliverables?: string | null,
+  timeline?: string | null,
+  rewardDescription?: string | null,
   shipsPhysicalProduct?: boolean,
 ): unknown {
   if (!Array.isArray(nodes)) return nodes;
@@ -115,6 +107,18 @@ export function restampBrand(
     const hasBrand = typeof config["brandName"] === "string" && config["brandName"] !== "";
     const hasSender = typeof config["senderName"] === "string" && config["senderName"] !== "";
     const hasDesc = typeof config["brandDescription"] === "string" && config["brandDescription"] !== "";
+    // deliverables/timeline are re-injected so the Reward Setup node (and the
+    // negotiation copy) reliably see the brand-supplied scope even after the
+    // builder's per-node forms round-trip a config that dropped them.
+    const hasDeliverables = typeof config["deliverables"] === "string" && config["deliverables"] !== "";
+    const hasTimeline = typeof config["timeline"] === "string" && config["timeline"] !== "";
+    // rewardDescription is a free-text blurb mentioned across the email copy;
+    // preserve-if-present like the other campaign fields. shipsPhysicalProduct
+    // is a boolean flag that gates the payment form's shipping-address section;
+    // it is authoritative from the campaign, so it OVERWRITES every save (a node
+    // can't meaningfully override "does this campaign ship a product").
+    const hasReward =
+      typeof config["rewardDescription"] === "string" && config["rewardDescription"] !== "";
     return {
       ...n,
       config: {
@@ -122,10 +126,9 @@ export function restampBrand(
         ...(hasBrand ? {} : { brandName: brand }),
         ...(hasSender ? {} : { senderName: brand }),
         ...(hasDesc || !brandDescription ? {} : { brandDescription }),
-        // shipsPhysicalProduct gates the payout-page shipping-address section and is
-        // authoritative from the campaign — a node can't meaningfully override "does
-        // this campaign ship a product". PLU-138 compat: RETAINED until the payout
-        // route + paymentInfo executor read it from the snapshot (PLU-144).
+        ...(hasDeliverables || !deliverables ? {} : { deliverables }),
+        ...(hasTimeline || !timeline ? {} : { timeline }),
+        ...(hasReward || !rewardDescription ? {} : { rewardDescription }),
         ...(shipsPhysicalProduct ? { shipsPhysicalProduct: true } : { shipsPhysicalProduct: false }),
       },
     };
@@ -133,20 +136,29 @@ export function restampBrand(
 }
 
 // ---------------------------------------------------------------------------
-// PLU-138 (1d): STOP mirroring the negotiation commission onto the email node(s).
+// Mirror the negotiation commission onto the post-negotiation email node(s).
 // ---------------------------------------------------------------------------
-// This used to COPY the NEGOTIATION node's commissionRate onto the CONTENT_BRIEF /
-// REWARD_SETUP node config — a competing copy of a PUBLIC compensation term that
-// CampaignTermsSnapshot.detailsSnapshot.publicCommissionRate now owns. The
-// post-accept executors + partnership read the commission from the pinned snapshot
-// (Commit 3), so this copy is not just redundant, it's a stale-authority hazard.
-// The function now STRIPS commissionRate from those node configs instead of stamping
-// it — actively neutralizing the old copy so a legacy nodeGraph value can never win
-// over the snapshot on any path that still reads node config for a no-snapshot
-// journey. Kept (not deleted) + still called so re-publishing an existing workflow
-// scrubs the stamped copy; renamed intent documented here.
+// The brand decides the commission % on the NEGOTIATION node. The node that
+// emails the finalized commission — CONTENT_BRIEF in the merged flow, or the
+// legacy REWARD_SETUP node — must always reflect the CURRENT negotiation value,
+// not a stale copy. Unlike the brand fields above (preserve-if-present), this
+// OVERWRITES the target node's commissionRate every save so editing the
+// negotiation node keeps it in sync. Deliverables are already carried by
+// restampBrand from the campaign; commission is the one field sourced from
+// another node, so it's stamped here.
 export function stampRewardFromNegotiation(nodes: unknown): unknown {
   if (!Array.isArray(nodes)) return nodes;
+
+  const negotiation = nodes.find(
+    (n): n is { type: string; config?: Record<string, unknown> } =>
+      !!n && typeof n === "object" && (n as { type?: unknown }).type === "NEGOTIATION",
+  );
+  const negConfig = (negotiation?.config ?? {}) as Record<string, unknown>;
+  const commission = negConfig["commissionRate"];
+  // Only a positive number is a real commission; 0/absent means fixed-fee only,
+  // in which case the target node should carry no commissionRate.
+  const hasCommission = typeof commission === "number" && commission > 0;
+
   return nodes.map((node) => {
     if (!node || typeof node !== "object") return node;
     const n = node as { type?: unknown; config?: unknown; [k: string]: unknown };
@@ -155,9 +167,15 @@ export function stampRewardFromNegotiation(nodes: unknown): unknown {
       string,
       unknown
     >;
-    // Drop the stamped commissionRate copy; the snapshot is authoritative on read.
+    // Drop any stale commissionRate, then set it iff the negotiation has one.
     const { commissionRate: _drop, ...rest } = config;
-    return { ...n, config: rest };
+    return {
+      ...n,
+      config: {
+        ...rest,
+        ...(hasCommission ? { commissionRate: commission } : {}),
+      },
+    };
   });
 }
 
@@ -480,13 +498,13 @@ router.put("/:id/draft", async (req: Request, res: Response) => {
       const campaign = await findCampaignById(wf.campaignId);
       if (campaign) {
         const details = await getCampaignDetails(campaign.id);
-        // PLU-138 (1d): material terms (deliverables/timeline/productOrOffer) are no
-        // longer stamped — CampaignTermsSnapshot owns them. Only brand presentation
-        // + the shipsPhysicalProduct compat flag are re-injected.
         nodesToSave = restampBrand(
           nodes,
           campaign.brand,
           details?.brandDescription,
+          details?.deliverables,
+          details?.timeline,
+          details?.productOrOffer,
           details?.shipsPhysicalProduct,
         );
         // PLU-117: stamp campaignName + deal-shape sources onto the outreach node
@@ -569,13 +587,13 @@ router.post("/:id/publish", async (req: Request, res: Response) => {
       const campaign = await findCampaignById(wf.campaignId);
       if (campaign) {
         const details = await getCampaignDetails(campaign.id);
-        // PLU-138 (1d): publish no longer freezes material terms into nodeGraph —
-        // CampaignTermsSnapshot is the authoritative launched copy. Only brand
-        // presentation + the shipsPhysicalProduct compat flag are (re)stamped.
         nodeGraphToPublish = restampBrand(
           wf.draftNodes,
           campaign.brand,
           details?.brandDescription,
+          details?.deliverables,
+          details?.timeline,
+          details?.productOrOffer,
           details?.shipsPhysicalProduct,
         ) as InputJsonValue;
         // PLU-117: freeze the derived outreach placeholder sources (campaignName +
@@ -586,9 +604,8 @@ router.post("/:id/publish", async (req: Request, res: Response) => {
         ) as InputJsonValue;
       }
     }
-    // PLU-138 (1d): SCRUB any stamped commissionRate copy off the email nodes (the
-    // snapshot's publicCommissionRate is authoritative on read) rather than freezing
-    // it. Re-publishing an existing workflow removes the stale competing copy.
+    // Freeze the current negotiation commission onto the Reward Setup node so the
+    // immutable version carries the finalized value the deal was published with.
     nodeGraphToPublish = stampRewardFromNegotiation(
       nodeGraphToPublish,
     ) as InputJsonValue;

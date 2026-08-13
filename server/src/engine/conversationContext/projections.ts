@@ -10,7 +10,6 @@ import type { PriorNegotiationContext } from "../types.js";
 // this exact list rather than re-listing the keys (BAND_CONTEXT_KEYS strips the raw
 // minBudget/maxBudget too — the real leak surface).
 import { stripBandFromContext } from "../providerFactory.js";
-import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 import { estimateTokens } from "./assemble.js";
 import type {
   AssembledContext,
@@ -166,21 +165,8 @@ export function toDraftContext(ctx: AssembledContext): DraftContext {
   // guard-nulled turns still answer from the brief), independent of the negotiate
   // gating flags. So we read it from the brief directly, not from knowledgeContext.
   const briefKnowledge = ctx.brief.flatText;
-  // PLU-138 (1d): overlay the pinned CampaignTermsSnapshot's PUBLIC terms onto the
-  // merged config so the DRAFT copy quotes the SAME snapshot-sourced terms the
-  // decision was made against — the ticket's "the creator is never quoted one thing
-  // while another service validates a different copy". The SAME resolver the decision
-  // path uses (one source of truth, no drift), but with `policyAuthority: undefined`
-  // so ONLY public terms overlay — the private band/policy NEVER reaches draft. The
-  // stripBandFromContext below still runs as defense-in-depth over the (band-free)
-  // result. No terms snapshot ⇒ zero overlay ⇒ draftConfig byte-identical to today.
-  const publicOverlaid = resolveEffectiveNegotiationConfig({
-    policyAuthority: undefined,
-    termsSnapshot: ctx.termsSnapshot,
-    config: ctx.mergedConfig,
-  }).config;
   const draftConfig: Record<string, unknown> = {
-    ...stripBandFromContext(publicOverlaid),
+    ...stripBandFromContext(ctx.mergedConfig),
     ...(briefKnowledge ? { briefKnowledge } : {}),
     ...(ctx.briefSections ? { briefSections: ctx.briefSections } : {}),
     ...(ctx.structuredObligations.length

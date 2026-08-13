@@ -11,12 +11,8 @@
  */
 
 import assert from "node:assert/strict";
-import type { Campaign, CampaignDetails } from "../db/schema.js";
-import {
-  mergeCampaignFallback,
-  resolveBrandName,
-  toCampaignBrandFields,
-} from "./campaignContext.js";
+import type { Campaign } from "../db/schema.js";
+import { mergeCampaignFallback, resolveBrandName } from "./campaignContext.js";
 
 let n = 0;
 function test(name: string, fn: () => void): void {
@@ -81,37 +77,6 @@ test("a campaign with blank optional fields does not overwrite with junk", () =>
   // No brandDescription on the campaign → key stays absent (not "undefined").
   assert.ok(!("brandDescription" in merged) || merged["brandDescription"] === undefined);
   assert.equal(merged["shipsPhysicalProduct"], false);
-});
-
-// ---------------------------------------------------------------------------
-// PLU-138 (1d) — post-PLU-135 the material terms live on CampaignDetails, NOT
-// the Campaign row, and restampBrand no longer stamps them into node config. A
-// bare-Campaign fallback therefore resolves them to undefined; the follow-up
-// executor must build the fallback via toCampaignBrandFields so they're recovered
-// from CampaignDetails. Regression guard for the review finding.
-// ---------------------------------------------------------------------------
-
-test("toCampaignBrandFields recovers material terms off CampaignDetails (post-135 split)", () => {
-  const campaignRow = { id: "c4", brand: "Split Co" } as unknown as Campaign;
-  const details = {
-    deliverables: "3 TikToks",
-    timeline: "by Oct 1",
-    productOrOffer: "a $200 gift box",
-    publicPaymentTerms: "net 30",
-    shipsPhysicalProduct: true,
-  } as unknown as CampaignDetails;
-
-  // Bare Campaign row has no material terms → fallback fills nothing (the bug).
-  const bare = mergeCampaignFallback({}, campaignRow);
-  assert.ok(bare["deliverables"] === undefined, "bare campaign leaks no deliverables");
-
-  // Via toCampaignBrandFields the details are recovered and filled.
-  const fixed = mergeCampaignFallback({}, toCampaignBrandFields(campaignRow, details));
-  assert.equal(fixed["deliverables"], "3 TikToks");
-  assert.equal(fixed["timeline"], "by Oct 1");
-  assert.equal(fixed["rewardDescription"], "a $200 gift box"); // productOrOffer → rewardDescription
-  assert.equal(fixed["paymentTerms"], "net 30"); // publicPaymentTerms → paymentTerms
-  assert.equal(fixed["shipsPhysicalProduct"], true);
 });
 
 // ---------------------------------------------------------------------------
