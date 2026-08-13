@@ -1,5 +1,7 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
+import { db } from "../db/drizzle.js";
+import { campaigns } from "../db/schema.js";
 import {
   listCampaigns,
   createCampaign,
@@ -13,12 +15,36 @@ import {
   updateWorkflow,
 } from "../db/workflows.js";
 import { findEmailAccountById } from "../db/emailAccounts.js";
+import {
+  getCampaignDetails,
+  upsertCampaignDetails,
+  assertCampaignIsDraft,
+  CampaignNotDraftError,
+} from "../db/campaignDetails.js";
+import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
+import {
+  getCreatorRequirement,
+  upsertCreatorRequirement,
+} from "../db/creatorRequirement.js";
 import { getTemplate } from "../templates/index.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
 import {
   validateCreateSendingSettings,
   validatePatchSendingSettings,
 } from "../validation/campaignSendingSettings.js";
+import {
+  validateDetailsGroup,
+  validateBrandIdentityGroup,
+  validateCreatorRequirementGroup,
+} from "../validation/campaignSections.js";
+import type {
+  BrandIdentity,
+  CampaignDetails,
+  CampaignDetailsInsert,
+  BrandIdentityInsert,
+  CreatorRequirement,
+  CreatorRequirementInsert,
+} from "../db/schema.js";
 
 const router = Router();
 
@@ -46,6 +72,7 @@ router.get("/", async (_req: Request, res: Response) => {
         negotiationReplyPacingMinMinutes: c.negotiationReplyPacingMinMinutes,
         negotiationReplyPacingMaxMinutes: c.negotiationReplyPacingMaxMinutes,
         emailAccountId: c.emailAccountId,
+        status: c.status,
         createdAt: c.createdAt.toISOString(),
         updatedAt: c.updatedAt.toISOString(),
         workflowCount: c._count.workflows,
@@ -72,6 +99,100 @@ type PostAcceptanceModeValue = (typeof POST_ACCEPTANCE_MODES)[number];
 
 function isPostAcceptanceMode(v: unknown): v is PostAcceptanceModeValue {
   return typeof v === "string" && (POST_ACCEPTANCE_MODES as readonly string[]).includes(v);
+}
+
+// ---------------------------------------------------------------------------
+// PLU-139 — sectioned Draft intake helpers
+// ---------------------------------------------------------------------------
+
+// The nested public-terms groups a POST/PATCH body may carry. The Draft-lock guard
+// fires (on PATCH) ONLY when the body touches one of these (review B2).
+const SECTION_GROUPS = ["details", "brandIdentity", "creatorRequirement"] as const;
+
+interface ValidatedSections {
+  present: boolean;
+  details?: Partial<CampaignDetailsInsert>;
+  brandIdentity?: Partial<BrandIdentityInsert>;
+  creatorRequirement?: Partial<CreatorRequirementInsert>;
+}
+
+/** Validate whichever of the three nested groups are present. `error` set → 400. */
+function validateSections(
+  body: Record<string, unknown>,
+):
+  | { ok: true; sections: ValidatedSections }
+  | { ok: false; error: string } {
+  const sections: ValidatedSections = {
+    present: SECTION_GROUPS.some((g) => body[g] !== undefined),
+  };
+  if (body["details"] !== undefined) {
+    const r = validateDetailsGroup(body["details"]);
+    if (!r.valid) return { ok: false, error: r.error };
+    sections.details = r.value;
+  }
+  if (body["brandIdentity"] !== undefined) {
+    const r = validateBrandIdentityGroup(body["brandIdentity"]);
+    if (!r.valid) return { ok: false, error: r.error };
+    sections.brandIdentity = r.value;
+  }
+  if (body["creatorRequirement"] !== undefined) {
+    const r = validateCreatorRequirementGroup(body["creatorRequirement"]);
+    if (!r.valid) return { ok: false, error: r.error };
+    sections.creatorRequirement = r.value;
+  }
+  return { ok: true, sections };
+}
+
+/**
+ * Persist whichever validated groups are present, inside one transaction. A
+ * `details` create requires compensationStructure; upsertCampaignDetails throws if
+ * it's missing on a first insert (surfaced as 400 by the caller). Runs the shared
+ * clearStaleCompFields via the DB module.
+ */
+async function writeSections(
+  campaignId: string,
+  sections: ValidatedSections,
+): Promise<void> {
+  await db.transaction(async (tx) => {
+    if (sections.details) await upsertCampaignDetails(campaignId, sections.details, tx);
+    if (sections.brandIdentity) {
+      await upsertBrandIdentity(campaignId, sections.brandIdentity, tx);
+    }
+    if (sections.creatorRequirement) {
+      await upsertCreatorRequirement(campaignId, sections.creatorRequirement, tx);
+    }
+  });
+}
+
+// Public payload shapers — expose ONLY the public columns (no id/campaignId/
+// timestamps, and — for CampaignDetails — NO private-policy key, since none exist
+// on the table). Return null when the row is absent so GET is a stable shape.
+function detailsPayload(d: CampaignDetails | null) {
+  if (!d) return null;
+  const { id: _id, campaignId: _c, createdAt: _ca, updatedAt: _ua, ...rest } = d;
+  return {
+    ...rest,
+    createdAt: d.createdAt.toISOString(),
+    updatedAt: d.updatedAt.toISOString(),
+  };
+}
+function brandIdentityPayload(b: BrandIdentity | null) {
+  if (!b) return null;
+  const { id: _id, campaignId: _c, createdAt: _ca, updatedAt: _ua, ...rest } = b;
+  return {
+    ...rest,
+    createdAt: b.createdAt.toISOString(),
+    updatedAt: b.updatedAt.toISOString(),
+  };
+}
+function creatorRequirementPayload(r: CreatorRequirement | null) {
+  if (!r) return null;
+  const { id: _id, campaignId: _c, createdAt: _ca, updatedAt: _ua, ...rest } = r;
+  return {
+    ...rest,
+    createdAt: r.createdAt.toISOString(),
+    updatedAt: r.updatedAt.toISOString(),
+  };
 }
 
 // POST /campaigns — create a campaign
@@ -157,6 +278,21 @@ router.post("/", async (req: Request, res: Response) => {
     return;
   }
 
+  // PLU-139: validate the optional nested public-terms groups up front. A `details`
+  // group that omits compensationStructure on a brand-new campaign is rejected here
+  // (the one required term) rather than failing mid-write.
+  const sections = validateSections(req.body as Record<string, unknown>);
+  if (!sections.ok) {
+    res.status(400).json({ error: sections.error });
+    return;
+  }
+  if (sections.sections.details && !sections.sections.details.compensationStructure) {
+    res.status(400).json({
+      error: "details.compensationStructure is required when creating campaign details",
+    });
+    return;
+  }
+
   // PLU-121: when a default sender is supplied, it must reference a real
   // connected account — reject an unknown id rather than silently storing a
   // dangling pointer that would fall back to the default account at enrollment.
@@ -205,6 +341,13 @@ router.post("/", async (req: Request, res: Response) => {
       // to the default connected account.
       ...(trimmedAccountId ? { emailAccountId: trimmedAccountId } : {}),
     });
+
+    // PLU-139: persist the nested public-terms groups. New campaigns are DRAFT
+    // (schema default), so no lifecycle guard is needed on create.
+    if (sections.sections.present) {
+      await writeSections(campaign.id, sections.sections);
+    }
+
     res.status(201).json({
       id: campaign.id,
       name: campaign.name,
@@ -230,7 +373,17 @@ router.post("/", async (req: Request, res: Response) => {
       negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
       negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       emailAccountId: campaign.emailAccountId,
+      status: campaign.status,
       createdAt: campaign.createdAt.toISOString(),
+      details: sections.sections.details
+        ? detailsPayload(await getCampaignDetails(campaign.id))
+        : null,
+      brandIdentity: sections.sections.brandIdentity
+        ? brandIdentityPayload(await getBrandIdentity(campaign.id))
+        : null,
+      creatorRequirement: sections.sections.creatorRequirement
+        ? creatorRequirementPayload(await getCreatorRequirement(campaign.id))
+        : null,
     });
   } catch (err) {
     console.error("[campaigns] create error:", err);
@@ -246,6 +399,14 @@ router.get("/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
+    // PLU-139: load the three 1:1 detail groups for the normalized single payload
+    // (the source of truth PLU-140 reads). Only the detail route reads these, so
+    // no matching/outreach code ever touches CreatorRequirement.
+    const [details, brandIdentity, creatorRequirement] = await Promise.all([
+      getCampaignDetails(campaign.id),
+      getBrandIdentity(campaign.id),
+      getCreatorRequirement(campaign.id),
+    ]);
     res.json({
       id: campaign.id,
       name: campaign.name,
@@ -265,8 +426,12 @@ router.get("/:id", async (req: Request, res: Response) => {
       negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
       negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       emailAccountId: campaign.emailAccountId,
+      status: campaign.status,
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
+      details: detailsPayload(details),
+      brandIdentity: brandIdentityPayload(brandIdentity),
+      creatorRequirement: creatorRequirementPayload(creatorRequirement),
       workflows: campaign.workflows.map((w) => ({
         id: w.id,
         name: w.name,
@@ -390,6 +555,14 @@ router.patch("/:id", async (req: Request, res: Response) => {
   }
   Object.assign(patch, sendingSettings.value);
 
+  // PLU-139: validate any nested public-terms groups. The Draft guard fires below
+  // ONLY when one of these is present — scalar/sender edits stay ungated (B2).
+  const sections = validateSections(req.body as Record<string, unknown>);
+  if (!sections.ok) {
+    res.status(400).json({ error: sections.error });
+    return;
+  }
+
   if (notifyEmail !== undefined) {
     const trimmed = typeof notifyEmail === "string" ? notifyEmail.trim() : "";
     if (trimmed && !isEmailish(trimmed)) {
@@ -457,7 +630,53 @@ router.patch("/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const campaign = await updateCampaign(req.params["id"]!, patch);
+
+    // PLU-139 (B2): the Draft-lock guard fires ONLY for a material edit — a PATCH
+    // touching one of the nested public-terms groups. A scalar/sender-settings edit
+    // (notifyEmail, pacing, emailAccountId, postAcceptanceMode) stays editable on a
+    // running campaign, so it is never guarded. Guard + write share one transaction
+    // so the status can't change between the check and the upserts.
+    if (sections.sections.present) {
+      try {
+        await db.transaction(async (tx) => {
+          await assertCampaignIsDraft(req.params["id"]!, tx);
+          if (sections.sections.details) {
+            await upsertCampaignDetails(req.params["id"]!, sections.sections.details, tx);
+          }
+          if (sections.sections.brandIdentity) {
+            await upsertBrandIdentity(req.params["id"]!, sections.sections.brandIdentity, tx);
+          }
+          if (sections.sections.creatorRequirement) {
+            await upsertCreatorRequirement(
+              req.params["id"]!,
+              sections.sections.creatorRequirement,
+              tx,
+            );
+          }
+        });
+      } catch (err) {
+        if (err instanceof CampaignNotDraftError) {
+          res.status(409).json({
+            error: `campaign is ${err.status}; material edits are only allowed on a DRAFT campaign`,
+          });
+          return;
+        }
+        throw err;
+      }
+    }
+
+    // Only touch the campaign row when a scalar patch was actually supplied — a
+    // pure-sections PATCH leaves the Campaign row alone.
+    const campaign =
+      Object.keys(patch).length > 0
+        ? await updateCampaign(req.params["id"]!, patch)
+        : existing;
+
+    const [details, brandIdentity, creatorRequirement] = await Promise.all([
+      getCampaignDetails(campaign.id),
+      getBrandIdentity(campaign.id),
+      getCreatorRequirement(campaign.id),
+    ]);
     res.json({
       id: campaign.id,
       name: campaign.name,
@@ -477,10 +696,94 @@ router.patch("/:id", async (req: Request, res: Response) => {
       negotiationReplyPacingMinMinutes: campaign.negotiationReplyPacingMinMinutes,
       negotiationReplyPacingMaxMinutes: campaign.negotiationReplyPacingMaxMinutes,
       emailAccountId: campaign.emailAccountId,
+      status: campaign.status,
       updatedAt: campaign.updatedAt.toISOString(),
+      details: detailsPayload(details),
+      brandIdentity: brandIdentityPayload(brandIdentity),
+      creatorRequirement: creatorRequirementPayload(creatorRequirement),
     });
   } catch (err) {
     console.error("[campaigns] update error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// POST /campaigns/:id/duplicate — "Copy prior campaign" (PLU-139).
+// Creates a NEW DRAFT campaign copying the source Campaign scalars + the three
+// 1:1 detail groups. Does NOT copy workflows/versions/instances/creators/messages/
+// snapshots — every heavy relation hangs off workflows→versions→instances, not the
+// campaign scalars or the detail tables, so copying only these is safe.
+router.post("/:id/duplicate", async (req: Request, res: Response) => {
+  try {
+    const source = await findCampaignById(req.params["id"]!);
+    if (!source) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const [srcDetails, srcBrand, srcCreator] = await Promise.all([
+      getCampaignDetails(source.id),
+      getBrandIdentity(source.id),
+      getCreatorRequirement(source.id),
+    ]);
+
+    // Don't blind-copy the default sender: an account that was since disconnected
+    // must not carry over as a dangling pointer. Copy only when still active.
+    let emailAccountId: string | null = null;
+    if (source.emailAccountId) {
+      const account = await findEmailAccountById(source.emailAccountId);
+      if (account && account.status === "active") emailAccountId = source.emailAccountId;
+    }
+
+    const copy = await db.transaction(async (tx) => {
+      const [created] = await tx
+        .insert(campaigns)
+        .values({
+          // Scalars only — the new campaign is a fresh DRAFT (schema default).
+          name: `${source.name} (copy)`,
+          brand: source.brand,
+          objective: source.objective,
+          notes: source.notes,
+          notifyEmail: source.notifyEmail,
+          brandDescription: source.brandDescription,
+          deliverables: source.deliverables,
+          timeline: source.timeline,
+          rewardDescription: source.rewardDescription,
+          shipsPhysicalProduct: source.shipsPhysicalProduct,
+          usageRights: source.usageRights,
+          exclusivity: source.exclusivity,
+          paymentTerms: source.paymentTerms,
+          attributionWindow: source.attributionWindow,
+          targetUrl: source.targetUrl,
+          hiddenParamKey: source.hiddenParamKey,
+          postAcceptanceMode: source.postAcceptanceMode,
+          dailyInitialOutreachLimit: source.dailyInitialOutreachLimit,
+          outreachPacingMinMinutes: source.outreachPacingMinMinutes,
+          outreachPacingMaxMinutes: source.outreachPacingMaxMinutes,
+          negotiationReplyPacingMinMinutes: source.negotiationReplyPacingMinMinutes,
+          negotiationReplyPacingMaxMinutes: source.negotiationReplyPacingMaxMinutes,
+          emailAccountId,
+        })
+        .returning();
+      const newId = created!.id;
+      // Copy the detail groups WITHOUT the source id/campaignId/timestamps.
+      if (srcDetails) {
+        const { id: _i, campaignId: _c, createdAt: _ca, updatedAt: _u, ...rest } = srcDetails;
+        await upsertCampaignDetails(newId, rest, tx);
+      }
+      if (srcBrand) {
+        const { id: _i, campaignId: _c, createdAt: _ca, updatedAt: _u, ...rest } = srcBrand;
+        await upsertBrandIdentity(newId, rest, tx);
+      }
+      if (srcCreator) {
+        const { id: _i, campaignId: _c, createdAt: _ca, updatedAt: _u, ...rest } = srcCreator;
+        await upsertCreatorRequirement(newId, rest, tx);
+      }
+      return created!;
+    });
+
+    res.status(201).json({ id: copy.id, name: copy.name, status: copy.status });
+  } catch (err) {
+    console.error("[campaigns] duplicate error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });

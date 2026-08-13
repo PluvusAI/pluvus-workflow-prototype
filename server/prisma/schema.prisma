@@ -222,6 +222,45 @@ enum WorkflowStatus {
   ARCHIVED
 }
 
+/// PLU-139: campaign lifecycle. Only DRAFT accepts material edits to the public
+/// terms (CampaignDetails/BrandIdentity/CreatorRequirement); ACTIVE/CLOSING/
+/// ARCHIVED are locked → "Duplicate as new campaign" instead. Activation itself
+/// (DRAFT → ACTIVE) is out of scope here (PLU-135/146 own it); A1 only needs the
+/// DRAFT-vs-not distinction to guard edits.
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  CLOSING
+  ARCHIVED
+}
+
+/// PLU-139: the canonical compensation structure. This is the ONE axis that
+/// classifies a campaign's offer — never `FIXED | NEGOTIATED`, never derived from
+/// whether a fee amount is present.
+///   PAID      — an upfront fee (optionally plus an additive gift).
+///   GIFTING   — gift-only, no cash.
+///   AFFILIATE — commission-only, no upfront fee (optionally plus an additive gift).
+///   HYBRID    — an upfront fee AND commission.
+enum CompensationStructure {
+  PAID
+  GIFTING
+  AFFILIATE
+  HYBRID
+}
+
+/// PLU-139: a SEPARATE axis from CompensationStructure — how the upfront fee is
+/// arrived at. Only meaningful when an upfront-fee component exists (PAID/HYBRID).
+///   REQUEST_RATE_CARD       — ask the creator for their rate card.
+///   PROPOSE_STARTING_AMOUNT — propose a starting fee.
+/// ⚠ Source conflict (see PLAN N2): the worksheet Page 7 pricing grid says "no
+/// rate-card request" for Paid, while the issue text / PLU-158 contract name this
+/// axis. Kept additive + nullable so it's schema-safe; the SEMANTIC is design-
+/// gated on PLU-159 — do not cement its meaning.
+enum PriceStrategy {
+  REQUEST_RATE_CARD
+  PROPOSE_STARTING_AMOUNT
+}
+
 // ---------------------------------------------------------------------------
 // Definition models
 // ---------------------------------------------------------------------------
@@ -310,14 +349,143 @@ model Campaign {
   /// whose account was disconnected, falls back to the default ConnectedEmailAccount.
   emailAccountId String?
 
+  /// PLU-139: lifecycle status. New campaigns are DRAFT (public terms freely
+  /// editable); the migration backfills every EXISTING row to ACTIVE (they are
+  /// already live — leaving them DRAFT would wrongly unlock material edits).
+  status CampaignStatus @default(DRAFT)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  workflows    Workflow[]
-  outreachDays CampaignOutreachDay[]
-  emailAccount ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
+  workflows          Workflow[]
+  outreachDays       CampaignOutreachDay[]
+  emailAccount       ConnectedEmailAccount? @relation(fields: [emailAccountId], references: [id])
+  details            CampaignDetails?
+  brandIdentity      BrandIdentity?
+  creatorRequirement CreatorRequirement?
 
   @@index([emailAccountId])
+}
+
+/// PLU-139: the structured, public creator-facing terms for a campaign (1:1 with
+/// Campaign). PUBLIC ONLY — no private fee bound, ceiling, flexibility, or
+/// escalation field lives here (those are the private NegotiationPolicy, PLU-140).
+/// Every column except id/campaignId/compensationStructure is nullable: a DRAFT is
+/// allowed to be incomplete (save/resume). The free-text Campaign.deliverables
+/// remains the agent-facing source of truth; the structured `deliverables` here is
+/// presentation-only until a follow-up reconciles node-config stamping (PLAN N3).
+model CampaignDetails {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  /// The one required term — the campaign's canonical structure.
+  compensationStructure CompensationStructure
+
+  /// PAID/HYBRID only: how the upfront fee is arrived at (design-gated semantic).
+  priceStrategy PriceStrategy?
+  /// Proposed/starting upfront fee, in INTEGER CENTS (matches the ledger's
+  /// agreedFeeCents so this never needs a later unit migration). NOT dollars.
+  proposedFeeCents Int?
+  /// ISO currency of proposedFeeCents; app layer defaults "USD".
+  feeCurrency String?
+
+  /// Additive gift on top of a Paid/Affiliate/Hybrid offer.
+  additiveGifting  Boolean @default(false)
+  giftDescription  String?
+  /// Calvin #6: does the creator KEEP the product as reward (true) vs is it
+  /// supplied ONLY to produce content (false)? Nullable when there is no gift.
+  giftIsCompensation Boolean?
+  giftIsPhysical     Boolean?
+  /// How the creator gets the gift: "promo_code" | "manual_contact" | null.
+  giftAccessMethod   String?
+
+  /// Public commission (Affiliate/Hybrid). commissionRate is a WHOLE-NUMBER
+  /// PERCENT (matches every existing consumer: valueCents*commissionRate/100). No
+  /// bps anywhere in the repo.
+  commissionRate         Int?
+  /// "percent" | "flat".
+  commissionMode         String?
+  /// "lifetime" | "time_span" | "count".
+  commissionDurationKind String?
+  commissionDurationValue Int?
+  attributionWindowDays   Int?
+
+  /// Public payment terms, free text (e.g. "Pay after post" | "50/50").
+  publicPaymentTerms String?
+
+  objective            String?
+  summary              String?
+  /// Approved claims / prohibited claims / content requirements — jsonb string[],
+  /// NOT Postgres text[] (repo has no array columns).
+  keyMessages          Json?
+  prohibitedClaims     Json?
+  contentRequirements  Json?
+
+  /// Rights & restrictions (public).
+  usageRights            String?
+  usageRightsDurationDays Int?
+  exclusivity            String?
+  exclusivityDurationDays Int?
+  adAuthorizationDays    Int?
+  postRetentionDays      Int?
+  contentRepurposeDays   Int?
+
+  /// Deliverables (presentation-only — see model note). platforms = jsonb
+  /// string[]; deliverables = jsonb array of {platform, format, quantity}.
+  platforms    Json?
+  deliverables Json?
+  postDeadline String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// PLU-139: the brand's identity/branding for a campaign (1:1 with Campaign). All
+/// nullable — a DRAFT may fill these in over time.
+model BrandIdentity {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  brandName          String?
+  brandDescription   String?
+  websiteUrl         String?
+  productUrl         String?
+  productDescription String?
+  logoUrl            String?
+  primaryColor       String?
+  secondaryColor     String?
+  typography         String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+/// PLU-139: informational creator-fit notes for a campaign (1:1 with Campaign).
+/// INFORMATIONAL ONLY — nothing reads this into matching/ranking/discovery/
+/// outreach (guaranteed by construction: only the campaigns route touches it).
+/// Lists are jsonb string[], never Postgres text[].
+model CreatorRequirement {
+  id         String @id @default(cuid())
+  campaignId String @unique
+
+  platforms    Json?
+  niche        String?
+  geographies  Json?
+  languages    Json?
+  audience     String?
+  minFollowers Int?
+  maxFollowers Int?
+  contentStyle String?
+  safetyNotes  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
 }
 
 /// PLU-122: one UTC calendar-day counter/pacing cursor per campaign. This is

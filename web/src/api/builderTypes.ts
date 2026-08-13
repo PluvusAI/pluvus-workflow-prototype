@@ -167,6 +167,8 @@ export interface CampaignListItem {
   /** PLU-121: the connected mailbox outreach is sent from (a
    *  ConnectedEmailAccount id), or null to use the default account. */
   emailAccountId: string | null;
+  /** PLU-139: lifecycle status. The list omits the nested detail groups (no N+1). */
+  status: CampaignStatus;
   createdAt: string;
   updatedAt: string;
   workflowCount: number;
@@ -197,6 +199,113 @@ export interface CampaignWorkflowItem {
   updatedAt: string;
 }
 
+// ---------------------------------------------------------------------------
+// PLU-139 — sectioned campaign Draft intake (public terms only)
+// ---------------------------------------------------------------------------
+
+/** Campaign lifecycle. Only DRAFT accepts material edits to the public terms. */
+export type CampaignStatus = "DRAFT" | "ACTIVE" | "CLOSING" | "ARCHIVED";
+
+/** The canonical compensation structure — never FIXED|NEGOTIATED. */
+export type CompensationStructure = "PAID" | "GIFTING" | "AFFILIATE" | "HYBRID";
+
+/** A separate axis from structure — how an upfront fee is arrived at (PAID/HYBRID). */
+export type PriceStrategy = "REQUEST_RATE_CARD" | "PROPOSE_STARTING_AMOUNT";
+
+/** One structured deliverable (presentation-only; the free-text Campaign.deliverables
+ *  stays the agent-facing source of truth). */
+export interface DeliverableItem {
+  platform?: string;
+  format?: string;
+  quantity?: number;
+}
+
+/** Structured PUBLIC creator-facing terms. NO private-policy field appears here. */
+export interface CampaignDetailsFields {
+  compensationStructure: CompensationStructure;
+  priceStrategy: PriceStrategy | null;
+  /** INTEGER CENTS, not dollars. */
+  proposedFeeCents: number | null;
+  feeCurrency: string | null;
+  additiveGifting: boolean;
+  giftDescription: string | null;
+  /** Keep-as-reward (true) vs supplied-for-content-only (false). */
+  giftIsCompensation: boolean | null;
+  giftIsPhysical: boolean | null;
+  giftAccessMethod: string | null;
+  /** WHOLE-NUMBER PERCENT, not bps. */
+  commissionRate: number | null;
+  commissionMode: string | null;
+  commissionDurationKind: string | null;
+  commissionDurationValue: number | null;
+  attributionWindowDays: number | null;
+  publicPaymentTerms: string | null;
+  objective: string | null;
+  summary: string | null;
+  keyMessages: string[] | null;
+  prohibitedClaims: string[] | null;
+  contentRequirements: string[] | null;
+  usageRights: string | null;
+  usageRightsDurationDays: number | null;
+  exclusivity: string | null;
+  exclusivityDurationDays: number | null;
+  adAuthorizationDays: number | null;
+  postRetentionDays: number | null;
+  contentRepurposeDays: number | null;
+  platforms: string[] | null;
+  deliverables: DeliverableItem[] | null;
+  postDeadline: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BrandIdentityFields {
+  brandName: string | null;
+  brandDescription: string | null;
+  websiteUrl: string | null;
+  productUrl: string | null;
+  productDescription: string | null;
+  logoUrl: string | null;
+  primaryColor: string | null;
+  secondaryColor: string | null;
+  typography: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Informational only — never drives matching/ranking/outreach. */
+export interface CreatorRequirementFields {
+  platforms: string[] | null;
+  niche: string | null;
+  geographies: string[] | null;
+  languages: string[] | null;
+  audience: string | null;
+  minFollowers: number | null;
+  maxFollowers: number | null;
+  contentStyle: string | null;
+  safetyNotes: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The write shape (all optional, nullable) — what create/update sends per group. */
+export type CampaignDetailsInput = Partial<
+  Omit<CampaignDetailsFields, "createdAt" | "updatedAt" | "compensationStructure">
+> & { compensationStructure?: CompensationStructure };
+export type BrandIdentityInput = Partial<
+  Omit<BrandIdentityFields, "createdAt" | "updatedAt">
+>;
+export type CreatorRequirementInput = Partial<
+  Omit<CreatorRequirementFields, "createdAt" | "updatedAt">
+>;
+
+/** The three nested groups a create/update body may carry. */
+export interface CampaignSectionsInput {
+  details?: CampaignDetailsInput;
+  brandIdentity?: BrandIdentityInput;
+  creatorRequirement?: CreatorRequirementInput;
+}
+
 export interface CampaignDetail {
   id: string;
   name: string;
@@ -219,8 +328,14 @@ export interface CampaignDetail {
   negotiationReplyPacingMaxMinutes: number | null;
   /** PLU-121: the connected mailbox outreach is sent from, or null for default. */
   emailAccountId: string | null;
+  /** PLU-139: lifecycle status. */
+  status: CampaignStatus;
   createdAt: string;
   updatedAt: string;
+  /** PLU-139: the three 1:1 public-terms groups (null when never filled in). */
+  details: CampaignDetailsFields | null;
+  brandIdentity: BrandIdentityFields | null;
+  creatorRequirement: CreatorRequirementFields | null;
   workflows: CampaignWorkflowItem[];
 }
 

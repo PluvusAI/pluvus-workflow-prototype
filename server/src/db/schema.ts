@@ -280,6 +280,32 @@ export const workflowStatusEnum = pgEnum("WorkflowStatus", [
   "ARCHIVED",
 ]);
 
+// PLU-139: campaign lifecycle. Only DRAFT accepts material edits to the public
+// terms; ACTIVE/CLOSING/ARCHIVED are locked (→ Duplicate). Member order mirrors
+// the migration's CREATE TYPE.
+export const campaignStatusEnum = pgEnum("CampaignStatus", [
+  "DRAFT",
+  "ACTIVE",
+  "CLOSING",
+  "ARCHIVED",
+]);
+
+// PLU-139: the canonical compensation structure — the ONE axis that classifies an
+// offer. Never FIXED|NEGOTIATED, never derived from a fee amount.
+export const compensationStructureEnum = pgEnum("CompensationStructure", [
+  "PAID",
+  "GIFTING",
+  "AFFILIATE",
+  "HYBRID",
+]);
+
+// PLU-139: a separate axis from CompensationStructure — how an upfront fee is
+// arrived at (only meaningful for PAID/HYBRID). Design-gated semantic (PLAN N2).
+export const priceStrategyEnum = pgEnum("PriceStrategy", [
+  "REQUEST_RATE_CARD",
+  "PROPOSE_STARTING_AMOUNT",
+]);
+
 export const outboxStatusEnum = pgEnum("OutboxStatus", [
   "PENDING",
   "SENT",
@@ -450,11 +476,104 @@ export const campaigns = pgTable(
     outreachPacingMaxMinutes: integer("outreachPacingMaxMinutes"),
     negotiationReplyPacingMinMinutes: integer("negotiationReplyPacingMinMinutes"),
     negotiationReplyPacingMaxMinutes: integer("negotiationReplyPacingMaxMinutes"),
+    // PLU-139: lifecycle. New rows DRAFT; the migration backfills existing rows to
+    // ACTIVE so the Draft-edit guard never unlocks a live campaign.
+    status: campaignStatusEnum("status").notNull().default("DRAFT"),
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },
   (table) => [index("Campaign_emailAccountId_idx").on(table.emailAccountId)],
 );
+
+// PLU-139: structured PUBLIC creator-facing terms (1:1 with Campaign). No private
+// policy field lives here (PLU-140). Every column but id/campaignId/
+// compensationStructure is nullable — a DRAFT may be incomplete. List columns are
+// jsonb typed string[] (repo has zero Postgres array columns).
+export const campaignDetails = pgTable("CampaignDetails", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  compensationStructure: compensationStructureEnum("compensationStructure").notNull(),
+  priceStrategy: priceStrategyEnum("priceStrategy"),
+  // INTEGER CENTS (matches the ledger's agreedFeeCents) — NOT dollars.
+  proposedFeeCents: integer("proposedFeeCents"),
+  feeCurrency: text("feeCurrency"),
+  additiveGifting: boolean("additiveGifting").notNull().default(false),
+  giftDescription: text("giftDescription"),
+  // Calvin #6: keep-as-reward (true) vs supplied-for-content-only (false).
+  giftIsCompensation: boolean("giftIsCompensation"),
+  giftIsPhysical: boolean("giftIsPhysical"),
+  // "promo_code" | "manual_contact" | null.
+  giftAccessMethod: text("giftAccessMethod"),
+  // WHOLE-NUMBER PERCENT (valueCents*commissionRate/100) — no bps in the repo.
+  commissionRate: integer("commissionRate"),
+  commissionMode: text("commissionMode"),
+  commissionDurationKind: text("commissionDurationKind"),
+  commissionDurationValue: integer("commissionDurationValue"),
+  attributionWindowDays: integer("attributionWindowDays"),
+  publicPaymentTerms: text("publicPaymentTerms"),
+  objective: text("objective"),
+  summary: text("summary"),
+  keyMessages: jsonb("keyMessages").$type<string[]>(),
+  prohibitedClaims: jsonb("prohibitedClaims").$type<string[]>(),
+  contentRequirements: jsonb("contentRequirements").$type<string[]>(),
+  usageRights: text("usageRights"),
+  usageRightsDurationDays: integer("usageRightsDurationDays"),
+  exclusivity: text("exclusivity"),
+  exclusivityDurationDays: integer("exclusivityDurationDays"),
+  adAuthorizationDays: integer("adAuthorizationDays"),
+  postRetentionDays: integer("postRetentionDays"),
+  contentRepurposeDays: integer("contentRepurposeDays"),
+  platforms: jsonb("platforms").$type<string[]>(),
+  // Array of { platform, format, quantity }. Presentation-only (PLAN N3).
+  deliverables: jsonb("deliverables").$type<JsonValue>(),
+  postDeadline: text("postDeadline"),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
+
+// PLU-139: brand identity/branding (1:1 with Campaign). All nullable.
+export const brandIdentity = pgTable("BrandIdentity", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  brandName: text("brandName"),
+  brandDescription: text("brandDescription"),
+  websiteUrl: text("websiteUrl"),
+  productUrl: text("productUrl"),
+  productDescription: text("productDescription"),
+  logoUrl: text("logoUrl"),
+  primaryColor: text("primaryColor"),
+  secondaryColor: text("secondaryColor"),
+  typography: text("typography"),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
+
+// PLU-139: informational creator-fit notes (1:1 with Campaign). INFORMATIONAL ONLY
+// — nothing reads it into matching/ranking/outreach. Lists are jsonb string[].
+export const creatorRequirement = pgTable("CreatorRequirement", {
+  id: cuidId("id"),
+  campaignId: text("campaignId")
+    .notNull()
+    .unique()
+    .references(() => campaigns.id, { onDelete: "cascade" }),
+  platforms: jsonb("platforms").$type<string[]>(),
+  niche: text("niche"),
+  geographies: jsonb("geographies").$type<string[]>(),
+  languages: jsonb("languages").$type<string[]>(),
+  audience: text("audience"),
+  minFollowers: integer("minFollowers"),
+  maxFollowers: integer("maxFollowers"),
+  contentStyle: text("contentStyle"),
+  safetyNotes: text("safetyNotes"),
+  createdAt: tsNow("createdAt"),
+  updatedAt: tsUpdatedAt("updatedAt"),
+});
 
 // PLU-122: per-campaign UTC-day quota + pacing cursor. Email payloads remain in
 // Message and delivery remains in the existing delayed-send queue.
@@ -1357,6 +1476,19 @@ export const insertCampaignSchema = createInsertSchema(campaigns).omit({
   createdAt: true,
   updatedAt: true,
 });
+export const insertCampaignDetailsSchema = createInsertSchema(campaignDetails).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+export const insertBrandIdentitySchema = createInsertSchema(brandIdentity).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+export const insertCreatorRequirementSchema = createInsertSchema(
+  creatorRequirement,
+).omit({ id: true, createdAt: true, updatedAt: true });
 export const insertWorkflowSchema = createInsertSchema(workflows).omit({
   id: true,
   createdAt: true,
@@ -1451,6 +1583,13 @@ export const insertPayoutSchema = createInsertSchema(payouts).omit({
 // ---------------------------------------------------------------------------
 
 export type Campaign = typeof campaigns.$inferSelect;
+export type CampaignStatus = (typeof campaignStatusEnum.enumValues)[number];
+export type CompensationStructure =
+  (typeof compensationStructureEnum.enumValues)[number];
+export type PriceStrategy = (typeof priceStrategyEnum.enumValues)[number];
+export type CampaignDetails = typeof campaignDetails.$inferSelect;
+export type BrandIdentity = typeof brandIdentity.$inferSelect;
+export type CreatorRequirement = typeof creatorRequirement.$inferSelect;
 export type CampaignOutreachDay = typeof campaignOutreachDays.$inferSelect;
 export type ConnectedEmailAccount = typeof connectedEmailAccounts.$inferSelect;
 export type Workflow = typeof workflows.$inferSelect;
@@ -1481,6 +1620,11 @@ export type Payout = typeof payouts.$inferSelect;
 export type LlmCall = typeof llmCalls.$inferSelect;
 
 export type InsertCampaign = z.infer<typeof insertCampaignSchema>;
+export type InsertCampaignDetails = z.infer<typeof insertCampaignDetailsSchema>;
+export type InsertBrandIdentity = z.infer<typeof insertBrandIdentitySchema>;
+export type InsertCreatorRequirement = z.infer<
+  typeof insertCreatorRequirementSchema
+>;
 export type InsertWorkflow = z.infer<typeof insertWorkflowSchema>;
 export type InsertWorkflowVersion = z.infer<typeof insertWorkflowVersionSchema>;
 export type InsertCreator = z.infer<typeof insertCreatorSchema>;
@@ -1508,6 +1652,9 @@ export type InsertPayout = z.infer<typeof insertPayoutSchema>;
 // Raw insert types (what db.insert(...).values() accepts, ids/timestamps
 // optional because of the $defaultFn/default declarations above).
 export type CampaignInsert = typeof campaigns.$inferInsert;
+export type CampaignDetailsInsert = typeof campaignDetails.$inferInsert;
+export type BrandIdentityInsert = typeof brandIdentity.$inferInsert;
+export type CreatorRequirementInsert = typeof creatorRequirement.$inferInsert;
 export type CampaignOutreachDayInsert = typeof campaignOutreachDays.$inferInsert;
 export type ConnectedEmailAccountInsert = typeof connectedEmailAccounts.$inferInsert;
 export type InsertConnectedEmailAccount = z.infer<

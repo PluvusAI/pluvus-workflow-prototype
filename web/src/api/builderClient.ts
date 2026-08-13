@@ -31,6 +31,9 @@ import type {
   PostAcceptanceMode,
   CompleteHandoffResult,
   ConnectedEmailAccount,
+  CampaignDetailsInput,
+  BrandIdentityInput,
+  CreatorRequirementInput,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -123,6 +126,10 @@ export function createCampaign(data: {
   negotiationReplyPacingMaxMinutes?: number;
   /** PLU-121: the connected mailbox to send this campaign's outreach from. */
   emailAccountId?: string;
+  // PLU-139: the nested public-terms groups (all optional; a Draft may be partial).
+  details?: CampaignDetailsInput;
+  brandIdentity?: BrandIdentityInput;
+  creatorRequirement?: CreatorRequirementInput;
 }) {
   return postJson<{ id: string; name: string }>("/api/campaigns", data);
 }
@@ -146,6 +153,12 @@ export function updateCampaign(
   negotiationReplyPacingMaxMinutes?: number;
   /** PLU-121: change the default sender (null clears back to the default account). */
   emailAccountId?: string | null;
+  // PLU-139: the nested public-terms groups. Touching any one gates the PATCH on
+  // the campaign being DRAFT (server returns 409 otherwise); scalar/sender edits
+  // above stay allowed on running campaigns.
+  details?: CampaignDetailsInput;
+  brandIdentity?: BrandIdentityInput;
+  creatorRequirement?: CreatorRequirementInput;
   },
 ) {
   return apiFetch<{
@@ -160,6 +173,15 @@ export function updateCampaign(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+}
+
+/** PLU-139: "Copy prior campaign" — creates a new DRAFT with the scalars + the
+ *  three detail groups copied. Returns the new campaign id. */
+export function duplicateCampaign(id: string) {
+  return postJson<{ id: string; name: string; status: string }>(
+    `/api/campaigns/${id}/duplicate`,
+    {},
+  );
 }
 
 export function deleteCampaign(id: string): Promise<void> {
