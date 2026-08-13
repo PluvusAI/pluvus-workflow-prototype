@@ -35,6 +35,10 @@ import type {
   GiftDisposition,
   PriceStrategy,
   CompensationReviewStatus,
+  BrandIdentityFields,
+  BrandIdentityInput,
+  CreatorRequirementFields,
+  CreatorRequirementInput,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -180,6 +184,42 @@ export function updateCampaign(
 
 export function deleteCampaign(id: string): Promise<void> {
   return apiFetch<void>(`/api/campaigns/${id}`, { method: "DELETE" });
+}
+
+// PLU-139 (2a): BrandIdentity + CreatorRequirement sections. Each has its own
+// GET + draft-only PATCH sub-endpoint (409 once the campaign is ACTIVE). GET is a
+// hook (react-query) like useCampaign; the PATCH is a plain one-shot mutation.
+export function useBrandIdentity(id: string | null) {
+  return useQuery({
+    queryKey: ["campaign", id, "brand-identity"],
+    queryFn: () => apiFetch<BrandIdentityFields>(`/api/campaigns/${id}/brand-identity`),
+    enabled: !!id,
+  });
+}
+
+export function updateBrandIdentity(id: string, data: BrandIdentityInput) {
+  return apiFetch<BrandIdentityFields>(`/api/campaigns/${id}/brand-identity`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function useCreatorRequirement(id: string | null) {
+  return useQuery({
+    queryKey: ["campaign", id, "creator-requirement"],
+    queryFn: () =>
+      apiFetch<CreatorRequirementFields>(`/api/campaigns/${id}/creator-requirement`),
+    enabled: !!id,
+  });
+}
+
+export function updateCreatorRequirement(id: string, data: CreatorRequirementInput) {
+  return apiFetch<CreatorRequirementFields>(`/api/campaigns/${id}/creator-requirement`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
 }
 
 // ---------------------------------------------------------------------------

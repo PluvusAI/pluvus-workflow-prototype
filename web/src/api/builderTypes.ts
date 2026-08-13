@@ -266,6 +266,52 @@ export interface CampaignDetail {
 }
 
 // ---------------------------------------------------------------------------
+// PLU-139 (2a): BrandIdentity + CreatorRequirement — the two public intake
+// sections. Fetched/patched via their own sub-endpoints (not folded into the
+// flat campaign payload), draft-only (409 once the campaign is ACTIVE).
+// ---------------------------------------------------------------------------
+
+/** PLU-135: how a BrandIdentity's values were populated. */
+export type BrandIdentityExtractionSource = "EXTRACTED" | "MANUAL" | "DEFAULT";
+
+export interface BrandIdentityFields {
+  id: string;
+  campaignId: string;
+  logoRef: string | null;
+  primaryColor: string | null;
+  secondaryColor: string | null;
+  typography: string | null;
+  extractionSource: BrandIdentityExtractionSource | null;
+  extractedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Informational only — never drives matching/ranking/outreach. */
+export interface CreatorRequirementFields {
+  id: string;
+  campaignId: string;
+  platforms: string[] | null;
+  niches: string[] | null;
+  geography: string[] | null;
+  languages: string[] | null;
+  minFollowers: number | null;
+  audienceNotes: string | null;
+  contentStyle: string | null;
+  brandSafety: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The write shape for each PATCH (all optional/nullable). */
+export type BrandIdentityInput = Partial<
+  Omit<BrandIdentityFields, "id" | "campaignId" | "extractionSource" | "extractedAt" | "createdAt" | "updatedAt">
+>;
+export type CreatorRequirementInput = Partial<
+  Omit<CreatorRequirementFields, "id" | "campaignId" | "createdAt" | "updatedAt">
+>;
+
+// ---------------------------------------------------------------------------
 // Workflow
 // ---------------------------------------------------------------------------
 

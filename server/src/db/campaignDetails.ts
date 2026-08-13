@@ -22,7 +22,9 @@ export class CampaignLockedError extends Error {
   }
 }
 
-async function assertCampaignIsDraft(campaignId: string, client: Db | DbTx): Promise<void> {
+// Exported so the sibling draft-only tables (BrandIdentity, CreatorRequirement)
+// reuse the ONE guard rather than re-implementing the status check (PLU-139 2a).
+export async function assertCampaignIsDraft(campaignId: string, client: Db | DbTx): Promise<void> {
   const [campaign] = await client
     .select({ status: campaigns.status })
     .from(campaigns)
