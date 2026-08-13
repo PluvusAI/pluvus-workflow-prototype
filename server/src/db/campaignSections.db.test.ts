@@ -220,7 +220,7 @@ async function main(): Promise<void> {
     assert.equal(d.giftDescription, "sample box");
   });
 
-  await test("clearStaleCompFields is pure and structure-scoped", () => {
+  await test("clearStaleCompFields is pure and structure-scoped", async () => {
     // Non-structure patch → untouched.
     assert.deepEqual(clearStaleCompFields(undefined, { objective: "x" }), {
       objective: "x",

@@ -38,11 +38,8 @@ import {
   validateCreatorRequirementGroup,
 } from "../validation/campaignSections.js";
 import type {
-  BrandIdentity,
-  CampaignDetails,
   CampaignDetailsInsert,
   BrandIdentityInsert,
-  CreatorRequirement,
   CreatorRequirementInsert,
 } from "../db/schema.js";
 
@@ -164,35 +161,15 @@ async function writeSections(
   });
 }
 
-// Public payload shapers — expose ONLY the public columns (no id/campaignId/
-// timestamps, and — for CampaignDetails — NO private-policy key, since none exist
-// on the table). Return null when the row is absent so GET is a stable shape.
-function detailsPayload(d: CampaignDetails | null) {
-  if (!d) return null;
-  const { id: _id, campaignId: _c, createdAt: _ca, updatedAt: _ua, ...rest } = d;
-  return {
-    ...rest,
-    createdAt: d.createdAt.toISOString(),
-    updatedAt: d.updatedAt.toISOString(),
-  };
-}
-function brandIdentityPayload(b: BrandIdentity | null) {
-  if (!b) return null;
-  const { id: _id, campaignId: _c, createdAt: _ca, updatedAt: _ua, ...rest } = b;
-  return {
-    ...rest,
-    createdAt: b.createdAt.toISOString(),
-    updatedAt: b.updatedAt.toISOString(),
-  };
-}
-function creatorRequirementPayload(r: CreatorRequirement | null) {
-  if (!r) return null;
-  const { id: _id, campaignId: _c, createdAt: _ca, updatedAt: _ua, ...rest } = r;
-  return {
-    ...rest,
-    createdAt: r.createdAt.toISOString(),
-    updatedAt: r.updatedAt.toISOString(),
-  };
+// Public payload shaper — strips id/campaignId (and the raw Date timestamps),
+// ISO-stamps createdAt/updatedAt. The three detail tables share this exact shape,
+// and none carries a private-policy column, so one generic covers all three.
+// Returns null for an absent row so GET is a stable shape.
+type SectionRow = { id: string; campaignId: string; createdAt: Date; updatedAt: Date };
+function sectionPayload<T extends SectionRow>(row: T | null) {
+  if (!row) return null;
+  const { id: _id, campaignId: _c, createdAt, updatedAt, ...rest } = row;
+  return { ...rest, createdAt: createdAt.toISOString(), updatedAt: updatedAt.toISOString() };
 }
 
 // POST /campaigns — create a campaign
@@ -376,13 +353,13 @@ router.post("/", async (req: Request, res: Response) => {
       status: campaign.status,
       createdAt: campaign.createdAt.toISOString(),
       details: sections.sections.details
-        ? detailsPayload(await getCampaignDetails(campaign.id))
+        ? sectionPayload(await getCampaignDetails(campaign.id))
         : null,
       brandIdentity: sections.sections.brandIdentity
-        ? brandIdentityPayload(await getBrandIdentity(campaign.id))
+        ? sectionPayload(await getBrandIdentity(campaign.id))
         : null,
       creatorRequirement: sections.sections.creatorRequirement
-        ? creatorRequirementPayload(await getCreatorRequirement(campaign.id))
+        ? sectionPayload(await getCreatorRequirement(campaign.id))
         : null,
     });
   } catch (err) {
@@ -429,9 +406,9 @@ router.get("/:id", async (req: Request, res: Response) => {
       status: campaign.status,
       createdAt: campaign.createdAt.toISOString(),
       updatedAt: campaign.updatedAt.toISOString(),
-      details: detailsPayload(details),
-      brandIdentity: brandIdentityPayload(brandIdentity),
-      creatorRequirement: creatorRequirementPayload(creatorRequirement),
+      details: sectionPayload(details),
+      brandIdentity: sectionPayload(brandIdentity),
+      creatorRequirement: sectionPayload(creatorRequirement),
       workflows: campaign.workflows.map((w) => ({
         id: w.id,
         name: w.name,
@@ -698,9 +675,9 @@ router.patch("/:id", async (req: Request, res: Response) => {
       emailAccountId: campaign.emailAccountId,
       status: campaign.status,
       updatedAt: campaign.updatedAt.toISOString(),
-      details: detailsPayload(details),
-      brandIdentity: brandIdentityPayload(brandIdentity),
-      creatorRequirement: creatorRequirementPayload(creatorRequirement),
+      details: sectionPayload(details),
+      brandIdentity: sectionPayload(brandIdentity),
+      creatorRequirement: sectionPayload(creatorRequirement),
     });
   } catch (err) {
     console.error("[campaigns] update error:", err);
