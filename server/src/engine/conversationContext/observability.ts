@@ -42,6 +42,14 @@ export function buildContextRecord(ctx: AssembledContext): ContextRecord {
       ? { policySnapshotId: ctx.policySnapshot.id }
       : {}),
     legacyFallbackUsed: ctx.legacyFallbackUsed,
+    // PLU-138 §obs — band-fallback + effective source, derived from snapshot PRESENCE
+    // (never values). bandLegacyFallback mirrors the effectiveTerms resolver's own
+    // rule (!policySnapshot ⇒ band from config); termsSource is 'legacy_nodegraph'
+    // only when BOTH snapshots are absent, matching resolveEffectiveNegotiationConfig.
+    bandLegacyFallback: ctx.policySnapshot == null,
+    termsSource: ctx.policySnapshot == null && ctx.termsSnapshot == null
+      ? "legacy_nodegraph"
+      : "snapshot",
     ...(ctx.integrityFailure ? { integrityFailureReason: ctx.integrityFailure.reason } : {}),
   };
 }

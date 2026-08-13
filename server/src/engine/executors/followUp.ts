@@ -8,7 +8,7 @@ import {
   maskGuardHits,
   type GuardHit,
 } from "../guards/outputGuard.js";
-import { mergeCampaignFallback } from "../campaignContext.js";
+import { mergeCampaignFallback, toCampaignBrandFields } from "../campaignContext.js";
 
 // H4: guard the AI-generated follow-up before sending. A follow-up quotes no
 // money, so any floor/ceiling number is a leak → halt for human review.
@@ -47,7 +47,16 @@ export async function executeFollowUp(
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
   // H5: fill missing brand context from the parent campaign (node config wins).
-  const config = mergeCampaignFallback(node.config, ctx.campaign);
+  // PLU-138 (1d): deliverables/timeline/rewardDescription are no longer stamped
+  // into node config (restampBrand stopped copying material terms), and post-PLU-135
+  // they live on CampaignDetails, not the Campaign row — so a bare ctx.campaign
+  // fallback resolves them to undefined and the follow-up copy can hallucinate them.
+  // Build the fallback from CampaignDetails via toCampaignBrandFields, matching the
+  // operatorHandoff/brandApproval executors.
+  const config = mergeCampaignFallback(
+    node.config,
+    toCampaignBrandFields(ctx.campaign, ctx.campaignDetails),
+  );
   const maxCount = typeof config["maxCount"] === "number" ? config["maxCount"] : 3;
 
   // Case 1: Just sent outreach — enter the first waiting period.

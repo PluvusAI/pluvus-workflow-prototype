@@ -20,6 +20,8 @@ import { resolveBand } from "../band.js";
 import { resolveBrandName, toCampaignBrandFields } from "../campaignContext.js";
 import { blockedByMissingBrand } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Brand-approval executor (brand-approval gate)
@@ -53,7 +55,6 @@ export async function executeBrandApproval(
   email: IEmailProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator, campaign, campaignDetails } = ctx;
-  const config = node.config;
   // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
   // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
   // loads CampaignDetails alongside Campaign into ExecutionContext specifically
@@ -66,6 +67,29 @@ export async function executeBrandApproval(
       `Brand approval expects ACCEPTED state, got ${instance.currentState}`,
     );
   }
+
+  // PLU-138 (1d): the approve-this-creator email states the deal's PUBLIC terms to
+  // the brand, so overlay them from the pinned CampaignTermsSnapshot (snapshot-wins
+  // over the stale nodeGraph). Integrity failure → MANUAL_REVIEW. No-snapshot journey
+  // → the existing inline config→negotiationConfig→campaignFields chain is unchanged.
+  // Band stays on resolveBand(negotiationConfig) (private-band swap is a follow-up).
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, campaign?.id);
+  if (pinnedTerms.integrityFailure) {
+    return {
+      nextState: "MANUAL_REVIEW",
+      nextNodeId: null,
+      completedAt: new Date(),
+      eventType: "MANUAL_REVIEW_FLAGGED",
+      eventPayload: {
+        outcome: "ESCALATE",
+        reason: pinnedTerms.integrityFailure.reason,
+        node: node.type,
+      },
+    };
+  }
+  const config = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
+    : node.config;
 
   // 1. Resolve the brand name. Same L4 contract as every other post-acceptance
   //    executor: with no resolvable brand name we escalate rather than proceed.

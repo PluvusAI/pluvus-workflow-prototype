@@ -440,6 +440,10 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
 
     // Stamp brandName/senderName into every node's config so {{brandName}}
     // resolves correctly when draft() is called at send time.
+    // PLU-138 (1d): material terms (deliverables/timeline/productOrOffer) are NO
+    // LONGER stamped here — CampaignTermsSnapshot owns them once the campaign
+    // launches, and the engine reads them from the pinned snapshot. Only brand
+    // presentation + the shipsPhysicalProduct compat flag are seeded.
     const nodes = (JSON.parse(JSON.stringify(template.nodes)) as typeof template.nodes).map(
       (node) => ({
         ...node,
@@ -447,9 +451,6 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
           brandName: campaign.brand,
           senderName: campaign.brand,
           ...(details?.brandDescription ? { brandDescription: details.brandDescription } : {}),
-          ...(details?.deliverables ? { deliverables: details.deliverables } : {}),
-          ...(details?.timeline ? { timeline: details.timeline } : {}),
-          ...(details?.productOrOffer ? { rewardDescription: details.productOrOffer } : {}),
           ...(details?.shipsPhysicalProduct ? { shipsPhysicalProduct: true } : {}),
           ...node.config,
         },
