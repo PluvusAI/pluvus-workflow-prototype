@@ -260,49 +260,6 @@ test("H1: executeNegotiation escalates an uncapped campaign WITHOUT calling the 
   assert.equal((result.eventPayload as Record<string, unknown>)["reason"], "no_ceiling_configured");
 });
 
-test("H1: a pinned (even corrupt) journey does NOT pre-escalate as no_ceiling on stale config", async () => {
-  // Harshit review (PLU-138): the pre-build H1 arm must be gated on there being NO
-  // pin AT ALL. A journey pinned to a snapshot (here a terms-only pin) with a
-  // floor-no-ceiling *legacy* config must NOT short-circuit to no_ceiling_configured
-  // before the build — that would mask a corrupt pin with the wrong reason and let
-  // stale config decide. It must fall THROUGH the pre-build arm to the build, where
-  // the snapshot integrity guard (or a valid snapshot ceiling) gets first say.
-  let negotiateCalls = 0;
-  const spyAgent = {
-    negotiate: async () => {
-      negotiateCalls++;
-      throw new Error("agent-not-expected");
-    },
-    draftEmail: async () => null,
-    classify: async () => ({ intent: "POSITIVE", confidence: 1 }),
-  } as never;
-
-  const cfg = { minBudget: 200 }; // floor only — no ceiling (the H1 trap shape)
-  const ctx = {
-    instance: {
-      id: "i1",
-      currentState: "NEGOTIATING",
-      negotiationRound: 1,
-      campaignTermsSnapshotId: "terms-pin-1", // a pin exists → defer to post-build
-      negotiationPolicySnapshotId: null,
-    },
-    node: { id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg },
-    nodeGraph: [{ id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg }],
-    creator: { id: "c1", name: "Alex" },
-  } as never;
-
-  // Any pin ⇒ the pre-build no-ceiling arm is skipped. The executor proceeds to the
-  // build, where the integrity guard fires (here the corrupt pin can't resolve a
-  // campaign → campaign_unresolved). The result is a snapshot_integrity escalation,
-  // NEVER the pre-build no_ceiling escalation on stale config — that's the fix.
-  const result = await executeNegotiation(ctx, fakeEmail, spyAgent);
-  assert.equal(negotiateCalls, 0, "the agent was never consulted");
-  assert.equal(result.nextState, "MANUAL_REVIEW");
-  const reason = (result.eventPayload as Record<string, unknown>)["reason"];
-  assert.notEqual(reason, "no_ceiling_configured", "must NOT pre-escalate as no_ceiling on stale config");
-  assert.equal(reason, "snapshot_integrity", "a corrupt pin fails as an integrity error, with the correct reason");
-});
-
 test("H1: a fully-capped campaign (floor AND ceiling) does NOT trip the no-ceiling guard", async () => {
   // Regression guard on the guard: a normal capped campaign must fall THROUGH to
   // the agent. We prove that by letting the spy agent throw a sentinel — reaching

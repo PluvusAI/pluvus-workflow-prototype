@@ -12,8 +12,6 @@ import { sendOnce } from "./idempotentSend.js";
 import { blockedByGuard, blockedByMissingBrand } from "./guardEscalation.js";
 import { renderRewardConfirmationEmail } from "./rewardEmail.js";
 import { resolveBrandName } from "../campaignContext.js";
-import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
-import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Reward Setup executor
@@ -42,34 +40,13 @@ export async function executeRewardSetup(
   agent: IAgentProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
+  const config = node.config;
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
       `REWARD_SETUP expects ACCEPTED state, got ${instance.currentState}`,
     );
   }
-
-  // PLU-138 (1d): the "I Agree" confirmation is contract-forming, so its PUBLIC
-  // terms come from the pinned CampaignTermsSnapshot (overlaid onto config), not
-  // the stale nodeGraph. Integrity failure (missing/cross-campaign) → MANUAL_REVIEW.
-  // No-snapshot journey → no overlay → the existing config chain runs unchanged.
-  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, ctx.campaign?.id);
-  if (pinnedTerms.integrityFailure) {
-    return {
-      nextState: "MANUAL_REVIEW",
-      nextNodeId: null,
-      completedAt: new Date(),
-      eventType: "MANUAL_REVIEW_FLAGGED",
-      eventPayload: {
-        outcome: "ESCALATE",
-        reason: pinnedTerms.integrityFailure.reason,
-        node: node.type,
-      },
-    };
-  }
-  const config = pinnedTerms.terms
-    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
-    : node.config;
 
   // The brand's negotiation commission is stamped onto THIS node's config at
   // save/publish (stampRewardFromNegotiation in routes/workflows.ts), so the

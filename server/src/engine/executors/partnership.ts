@@ -16,7 +16,6 @@ import { sendOnce } from "./idempotentSend.js";
 import { renderPartnershipWelcomeEmail } from "./partnershipWelcomeEmail.js";
 import { resolveAgreedFee, firstNumber } from "./agreedFee.js";
 import { resolveBrandName } from "../campaignContext.js";
-import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
 import { paymentBaseUrl } from "./paymentEmail.js";
 import { isSafeRedirectUrl } from "../../validation/targetUrl.js";
 
@@ -145,24 +144,7 @@ export async function resolvePartnership(
       nodeGraph.find((n) => n.type === "NEGOTIATION")?.config ?? {};
     const cbConfig =
       nodeGraph.find((n) => n.type === "CONTENT_BRIEF")?.config ?? {};
-    // PLU-138 (1d): the PUBLIC commission is owned by CampaignTermsSnapshot, and
-    // PLU-138 Commit 5 stops stamping it into the CONTENT_BRIEF/NEGOTIATION node
-    // configs — so for a new campaign the nodeGraph fallback below is empty. Prefer
-    // the pinned snapshot's publicCommissionRate here (the primary path — the
-    // persisted PAYMENT_INFO_SENT commission — is already snapshot-sourced because
-    // contentBrief overlays it before stamping the event). Best-effort: this
-    // executor returns Partnership|null (no MANUAL_REVIEW surface) and the deal's
-    // integrity was already gated upstream at contentBrief/brandApproval, so on a
-    // pin failure we simply fall through to the (empty) nodeGraph read rather than
-    // block the ledger mint.
-    const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, campaign?.id);
-    const ds = pinnedTerms.terms?.detailsSnapshot;
-    const snapshotCommission =
-      ds && typeof ds === "object" && !Array.isArray(ds)
-        ? (ds as Record<string, unknown>)["publicCommissionRate"]
-        : undefined;
     commissionRate = firstNumber(
-      snapshotCommission,
       cbConfig["commissionRate"],
       negotiationConfig["commissionRate"],
     );

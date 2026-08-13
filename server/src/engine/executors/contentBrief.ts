@@ -17,8 +17,6 @@ import { paymentFormLink } from "./paymentEmail.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { blockedByGuard, blockedByMissingBrand, blockedByAttributionMint } from "./guardEscalation.js";
 import { resolveBrandName } from "../campaignContext.js";
-import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
-import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Content Brief executor (merged post-negotiation node)
@@ -59,6 +57,7 @@ export async function executeContentBrief(
   _agent: IAgentProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
+  const config = node.config;
 
   // The merged flow enters on ACCEPTED (Content Brief directly follows negotiation).
   // With the brand-approval gate ON, the SEND phase is deferred until the brand
@@ -76,32 +75,6 @@ export async function executeContentBrief(
       `CONTENT_BRIEF expects ACCEPTED, AWAITING_BRAND_APPROVAL or PAYMENT_RECEIVED state, got ${instance.currentState}`,
     );
   }
-
-  // PLU-138 (1d): this email is contract-forming, so its PUBLIC terms
-  // (deliverables / timeline / public commission / reward) must come from the
-  // pinned CampaignTermsSnapshot, not the stale nodeGraph config. Load the pinned
-  // snapshot with integrity discipline (missing / cross-campaign → MANUAL_REVIEW,
-  // never a silent config read) and overlay its public fields onto the config the
-  // knowledge resolver reads. A no-snapshot (legacy) journey overlays nothing → the
-  // existing config→negotiationConfig chain runs unchanged. The FEE stays
-  // creator-history-sourced (resolveAgreedFee) — final-deal state, not a snapshot.
-  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, ctx.campaign?.id);
-  if (pinnedTerms.integrityFailure) {
-    return {
-      nextState: "MANUAL_REVIEW",
-      nextNodeId: null,
-      completedAt: new Date(),
-      eventType: "MANUAL_REVIEW_FLAGGED",
-      eventPayload: {
-        outcome: "ESCALATE",
-        reason: pinnedTerms.integrityFailure.reason,
-        node: node.type,
-      },
-    };
-  }
-  const config = pinnedTerms.terms
-    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
-    : node.config;
 
   // 1. Read the brand-supplied configuration.
   const briefFileRef = str(config, "briefFileRef");
