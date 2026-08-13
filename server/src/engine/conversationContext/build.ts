@@ -23,6 +23,7 @@ import type {
   ContextPurpose,
   ConversationSummary,
   CreatorMemoryPayload,
+  SnapshotLoadResult,
 } from "./types.js";
 
 /**
@@ -68,6 +69,12 @@ export async function buildConversationContext(
   const loadConversationSummary =
     deps.loadConversationSummary ??
     (async (): Promise<ConversationSummary | undefined> => undefined);
+  // PLU-137 §2b — default stub returns {} so the builder behaves identically when the
+  // dep is unused (no snapshots loaded ⇒ legacy fallback, same as before the change).
+  // The real loader (injected from negotiation.ts) gates the PRIVATE policy load on the
+  // authorized-decision purpose and detects integrity failures WITHOUT throwing.
+  const loadSnapshots =
+    deps.loadSnapshots ?? (async (): Promise<SnapshotLoadResult> => ({}));
 
   // §5.1 / §6.2 — the executor merged node + campaign EXACTLY ONCE before its
   // pure-config preconditions. Reuse that same object for brief conflict detection
@@ -86,11 +93,16 @@ export async function buildConversationContext(
   // When a caller supplies `client`, use it directly. DbTx also exposes
   // `.transaction()` (nested savepoints), so capability detection would
   // accidentally nest; presence of args.client is the authoritative distinction.
+  // PLU-137 §2b — the pinned launch snapshots load INSIDE this same read-tx (using the
+  // tx client) so they observe the SAME snapshot as the messages/events/obligations,
+  // and — critically — an integrity failure is detected against a consistent view. The
+  // loader returns `{terms?, policy?, integrityFailure?}`; it NEVER throws (Defect 1).
   const readRows = args.client
     ? Promise.all([
         listMessagesByInstance(args.instanceId, client),
         listEventsByInstance(args.instanceId, undefined, client),
         listOpenObligationsByInstance(args.instanceId, client),
+        loadSnapshots(args.instance, args.purpose, client),
       ])
     : db.transaction(
         async (tx) =>
@@ -98,6 +110,7 @@ export async function buildConversationContext(
             listMessagesByInstance(args.instanceId, tx),
             listEventsByInstance(args.instanceId, undefined, tx),
             listOpenObligationsByInstance(args.instanceId, tx),
+            loadSnapshots(args.instance, args.purpose, tx),
           ]),
         { isolationLevel: "repeatable read", accessMode: "read only" },
       );
@@ -105,8 +118,12 @@ export async function buildConversationContext(
   // The reads — ONCE. The 3 DB reads (snapshot-consistent, above) run concurrently
   // with the brief resolve (best-effort, never throws — §5.5) and the optional
   // loaders (default to undefined stubs).
-  const [[messages, events, obligationRows], resolvedBrief, creatorMemory, conversationSummary] =
-    await Promise.all([
+  const [
+    [messages, events, obligationRows, snapshots],
+    resolvedBrief,
+    creatorMemory,
+    conversationSummary,
+  ] = await Promise.all([
       readRows,
       resolveBrief(args.nodeGraph, {
         usageRights:
@@ -143,6 +160,12 @@ export async function buildConversationContext(
     resolvedBrief,
     creatorMemory,
     conversationSummary,
+    // PLU-137 §2b — the loaded pinned snapshots + integrity outcome (Defect 1: a flag,
+    // never a throw). The pure core projects policy into DecisionContext.policyAuthority
+    // (§3a) and structurally excludes it from DraftContext (§3b).
+    ...(snapshots.terms ? { termsSnapshot: snapshots.terms } : {}),
+    ...(snapshots.policy ? { policySnapshot: snapshots.policy } : {}),
+    ...(snapshots.integrityFailure ? { integrityFailure: snapshots.integrityFailure } : {}),
     latestMessageId: args.latestMessageId,
     // §6.2 — thread the single merged object into the pure core (no re-merge).
     mergedConfig,

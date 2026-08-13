@@ -135,6 +135,9 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
     resolvedBrief,
     creatorMemory,
     conversationSummary,
+    termsSnapshot,
+    policySnapshot,
+    integrityFailure,
     latestMessageId,
     mergedConfig,
   } = inputs;
@@ -239,6 +242,13 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
     typeof mergedConfig["minBudget"] === "number" ||
     typeof mergedConfig["maxBudget"] === "number";
 
+  // PLU-137 §5 — a legacy/no-snapshot turn: the public terms this context reads come
+  // from nodeGraph/mergedConfig rather than a pinned CampaignTermsSnapshot. Logged via
+  // observability (§4a). A valid snapshot ALWAYS wins — this is only ever true when no
+  // terms snapshot was pinned. NOT set on an integrity failure (that's its own outcome,
+  // §3d — we don't silently fall back over a broken pin).
+  const legacyFallbackUsed = !termsSnapshot && !integrityFailure;
+
   return {
     purpose,
     instance,
@@ -264,5 +274,14 @@ export function assembleContext(inputs: AssembleInputs): AssembledContext {
     creatorMemory,
     conversationSummary,
     campaignConstraints: { bandPresent },
+    // PLU-137 — the pinned snapshots + integrity outcome, threaded through. The
+    // projections read policySnapshot into DecisionContext.policyAuthority (§3a) and
+    // never expose it on the draft surface (§3b). Kept `undefined`-not-omitted only
+    // where present, so a no-snapshot turn's object is unchanged except the two new
+    // always-present keys (legacyFallbackUsed boolean).
+    ...(termsSnapshot ? { termsSnapshot } : {}),
+    ...(policySnapshot ? { policySnapshot } : {}),
+    ...(integrityFailure ? { integrityFailure } : {}),
+    legacyFallbackUsed,
   };
 }

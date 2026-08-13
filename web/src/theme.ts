@@ -367,7 +367,12 @@ export const stateDescription: Record<InstanceState, string> = {
 };
 
 export function formatDuration(seconds: number | null): string {
-  if (seconds === null || seconds < 0) return "—";
+  if (seconds === null) return "—";
+  // Clamp negatives to 0 ("just now") instead of a bogus dash/negative: a
+  // Date.now()-minus-timestamp elapsed can go slightly negative from client/
+  // server clock skew or a row rendered the instant it's created (PLU-137
+  // review: "date.now() shows negative time slot").
+  if (seconds < 0) seconds = 0;
   if (seconds < 60) return `${seconds}s`;
   const m = Math.floor(seconds / 60);
   if (m < 60) return `${m}m`;

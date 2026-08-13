@@ -8,12 +8,15 @@
 
 import type {
   Campaign,
+  CampaignTermsSnapshot,
   ConversationObligation,
   Creator,
   Event,
   ExecutionInstance,
   Message,
+  NegotiationPolicySnapshot,
 } from "../../db/schema.js";
+import type { Db, DbTx } from "../../db/drizzle.js";
 import type { NodeSnapshot, PriorNegotiationContext } from "../types.js";
 import type { DraftHistoryEntry } from "../../adapters/negotiation/types.js";
 import type { StructuredObligation, DatedEntry } from "../executors/negotiationHistory.js";
@@ -33,6 +36,22 @@ export type ContextPurpose =
   | "PAYMENT_REPLY"
   | "CONTENT_SUBMISSION"
   | "OPERATOR_REVIEW";
+
+// PLU-137 §2a (Defect 4): the SET of purposes authorized to load the PRIVATE
+// negotiation-policy snapshot. A purpose predicate — reads `purpose` ONLY, never a
+// fee field, so no fee value can ever gate whether policy loads (E12 by construction).
+// Only NEGOTIATION_DECISION is a live purpose today (the sole call site is
+// negotiation.ts); OPERATOR_REVIEW is included for forward-safety (an authorized
+// internal view). EMAIL_DRAFT / creator-facing purposes are excluded — draft context
+// must never load private policy at all.
+const AUTHORIZED_DECISION_PURPOSES = new Set<ContextPurpose>([
+  "NEGOTIATION_DECISION",
+  "OPERATOR_REVIEW",
+]);
+
+export function isAuthorizedDecisionPurpose(purpose: ContextPurpose): boolean {
+  return AUTHORIZED_DECISION_PURPOSES.has(purpose);
+}
 
 // ---------------------------------------------------------------------------
 // Forward-compat optional-slot types (§9)
@@ -104,6 +123,37 @@ export interface CampaignConstraints {
   bandPresent: boolean;
 }
 
+/** PLU-137 §3a — the private negotiation-policy authority, projected from the pinned
+ *  NegotiationPolicySnapshot. Lives ONLY on the decision-facing surface
+ *  (DecisionContext); DraftContext has NO field of this type at all (structural
+ *  exclusion — the money-safety property, mirror of `campaignConstraints`). Attached
+ *  to AssembledContext / DecisionContext ONLY when a policy snapshot was loaded
+ *  (emptiness contract — omitted on legacy/no-snapshot turns so the decision payload
+ *  stays byte-identical). Every field independently nullable: a GIFT/affiliate deal
+ *  legitimately has null floor/ceiling/preferred but still provides non-fee policy
+ *  (E12 corollary — no fee field gates whether it loads). */
+export interface PolicyAuthority {
+  floorCents: number | null;
+  ceilingCents: number | null;
+  preferredFeeCents: number | null;
+  // PLU-136 1b.b — the bare commissionRate scalar was split into private
+  // floor/ceiling/preferred (mirroring the fee fields). publicCommissionRate
+  // is the PUBLIC number and lives on CampaignTermsSnapshot, never here.
+  commissionFloorRate: number | null;
+  commissionCeilingRate: number | null;
+  preferredCommissionRate: number | null;
+  maxRounds: number | null;
+  openingOfferPosition: number | null;
+  overCeilingTolerance: number | null;
+  negotiationGuidance: string | null;
+  // PLU-136 1b.b — private gift-negotiation authority (only meaningful when the
+  // campaign includes gifting / is GIFT_ONLY). Nullable like every other field.
+  giftSubstitutionAllowed: boolean | null;
+  giftValueFlexibilityCents: number | null;
+  negotiableTerms: unknown;
+  nonNegotiableTerms: unknown;
+}
+
 export interface AssembledContext {
   // The purpose this context was built for. Drives the debug/token estimate; both
   // projections are derivable regardless (§4.5).
@@ -161,6 +211,19 @@ export interface AssembledContext {
   // Decision-only compartment: band presence + non-negotiable money terms.
   // STRUCTURALLY ABSENT from DraftContext (§4.3).
   campaignConstraints: CampaignConstraints;
+
+  // PLU-137 §2a — the pinned launch snapshots (undefined on legacy/no-snapshot
+  // turns). `termsSnapshot` = frozen PUBLIC terms; `policySnapshot` = frozen PRIVATE
+  // authority, loaded ONLY for an authorized decision purpose (build.ts gate).
+  termsSnapshot?: CampaignTermsSnapshot | undefined;
+  policySnapshot?: NegotiationPolicySnapshot | undefined;
+  // PLU-137 §5 — true when a material term fell back to nodeGraph/mergedConfig
+  // because no valid snapshot was pinned (legacy compatibility, logged via §4a).
+  legacyFallbackUsed: boolean;
+  // PLU-137 §2b/§3d (Defect 1) — set (NOT thrown) when a pinned id is missing/
+  // mismatched/cross-campaign. The executor RETURNS a MANUAL_REVIEW NodeResult; the
+  // builder never throws across the executor boundary (a throw dead-letters the job).
+  integrityFailure?: { reason: string } | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +243,8 @@ export interface ContextDebug {
   estimatedTokens: number;
   /** Band PRESENCE only — never the floor/ceiling values (§7.5). */
   bandPresent: boolean;
+  /** PLU-137 — policy-snapshot PRESENCE only (mirror of bandPresent), never values. */
+  policyPresent: boolean;
 }
 
 /** The sanitized record folded onto the NEGOTIATION_TURN payload (§7.2). Every
@@ -195,6 +260,11 @@ export interface ContextRecord {
   estimatedTokens: number; // §7.3 coarse proxy, labeled as such
   sourcesUsed: string[]; // §7.4 provenance labels
   bandPresent: boolean; // band PRESENCE only — never values (§7.5)
+  // PLU-137 §4a — snapshot ids + booleans + reason string ONLY, never policy VALUES.
+  termsSnapshotId?: string; // pinned CampaignTermsSnapshot id (undefined = legacy)
+  policySnapshotId?: string; // pinned NegotiationPolicySnapshot id — authorized-decision purposes ONLY
+  legacyFallbackUsed: boolean; // a material term came from nodeGraph (no snapshot)
+  integrityFailureReason?: string; // §3d — set when a pinned snapshot was missing/mismatched
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +279,10 @@ export interface DecisionContext {
   decisionHistory: PriorNegotiationContext;
   /** Band presence + money terms live HERE (never on DraftContext, §4.3). */
   campaignConstraints: CampaignConstraints;
+  /** PLU-137 §3a — the private policy authority from the pinned snapshot. Present
+   *  ONLY when a policy snapshot was loaded (emptiness contract); DraftContext has
+   *  NO field of this type at all (structural exclusion, §3b). */
+  policyAuthority?: PolicyAuthority | undefined;
   creatorReply: string;
   round: number;
   debug: ContextDebug;
@@ -225,8 +299,12 @@ export interface DraftContext {
    *  read (§5.6) — the builder exposes the slot but does not compute it. */
   openCommitments: string[];
   creatorMemory?: CreatorMemoryPayload | undefined;
+  /** PLU-137 §3b — policy-snapshot PRESENCE only (mirror of the band's presence
+   *  flag). Raw policy VALUES live only on DecisionContext.policyAuthority and are
+   *  UNREACHABLE from this projection — the type has no field for them. */
+  policyPresent: boolean;
   debug: ContextDebug;
-  // NO campaignConstraints, NO termFloor/termCeiling.
+  // NO campaignConstraints, NO policyAuthority, NO termFloor/termCeiling.
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +323,24 @@ export interface ContextDeps {
     instanceId: string,
     purpose: ContextPurpose,
   ) => Promise<ConversationSummary | undefined>;
+  /** PLU-137 §2b loader. Loads the two pinned launch snapshots off the instance.
+   *  Gates the PRIVATE policy load on isAuthorizedDecisionPurpose(purpose) — reads
+   *  `purpose` only, never a fee field (E12). Returns `integrityFailure` (NOT a
+   *  throw, Defect 1) when a pinned id is set but its row is missing or belongs to a
+   *  different campaign. Default stub returns `{}` (builder byte-identical when unused). */
+  loadSnapshots?: (
+    instance: ExecutionInstance,
+    purpose: ContextPurpose,
+    client: Db | DbTx,
+  ) => Promise<SnapshotLoadResult>;
+}
+
+/** PLU-137 §2b — the loadSnapshots result. All fields optional/absent for a legacy
+ *  no-snapshot turn. `policy` present ONLY for an authorized decision purpose. */
+export interface SnapshotLoadResult {
+  terms?: CampaignTermsSnapshot | undefined;
+  policy?: NegotiationPolicySnapshot | undefined;
+  integrityFailure?: { reason: string } | undefined;
 }
 
 /** The already-fetched rows + resolved brief + loaded optional slots. assembleContext
@@ -262,6 +358,11 @@ export interface AssembleInputs {
   resolvedBrief: ResolvedBrief;
   creatorMemory?: CreatorMemoryPayload | undefined;
   conversationSummary?: ConversationSummary | undefined;
+  // PLU-137 §2b — the loaded pinned snapshots (absent on a legacy no-snapshot turn)
+  // + the integrity outcome, threaded from the shell into the pure core.
+  termsSnapshot?: CampaignTermsSnapshot | undefined;
+  policySnapshot?: NegotiationPolicySnapshot | undefined;
+  integrityFailure?: { reason: string } | undefined;
   latestMessageId?: string | undefined;
   /** §6.2 — mergeCampaignFallback(node.config, campaign), computed ONCE by the
    *  executor before its preconditions and threaded through the I/O shell. Fed to

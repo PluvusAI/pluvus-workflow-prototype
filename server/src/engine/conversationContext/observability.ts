@@ -6,6 +6,7 @@
 // values NEVER enter this (§7.5).
 
 import { toDecisionContext } from "./projections.js";
+import { isAuthorizedDecisionPurpose } from "./types.js";
 import type { AssembledContext, ContextRecord } from "./types.js";
 
 /**
@@ -31,5 +32,16 @@ export function buildContextRecord(ctx: AssembledContext): ContextRecord {
     estimatedTokens: decision.debug.estimatedTokens,
     sourcesUsed: decision.debug.sourcesUsed,
     bandPresent: ctx.campaignConstraints.bandPresent,
+    // PLU-137 §4a — snapshot ids + booleans + reason string ONLY, never policy VALUES.
+    // termsSnapshotId is a public-terms pointer (always safe); policySnapshotId is a
+    // PRIVATE-authority pointer, emitted ONLY for an authorized decision purpose
+    // (Defect 4) — reads `purpose` only, never a fee field (E12). The guidance/floor/
+    // ceiling VALUES never enter this record (same rule the band follows).
+    ...(ctx.termsSnapshot ? { termsSnapshotId: ctx.termsSnapshot.id } : {}),
+    ...(ctx.policySnapshot && isAuthorizedDecisionPurpose(ctx.purpose)
+      ? { policySnapshotId: ctx.policySnapshot.id }
+      : {}),
+    legacyFallbackUsed: ctx.legacyFallbackUsed,
+    ...(ctx.integrityFailure ? { integrityFailureReason: ctx.integrityFailure.reason } : {}),
   };
 }
