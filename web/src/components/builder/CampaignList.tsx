@@ -1,6 +1,6 @@
 import { useState } from "react";
-import { Trash2, ChevronDown, FolderOpen, AlertTriangle } from "lucide-react";
-import { useCampaigns, useCampaign, deleteCampaign } from "../../api/builderClient";
+import { Trash2, ChevronDown, FolderOpen, AlertTriangle, Pencil, Copy } from "lucide-react";
+import { useCampaigns, useCampaign, deleteCampaign, duplicateCampaign } from "../../api/builderClient";
 import { colors, radii, font, text, formatTimestamp } from "../../theme";
 import {
   Button,
@@ -13,21 +13,24 @@ import {
   IconButton,
   useToast,
 } from "../ds";
-import { CampaignWizard } from "./CampaignWizard";
+import { StartCampaignModal } from "./campaignIntake/StartCampaignModal";
 import type { CampaignListItem } from "../../api/builderTypes";
 
 interface Props {
   onSelectWorkflow: (workflowId: string) => void;
+  /** PLU-139 (2a): open a campaign's sectioned brief intake. */
+  onOpenIntake: (campaignId: string) => void;
 }
 
-export function CampaignList({ onSelectWorkflow }: Props) {
+export function CampaignList({ onSelectWorkflow, onOpenIntake }: Props) {
   const { data: campaigns, isLoading, isError, refetch } = useCampaigns();
   const [showWizard, setShowWizard] = useState(false);
 
-  function handleCreated(workflowId: string) {
+  // New campaign → mint a DRAFT + workflow, then open its brief intake.
+  function handleCreated(campaignId: string) {
     setShowWizard(false);
     void refetch();
-    onSelectWorkflow(workflowId);
+    onOpenIntake(campaignId);
   }
 
   return (
@@ -99,6 +102,8 @@ export function CampaignList({ onSelectWorkflow }: Props) {
                 key={c.id}
                 campaign={c}
                 onSelectWorkflow={onSelectWorkflow}
+                onOpenIntake={onOpenIntake}
+                onChanged={() => void refetch()}
                 onDeleted={() => void refetch()}
               />
             ))}
@@ -108,7 +113,7 @@ export function CampaignList({ onSelectWorkflow }: Props) {
       </div>
 
       {showWizard && (
-        <CampaignWizard onCreated={handleCreated} onClose={() => setShowWizard(false)} />
+        <StartCampaignModal onCreated={handleCreated} onClose={() => setShowWizard(false)} />
       )}
     </div>
   );
@@ -117,14 +122,19 @@ export function CampaignList({ onSelectWorkflow }: Props) {
 function CampaignCard({
   campaign,
   onSelectWorkflow,
+  onOpenIntake,
+  onChanged,
   onDeleted,
 }: {
   campaign: CampaignListItem;
   onSelectWorkflow: (id: string) => void;
+  onOpenIntake: (id: string) => void;
+  onChanged: () => void;
   onDeleted: () => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [duplicating, setDuplicating] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const toast = useToast();
 
@@ -144,6 +154,22 @@ function CampaignCard({
     }
   }
 
+  // PLU-139: "Duplicate as new campaign" → clone on the server, open the new
+  // draft's brief. Available for any campaign (the material-change path for a
+  // launched one, per PLU-136 1b).
+  async function handleDuplicate() {
+    setDuplicating(true);
+    try {
+      const dup = await duplicateCampaign(campaign.id);
+      toast.success(`Duplicated as “${dup.name}”.`);
+      onChanged();
+      onOpenIntake(dup.id);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to duplicate campaign.");
+      setDuplicating(false);
+    }
+  }
+
   const publishedCount =
     detail.data?.workflows.filter((w) => w.status === "PUBLISHED").length ?? null;
 
@@ -157,6 +183,13 @@ function CampaignCard({
               <span style={{ ...text.heading }}>{campaign.name}</span>
               <Badge color={colors.textMuted} small>
                 {campaign.brand}
+              </Badge>
+              <Badge
+                color={campaign.status === "DRAFT" ? colors.warning : colors.success}
+                dot
+                small
+              >
+                {campaign.status === "DRAFT" ? "Draft" : "Active"}
               </Badge>
             </div>
             <div
@@ -174,14 +207,29 @@ function CampaignCard({
               {campaign.objective || "No objective set"}
             </div>
           </div>
-          <IconButton
-            label="Delete campaign"
-            icon={<Trash2 size={15} strokeWidth={1.75} />}
-            onClick={() => setConfirmDelete(true)}
-            disabled={deleting}
-            className="ds-danger-hover"
-            style={{ color: colors.textDim, opacity: 0.75, flexShrink: 0 }}
-          />
+          <div style={{ display: "flex", alignItems: "center", gap: 2, flexShrink: 0 }}>
+            <IconButton
+              label={campaign.status === "DRAFT" ? "Edit brief" : "View brief"}
+              icon={<Pencil size={15} strokeWidth={1.75} />}
+              onClick={() => onOpenIntake(campaign.id)}
+              style={{ color: colors.textDim, opacity: 0.75 }}
+            />
+            <IconButton
+              label="Duplicate as new campaign"
+              icon={<Copy size={15} strokeWidth={1.75} />}
+              onClick={() => void handleDuplicate()}
+              disabled={duplicating}
+              style={{ color: colors.textDim, opacity: 0.75 }}
+            />
+            <IconButton
+              label="Delete campaign"
+              icon={<Trash2 size={15} strokeWidth={1.75} />}
+              onClick={() => setConfirmDelete(true)}
+              disabled={deleting}
+              className="ds-danger-hover"
+              style={{ color: colors.textDim, opacity: 0.75 }}
+            />
+          </div>
         </div>
 
         {/* Stat row (derived from data we already have) */}

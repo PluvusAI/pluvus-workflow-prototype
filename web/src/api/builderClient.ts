@@ -147,6 +147,13 @@ export function createCampaign(data: {
   return postJson<{ id: string; name: string }>("/api/campaigns", data);
 }
 
+// PATCH /campaigns/:id. The server (routes/campaigns.ts) routes each field to the
+// Campaign row or its CampaignDetails row and rejects everything with 409 once the
+// campaign is ACTIVE. This type was previously narrower than the route: the
+// CampaignDetails knowledge fields (usageRights/…) and the whole PLU-136
+// compensation block were already accepted server-side but not typed here. Widened
+// (additively) so the sectioned intake (PLU-139 2a) can PATCH them. Returns the
+// full flattened CampaignDetail-shaped object.
 export function updateCampaign(
   id: string,
   data: {
@@ -158,6 +165,23 @@ export function updateCampaign(
     timeline?: string | null;
     rewardDescription?: string | null;
     shipsPhysicalProduct?: boolean;
+    // PLU-135 creator-facing knowledge fields (CampaignDetails).
+    usageRights?: string | null;
+    exclusivity?: string | null;
+    paymentTerms?: string | null;
+    attributionWindow?: string | null;
+    targetUrl?: string | null;
+    hiddenParamKey?: string | null;
+    // PLU-136 compensation contract (CampaignDetails). Editable while DRAFT.
+    campaignType?: CampaignType;
+    includesGifting?: boolean;
+    giftDisposition?: GiftDisposition | null;
+    priceStrategy?: PriceStrategy | null;
+    publicStartingFeeCents?: number | null;
+    publicCommissionRate?: number | null;
+    commissionDurationDays?: number | null;
+    commissionConditions?: string | null;
+    compensationReviewStatus?: CompensationReviewStatus;
     postAcceptanceMode?: PostAcceptanceMode;
   dailyInitialOutreachLimit?: number;
   outreachPacingMinMinutes?: number;
@@ -168,18 +192,18 @@ export function updateCampaign(
   emailAccountId?: string | null;
   },
 ) {
-  return apiFetch<{
-    id: string;
-    dailyInitialOutreachLimit: number | null;
-    outreachPacingMinMinutes: number | null;
-    outreachPacingMaxMinutes: number | null;
-    negotiationReplyPacingMinMinutes: number | null;
-    negotiationReplyPacingMaxMinutes: number | null;
-  }>(`/api/campaigns/${id}`, {
+  return apiFetch<CampaignDetail>(`/api/campaigns/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+}
+
+/** PLU-136 (1b) / PLU-139: "Duplicate as new campaign" — POST to the existing
+ *  server route, which copies scalars + CampaignDetails + BrandIdentity +
+ *  CreatorRequirement + policy into a fresh DRAFT (no history) and returns it. */
+export function duplicateCampaign(id: string) {
+  return postJson<CampaignDetail>(`/api/campaigns/${id}/duplicate`, {});
 }
 
 export function deleteCampaign(id: string): Promise<void> {

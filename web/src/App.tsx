@@ -14,6 +14,7 @@
 import { Suspense, lazy, useState, useEffect, useCallback } from "react";
 import { Sun, Moon } from "lucide-react";
 import { CampaignList } from "./components/builder/CampaignList";
+import { CampaignIntake } from "./components/builder/campaignIntake/CampaignIntake";
 import { WorkflowBuilder } from "./components/builder/WorkflowBuilder";
 import { ToastProvider } from "./components/ds";
 import { useThemeMode } from "./theme-mode";
@@ -26,27 +27,36 @@ const PartnersView = lazy(() =>
   import("./components/partners/PartnersView").then((m) => ({ default: m.PartnersView })),
 );
 
-type View = "campaigns" | "builder" | "observe" | "partners";
+type View = "campaigns" | "builder" | "observe" | "partners" | "intake";
 
 interface Route {
   view: View;
   activeWorkflowId: string | null;
+  // PLU-139 (2a): the campaign whose sectioned brief intake is open. Deep-linked
+  // as `#/intake/<campaignId>` so a refresh reopens the same campaign's brief.
+  activeCampaignId: string | null;
 }
 
 // -- URL hash <-> route serialization ---------------------------------------
-// Formats: `#/campaigns`, `#/observe`, `#/builder/<workflowId>`.
+// Formats: `#/campaigns`, `#/observe`, `#/builder/<workflowId>`, `#/intake/<campaignId>`.
 function parseHash(): Route {
   const raw = (typeof window !== "undefined" ? window.location.hash : "").replace(/^#\/?/, "");
   const [view, id] = raw.split("/");
-  if (view === "builder" && id) return { view: "builder", activeWorkflowId: decodeURIComponent(id) };
-  if (view === "observe") return { view: "observe", activeWorkflowId: null };
-  if (view === "partners") return { view: "partners", activeWorkflowId: null };
-  return { view: "campaigns", activeWorkflowId: null };
+  if (view === "builder" && id)
+    return { view: "builder", activeWorkflowId: decodeURIComponent(id), activeCampaignId: null };
+  if (view === "intake" && id)
+    return { view: "intake", activeWorkflowId: null, activeCampaignId: decodeURIComponent(id) };
+  if (view === "observe") return { view: "observe", activeWorkflowId: null, activeCampaignId: null };
+  if (view === "partners") return { view: "partners", activeWorkflowId: null, activeCampaignId: null };
+  return { view: "campaigns", activeWorkflowId: null, activeCampaignId: null };
 }
 
 function routeToHash(r: Route): string {
   if (r.view === "builder" && r.activeWorkflowId) {
     return `#/builder/${encodeURIComponent(r.activeWorkflowId)}`;
+  }
+  if (r.view === "intake" && r.activeCampaignId) {
+    return `#/intake/${encodeURIComponent(r.activeCampaignId)}`;
   }
   if (r.view === "observe") return "#/observe";
   if (r.view === "partners") return "#/partners";
@@ -54,15 +64,15 @@ function routeToHash(r: Route): string {
 }
 
 export default function App() {
-  const [{ view, activeWorkflowId }, setRoute] = useState<Route>(parseHash);
+  const [{ view, activeWorkflowId, activeCampaignId }, setRoute] = useState<Route>(parseHash);
 
   // Keep the URL hash in sync with the current route (so refresh restores it).
   useEffect(() => {
-    const target = routeToHash({ view, activeWorkflowId });
+    const target = routeToHash({ view, activeWorkflowId, activeCampaignId });
     if (window.location.hash !== target) {
       window.history.replaceState(null, "", target);
     }
-  }, [view, activeWorkflowId]);
+  }, [view, activeWorkflowId, activeCampaignId]);
 
   // Respond to browser back/forward + manual hash edits.
   useEffect(() => {
@@ -72,15 +82,24 @@ export default function App() {
   }, []);
 
   const setView = useCallback((v: View) => {
-    setRoute((prev) => ({ view: v, activeWorkflowId: v === "builder" ? prev.activeWorkflowId : null }));
+    setRoute((prev) => ({
+      view: v,
+      activeWorkflowId: v === "builder" ? prev.activeWorkflowId : null,
+      activeCampaignId: v === "intake" ? prev.activeCampaignId : null,
+    }));
   }, []);
 
   const openWorkflow = useCallback((id: string) => {
-    setRoute({ view: "builder", activeWorkflowId: id });
+    setRoute({ view: "builder", activeWorkflowId: id, activeCampaignId: null });
+  }, []);
+
+  // PLU-139 (2a): open a campaign's sectioned brief intake.
+  const openIntake = useCallback((campaignId: string) => {
+    setRoute({ view: "intake", activeWorkflowId: null, activeCampaignId: campaignId });
   }, []);
 
   const backToCampaigns = useCallback(() => {
-    setRoute({ view: "campaigns", activeWorkflowId: null });
+    setRoute({ view: "campaigns", activeWorkflowId: null, activeCampaignId: null });
   }, []);
 
   return (
@@ -88,11 +107,25 @@ export default function App() {
       <div style={{ display: "flex", flexDirection: "column", height: "100vh", background: colors.bg }}>
         <AppTopbar view={view} onChangeView={setView} />
         <div style={{ flex: 1, minHeight: 0 }}>
-          {view === "campaigns" && <CampaignList onSelectWorkflow={openWorkflow} />}
+          {view === "campaigns" && (
+            <CampaignList onSelectWorkflow={openWorkflow} onOpenIntake={openIntake} />
+          )}
+          {view === "intake" && activeCampaignId && (
+            <CampaignIntake
+              campaignId={activeCampaignId}
+              onBack={backToCampaigns}
+              onOpenCampaign={openIntake}
+            />
+          )}
+          {view === "intake" && !activeCampaignId && (
+            <CampaignList onSelectWorkflow={openWorkflow} onOpenIntake={openIntake} />
+          )}
           {view === "builder" && activeWorkflowId && (
             <WorkflowBuilder workflowId={activeWorkflowId} onBack={backToCampaigns} />
           )}
-          {view === "builder" && !activeWorkflowId && <CampaignList onSelectWorkflow={openWorkflow} />}
+          {view === "builder" && !activeWorkflowId && (
+            <CampaignList onSelectWorkflow={openWorkflow} onOpenIntake={openIntake} />
+          )}
           {view === "observe" && (
             <Suspense fallback={<Center>Loading observability…</Center>}>
               <ObservabilityView />

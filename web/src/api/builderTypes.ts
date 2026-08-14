@@ -163,10 +163,16 @@ export type PriceStrategy = "REQUEST_RATE_CARD" | "PROPOSE_STARTING_FEE";
  *  automatically (an explicit, verified selection). */
 export type CompensationReviewStatus = "NEEDS_REVIEW" | "CONFIRMED";
 
+/** PLU-135 (1a): campaign lifecycle. DRAFT is editable; ACTIVE means launched —
+ *  CampaignDetails/BrandIdentity/CreatorRequirement writes are rejected (409). */
+export type CampaignStatus = "DRAFT" | "ACTIVE";
+
 export interface CampaignListItem {
   id: string;
   name: string;
   brand: string;
+  /** PLU-135 (1a): DRAFT (editable) | ACTIVE (launched, locked). */
+  status: CampaignStatus;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;
@@ -198,6 +204,16 @@ export interface CampaignListItem {
   commissionDurationDays: number | null;
   commissionConditions: string | null;
   compensationReviewStatus: CompensationReviewStatus | null;
+  // PLU-135: creator-facing knowledge fields (live on CampaignDetails). Stated
+  // verbatim by the agent when a creator asks; deferred honestly when null.
+  usageRights: string | null;
+  exclusivity: string | null;
+  paymentTerms: string | null;
+  attributionWindow: string | null;
+  targetUrl: string | null;
+  hiddenParamKey: string | null;
+  /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
+  duplicatedFromCampaignId: string | null;
   createdAt: string;
   updatedAt: string;
   workflowCount: number;
@@ -232,6 +248,8 @@ export interface CampaignDetail {
   id: string;
   name: string;
   brand: string;
+  /** PLU-135 (1a): DRAFT (editable) | ACTIVE (launched, locked). */
+  status: CampaignStatus;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;
@@ -260,6 +278,15 @@ export interface CampaignDetail {
   commissionDurationDays: number | null;
   commissionConditions: string | null;
   compensationReviewStatus: CompensationReviewStatus | null;
+  // PLU-135: creator-facing knowledge fields (live on CampaignDetails).
+  usageRights: string | null;
+  exclusivity: string | null;
+  paymentTerms: string | null;
+  attributionWindow: string | null;
+  targetUrl: string | null;
+  hiddenParamKey: string | null;
+  /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
+  duplicatedFromCampaignId: string | null;
   createdAt: string;
   updatedAt: string;
   workflows: CampaignWorkflowItem[];
