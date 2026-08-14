@@ -170,6 +170,7 @@ export function updateCampaign(
     exclusivity?: string | null;
     paymentTerms?: string | null;
     attributionWindow?: string | null;
+    keyMessages?: string | null;
     targetUrl?: string | null;
     hiddenParamKey?: string | null;
     // PLU-136 compensation contract (CampaignDetails). Editable while DRAFT.

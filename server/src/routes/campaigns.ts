@@ -83,6 +83,7 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     exclusivity: details?.exclusivity ?? null,
     paymentTerms: details?.publicPaymentTerms ?? null,
     attributionWindow: details?.attributionWindow ?? null,
+    keyMessages: details?.keyMessages ?? null,
     targetUrl: campaign.targetUrl,
     hiddenParamKey: campaign.hiddenParamKey,
     postAcceptanceMode: campaign.postAcceptanceMode,
@@ -505,6 +506,9 @@ router.patch("/:id", async (req: Request, res: Response) => {
     commissionDurationDays,
     commissionConditions,
     compensationReviewStatus,
+    paymentTerms,
+    attributionWindow,
+    keyMessages,
   } = req.body as {
     notifyEmail?: string | null;
     objective?: string | null;
@@ -526,6 +530,11 @@ router.patch("/:id", async (req: Request, res: Response) => {
     commissionDurationDays?: number | null;
     commissionConditions?: string | null;
     compensationReviewStatus?: string;
+    // Public offer fields the create path already accepts but PATCH did not,
+    // so the sectioned intake (PATCH-based autosave) could never edit them.
+    paymentTerms?: string | null;
+    attributionWindow?: string | null;
+    keyMessages?: string | null;
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
@@ -631,6 +640,18 @@ router.patch("/:id", async (req: Request, res: Response) => {
   if (commissionConditions !== undefined) {
     detailsPatch.commissionConditions =
       typeof commissionConditions === "string" ? commissionConditions.trim() || null : null;
+  }
+  if (paymentTerms !== undefined) {
+    detailsPatch.publicPaymentTerms =
+      typeof paymentTerms === "string" ? paymentTerms.trim() || null : null;
+  }
+  if (attributionWindow !== undefined) {
+    detailsPatch.attributionWindow =
+      typeof attributionWindow === "string" ? attributionWindow.trim() || null : null;
+  }
+  if (keyMessages !== undefined) {
+    detailsPatch.keyMessages =
+      typeof keyMessages === "string" ? keyMessages.trim() || null : null;
   }
   if (compensationReviewStatus !== undefined) {
     if (!isCompensationReviewStatus(compensationReviewStatus)) {

@@ -210,6 +210,7 @@ export interface CampaignListItem {
   exclusivity: string | null;
   paymentTerms: string | null;
   attributionWindow: string | null;
+  keyMessages: string | null;
   targetUrl: string | null;
   hiddenParamKey: string | null;
   /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
@@ -283,6 +284,7 @@ export interface CampaignDetail {
   exclusivity: string | null;
   paymentTerms: string | null;
   attributionWindow: string | null;
+  keyMessages: string | null;
   targetUrl: string | null;
   hiddenParamKey: string | null;
   /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */

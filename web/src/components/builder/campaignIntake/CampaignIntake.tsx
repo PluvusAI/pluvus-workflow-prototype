@@ -135,9 +135,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       brandDescription: c.brandDescription ?? "",
       deliverables: c.deliverables ?? "",
       notes: c.notes ?? "",
+      keyMessages: c.keyMessages ?? "",
       timeline: c.timeline ?? "",
       usageRights: c.usageRights ?? "",
       exclusivity: c.exclusivity ?? "",
+      paymentTerms: c.paymentTerms ?? "",
+      attributionWindow: c.attributionWindow ?? "",
       campaignType: (c.campaignType ?? "PAID") as CampaignType,
       priceStrategy: (c.priceStrategy ?? "REQUEST_RATE_CARD") as PriceStrategy,
       publicStartingFeeCents: centsToDollars(c.publicStartingFeeCents),
@@ -201,6 +204,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       brandDescription: strOrNull(d.brandDescription),
       deliverables: strOrNull(d.deliverables),
       notes: strOrNull(d.notes),
+      keyMessages: strOrNull(d.keyMessages),
       timeline: strOrNull(d.timeline),
       usageRights: strOrNull(d.usageRights),
       exclusivity: strOrNull(d.exclusivity),
@@ -215,9 +219,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.priceStrategy = comp.priceStrategy;
       p.publicStartingFeeCents =
         comp.priceStrategy === "PROPOSE_STARTING_FEE" ? dollarsToCents(d.publicStartingFeeCents) : null;
+      p.paymentTerms = strOrNull(d.paymentTerms);
     } else {
       p.priceStrategy = null;
       p.publicStartingFeeCents = null;
+      p.paymentTerms = null;
     }
 
     // Commission — only for affiliate/hybrid; cleared otherwise.
@@ -225,10 +231,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.publicCommissionRate = numOrNull(d.publicCommissionRate);
       p.commissionDurationDays = numOrNull(d.commissionDurationDays);
       p.commissionConditions = strOrNull(d.commissionConditions);
+      p.attributionWindow = strOrNull(d.attributionWindow);
     } else {
       p.publicCommissionRate = null;
       p.commissionDurationDays = null;
       p.commissionConditions = null;
+      p.attributionWindow = null;
     }
 
     // Gift details — for gift-only or additive gifting; cleared otherwise.

@@ -365,14 +365,23 @@ export const SECTIONS: SectionSpec[] = [
       "Creative direction for the content. (Structured brief fields from worksheet Page 5 aren't in the data model yet — this collects guidelines as notes for now.)",
     fields: [
       {
+        key: "keyMessages",
+        group: "campaign",
+        control: "textarea",
+        label: "Core message", // COPY:PLU-159
+        hint: "The campaign through-line every piece of content should reflect. The agent only states messaging you provide.", // COPY:PLU-159
+        placeholder: "e.g. Our shoes are the lightest running shoe under $120.", // COPY:PLU-159
+        source: "S5.3",
+      },
+      {
         key: "notes",
         group: "campaign",
         control: "textarea",
         label: "Content requirements & guidelines", // COPY:PLU-159
-        hint: "Content restrictions, music/sound, subtitles, core message, tone. Structured fields land with PLU-159's brief builder.", // COPY:PLU-159
+        hint: "Content restrictions, music/sound, subtitles, tone. Structured brief fields land with PLU-159's brief builder.", // COPY:PLU-159
         placeholder:
           "e.g. Show the product in use in the first 3 seconds. No competitor mentions. Add captions.", // COPY:PLU-159
-        source: "S5.2–S5.7",
+        source: "S5.2/S5.4–S5.7",
       },
     ],
   },
@@ -447,6 +456,16 @@ export const SECTIONS: SectionSpec[] = [
         source: "S7.P1",
         visibleWhen: showsStartingFee,
       },
+      {
+        key: "paymentTerms",
+        group: "campaign",
+        control: "text",
+        label: "Payment terms", // COPY:PLU-159
+        hint: "When the creator is paid, e.g. Pay after post · 50% upfront / 50% after · Full upfront.", // COPY:PLU-159
+        placeholder: "e.g. Pay after post", // COPY:PLU-159
+        source: "S7.P2",
+        visibleWhen: (c) => needsFee(c.campaignType),
+      },
       // Affiliate / Hybrid — commission.
       {
         key: "publicCommissionRate",
@@ -478,6 +497,16 @@ export const SECTIONS: SectionSpec[] = [
         label: "Commission conditions", // COPY:PLU-159
         placeholder: "e.g. applies to first-time customers only", // COPY:PLU-159
         source: "S7.A2",
+        visibleWhen: (c) => needsCommission(c.campaignType),
+      },
+      {
+        key: "attributionWindow",
+        group: "campaign",
+        control: "text",
+        label: "Attribution window", // COPY:PLU-159
+        hint: "How long a click/sale is credited to the creator, e.g. 30 days · Customer lifetime.", // COPY:PLU-159
+        placeholder: "e.g. 30 days", // COPY:PLU-159
+        source: "S7.A4",
         visibleWhen: (c) => needsCommission(c.campaignType),
       },
       // Gift — additive toggle (Paid/Affiliate/Hybrid) or implied (Gift-only).

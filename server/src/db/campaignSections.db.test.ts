@@ -15,7 +15,11 @@ import { drizzle } from "drizzle-orm/pglite";
 import { eq } from "drizzle-orm";
 import * as schema from "./schema.js";
 import type { Db } from "./drizzle.js";
-import { CampaignLockedError } from "./campaignDetails.js";
+import {
+  CampaignLockedError,
+  upsertCampaignDetails,
+  getCampaignDetails,
+} from "./campaignDetails.js";
 import {
   getBrandIdentity,
   getBrandIdentitiesByCampaignIds,
@@ -140,6 +144,27 @@ async function main(): Promise<void> {
     await upsertCreatorRequirement(id, { minFollowers: 5000 }, pgdb);
     assert.equal((await getBrandIdentity(id, pgdb))?.logoRef, "ok");
     assert.equal((await getCreatorRequirement(id, pgdb))?.minFollowers, 5000);
+  });
+
+  // ── previously-unreachable CampaignDetails columns now editable (PLU-139 2a) ──
+  // publicPaymentTerms / attributionWindow / keyMessages existed as columns but no
+  // PATCH wrote them, so the sectioned intake could never edit them. Prove they
+  // round-trip through the upsert the route now delegates to.
+  await test("upsertCampaignDetails persists paymentTerms/attributionWindow/keyMessages", async () => {
+    const id = await seedCampaign(pgdb);
+    await upsertCampaignDetails(
+      id,
+      {
+        publicPaymentTerms: "50% upfront / 50% after",
+        attributionWindow: "30 days",
+        keyMessages: "Lightest shoe under $120",
+      },
+      pgdb,
+    );
+    const d = await getCampaignDetails(id, pgdb);
+    assert.equal(d?.publicPaymentTerms, "50% upfront / 50% after");
+    assert.equal(d?.attributionWindow, "30 days");
+    assert.equal(d?.keyMessages, "Lightest shoe under $120");
   });
 
   // ── draft-lock atomicity (Greptile P1) ───────────────────────────────────────
