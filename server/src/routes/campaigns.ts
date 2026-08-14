@@ -94,6 +94,8 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     paymentTerms: details?.publicPaymentTerms ?? null,
     attributionWindow: details?.attributionWindow ?? null,
     keyMessages: details?.keyMessages ?? null,
+    contentRequirements: details?.contentRequirements ?? null,
+    prohibitedClaims: details?.prohibitedClaims ?? null,
     targetUrl: campaign.targetUrl,
     hiddenParamKey: campaign.hiddenParamKey,
     postAcceptanceMode: campaign.postAcceptanceMode,
@@ -519,6 +521,8 @@ router.patch("/:id", async (req: Request, res: Response) => {
     paymentTerms,
     attributionWindow,
     keyMessages,
+    contentRequirements,
+    prohibitedClaims,
   } = req.body as {
     notifyEmail?: string | null;
     objective?: string | null;
@@ -545,6 +549,10 @@ router.patch("/:id", async (req: Request, res: Response) => {
     paymentTerms?: string | null;
     attributionWindow?: string | null;
     keyMessages?: string | null;
+    // CampaignDetails columns that existed but had no read/write path at all
+    // (not in flatten/create/PATCH) — the last two unreachable content fields.
+    contentRequirements?: string | null;
+    prohibitedClaims?: string | null;
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
@@ -662,6 +670,14 @@ router.patch("/:id", async (req: Request, res: Response) => {
   if (keyMessages !== undefined) {
     detailsPatch.keyMessages =
       typeof keyMessages === "string" ? keyMessages.trim() || null : null;
+  }
+  if (contentRequirements !== undefined) {
+    detailsPatch.contentRequirements =
+      typeof contentRequirements === "string" ? contentRequirements.trim() || null : null;
+  }
+  if (prohibitedClaims !== undefined) {
+    detailsPatch.prohibitedClaims =
+      typeof prohibitedClaims === "string" ? prohibitedClaims.trim() || null : null;
   }
   if (compensationReviewStatus !== undefined) {
     if (!isCompensationReviewStatus(compensationReviewStatus)) {

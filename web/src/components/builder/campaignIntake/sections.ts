@@ -358,11 +358,11 @@ export const SECTIONS: SectionSpec[] = [
     key: "contentGuidelines",
     title: "Content guidelines", // COPY:PLU-159
     blurb:
-      // COPY:PLU-159 — the shipped CampaignDetails has NO dedicated content-brief
-      // columns (briefHighlight/coreMessage/creativeConcept from worksheet Page 5
-      // don't exist yet); this substage collects the guideline as free text on the
-      // fields that DO exist. Flagged for PLU-159/backend follow-up.
-      "Creative direction for the content. (Structured brief fields from worksheet Page 5 aren't in the data model yet — this collects guidelines as notes for now.)",
+      // COPY:PLU-159 — the granular worksheet Page-5 fields (briefHighlight /
+      // creativeConcept / reference-videos / script-submission) still have no
+      // dedicated columns; the through-line, requirements, and prohibited-claims
+      // fields below DO map to real CampaignDetails columns.
+      "Creative direction for the content — the message, what's required, and what creators must not say.",
     fields: [
       {
         key: "keyMessages",
@@ -374,14 +374,23 @@ export const SECTIONS: SectionSpec[] = [
         source: "S5.3",
       },
       {
-        key: "notes",
+        key: "contentRequirements",
         group: "campaign",
         control: "textarea",
         label: "Content requirements & guidelines", // COPY:PLU-159
-        hint: "Content restrictions, music/sound, subtitles, tone. Structured brief fields land with PLU-159's brief builder.", // COPY:PLU-159
+        hint: "Content restrictions, music/sound, subtitles, tone. Granular brief fields land with PLU-159's brief builder.", // COPY:PLU-159
         placeholder:
           "e.g. Show the product in use in the first 3 seconds. No competitor mentions. Add captions.", // COPY:PLU-159
         source: "S5.2/S5.4–S5.7",
+      },
+      {
+        key: "prohibitedClaims",
+        group: "campaign",
+        control: "textarea",
+        label: "Prohibited claims", // COPY:PLU-159
+        hint: "Statements creators must NOT make (regulated/false/off-brand). The agent treats these as hard restrictions.", // COPY:PLU-159
+        placeholder: "e.g. No medical or 'clinically proven' claims; don't call it waterproof.", // COPY:PLU-159
+        source: "S5 (restrictions)",
       },
     ],
   },

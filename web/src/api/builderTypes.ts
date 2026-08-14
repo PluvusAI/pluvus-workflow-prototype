@@ -211,6 +211,8 @@ export interface CampaignListItem {
   paymentTerms: string | null;
   attributionWindow: string | null;
   keyMessages: string | null;
+  contentRequirements: string | null;
+  prohibitedClaims: string | null;
   targetUrl: string | null;
   hiddenParamKey: string | null;
   /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
@@ -285,6 +287,8 @@ export interface CampaignDetail {
   paymentTerms: string | null;
   attributionWindow: string | null;
   keyMessages: string | null;
+  contentRequirements: string | null;
+  prohibitedClaims: string | null;
   targetUrl: string | null;
   hiddenParamKey: string | null;
   /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */

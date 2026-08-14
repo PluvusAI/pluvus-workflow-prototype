@@ -154,7 +154,7 @@ async function main(): Promise<void> {
   // publicPaymentTerms / attributionWindow / keyMessages existed as columns but no
   // PATCH wrote them, so the sectioned intake could never edit them. Prove they
   // round-trip through the upsert the route now delegates to.
-  await test("upsertCampaignDetails persists paymentTerms/attributionWindow/keyMessages", async () => {
+  await test("upsertCampaignDetails persists the previously-unreachable content columns", async () => {
     const id = await seedCampaign(pgdb);
     await upsertCampaignDetails(
       id,
@@ -162,6 +162,8 @@ async function main(): Promise<void> {
         publicPaymentTerms: "50% upfront / 50% after",
         attributionWindow: "30 days",
         keyMessages: "Lightest shoe under $120",
+        contentRequirements: "Add captions; product in first 3s",
+        prohibitedClaims: "No medical claims",
       },
       pgdb,
     );
@@ -169,6 +171,8 @@ async function main(): Promise<void> {
     assert.equal(d?.publicPaymentTerms, "50% upfront / 50% after");
     assert.equal(d?.attributionWindow, "30 days");
     assert.equal(d?.keyMessages, "Lightest shoe under $120");
+    assert.equal(d?.contentRequirements, "Add captions; product in first 3s");
+    assert.equal(d?.prohibitedClaims, "No medical claims");
   });
 
   // ── draft-lock atomicity (Greptile P1) ───────────────────────────────────────

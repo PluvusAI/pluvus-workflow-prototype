@@ -228,7 +228,16 @@ test("every field maps to a real persisted group", () => {
 
 test("candidateFieldFor maps known parser keys to their editable campaign field", () => {
   // These parser section keys share the name of an editable campaign text field.
-  for (const key of ["usageRights", "exclusivity", "paymentTerms", "attributionWindow", "deliverables"]) {
+  for (const key of [
+    "usageRights",
+    "exclusivity",
+    "paymentTerms",
+    "attributionWindow",
+    "deliverables",
+    "contentRequirements",
+    "prohibitedClaims",
+    "keyMessages",
+  ]) {
     const f = candidateFieldFor(key);
     assert.ok(f, `"${key}" should map to a field`);
     assert.equal(f!.key, key);
