@@ -987,8 +987,17 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
     patch[key] = (value as string[] | null) as JsonValue | null;
   }
   if (minFollowers !== undefined) {
-    if (minFollowers !== null && (typeof minFollowers !== "number" || !Number.isInteger(minFollowers) || minFollowers < 0)) {
-      res.status(400).json({ error: "minFollowers must be a non-negative integer" });
+    // Upper bound = PostgreSQL int4 max: the minFollowers column is `integer`,
+    // so a larger value overflows (SQLSTATE 22003) and the catch-all would 500
+    // instead of rejecting bad input. No real follower count approaches 2.1B.
+    if (
+      minFollowers !== null &&
+      (typeof minFollowers !== "number" ||
+        !Number.isInteger(minFollowers) ||
+        minFollowers < 0 ||
+        minFollowers > 2147483647)
+    ) {
+      res.status(400).json({ error: "minFollowers must be an integer between 0 and 2147483647" });
       return;
     }
     patch.minFollowers = minFollowers;

@@ -1,6 +1,6 @@
 import { eq, inArray } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
-import { assertCampaignIsDraft } from "./campaignDetails.js";
+import { withDraftLock } from "./campaignDetails.js";
 import {
   brandIdentities,
   type BrandIdentity,
@@ -50,11 +50,12 @@ export async function upsertBrandIdentity(
   data: Omit<Partial<BrandIdentityInsert>, "id" | "campaignId">,
   client: Db | DbTx = db,
 ): Promise<BrandIdentity> {
-  await assertCampaignIsDraft(campaignId, client);
-  const rows = await client
-    .insert(brandIdentities)
-    .values({ campaignId, ...data })
-    .onConflictDoUpdate({ target: brandIdentities.campaignId, set: data })
-    .returning();
-  return rows[0]!;
+  return withDraftLock(campaignId, client, async (tx) => {
+    const rows = await tx
+      .insert(brandIdentities)
+      .values({ campaignId, ...data })
+      .onConflictDoUpdate({ target: brandIdentities.campaignId, set: data })
+      .returning();
+    return rows[0]!;
+  });
 }

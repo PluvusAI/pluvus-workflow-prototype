@@ -1,6 +1,6 @@
 import { eq, inArray } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
-import { assertCampaignIsDraft } from "./campaignDetails.js";
+import { withDraftLock } from "./campaignDetails.js";
 import {
   creatorRequirements,
   type CreatorRequirement,
@@ -49,11 +49,12 @@ export async function upsertCreatorRequirement(
   data: Omit<Partial<CreatorRequirementInsert>, "id" | "campaignId">,
   client: Db | DbTx = db,
 ): Promise<CreatorRequirement> {
-  await assertCampaignIsDraft(campaignId, client);
-  const rows = await client
-    .insert(creatorRequirements)
-    .values({ campaignId, ...data })
-    .onConflictDoUpdate({ target: creatorRequirements.campaignId, set: data })
-    .returning();
-  return rows[0]!;
+  return withDraftLock(campaignId, client, async (tx) => {
+    const rows = await tx
+      .insert(creatorRequirements)
+      .values({ campaignId, ...data })
+      .onConflictDoUpdate({ target: creatorRequirements.campaignId, set: data })
+      .returning();
+    return rows[0]!;
+  });
 }

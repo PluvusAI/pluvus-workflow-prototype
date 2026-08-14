@@ -142,6 +142,36 @@ async function main(): Promise<void> {
     assert.equal((await getCreatorRequirement(id, pgdb))?.minFollowers, 5000);
   });
 
+  // ── draft-lock atomicity (Greptile P1) ───────────────────────────────────────
+  // The upsert reads status with SELECT ... FOR UPDATE inside its own tx, so a
+  // status flip committed BEFORE the upsert runs is observed → CampaignLockedError.
+  // (A true concurrent interleave can't be forced on PGlite's single connection;
+  // this proves the guard re-reads the row under lock rather than trusting a
+  // stale read, which is the property that closes the race with launchCampaign.)
+  await test("upsert re-reads status under lock: a just-committed ACTIVE is seen", async () => {
+    const id = await seedCampaign(pgdb, "DRAFT");
+    await upsertBrandIdentity(id, { logoRef: "before" }, pgdb); // fine while DRAFT
+    // Commit the launch flip, THEN upsert — the FOR UPDATE read must see ACTIVE.
+    await pgdb
+      .update(schema.campaigns)
+      .set({ status: "ACTIVE" })
+      .where(eq(schema.campaigns.id, id));
+    await assert.rejects(
+      () => upsertBrandIdentity(id, { logoRef: "after" }, pgdb),
+      CampaignLockedError,
+    );
+    // The blocked write did not land.
+    assert.equal((await getBrandIdentity(id, pgdb))?.logoRef, "before");
+  });
+
+  await test("withDraftLock composes inside a caller transaction (nested savepoint)", async () => {
+    const id = await seedCampaign(pgdb, "DRAFT");
+    await pgdb.transaction(async (tx) => {
+      await upsertCreatorRequirement(id, { minFollowers: 42 }, tx as unknown as Db);
+    });
+    assert.equal((await getCreatorRequirement(id, pgdb))?.minFollowers, 42);
+  });
+
   // ── cascade: deleting the campaign clears both rows ───────────────────────────
   await test("ON DELETE CASCADE removes both section rows with the campaign", async () => {
     const id = await seedCampaign(pgdb);
