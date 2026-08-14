@@ -564,9 +564,11 @@ export function visibleFields(section: SectionSpec, comp: CompensationShape): Fi
 const REWARD_CLEAR_VALUES: Record<string, null | false> = {
   priceStrategy: null,
   publicStartingFeeCents: null,
+  paymentTerms: null,
   publicCommissionRate: null,
   commissionDurationDays: null,
   commissionConditions: null,
+  attributionWindow: null,
   rewardDescription: null,
   giftDisposition: null,
   shipsPhysicalProduct: false,

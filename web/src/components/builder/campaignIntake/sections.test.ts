@@ -183,6 +183,28 @@ test("Hybrid clears nothing on the reward side (both sides visible)", () => {
   assert.deepEqual(cleared, [], "hybrid + gift shows all reward fields");
 });
 
+test("no clear-list drift: every conditional reward field is clearable on switch", () => {
+  // Guard against the REWARD_CLEAR_VALUES map falling out of sync with the
+  // reward section's conditional fields. Any field with a visibleWhen predicate
+  // CAN be hidden by a structure switch, so it MUST be sent cleared — i.e. it
+  // must appear in the cleared set for at least one structure. campaignType
+  // itself is the switch and always visible, so it's exempt.
+  const structures: CompensationShape[] = [
+    shape("PAID", false),
+    shape("AFFILIATE", false),
+    shape("GIFT_ONLY", false),
+    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD" },
+  ];
+  const everCleared = new Set(structures.flatMap((s) => clearedRewardFieldKeys(s)));
+  for (const f of reward.fields) {
+    if (!f.visibleWhen) continue; // always-visible field, never needs clearing
+    assert.ok(
+      everCleared.has(f.key),
+      `reward field "${f.key}" is conditional but never appears in the cleared set — add it to REWARD_CLEAR_VALUES`,
+    );
+  }
+});
+
 test("turning additive gift OFF clears the gift fields", () => {
   const cleared = new Set(clearedRewardFieldKeys(shape("PAID", false)));
   assert.ok(cleared.has("rewardDescription"), "gift description cleared");
