@@ -96,6 +96,29 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     keyMessages: details?.keyMessages ?? null,
     contentRequirements: details?.contentRequirements ?? null,
     prohibitedClaims: details?.prohibitedClaims ?? null,
+    // PLU-139 (2a): worksheet Stage-1 fields.
+    productType: details?.productType ?? null,
+    creatorAccessNeeded: details?.creatorAccessNeeded ?? null,
+    uniqueSellingPoints: details?.uniqueSellingPoints ?? null,
+    whyTrust: details?.whyTrust ?? null,
+    howToUse: details?.howToUse ?? null,
+    brandAssets: details?.brandAssets ?? null,
+    brandMaterialsRef: details?.brandMaterialsRef ?? null,
+    deliverableQuantities: details?.deliverableQuantities ?? null,
+    briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
+    linkInBioDuration: details?.linkInBioDuration ?? null,
+    postRetention: details?.postRetention ?? null,
+    instagramCollab: details?.instagramCollab ?? null,
+    requireApproval: details?.requireApproval ?? null,
+    variableCommission: details?.variableCommission ?? null,
+    giftDeliveryMethod: details?.giftDeliveryMethod ?? null,
+    promoCode: details?.promoCode ?? null,
+    giftContactEmail: details?.giftContactEmail ?? null,
+    requiresShippingInfo: details?.requiresShippingInfo ?? null,
+    affiliateTrackingUrl: details?.affiliateTrackingUrl ?? null,
+    trackingLinkMode: details?.trackingLinkMode ?? null,
+    trackingDestinationUrl: details?.trackingDestinationUrl ?? null,
+    trackingParameter: details?.trackingParameter ?? null,
     targetUrl: campaign.targetUrl,
     hiddenParamKey: campaign.hiddenParamKey,
     postAcceptanceMode: campaign.postAcceptanceMode,
@@ -523,6 +546,29 @@ router.patch("/:id", async (req: Request, res: Response) => {
     keyMessages,
     contentRequirements,
     prohibitedClaims,
+    // PLU-139 (2a): worksheet Stage-1 fields.
+    productType,
+    creatorAccessNeeded,
+    uniqueSellingPoints,
+    whyTrust,
+    howToUse,
+    brandAssets,
+    brandMaterialsRef,
+    deliverableQuantities,
+    briefDeliveryMethod,
+    linkInBioDuration,
+    postRetention,
+    instagramCollab,
+    requireApproval,
+    variableCommission,
+    giftDeliveryMethod,
+    promoCode,
+    giftContactEmail,
+    requiresShippingInfo,
+    affiliateTrackingUrl,
+    trackingLinkMode,
+    trackingDestinationUrl,
+    trackingParameter,
   } = req.body as {
     notifyEmail?: string | null;
     objective?: string | null;
@@ -553,6 +599,29 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // (not in flatten/create/PATCH) — the last two unreachable content fields.
     contentRequirements?: string | null;
     prohibitedClaims?: string | null;
+    // PLU-139 (2a): worksheet Stage-1 fields.
+    productType?: string | null;
+    creatorAccessNeeded?: boolean | null;
+    uniqueSellingPoints?: string | null;
+    whyTrust?: string | null;
+    howToUse?: string | null;
+    brandAssets?: string | null;
+    brandMaterialsRef?: string | null;
+    deliverableQuantities?: unknown;
+    briefDeliveryMethod?: string | null;
+    linkInBioDuration?: string | null;
+    postRetention?: string | null;
+    instagramCollab?: boolean | null;
+    requireApproval?: boolean | null;
+    variableCommission?: string | null;
+    giftDeliveryMethod?: string | null;
+    promoCode?: string | null;
+    giftContactEmail?: string | null;
+    requiresShippingInfo?: boolean | null;
+    affiliateTrackingUrl?: string | null;
+    trackingLinkMode?: string | null;
+    trackingDestinationUrl?: string | null;
+    trackingParameter?: string | null;
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
@@ -679,6 +748,62 @@ router.patch("/:id", async (req: Request, res: Response) => {
     detailsPatch.prohibitedClaims =
       typeof prohibitedClaims === "string" ? prohibitedClaims.trim() || null : null;
   }
+
+  // PLU-139 (2a): worksheet Stage-1 fields. Plain free-text and boolean columns
+  // (closed-set values are validated in the UI pre-PLU-159; the server accepts
+  // any string so PLU-159 can change the option sets without a server change).
+  // Each is applied only when present, and trimmed/coerced-to-null like every
+  // other CampaignDetails field.
+  const trimToNull = (v: unknown): string | null =>
+    typeof v === "string" ? v.trim() || null : null;
+  const boolOrNull = (v: unknown): boolean | null =>
+    typeof v === "boolean" ? v : null;
+  const stringFields139 = {
+    productType,
+    uniqueSellingPoints,
+    whyTrust,
+    howToUse,
+    brandAssets,
+    brandMaterialsRef,
+    briefDeliveryMethod,
+    linkInBioDuration,
+    postRetention,
+    variableCommission,
+    giftDeliveryMethod,
+    promoCode,
+    giftContactEmail,
+    affiliateTrackingUrl,
+    trackingLinkMode,
+    trackingDestinationUrl,
+    trackingParameter,
+  } as const;
+  for (const [key, value] of Object.entries(stringFields139)) {
+    if (value !== undefined) {
+      (detailsPatch as Record<string, unknown>)[key] = trimToNull(value);
+    }
+  }
+  const boolFields139 = {
+    creatorAccessNeeded,
+    instagramCollab,
+    requireApproval,
+    requiresShippingInfo,
+  } as const;
+  for (const [key, value] of Object.entries(boolFields139)) {
+    if (value !== undefined) {
+      (detailsPatch as Record<string, unknown>)[key] = boolOrNull(value);
+    }
+  }
+  if (deliverableQuantities !== undefined) {
+    // Structured list [{ platform, format, quantity }] — accept an array or
+    // null; reject anything else at the trust boundary.
+    if (deliverableQuantities !== null && !Array.isArray(deliverableQuantities)) {
+      res.status(400).json({ error: "deliverableQuantities must be an array or null" });
+      return;
+    }
+    (detailsPatch as Record<string, unknown>)["deliverableQuantities"] =
+      deliverableQuantities as JsonValue | null;
+  }
+
   if (compensationReviewStatus !== undefined) {
     if (!isCompensationReviewStatus(compensationReviewStatus)) {
       res.status(400).json({

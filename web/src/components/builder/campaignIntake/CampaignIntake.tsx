@@ -36,6 +36,7 @@ import type {
   BriefExtractionFields,
   CampaignType,
   CreatorRequirementInput,
+  DeliverableQuantity,
   GiftDisposition,
   PriceStrategy,
 } from "../../../api/builderTypes";
@@ -161,6 +162,29 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       giftDisposition: c.giftDisposition ?? "",
       rewardDescription: c.rewardDescription ?? "",
       shipsPhysicalProduct: c.shipsPhysicalProduct ?? false,
+      // PLU-139 (2a): worksheet Stage-1 fields.
+      brandMaterialsRef: c.brandMaterialsRef ?? "",
+      productType: c.productType ?? "",
+      creatorAccessNeeded: c.creatorAccessNeeded ?? false,
+      uniqueSellingPoints: c.uniqueSellingPoints ?? "",
+      whyTrust: c.whyTrust ?? "",
+      howToUse: c.howToUse ?? "",
+      brandAssets: c.brandAssets ?? "",
+      deliverableQuantities: c.deliverableQuantities ?? [],
+      briefDeliveryMethod: c.briefDeliveryMethod ?? "",
+      linkInBioDuration: c.linkInBioDuration ?? "",
+      postRetention: c.postRetention ?? "",
+      instagramCollab: c.instagramCollab ?? false,
+      requireApproval: c.requireApproval ?? false,
+      variableCommission: c.variableCommission ?? "",
+      giftDeliveryMethod: c.giftDeliveryMethod ?? "",
+      promoCode: c.promoCode ?? "",
+      giftContactEmail: c.giftContactEmail ?? "",
+      requiresShippingInfo: c.requiresShippingInfo ?? false,
+      affiliateTrackingUrl: c.affiliateTrackingUrl ?? "",
+      trackingLinkMode: c.trackingLinkMode ?? "",
+      trackingDestinationUrl: c.trackingDestinationUrl ?? "",
+      trackingParameter: c.trackingParameter ?? "",
     });
     const b = brandQ.data;
     setBrandDraft({
@@ -190,8 +214,14 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       campaignType: (campaignDraft.campaignType as CampaignType) ?? "PAID",
       includesGifting: Boolean(campaignDraft.includesGifting),
       priceStrategy: (campaignDraft.priceStrategy as PriceStrategy) ?? "REQUEST_RATE_CARD",
+      giftDeliveryMethod: String(campaignDraft.giftDeliveryMethod ?? ""),
     }),
-    [campaignDraft.campaignType, campaignDraft.includesGifting, campaignDraft.priceStrategy],
+    [
+      campaignDraft.campaignType,
+      campaignDraft.includesGifting,
+      campaignDraft.priceStrategy,
+      campaignDraft.giftDeliveryMethod,
+    ],
   );
 
   // -- persistence --------------------------------------------------------
@@ -218,6 +248,22 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       timeline: strOrNull(d.timeline),
       usageRights: strOrNull(d.usageRights),
       exclusivity: strOrNull(d.exclusivity),
+      // PLU-139 (2a): always-on worksheet fields (not structure-conditional).
+      brandMaterialsRef: strOrNull(d.brandMaterialsRef),
+      productType: strOrNull(d.productType),
+      creatorAccessNeeded: Boolean(d.creatorAccessNeeded),
+      uniqueSellingPoints: strOrNull(d.uniqueSellingPoints),
+      whyTrust: strOrNull(d.whyTrust),
+      howToUse: strOrNull(d.howToUse),
+      brandAssets: strOrNull(d.brandAssets),
+      deliverableQuantities: Array.isArray(d.deliverableQuantities)
+        ? (d.deliverableQuantities as DeliverableQuantity[])
+        : null,
+      briefDeliveryMethod: strOrNull(d.briefDeliveryMethod),
+      linkInBioDuration: strOrNull(d.linkInBioDuration),
+      postRetention: strOrNull(d.postRetention),
+      instagramCollab: Boolean(d.instagramCollab),
+      requireApproval: Boolean(d.requireApproval),
       // Compensation shape is always sent — it's the switch itself.
       campaignType: comp.campaignType,
       includesGifting: !isGiftOnly(comp.campaignType) ? comp.includesGifting : true,
@@ -236,20 +282,32 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.paymentTerms = null;
     }
 
-    // Commission — only for affiliate/hybrid; cleared otherwise.
+    // Commission — only for affiliate/hybrid; cleared otherwise. Public tracking
+    // (T-series) + variable commission share this condition.
     if (needsCommission(comp.campaignType)) {
       p.publicCommissionRate = numOrNull(d.publicCommissionRate);
       p.commissionDurationDays = numOrNull(d.commissionDurationDays);
       p.commissionConditions = strOrNull(d.commissionConditions);
       p.attributionWindow = strOrNull(d.attributionWindow);
+      p.variableCommission = strOrNull(d.variableCommission);
+      p.affiliateTrackingUrl = strOrNull(d.affiliateTrackingUrl);
+      p.trackingLinkMode = strOrNull(d.trackingLinkMode);
+      p.trackingDestinationUrl = strOrNull(d.trackingDestinationUrl);
+      p.trackingParameter = strOrNull(d.trackingParameter);
     } else {
       p.publicCommissionRate = null;
       p.commissionDurationDays = null;
       p.commissionConditions = null;
       p.attributionWindow = null;
+      p.variableCommission = null;
+      p.affiliateTrackingUrl = null;
+      p.trackingLinkMode = null;
+      p.trackingDestinationUrl = null;
+      p.trackingParameter = null;
     }
 
-    // Gift details — for gift-only or additive gifting; cleared otherwise.
+    // Gift details — for gift-only or additive gifting; cleared otherwise. The
+    // delivery-path fields (method → promo-code / manual-contact) live here too.
     if (showsGiftDetails(comp)) {
       p.rewardDescription = strOrNull(d.rewardDescription);
       p.shipsPhysicalProduct = Boolean(d.shipsPhysicalProduct);
@@ -257,10 +315,20 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.giftDisposition = isGiftOnly(comp.campaignType)
         ? "KEEP"
         : ((d.giftDisposition as GiftDisposition) || null);
+      p.requiresShippingInfo = Boolean(d.requiresShippingInfo);
+      const method = String(d.giftDeliveryMethod ?? "");
+      p.giftDeliveryMethod = method || null;
+      // Only the chosen path's field is sent; the other is cleared.
+      p.promoCode = method === "promo_code" ? strOrNull(d.promoCode) : null;
+      p.giftContactEmail = method === "manual_contact" ? strOrNull(d.giftContactEmail) : null;
     } else {
       p.rewardDescription = null;
       p.shipsPhysicalProduct = false;
       p.giftDisposition = null;
+      p.requiresShippingInfo = false;
+      p.giftDeliveryMethod = null;
+      p.promoCode = null;
+      p.giftContactEmail = null;
     }
     return p;
   }, [campaignDraft, comp]);
@@ -721,6 +789,15 @@ function FieldRenderer({
         />
       );
       break;
+    case "quantityRows":
+      control = (
+        <QuantityRows
+          value={Array.isArray(value) ? (value as DeliverableQuantity[]) : []}
+          onChange={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
     case "number":
     case "money":
       control = (
@@ -1024,6 +1101,76 @@ function BriefImport({
         </div>
       )}
     </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// QuantityRows — repeatable {platform, format, quantity} editor (S3.2–S3.9).
+// ---------------------------------------------------------------------------
+// A minimal add/remove list; the structured counterpart to the free-text
+// deliverables field. Values round-trip as the deliverableQuantities jsonb list.
+function QuantityRows({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: DeliverableQuantity[];
+  onChange: (v: DeliverableQuantity[]) => void;
+  disabled: boolean;
+}) {
+  function update(i: number, patch: Partial<DeliverableQuantity>) {
+    onChange(value.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  }
+  function remove(i: number) {
+    onChange(value.filter((_, idx) => idx !== i));
+  }
+  function add() {
+    onChange([...value, { platform: "", format: "", quantity: 1 }]);
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {value.map((row, i) => (
+        <div key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <Input
+            aria-label="Platform"
+            placeholder="Platform" // COPY:PLU-159
+            value={row.platform}
+            disabled={disabled}
+            onChange={(e) => update(i, { platform: e.target.value })}
+            style={{ flex: 2 }}
+          />
+          <Input
+            aria-label="Format"
+            placeholder="Format" // COPY:PLU-159
+            value={row.format}
+            disabled={disabled}
+            onChange={(e) => update(i, { format: e.target.value })}
+            style={{ flex: 2 }}
+          />
+          <Input
+            aria-label="Quantity"
+            type="number"
+            min={1}
+            value={String(row.quantity ?? "")}
+            disabled={disabled}
+            onChange={(e) => update(i, { quantity: Number(e.target.value) || 0 })}
+            style={{ flex: 1 }}
+          />
+          {!disabled && (
+            <Button variant="ghost" size="sm" onClick={() => remove(i)} leftIcon={<X size={13} strokeWidth={2.25} />}>
+              {""}
+            </Button>
+          )}
+        </div>
+      ))}
+      {!disabled && (
+        <div>
+          <Button variant="secondary" size="sm" onClick={add}>
+            Add row {/* COPY:PLU-159 */}
+          </Button>
+        </div>
+      )}
+    </div>
   );
 }
 

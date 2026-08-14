@@ -43,11 +43,16 @@ function rewardKeys(comp: CompensationShape): Set<string> {
   return new Set(visibleFields(reward, comp).map((f) => f.key));
 }
 
-function shape(campaignType: CampaignType, includesGifting = false): CompensationShape {
+function shape(
+  campaignType: CampaignType,
+  includesGifting = false,
+  giftDeliveryMethod = "",
+): CompensationShape {
   return {
     campaignType,
     includesGifting,
     priceStrategy: "PROPOSE_STARTING_FEE",
+    giftDeliveryMethod,
   };
 }
 
@@ -155,8 +160,8 @@ test("additive gift on Paid: toggle available; turning it on reveals gift + disp
 // -- price strategy conditional ----------------------------------------------
 
 test("starting fee only shows in PROPOSE_STARTING_FEE mode", () => {
-  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "PROPOSE_STARTING_FEE" }), true);
-  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD" }), false);
+  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "PROPOSE_STARTING_FEE", giftDeliveryMethod: "" }), true);
+  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "" }), false);
 });
 
 // -- switching structure hides AND clears ------------------------------------
@@ -178,10 +183,21 @@ test("switch to Gift-only clears BOTH fee and commission fields", () => {
   assert.ok(!cleared.has("rewardDescription"), "gift description stays");
 });
 
-test("Hybrid clears nothing on the reward side (both sides visible)", () => {
-  const cleared = clearedRewardFieldKeys(shape("HYBRID", true));
-  // with additive gifting on, every reward field is visible
-  assert.deepEqual(cleared, [], "hybrid + gift shows all reward fields");
+test("Hybrid clears nothing on the reward side when all conditionals resolve", () => {
+  // Fee + commission both apply (Hybrid), gifting on, AND a gift-delivery method
+  // chosen so promo-code shows — every reward field is then visible.
+  const cleared = clearedRewardFieldKeys(shape("HYBRID", true, "promo_code"));
+  // giftContactEmail is the OTHER path (manual_contact), so it's still hidden.
+  assert.deepEqual(cleared, ["giftContactEmail"], "only the unused gift path is cleared");
+});
+
+test("gift-delivery path: choosing promo_code clears the manual-contact field and vice versa", () => {
+  const promo = new Set(clearedRewardFieldKeys(shape("GIFT_ONLY", false, "promo_code")));
+  assert.ok(promo.has("giftContactEmail"), "manual-contact field cleared under promo_code");
+  assert.ok(!promo.has("promoCode"), "promo code stays under promo_code");
+  const manual = new Set(clearedRewardFieldKeys(shape("GIFT_ONLY", false, "manual_contact")));
+  assert.ok(manual.has("promoCode"), "promo code cleared under manual_contact");
+  assert.ok(!manual.has("giftContactEmail"), "contact email stays under manual_contact");
 });
 
 test("no clear-list drift: every conditional reward field is clearable on switch", () => {
@@ -193,8 +209,8 @@ test("no clear-list drift: every conditional reward field is clearable on switch
   const structures: CompensationShape[] = [
     shape("PAID", false),
     shape("AFFILIATE", false),
-    shape("GIFT_ONLY", false),
-    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD" },
+    shape("GIFT_ONLY", false), // no gift-delivery method → promo/contact both cleared
+    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "" },
   ];
   const everCleared = new Set(structures.flatMap((s) => clearedRewardFieldKeys(s)));
   for (const f of reward.fields) {
@@ -222,6 +238,49 @@ test("every field maps to a real persisted group", () => {
       assert.ok(groups.has(f.group), `${s.key}.${f.key} has a valid group`);
     }
   }
+});
+
+// -- worksheet Stage-1 coverage ----------------------------------------------
+
+test("every non-deferred worksheet Stage-1 question is covered by a field", () => {
+  // The union of all worksheet IDs any field cites in `source` (ranges like
+  // "S3.1–S3.9" and multi like "S6.3/S6.5" expand to each member).
+  const cited = new Set<string>();
+  for (const s of SECTIONS) {
+    for (const f of s.fields) {
+      // Split on / and en-dash ranges; keep S<page>.<id> tokens.
+      const raw = f.source.replace(/–/g, "-");
+      for (const part of raw.split(/[/,]/)) {
+        const m = part.trim().match(/^S(\d)\.([A-Za-z0-9]+)(?:-S?\d?\.?([A-Za-z0-9]+))?/);
+        if (!m) continue;
+        const page = m[1] ?? "";
+        const start = m[2] ?? "";
+        const end = m[3];
+        cited.add(`S${page}.${start}`);
+        // Expand a numeric range like S3.1-S3.9 → S3.1..S3.9.
+        if (end && /^\d+$/.test(start) && /^\d+$/.test(end)) {
+          for (let i = Number(start); i <= Number(end); i++) cited.add(`S${page}.${i}`);
+        }
+      }
+    }
+  }
+  // The worksheet's Stage-1 public questions, EXCLUDING the ones that are
+  // deliberately out of scope: S1.C* + S4.* (Content Angles, deferred), S1.5/S1.6
+  // (system actions, not fields), S2.2 sub-rows handled by BrandIdentity.
+  const required = [
+    "S1.1", "S1.2", "S1.4",
+    "S2.1", "S2.3", "S2.4", "S2.5", "S2.6", "S2.7", "S2.8", "S2.9", "S2.10",
+    "S3.1", "S3.10", "S3.11",
+    "S5.1", "S5.2", "S5.3",
+    "S6.1", "S6.2", "S6.3", "S6.4", "S6.5", "S6.6",
+    "S7.1", "S7.2", "S7.3",
+    "S7.A1", "S7.A2", "S7.A3", "S7.A4",
+    "S7.G1", "S7.G3", "S7.G5", "S7.G6", "S7.G7",
+    "S7.P1", "S7.P2",
+    "S7.T0", "S7.T1", "S7.T2", "S7.T3",
+  ];
+  const missing = required.filter((id) => !cited.has(id));
+  assert.deepEqual(missing, [], `uncovered worksheet Stage-1 questions: ${missing.join(", ")}`);
 });
 
 // -- brief-import candidate mapping ------------------------------------------

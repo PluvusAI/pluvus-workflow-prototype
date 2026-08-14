@@ -656,6 +656,45 @@ export const campaignDetails = pgTable("CampaignDetails", {
   publicPaymentTerms: text("publicPaymentTerms"),
   shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
   brandDescription: text("brandDescription"),
+  // PLU-139 (2a): worksheet Stage-1 questions that had no CampaignDetails column
+  // until now — all creator-facing public brief fields, all nullable (an
+  // incomplete Draft is valid). Grouped by worksheet page. Free-text unless a
+  // closed set is noted; the closed sets are stored as plain strings (validated
+  // at the route) rather than PG enums so PLU-159 can retune options without a
+  // migration.
+  // Page 2 — Campaign & product.
+  productType: text("productType"), // S2.4
+  creatorAccessNeeded: boolean("creatorAccessNeeded"), // S2.5 (enable access / none)
+  uniqueSellingPoints: text("uniqueSellingPoints"), // S2.7
+  whyTrust: text("whyTrust"), // S2.8
+  howToUse: text("howToUse"), // S2.9
+  brandAssets: text("brandAssets"), // S2.10 (links)
+  brandMaterialsRef: text("brandMaterialsRef"), // S1.4 uploaded supporting materials
+  // Page 3 — per-platform deliverable quantities (S3.2–S3.9). Structured list:
+  // [{ platform, format, quantity }]. jsonb, following the CreatorRequirement
+  // string[] list precedent.
+  deliverableQuantities: jsonb("deliverableQuantities").$type<JsonValue>(),
+  // Page 5 — brief delivery (S5.1: "own_doc" | "pluvus_builder").
+  briefDeliveryMethod: text("briefDeliveryMethod"),
+  // Page 6 — rights durations not previously modelled (free text; worksheet
+  // shows dropdown+custom, kept as text pre-PLU-159).
+  linkInBioDuration: text("linkInBioDuration"), // S6.2
+  postRetention: text("postRetention"), // S6.4
+  instagramCollab: boolean("instagramCollab"), // S6.7
+  // Page 7 — shared onboarding + affiliate/gift specifics.
+  requireApproval: boolean("requireApproval"), // S7.3
+  variableCommission: text("variableCommission"), // S7.A3 (free text pre-PLU-159)
+  giftDeliveryMethod: text("giftDeliveryMethod"), // S7.G1 "promo_code" | "manual_contact"
+  promoCode: text("promoCode"), // S7.G2
+  giftContactEmail: text("giftContactEmail"), // S7.G4
+  requiresShippingInfo: boolean("requiresShippingInfo"), // S7.G7
+  // Page 7 — public affiliate tracking (T-series). targetUrl/hiddenParamKey on
+  // the Campaign row remain the create-time source; these are the public,
+  // brief-level tracking fields the worksheet surfaces.
+  affiliateTrackingUrl: text("affiliateTrackingUrl"), // S7.T0
+  trackingLinkMode: text("trackingLinkMode"), // S7.T1 "pluvus" | "own"
+  trackingDestinationUrl: text("trackingDestinationUrl"), // S7.T2
+  trackingParameter: text("trackingParameter"), // S7.T3
   // PLU-135 schema review §2.1 (Calvin, 2026-08-08): which extraction the
   // fields above were actually confirmed from — the missing link in the
   // extraction -> confirmation -> snapshot chain. Without this,

@@ -167,7 +167,42 @@ export type CompensationReviewStatus = "NEEDS_REVIEW" | "CONFIRMED";
  *  CampaignDetails/BrandIdentity/CreatorRequirement writes are rejected (409). */
 export type CampaignStatus = "DRAFT" | "ACTIVE";
 
-export interface CampaignListItem {
+/** PLU-139 (2a): one row of the per-platform deliverable quantity list (S3.2–S3.9). */
+export interface DeliverableQuantity {
+  platform: string;
+  format: string;
+  quantity: number;
+}
+
+/** PLU-139 (2a): the worksheet Stage-1 public-brief fields that gained
+ *  CampaignDetails columns. All nullable — an incomplete Draft is valid. Shared
+ *  by CampaignListItem and CampaignDetail (both flatten the same row). */
+export interface WorksheetStage1Fields {
+  productType: string | null; // S2.4
+  creatorAccessNeeded: boolean | null; // S2.5
+  uniqueSellingPoints: string | null; // S2.7
+  whyTrust: string | null; // S2.8
+  howToUse: string | null; // S2.9
+  brandAssets: string | null; // S2.10
+  brandMaterialsRef: string | null; // S1.4
+  deliverableQuantities: DeliverableQuantity[] | null; // S3.2–S3.9
+  briefDeliveryMethod: string | null; // S5.1
+  linkInBioDuration: string | null; // S6.2
+  postRetention: string | null; // S6.4
+  instagramCollab: boolean | null; // S6.7
+  requireApproval: boolean | null; // S7.3
+  variableCommission: string | null; // S7.A3
+  giftDeliveryMethod: string | null; // S7.G1
+  promoCode: string | null; // S7.G2
+  giftContactEmail: string | null; // S7.G4
+  requiresShippingInfo: boolean | null; // S7.G7
+  affiliateTrackingUrl: string | null; // S7.T0
+  trackingLinkMode: string | null; // S7.T1
+  trackingDestinationUrl: string | null; // S7.T2
+  trackingParameter: string | null; // S7.T3
+}
+
+export interface CampaignListItem extends WorksheetStage1Fields {
   id: string;
   name: string;
   brand: string;
@@ -247,7 +282,7 @@ export interface CampaignWorkflowItem {
   updatedAt: string;
 }
 
-export interface CampaignDetail {
+export interface CampaignDetail extends WorksheetStage1Fields {
   id: string;
   name: string;
   brand: string;

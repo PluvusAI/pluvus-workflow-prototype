@@ -499,6 +499,36 @@ model CampaignDetails {
   shipsPhysicalProduct   Boolean @default(false)
   brandDescription       String?
 
+  /// PLU-139 (2a): worksheet Stage-1 questions with no prior CampaignDetails
+  /// column. All creator-facing public brief fields, all nullable (incomplete
+  /// Draft is valid). Closed-set fields (creatorAccessNeeded, briefDeliveryMethod,
+  /// giftDeliveryMethod, trackingLinkMode) are stored as plain String/Boolean and
+  /// validated at the route, not as PG enums, so PLU-159 can retune the option
+  /// sets without another migration.
+  productType          String? /// S2.4
+  creatorAccessNeeded  Boolean? /// S2.5
+  uniqueSellingPoints  String? /// S2.7
+  whyTrust             String? /// S2.8
+  howToUse             String? /// S2.9
+  brandAssets          String? /// S2.10
+  brandMaterialsRef    String? /// S1.4 supporting-materials upload reference
+  /// S3.2–S3.9 per-platform deliverable quantities: [{ platform, format, quantity }].
+  deliverableQuantities Json?
+  briefDeliveryMethod  String? /// S5.1
+  linkInBioDuration    String? /// S6.2
+  postRetention        String? /// S6.4
+  instagramCollab      Boolean? /// S6.7
+  requireApproval      Boolean? /// S7.3
+  variableCommission   String? /// S7.A3
+  giftDeliveryMethod   String? /// S7.G1
+  promoCode            String? /// S7.G2
+  giftContactEmail     String? /// S7.G4
+  requiresShippingInfo Boolean? /// S7.G7
+  affiliateTrackingUrl   String? /// S7.T0
+  trackingLinkMode       String? /// S7.T1
+  trackingDestinationUrl String? /// S7.T2
+  trackingParameter      String? /// S7.T3
+
   /// PLU-135 schema review §2.1 (Calvin, 2026-08-08): the missing link in the
   /// extraction → confirmation → snapshot chain. Without this, launchCampaign()
   /// had to guess which extraction the confirmed values above actually came

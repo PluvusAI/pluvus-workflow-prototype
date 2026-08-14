@@ -55,6 +55,9 @@ export interface CompensationShape {
   campaignType: CampaignType;
   includesGifting: boolean;
   priceStrategy: PriceStrategy;
+  // PLU-139: which gift-delivery path is chosen (S7.G1), so the promo-code vs
+  // manual-contact fields show conditionally. "" = not yet chosen.
+  giftDeliveryMethod: string;
 }
 
 export type FieldControl =
@@ -67,6 +70,7 @@ export type FieldControl =
   | "select"
   | "toggle"
   | "chips" // comma/enter-separated string[] (CreatorRequirement.platforms etc.)
+  | "quantityRows" // PLU-139: repeatable {platform, format, quantity} rows (S3.2–S3.9)
   | "radioCards"; // RadioCardGroup
 
 export interface SelectOption {
@@ -143,6 +147,39 @@ export function showsGiftDispositionPicker(comp: CompensationShape): boolean {
 export function showsStartingFee(comp: CompensationShape): boolean {
   return needsFee(comp.campaignType) && comp.priceStrategy === "PROPOSE_STARTING_FEE";
 }
+// PLU-139 gift-delivery path (S7.G1). The method picker shows whenever gift
+// details show; the promo-code / manual-contact fields show per chosen method.
+export function showsGiftDelivery(comp: CompensationShape): boolean {
+  return showsGiftDetails(comp);
+}
+export function showsPromoCode(comp: CompensationShape): boolean {
+  return showsGiftDetails(comp) && comp.giftDeliveryMethod === "promo_code";
+}
+export function showsManualContact(comp: CompensationShape): boolean {
+  return showsGiftDetails(comp) && comp.giftDeliveryMethod === "manual_contact";
+}
+// PLU-139 public affiliate tracking (T-series) — shown for Affiliate/Hybrid.
+export function showsTracking(comp: CompensationShape): boolean {
+  return needsCommission(comp.campaignType);
+}
+
+export const GIFT_DELIVERY_OPTIONS: SelectOption[] = [
+  // COPY:PLU-159 — S7.G1
+  { value: "promo_code", label: "Promo code" },
+  { value: "manual_contact", label: "Manual contact" },
+];
+
+export const BRIEF_DELIVERY_OPTIONS: SelectOption[] = [
+  // COPY:PLU-159 — S5.1
+  { value: "pluvus_builder", label: "Use Pluvus's brief builder" },
+  { value: "own_doc", label: "Use your own content brief doc" },
+];
+
+export const TRACKING_MODE_OPTIONS: SelectOption[] = [
+  // COPY:PLU-159 — S7.T1
+  { value: "pluvus", label: "Let Pluvus generate unique links" },
+  { value: "own", label: "Use my own unique links" },
+];
 
 export const CAMPAIGN_TYPE_OPTIONS: SelectOption[] = [
   // COPY:PLU-159 — labels only; the values are the PLU-136 contract enum.
@@ -206,6 +243,14 @@ export const SECTIONS: SectionSpec[] = [
         placeholder: "e.g. https://example.com/shop", // COPY:PLU-159
         source: "S1.2",
       },
+      {
+        key: "brandMaterialsRef",
+        group: "campaign",
+        control: "text",
+        label: "Supporting materials reference", // COPY:PLU-159
+        hint: "A stored reference to brand guidelines / supporting materials. Full upload wiring is PR-B; manual reference for now.", // COPY:PLU-159
+        source: "S1.4",
+      },
     ],
   },
   {
@@ -230,6 +275,55 @@ export const SECTIONS: SectionSpec[] = [
         placeholder:
           "e.g. Avatar is a fintech app that helps Gen Z track spending and build credit.", // COPY:PLU-159
         source: "S2.3/S2.6",
+      },
+      {
+        key: "productType",
+        group: "campaign",
+        control: "text",
+        label: "Product type", // COPY:PLU-159
+        hint: "The product category. A searchable dropdown lands with PLU-159; free text for now.", // COPY:PLU-159
+        placeholder: "e.g. Running shoes", // COPY:PLU-159
+        source: "S2.4",
+      },
+      {
+        key: "creatorAccessNeeded",
+        group: "campaign",
+        control: "toggle",
+        label: "Creator needs product/account access to create content", // COPY:PLU-159
+        hint: "Operational access for content creation only — not automatically part of the reward (that's the gift toggle in Reward structure).", // COPY:PLU-159
+        source: "S2.5",
+      },
+      {
+        key: "uniqueSellingPoints",
+        group: "campaign",
+        control: "textarea",
+        label: "Unique selling points & features", // COPY:PLU-159
+        placeholder: "e.g. Lightest in class, carbon plate, recycled upper.", // COPY:PLU-159
+        source: "S2.7",
+      },
+      {
+        key: "whyTrust",
+        group: "campaign",
+        control: "textarea",
+        label: "Why creators should trust you", // COPY:PLU-159
+        hint: "Optional but recommended — helps the outreach land.", // COPY:PLU-159
+        source: "S2.8",
+      },
+      {
+        key: "howToUse",
+        group: "campaign",
+        control: "textarea",
+        label: "How to use the product", // COPY:PLU-159
+        source: "S2.9",
+      },
+      {
+        key: "brandAssets",
+        group: "campaign",
+        control: "textarea",
+        label: "Brand assets", // COPY:PLU-159
+        hint: "Links to logos, imagery, or a shared drive.", // COPY:PLU-159
+        placeholder: "e.g. https://drive.google.com/…", // COPY:PLU-159
+        source: "S2.10",
       },
       // BrandIdentity sub-group (its own endpoint).
       {
@@ -281,6 +375,14 @@ export const SECTIONS: SectionSpec[] = [
         placeholder:
           "e.g. 3 Instagram Reels + 1 YouTube integration, 30-day usage rights.", // COPY:PLU-159
         source: "S3.1–S3.9",
+      },
+      {
+        key: "deliverableQuantities",
+        group: "campaign",
+        control: "quantityRows",
+        label: "Per-platform quantities", // COPY:PLU-159
+        hint: "Add a row per platform/format with a quantity. Structured version of the deliverables text above.", // COPY:PLU-159
+        source: "S3.2–S3.9",
       },
       // CreatorRequirement sub-group (its own endpoint). Informational only —
       // never drives matching/ranking/outreach (per the field's server doc).
@@ -365,6 +467,14 @@ export const SECTIONS: SectionSpec[] = [
       "Creative direction for the content — the message, what's required, and what creators must not say.",
     fields: [
       {
+        key: "briefDeliveryMethod",
+        group: "campaign",
+        control: "select",
+        label: "How should creators receive the brief?", // COPY:PLU-159
+        options: BRIEF_DELIVERY_OPTIONS,
+        source: "S5.1",
+      },
+      {
         key: "keyMessages",
         group: "campaign",
         control: "textarea",
@@ -426,6 +536,32 @@ export const SECTIONS: SectionSpec[] = [
         hint: "How long before the creator may work with a competing brand. Blank = none.", // COPY:PLU-159
         placeholder: "e.g. 30 days, no competing footwear brands.", // COPY:PLU-159
         source: "S6.6",
+      },
+      {
+        key: "linkInBioDuration",
+        group: "campaign",
+        control: "text",
+        label: "Link-in-bio duration", // COPY:PLU-159
+        hint: "How long the link stays in the creator's bio. Dropdown+custom lands with PLU-159; free text for now.", // COPY:PLU-159
+        placeholder: "e.g. 30 days", // COPY:PLU-159
+        source: "S6.2",
+      },
+      {
+        key: "postRetention",
+        group: "campaign",
+        control: "text",
+        label: "Post retention", // COPY:PLU-159
+        hint: "How long the creator keeps the post live on their profile.", // COPY:PLU-159
+        placeholder: "e.g. 90 days", // COPY:PLU-159
+        source: "S6.4",
+      },
+      {
+        key: "instagramCollab",
+        group: "campaign",
+        control: "toggle",
+        label: "Invite as an Instagram collaborative post", // COPY:PLU-159
+        hint: "Publish as a collab so it appears on both accounts. Shown for Instagram campaigns.", // COPY:PLU-159
+        source: "S6.7",
       },
     ],
   },
@@ -518,6 +654,56 @@ export const SECTIONS: SectionSpec[] = [
         source: "S7.A4",
         visibleWhen: (c) => needsCommission(c.campaignType),
       },
+      {
+        key: "variableCommission",
+        group: "campaign",
+        control: "textarea",
+        label: "Variable commission over time", // COPY:PLU-159
+        hint: "Describe any rate that changes over time (e.g. two levels). Structured control lands with PLU-159.", // COPY:PLU-159
+        placeholder: "e.g. 20% for the first 60 days, then 10%.", // COPY:PLU-159
+        source: "S7.A3",
+        visibleWhen: (c) => needsCommission(c.campaignType),
+      },
+      // Public affiliate tracking (T-series) — Affiliate/Hybrid only.
+      {
+        key: "affiliateTrackingUrl",
+        group: "campaign",
+        control: "url",
+        label: "Affiliate tracking URL", // COPY:PLU-159
+        hint: "Pre-populated from the product page; edit if the tracked destination differs.", // COPY:PLU-159
+        placeholder: "e.g. https://example.com/shop", // COPY:PLU-159
+        source: "S7.T0",
+        visibleWhen: showsTracking,
+      },
+      {
+        key: "trackingLinkMode",
+        group: "campaign",
+        control: "select",
+        label: "How to provide the link", // COPY:PLU-159
+        options: TRACKING_MODE_OPTIONS,
+        source: "S7.T1",
+        visibleWhen: showsTracking,
+      },
+      {
+        key: "trackingDestinationUrl",
+        group: "campaign",
+        control: "url",
+        label: "Destination URL", // COPY:PLU-159
+        hint: "Where the audience lands when they click. Required when Pluvus generates unique links.", // COPY:PLU-159
+        placeholder: "e.g. https://example.com/landing", // COPY:PLU-159
+        source: "S7.T2",
+        visibleWhen: showsTracking,
+      },
+      {
+        key: "trackingParameter",
+        group: "campaign",
+        control: "text",
+        label: "Tracking parameter", // COPY:PLU-159
+        hint: "Advanced — the query-string key appended to each creator's link.", // COPY:PLU-159
+        placeholder: "e.g. _from", // COPY:PLU-159
+        source: "S7.T3",
+        visibleWhen: showsTracking,
+      },
       // Gift — additive toggle (Paid/Affiliate/Hybrid) or implied (Gift-only).
       {
         key: "includesGifting",
@@ -556,6 +742,54 @@ export const SECTIONS: SectionSpec[] = [
         source: "S7.G6",
         visibleWhen: showsGiftDetails,
       },
+      // Gift delivery path (S7.G1 → promo-code / manual-contact).
+      {
+        key: "giftDeliveryMethod",
+        group: "campaign",
+        control: "select",
+        label: "How will creators receive it?", // COPY:PLU-159
+        options: GIFT_DELIVERY_OPTIONS,
+        source: "S7.G1",
+        visibleWhen: showsGiftDelivery,
+      },
+      {
+        key: "promoCode",
+        group: "campaign",
+        control: "text",
+        label: "Promo code", // COPY:PLU-159
+        hint: "The code the creator enters to redeem the benefit.", // COPY:PLU-159
+        placeholder: "e.g. CREATOR30", // COPY:PLU-159
+        source: "S7.G2",
+        visibleWhen: showsPromoCode,
+      },
+      {
+        key: "giftContactEmail",
+        group: "campaign",
+        control: "email",
+        label: "Creator contact email", // COPY:PLU-159
+        hint: "The address Pluvus shares so the brand can arrange the benefit directly.", // COPY:PLU-159
+        placeholder: "e.g. partnerships@acme.com", // COPY:PLU-159
+        source: "S7.G4",
+        visibleWhen: showsManualContact,
+      },
+      {
+        key: "requiresShippingInfo",
+        group: "campaign",
+        control: "toggle",
+        label: "Require shipping info from the creator", // COPY:PLU-159
+        hint: "When on, the creator is asked for name and address as part of accepting, so the brand can fulfill.", // COPY:PLU-159
+        source: "S7.G7",
+        visibleWhen: (c) => showsGiftDetails(c),
+      },
+      // Shared onboarding control (S7.3).
+      {
+        key: "requireApproval",
+        group: "campaign",
+        control: "toggle",
+        label: "Require approval", // COPY:PLU-159
+        hint: "Whether a creator must be approved before onboarding.", // COPY:PLU-159
+        source: "S7.3",
+      },
     ],
   },
 ];
@@ -578,10 +812,19 @@ const REWARD_CLEAR_VALUES: Record<string, null | false> = {
   commissionDurationDays: null,
   commissionConditions: null,
   attributionWindow: null,
+  variableCommission: null,
+  affiliateTrackingUrl: null,
+  trackingLinkMode: null,
+  trackingDestinationUrl: null,
+  trackingParameter: null,
   rewardDescription: null,
   giftDisposition: null,
   shipsPhysicalProduct: false,
   includesGifting: false,
+  giftDeliveryMethod: null,
+  promoCode: null,
+  giftContactEmail: null,
+  requiresShippingInfo: false,
 };
 
 /** The reward-section field keys that are HIDDEN under `comp` and therefore must

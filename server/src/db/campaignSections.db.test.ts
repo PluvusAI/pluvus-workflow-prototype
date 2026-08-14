@@ -175,6 +175,55 @@ async function main(): Promise<void> {
     assert.equal(d?.prohibitedClaims, "No medical claims");
   });
 
+  // ── the ~18 worksheet Stage-1 columns (PLU-139) round-trip incl. jsonb list ──
+  await test("upsertCampaignDetails persists the worksheet Stage-1 columns", async () => {
+    const id = await seedCampaign(pgdb);
+    await upsertCampaignDetails(
+      id,
+      {
+        productType: "Running shoes",
+        creatorAccessNeeded: true,
+        uniqueSellingPoints: "Lightest in class",
+        whyTrust: "10 years in market",
+        howToUse: "Lace up and run",
+        brandAssets: "https://drive.example/assets",
+        brandMaterialsRef: "upload-ref-1",
+        deliverableQuantities: [
+          { platform: "instagram", format: "reel", quantity: 3 },
+          { platform: "youtube", format: "integration", quantity: 1 },
+        ] as unknown as (typeof schema.campaignDetails.$inferInsert)["deliverableQuantities"],
+        briefDeliveryMethod: "pluvus_builder",
+        linkInBioDuration: "30 days",
+        postRetention: "90 days",
+        instagramCollab: true,
+        requireApproval: true,
+        variableCommission: "20% then 10%",
+        giftDeliveryMethod: "promo_code",
+        promoCode: "CREATOR30",
+        requiresShippingInfo: true,
+        affiliateTrackingUrl: "https://example.com/shop",
+        trackingLinkMode: "pluvus",
+        trackingDestinationUrl: "https://example.com/landing",
+        trackingParameter: "_from",
+      },
+      pgdb,
+    );
+    const d = await getCampaignDetails(id, pgdb);
+    assert.equal(d?.productType, "Running shoes");
+    assert.equal(d?.creatorAccessNeeded, true);
+    assert.equal(d?.instagramCollab, true);
+    assert.equal(d?.requireApproval, true);
+    assert.equal(d?.giftDeliveryMethod, "promo_code");
+    assert.equal(d?.promoCode, "CREATOR30");
+    assert.equal(d?.trackingParameter, "_from");
+    // jsonb list round-trips structurally.
+    const dq = d?.deliverableQuantities as Array<{ platform: string; quantity: number }> | null;
+    assert.equal(Array.isArray(dq), true);
+    assert.equal(dq?.[0]?.platform, "instagram");
+    assert.equal(dq?.[0]?.quantity, 3);
+    assert.equal(dq?.length, 2);
+  });
+
   // ── draft-lock atomicity (Greptile P1) ───────────────────────────────────────
   // The upsert reads status with SELECT ... FOR UPDATE inside its own tx, so a
   // status flip committed BEFORE the upsert runs is observed → CampaignLockedError.

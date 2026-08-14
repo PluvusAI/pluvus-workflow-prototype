@@ -40,6 +40,7 @@ import type {
   CreatorRequirementFields,
   CreatorRequirementInput,
   BriefExtractionFields,
+  DeliverableQuantity,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -174,6 +175,29 @@ export function updateCampaign(
     keyMessages?: string | null;
     contentRequirements?: string | null;
     prohibitedClaims?: string | null;
+    // PLU-139 (2a): worksheet Stage-1 fields (all CampaignDetails, editable DRAFT).
+    productType?: string | null;
+    creatorAccessNeeded?: boolean | null;
+    uniqueSellingPoints?: string | null;
+    whyTrust?: string | null;
+    howToUse?: string | null;
+    brandAssets?: string | null;
+    brandMaterialsRef?: string | null;
+    deliverableQuantities?: DeliverableQuantity[] | null;
+    briefDeliveryMethod?: string | null;
+    linkInBioDuration?: string | null;
+    postRetention?: string | null;
+    instagramCollab?: boolean | null;
+    requireApproval?: boolean | null;
+    variableCommission?: string | null;
+    giftDeliveryMethod?: string | null;
+    promoCode?: string | null;
+    giftContactEmail?: string | null;
+    requiresShippingInfo?: boolean | null;
+    affiliateTrackingUrl?: string | null;
+    trackingLinkMode?: string | null;
+    trackingDestinationUrl?: string | null;
+    trackingParameter?: string | null;
     targetUrl?: string | null;
     hiddenParamKey?: string | null;
     // PLU-136 compensation contract (CampaignDetails). Editable while DRAFT.
