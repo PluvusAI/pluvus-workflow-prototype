@@ -16,6 +16,7 @@ import {
   getSection,
   visibleFields,
   clearedRewardFieldKeys,
+  candidateFieldFor,
   needsFee,
   needsCommission,
   isGiftOnly,
@@ -221,6 +222,29 @@ test("every field maps to a real persisted group", () => {
       assert.ok(groups.has(f.group), `${s.key}.${f.key} has a valid group`);
     }
   }
+});
+
+// -- brief-import candidate mapping ------------------------------------------
+
+test("candidateFieldFor maps known parser keys to their editable campaign field", () => {
+  // These parser section keys share the name of an editable campaign text field.
+  for (const key of ["usageRights", "exclusivity", "paymentTerms", "attributionWindow", "deliverables"]) {
+    const f = candidateFieldFor(key);
+    assert.ok(f, `"${key}" should map to a field`);
+    assert.equal(f!.key, key);
+    assert.equal(f!.group, "campaign");
+  }
+});
+
+test("candidateFieldFor returns null for unmapped / non-applicable keys", () => {
+  // Unknown key → no Apply target (shown as read-only evidence).
+  assert.equal(candidateFieldFor("somethingWeDontModel"), null);
+  // name/brand are readOnly → never an apply target even though they exist.
+  assert.equal(candidateFieldFor("name"), null);
+  assert.equal(candidateFieldFor("brand"), null);
+  // radioCards/select/toggle fields aren't text candidates.
+  assert.equal(candidateFieldFor("campaignType"), null);
+  assert.equal(candidateFieldFor("includesGifting"), null);
 });
 
 console.log(`\n${passed} passed\n`);

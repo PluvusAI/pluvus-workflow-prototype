@@ -584,6 +584,28 @@ export function clearedRewardFieldKeys(comp: CompensationShape): string[] {
   return Object.keys(REWARD_CLEAR_VALUES).filter((k) => !visible.has(k));
 }
 
+// PLU-139 import review: map a parser section key (usageRights, paymentTerms,
+// deliverables, …) to the editable campaign FieldSpec it can fill, if any. The
+// parser's canonical keys are the SAME strings as the campaign field keys, so
+// this is a direct lookup — a candidate for an unknown/unmapped key is shown as
+// read-only evidence with no Apply target. Single edit point: if PLU-159 renames
+// a field key, the candidate mapping follows automatically.
+export function candidateFieldFor(sectionKey: string): FieldSpec | null {
+  for (const section of SECTIONS) {
+    for (const f of section.fields) {
+      if (
+        f.key === sectionKey &&
+        f.group === "campaign" &&
+        !f.readOnly &&
+        (f.control === "text" || f.control === "textarea")
+      ) {
+        return f;
+      }
+    }
+  }
+  return null;
+}
+
 export function getSection(key: SectionKey): SectionSpec {
   const s = SECTIONS.find((x) => x.key === key);
   if (!s) throw new Error(`unknown section: ${key}`);

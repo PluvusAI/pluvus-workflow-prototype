@@ -17,18 +17,23 @@
 // banners) are PLACEHOLDER pending PLU-159, marked `// COPY:PLU-159`.
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, Copy, Lock } from "lucide-react";
+import { ArrowLeft, Copy, Lock, Upload, Check, X } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   useCampaign,
   useBrandIdentity,
   useCreatorRequirement,
+  useBriefExtraction,
   updateCampaign,
   updateBrandIdentity,
   updateCreatorRequirement,
   duplicateCampaign,
+  createBriefExtraction,
+  uploadFile,
 } from "../../../api/builderClient";
 import type {
   BrandIdentityInput,
+  BriefExtractionFields,
   CampaignType,
   CreatorRequirementInput,
   GiftDisposition,
@@ -54,6 +59,7 @@ import {
   needsCommission,
   showsGiftDetails,
   isGiftOnly,
+  candidateFieldFor,
   type CompensationShape,
   type FieldGroup,
   type FieldSpec,
@@ -469,6 +475,16 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
               <p style={{ ...text.body, margin: "0 0 22px", maxWidth: 620 }}>{section.blurb}</p>
             )}
 
+            {/* Import: upload a brief and review extracted candidates. Start
+                section only; never in read-only mode. Applying a candidate fills
+                the matching draft field — it's never auto-written. */}
+            {activeSection === "startSources" && !readOnly && (
+              <BriefImport
+                campaignId={campaignId}
+                onApply={(fieldKey, textValue) => setField("campaign", fieldKey, textValue)}
+              />
+            )}
+
             <Card variant="flat" padding={22} style={{ display: "flex", flexDirection: "column", gap: 18 }}>
               {visibleFields(section, comp).map((f) => (
                 <FieldRenderer
@@ -815,6 +831,195 @@ function Center({ children }: { children: React.ReactNode }) {
     >
       {children}
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// BriefImport — upload a brief PDF, review its extracted sections as CANDIDATES.
+// ---------------------------------------------------------------------------
+// The import half of the intake. Upload reuses the shared /uploads + /brief-
+// extraction routes; the result is EVIDENCE, never authoritative. Each extracted
+// section that maps to an editable campaign field gets an "Apply" that fills that
+// field (marking it dirty → autosave) — never auto-applied. Unmapped sections
+// show as read-only evidence. Applying/dismissing is per-candidate; re-uploading
+// produces a fresh candidate set and never overwrites already-entered values.
+// Upload/parse failure is surfaced but never blocks manual entry.
+function BriefImport({
+  campaignId,
+  onApply,
+}: {
+  campaignId: string;
+  onApply: (fieldKey: string, textValue: string) => void;
+}) {
+  const toast = useToast();
+  const qc = useQueryClient();
+  const existing = useBriefExtraction(campaignId);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Per-candidate local status so applied/dismissed ones collapse without a refetch.
+  const [handled, setHandled] = useState<Record<string, "applied" | "dismissed">>({});
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // The latest stored extraction (404 → none yet, not an error).
+  const extraction: BriefExtractionFields | undefined = existing.data;
+
+  async function handleFile(file: File) {
+    setError(null);
+    setBusy(true);
+    try {
+      const uploaded = await uploadFile(file);
+      await createBriefExtraction(campaignId, uploaded.reference);
+      // Fresh candidate set → clear per-candidate handled state and refetch.
+      setHandled({});
+      await qc.invalidateQueries({ queryKey: ["campaign", campaignId, "brief-extraction"] });
+      toast.success("Brief uploaded — review the extracted fields below."); // COPY:PLU-159
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Upload failed";
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  // Extracted sections → candidate rows. Defensive: sections may be null/loose.
+  const candidates = Object.entries(extraction?.sections ?? {})
+    .map(([key, sec]) => {
+      const textValue = typeof sec?.text === "string" ? sec.text.trim() : "";
+      return { key, textValue, field: candidateFieldFor(key) };
+    })
+    .filter((c) => c.textValue.length > 0);
+
+  const pending = candidates.filter((c) => !handled[c.key]);
+
+  return (
+    <Card
+      variant="inset"
+      padding={18}
+      style={{ marginBottom: 18, display: "flex", flexDirection: "column", gap: 14 }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ ...text.subheading }}>Import from a brief {/* COPY:PLU-159 */}</div>
+          <div style={{ ...text.caption }}>
+            {/* COPY:PLU-159 */}
+            Upload an existing brief PDF. We pull out fields for you to review — nothing is saved
+            until you apply it.
+          </div>
+        </div>
+        <input
+          ref={fileRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          style={{ display: "none" }}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) void handleFile(f);
+          }}
+        />
+        <Button
+          variant="secondary"
+          onClick={() => fileRef.current?.click()}
+          disabled={busy}
+          leftIcon={<Upload size={14} strokeWidth={2} />}
+        >
+          {busy ? "Reading…" : extraction ? "Upload another" : "Upload brief"} {/* COPY:PLU-159 */}
+        </Button>
+      </div>
+
+      {error && (
+        <div role="alert" style={{ fontSize: font.size.sm, color: colors.danger }}>
+          {error} — you can still fill everything in manually below. {/* COPY:PLU-159 */}
+        </div>
+      )}
+
+      {extraction && candidates.length === 0 && (
+        <div style={{ fontSize: font.size.sm, color: colors.textMuted }}>
+          {/* COPY:PLU-159 */}
+          We couldn't pull structured fields from that file. You can still fill everything in
+          manually below.
+        </div>
+      )}
+
+      {pending.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {pending.map((c) => (
+            <div
+              key={c.key}
+              style={{
+                display: "flex",
+                alignItems: "flex-start",
+                gap: 12,
+                padding: "10px 12px",
+                background: colors.panel,
+                border: `1px solid ${colors.border}`,
+                borderRadius: radii.sm,
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 3 }}>
+                  <span style={{ fontSize: font.size.sm, fontWeight: font.weight.semibold, color: colors.text }}>
+                    {c.field ? c.field.label : c.key}
+                  </span>
+                  <Badge color={colors.accent} small>
+                    From brief {/* COPY:PLU-159 */}
+                  </Badge>
+                </div>
+                <div
+                  style={{
+                    fontSize: font.size.sm,
+                    color: colors.textMuted,
+                    lineHeight: 1.5,
+                    display: "-webkit-box",
+                    WebkitLineClamp: 3,
+                    WebkitBoxOrient: "vertical",
+                    overflow: "hidden",
+                  }}
+                >
+                  {c.textValue}
+                </div>
+                {!c.field && (
+                  <div style={{ fontSize: font.size.xs, color: colors.textDim, marginTop: 3 }}>
+                    {/* COPY:PLU-159 */}
+                    No matching field yet — kept as reference.
+                  </div>
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                {c.field && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => {
+                      onApply(c.field!.key, c.textValue);
+                      setHandled((h) => ({ ...h, [c.key]: "applied" }));
+                    }}
+                    leftIcon={<Check size={13} strokeWidth={2.25} />}
+                  >
+                    Apply {/* COPY:PLU-159 */}
+                  </Button>
+                )}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setHandled((h) => ({ ...h, [c.key]: "dismissed" }))}
+                  leftIcon={<X size={13} strokeWidth={2.25} />}
+                >
+                  Dismiss {/* COPY:PLU-159 */}
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {extraction && pending.length === 0 && candidates.length > 0 && (
+        <div style={{ fontSize: font.size.sm, color: colors.textMuted }}>
+          All extracted fields reviewed. {/* COPY:PLU-159 */}
+        </div>
+      )}
+    </Card>
   );
 }
 

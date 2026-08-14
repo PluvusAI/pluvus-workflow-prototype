@@ -28,11 +28,21 @@ import {
   upsertCreatorRequirement,
 } from "../db/creatorRequirement.js";
 import {
+  getLatestBriefExtraction,
+  insertBriefExtraction,
+} from "../db/campaignBriefExtraction.js";
+import {
   createWorkflow,
   updateWorkflow,
 } from "../db/workflows.js";
 import { findEmailAccountById } from "../db/emailAccounts.js";
 import { getTemplate } from "../templates/index.js";
+import { readStoredFile } from "../storage/localFileStorage.js";
+import { agentBaseUrl, agentPostJson } from "../adapters/agentServiceClient.js";
+import {
+  expectedBriefParseMode,
+  expectedParserVersion,
+} from "../engine/executors/briefKnowledge.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
 import {
   validateCreateSendingSettings,
@@ -1051,6 +1061,101 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
       return;
     }
     console.error("[campaigns] update creator requirement error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Brief import / candidate extraction (PLU-139 2a)
+// ---------------------------------------------------------------------------
+// The IMPORT half of the sectioned intake: a brand uploads a brief PDF (via the
+// shared POST /uploads route, which returns a reference), then POSTs that
+// reference here. We parse it best-effort into a structured section map and
+// store a CampaignBriefExtraction record — EVIDENCE, never authoritative. The
+// intake then reads the latest record and shows its sections as CANDIDATES the
+// brand confirms/edits/rejects into CampaignDetails through the normal PATCH.
+// Nothing here writes CampaignDetails, so re-uploading never overwrites a
+// confirmed value, and a failed/empty parse never blocks the manual path.
+
+/** Best-effort parse of a stored PDF into flatText + a section map. Fail-soft:
+ *  any transport/parse error yields an empty-but-valid result so the evidence
+ *  record still stores and the brand falls back to manual entry — per the
+ *  ticket's "OCR/extraction limitations must not block the manual path". */
+async function parseBriefBestEffort(
+  reference: string,
+): Promise<{ flatText: string; sections: JsonValue; parserVersion: string }> {
+  try {
+    const bytes = await readStoredFile(reference);
+    const data = (await agentPostJson(agentBaseUrl(), "/parse-brief", {
+      pdfBase64: bytes.toString("base64"),
+      parseMode: expectedBriefParseMode(),
+    })) as Record<string, unknown>;
+    const flatText = typeof data["text"] === "string" ? (data["text"] as string) : "";
+    const sections = (data["sections"] ?? {}) as JsonValue;
+    const parserVersion =
+      typeof data["parserVersion"] === "string" && (data["parserVersion"] as string).trim()
+        ? (data["parserVersion"] as string)
+        : expectedParserVersion();
+    return { flatText, sections, parserVersion };
+  } catch (err) {
+    console.warn(
+      `[campaigns] brief parse failed for ${reference}, storing empty evidence: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return { flatText: "", sections: {} as JsonValue, parserVersion: expectedParserVersion() };
+  }
+}
+
+// POST /campaigns/:id/brief-extraction — parse an uploaded brief and store the
+// candidate record. Body: { sourceFileReference } (from POST /uploads).
+router.post("/:id/brief-extraction", async (req: Request, res: Response) => {
+  const { sourceFileReference } = req.body as { sourceFileReference?: unknown };
+  if (typeof sourceFileReference !== "string" || !sourceFileReference.trim()) {
+    res.status(400).json({ error: "sourceFileReference is required" });
+    return;
+  }
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const parsed = await parseBriefBestEffort(sourceFileReference.trim());
+    const record = await insertBriefExtraction(req.params["id"]!, {
+      flatText: parsed.flatText,
+      sections: parsed.sections,
+      sourceFileReference: sourceFileReference.trim(),
+      parserVersion: parsed.parserVersion,
+    });
+    res.status(201).json({ ...record, createdAt: record.createdAt.toISOString() });
+  } catch (err) {
+    if (err instanceof CampaignLockedError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    console.error("[campaigns] create brief extraction error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// GET /campaigns/:id/brief-extraction — the latest stored extraction (candidates
+// the brand can still review), or 404 when none has been uploaded yet.
+router.get("/:id/brief-extraction", async (req: Request, res: Response) => {
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const record = await getLatestBriefExtraction(req.params["id"]!);
+    if (!record) {
+      res.status(404).json({ error: "no brief extraction for this campaign yet" });
+      return;
+    }
+    res.json({ ...record, createdAt: record.createdAt.toISOString() });
+  } catch (err) {
+    console.error("[campaigns] get brief extraction error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });

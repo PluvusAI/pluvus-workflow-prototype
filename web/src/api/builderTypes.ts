@@ -341,6 +341,36 @@ export type CreatorRequirementInput = Partial<
 >;
 
 // ---------------------------------------------------------------------------
+// PLU-139 (2a): brief import / candidate extraction. A stored, append-only
+// EVIDENCE record of one brief-PDF parse — never authoritative. The intake shows
+// its `sections` as candidates the brand confirms into CampaignDetails; it never
+// auto-writes. `sections` is the parser's section map (keys like usageRights,
+// paymentTerms, deliverables → { text, ... }); shape is best-effort so it's typed
+// loosely and read defensively.
+// ---------------------------------------------------------------------------
+export interface BriefExtractionSection {
+  type?: string;
+  text?: string;
+  pageStart?: number;
+  pageEnd?: number;
+  extractionConfidence?: number;
+  sourceFileReference?: string;
+  parserVersion?: string;
+}
+
+export interface BriefExtractionFields {
+  id: string;
+  campaignId: string;
+  flatText: string;
+  /** Parser section map. Keys are canonical field names (usageRights, etc.). */
+  sections: Record<string, BriefExtractionSection> | null;
+  other: unknown;
+  sourceFileReference: string;
+  parserVersion: string;
+  createdAt: string;
+}
+
+// ---------------------------------------------------------------------------
 // Workflow
 // ---------------------------------------------------------------------------
 

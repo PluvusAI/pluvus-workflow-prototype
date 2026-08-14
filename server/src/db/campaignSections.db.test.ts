@@ -30,6 +30,10 @@ import {
   getCreatorRequirementsByCampaignIds,
   upsertCreatorRequirement,
 } from "./creatorRequirement.js";
+import {
+  insertBriefExtraction,
+  getLatestBriefExtraction,
+} from "./campaignBriefExtraction.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
@@ -205,6 +209,58 @@ async function main(): Promise<void> {
     await pgdb.delete(schema.campaigns).where(eq(schema.campaigns.id, id));
     assert.equal(await getBrandIdentity(id, pgdb), null);
     assert.equal(await getCreatorRequirement(id, pgdb), null);
+  });
+
+  // ── CampaignBriefExtraction (append-only import evidence, PLU-139) ────────────
+  await test("brief extraction: insert is append-only and getLatest returns newest", async () => {
+    const id = await seedCampaign(pgdb);
+    assert.equal(await getLatestBriefExtraction(id, pgdb), null, "none before upload");
+    const first = await insertBriefExtraction(
+      id,
+      {
+        flatText: "first brief text",
+        sections: { usageRights: { text: "90 days paid" } },
+        sourceFileReference: "ref-1",
+        parserVersion: "brief-parser-v1.1",
+      },
+      pgdb,
+    );
+    const second = await insertBriefExtraction(
+      id,
+      {
+        flatText: "second brief text",
+        sections: { paymentTerms: { text: "net 30" } },
+        sourceFileReference: "ref-2",
+        parserVersion: "brief-parser-v1.1",
+      },
+      pgdb,
+    );
+    assert.notEqual(first.id, second.id, "each upload is a NEW row (append-only)");
+    const latest = await getLatestBriefExtraction(id, pgdb);
+    assert.equal(latest?.id, second.id, "latest is the most recent insert");
+    assert.equal(latest?.sourceFileReference, "ref-2");
+  });
+
+  await test("brief extraction is draft-locked: rejected once campaign is ACTIVE", async () => {
+    const id = await seedCampaign(pgdb, "DRAFT");
+    await insertBriefExtraction(
+      id,
+      { flatText: "t", sections: {}, sourceFileReference: "r", parserVersion: "v" },
+      pgdb,
+    );
+    await pgdb
+      .update(schema.campaigns)
+      .set({ status: "ACTIVE" })
+      .where(eq(schema.campaigns.id, id));
+    await assert.rejects(
+      () =>
+        insertBriefExtraction(
+          id,
+          { flatText: "t2", sections: {}, sourceFileReference: "r2", parserVersion: "v" },
+          pgdb,
+        ),
+      CampaignLockedError,
+    );
   });
 
   console.log(`\n✓ campaignSections.db: all ${n} tests passed\n`);
