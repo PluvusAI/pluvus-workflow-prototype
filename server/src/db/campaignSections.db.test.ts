@@ -249,6 +249,47 @@ async function main(): Promise<void> {
     assert.equal(dq?.length, 2);
   });
 
+  // PLU-139 field provenance: the jsonb map recording how each value got here
+  // (manual = typed, pdf_extracted = applied from an uploaded brief candidate).
+  // Proves it round-trips as a structured map and that a re-save updates it.
+  await test("upsertCampaignDetails persists field provenance (manual + pdf_extracted)", async () => {
+    const id = await seedCampaign(pgdb);
+    await upsertCampaignDetails(
+      id,
+      {
+        objective: "Drive awareness",
+        deliverables: "2 reels, 3 stories",
+        fieldProvenance: {
+          objective: "manual",
+          deliverables: "pdf_extracted",
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["fieldProvenance"],
+      },
+      pgdb,
+    );
+    const d = await getCampaignDetails(id, pgdb);
+    assert.deepEqual(d?.fieldProvenance, {
+      objective: "manual",
+      deliverables: "pdf_extracted",
+    });
+
+    // A later save overwrites the provenance map (edited value flips to manual).
+    await upsertCampaignDetails(
+      id,
+      {
+        fieldProvenance: {
+          objective: "manual",
+          deliverables: "manual",
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["fieldProvenance"],
+      },
+      pgdb,
+    );
+    const d2 = await getCampaignDetails(id, pgdb);
+    assert.deepEqual(d2?.fieldProvenance, {
+      objective: "manual",
+      deliverables: "manual",
+    });
+  });
+
   // ── draft-lock atomicity (Greptile P1) ───────────────────────────────────────
   // The upsert reads status with SELECT ... FOR UPDATE inside its own tx, so a
   // status flip committed BEFORE the upsert runs is observed → CampaignLockedError.

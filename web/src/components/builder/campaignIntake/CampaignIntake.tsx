@@ -39,6 +39,8 @@ import type {
   DeliverableQuantity,
   DeliverablePricing,
   FollowerRanges,
+  FieldProvenance,
+  FieldProvenanceValue,
   GiftDisposition,
   PriceStrategy,
 } from "../../../api/builderTypes";
@@ -183,6 +185,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       deliverableQuantities: c.deliverableQuantities ?? [],
       deliverablePricing: c.deliverablePricing ?? {},
       followerRanges: c.followerRanges ?? {},
+      // PLU-139 field provenance: field-key → "manual" | "pdf_extracted".
+      fieldProvenance: c.fieldProvenance ?? {},
       commissionMode: c.commissionMode ?? "percent",
       briefDeliveryMethod: c.briefDeliveryMethod ?? "",
       briefHighlight: c.briefHighlight ?? "",
@@ -290,6 +294,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
         : null,
       // S3.11 per-platform follower ranges — always-on; empty map → null.
       followerRanges: objOrNull(d.followerRanges),
+      // PLU-139 provenance map — empty → null.
+      fieldProvenance: objOrNull(d.fieldProvenance) as FieldProvenance | null,
       briefDeliveryMethod: strOrNull(d.briefDeliveryMethod),
       briefHighlight: strOrNull(d.briefHighlight),
       creativeConcept: strOrNull(d.creativeConcept),
@@ -458,7 +464,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
 
   // -- edit handlers -------------------------------------------------------
   const setField = useCallback(
-    (group: FieldGroup, key: string, value: unknown) => {
+    (group: FieldGroup, key: string, value: unknown, provenance: FieldProvenanceValue = "manual") => {
       dirtyRef.current.add(group);
       // Editing the deliverable cards changes the DERIVED creatorRequirement
       // platforms too, so mark that group dirty so its PATCH re-sends them.
@@ -471,6 +477,18 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
           : group === "brandIdentity"
             ? setBrandDraft
             : setCreatorDraft;
+      // PLU-139 provenance: record how each campaign-group value got here. A
+      // normal edit is "manual"; applying a brief candidate passes "pdf_extracted"
+      // (see BriefImport onApply). Skip the provenance map key itself.
+      if (group === "campaign" && key !== "fieldProvenance") {
+        setCampaignDraft((prev) => ({
+          ...prev,
+          fieldProvenance: {
+            ...(prev.fieldProvenance as FieldProvenance | undefined),
+            [key]: provenance,
+          },
+        }));
+      }
       setter((prev) => ({ ...prev, [key]: value }));
       scheduleSave();
     },
@@ -656,7 +674,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
             {activeSection === "startSources" && !readOnly && (
               <BriefImport
                 campaignId={campaignId}
-                onApply={(fieldKey, textValue) => setField("campaign", fieldKey, textValue)}
+                onApply={(fieldKey, textValue) => setField("campaign", fieldKey, textValue, "pdf_extracted")}
               />
             )}
 

@@ -44,6 +44,7 @@ const FILES = [
   "20260814140000_plu139_product_name/migration.sql", // +productName (S2.3)
   "20260814150000_plu139_page5_page6_fields/migration.sql", // +5 Page-5/6 cols (S5.2/4/5/6, S6.3)
   "20260814160000_plu139_pricing_ranges_mode/migration.sql", // +3 cols (S7.P1 pricing, S3.11 ranges, S7.A1 mode)
+  "20260815120000_plu139_field_provenance/migration.sql", // +fieldProvenance (jsonb map)
 ];
 
 // Split SQL into top-level statements. Tracks $$...$$ dollar-quoting so the

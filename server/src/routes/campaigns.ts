@@ -107,6 +107,7 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     deliverableQuantities: details?.deliverableQuantities ?? null,
     deliverablePricing: details?.deliverablePricing ?? null,
     followerRanges: details?.followerRanges ?? null,
+    fieldProvenance: details?.fieldProvenance ?? null,
     briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
     briefHighlight: details?.briefHighlight ?? null,
     creativeConcept: details?.creativeConcept ?? null,
@@ -567,6 +568,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     deliverableQuantities,
     deliverablePricing,
     followerRanges,
+    fieldProvenance,
     briefDeliveryMethod,
     briefHighlight,
     creativeConcept,
@@ -630,6 +632,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     deliverableQuantities?: unknown;
     deliverablePricing?: unknown;
     followerRanges?: unknown;
+    fieldProvenance?: unknown;
     briefDeliveryMethod?: string | null;
     briefHighlight?: string | null;
     creativeConcept?: string | null;
@@ -855,7 +858,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
   // S7.P1 pricing map / S3.11 follower-ranges map — plain JSON objects keyed by
   // deliverable or platform. Accept an object or null; reject arrays/scalars at
   // the trust boundary (mirrors the deliverableQuantities array guard).
-  const jsonObjectFields139 = { deliverablePricing, followerRanges } as const;
+  const jsonObjectFields139 = { deliverablePricing, followerRanges, fieldProvenance } as const;
   for (const [key, value] of Object.entries(jsonObjectFields139)) {
     if (value === undefined) continue;
     if (value !== null && (typeof value !== "object" || Array.isArray(value))) {

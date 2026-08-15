@@ -43,6 +43,7 @@ import type {
   DeliverableQuantity,
   DeliverablePricing,
   FollowerRanges,
+  FieldProvenance,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -190,6 +191,7 @@ export function updateCampaign(
     deliverableQuantities?: DeliverableQuantity[] | null;
     deliverablePricing?: DeliverablePricing | null;
     followerRanges?: FollowerRanges | null;
+    fieldProvenance?: FieldProvenance | null;
     briefDeliveryMethod?: string | null;
     briefHighlight?: string | null;
     creativeConcept?: string | null;

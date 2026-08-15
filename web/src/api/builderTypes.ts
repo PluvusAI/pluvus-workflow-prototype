@@ -181,6 +181,14 @@ export type DeliverablePricing = Record<string, number>;
  *  null = no upper limit. */
 export type FollowerRanges = Record<string, { min: number | null; max: number | null }>;
 
+/** PLU-139: how a creator-facing value got here. Only the reachable sources are
+ *  recorded today — a field the brand typed/edited is "manual"; a value applied
+ *  from an uploaded brief candidate is "pdf_extracted". */
+export type FieldProvenanceValue = "manual" | "pdf_extracted";
+
+/** PLU-139: field-key → provenance. An absent key means "no provenance recorded". */
+export type FieldProvenance = Record<string, FieldProvenanceValue>;
+
 /** PLU-139 (2a): the worksheet Stage-1 public-brief fields that gained
  *  CampaignDetails columns. All nullable — an incomplete Draft is valid. Shared
  *  by CampaignListItem and CampaignDetail (both flatten the same row). */
@@ -303,6 +311,8 @@ export interface CampaignDetail extends WorksheetStage1Fields {
   brand: string;
   /** PLU-135 (1a): DRAFT (editable) | ACTIVE (launched, locked). */
   status: CampaignStatus;
+  /** PLU-139: field-key → how that value got here (manual | pdf_extracted). */
+  fieldProvenance: FieldProvenance | null;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;

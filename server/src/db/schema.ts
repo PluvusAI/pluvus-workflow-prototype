@@ -704,6 +704,10 @@ export const campaignDetails = pgTable("CampaignDetails", {
   trackingLinkMode: text("trackingLinkMode"), // S7.T1 "pluvus" | "own"
   trackingDestinationUrl: text("trackingDestinationUrl"), // S7.T2
   trackingParameter: text("trackingParameter"), // S7.T3
+  // PLU-139 field-level provenance: { "<fieldKey>": "manual" | "pdf_extracted" }.
+  // How each creator-facing value got here (typed = manual, applied from a brief
+  // candidate = pdf_extracted). Absent key = no provenance recorded.
+  fieldProvenance: jsonb("fieldProvenance").$type<JsonValue>(),
   // PLU-135 schema review §2.1 (Calvin, 2026-08-08): which extraction the
   // fields above were actually confirmed from — the missing link in the
   // extraction -> confirmation -> snapshot chain. Without this,
