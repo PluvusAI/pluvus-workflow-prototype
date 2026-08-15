@@ -781,7 +781,11 @@ model CampaignBrief {
   /// mintCampaignBriefCreatorToken(), never re-readable afterward). Minted
   /// once this row goes READY. Nothing in this PR emails it to a creator
   /// (route-only per the ticket's own resolution — no CONTENT_BRIEF executor
-  /// wiring); the worker logs the raw token at mint time as a testing seam.
+  /// wiring). Security review fix (Calvin): the raw token is NEVER logged —
+  /// possession of it alone authorizes the public /brief/:token route, so a
+  /// log line would hand the same access to anyone who can read logs. A
+  /// manual pre-delivery verification reads it via a secure, DB-scoped
+  /// channel, never a shipped log stream.
   creatorTokenHash String? @unique
 
   /// PLU-135 schema review §2.2 (Calvin, 2026-08-08) — named in review as the
