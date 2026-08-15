@@ -5,6 +5,13 @@
 FROM node:20-alpine AS build
 WORKDIR /app
 
+# PLU-139: puppeteer's own postinstall downloads a glibc-linked Chromium,
+# which does not run on Alpine's musl libc anyway (the runtime stage below
+# installs Alpine's own system `chromium` package instead and points
+# PUPPETEER_EXECUTABLE_PATH at it). Skipping the download here just saves
+# build time/image size on a browser build that would never run.
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
 # Install workspace deps (root + server). The repo is an npm workspace, so the
 # root package.json + lockfile drive install; the server package is a workspace.
 COPY package.json package-lock.json tsconfig.base.json ./
@@ -19,6 +26,21 @@ RUN npm run build --workspace server
 FROM node:20-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+
+# PLU-139 §2: headless-Chrome system libs for Puppeteer's HTML→PDF render
+# (server/src/workers/campaignBriefRenderWorker.ts). Alpine's own `chromium`
+# package (musl-compatible) is installed instead of puppeteer's bundled
+# glibc build (skipped above) — PUPPETEER_EXECUTABLE_PATH points Puppeteer
+# at it; every `puppeteer.launch()` call picks it up automatically, no code
+# path needs to know whether it's running in dev (bundled Chromium, any OS)
+# or here. This runs in EVERY role's image (api/worker/scheduler all share
+# one image per the file's own header comment) even though only
+# PROCESS_ROLE=worker ever actually launches Chromium — simplest to keep one
+# image, and the added size is Alpine's own chromium package, not a second
+# bundled browser.
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/server/dist ./server/dist
 COPY --from=build /app/server/package.json ./server/

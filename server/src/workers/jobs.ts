@@ -51,6 +51,20 @@ export interface DelayedSendJobData {
   messageId: string;
 }
 
+/**
+ * PLU-139 §6: render one CampaignBrief. The job carries ONLY the row id the
+ * job exists to complete — not campaignId, not renderRequestId — so the
+ * job's identity is fixed at enqueue time and every retry (BullMQ `attempts`)
+ * re-enters the SAME row, never a fresh one per attempt. jobId is keyed on
+ * this same id (`brief-render|${campaignBriefId}`), deliberately NOT on
+ * campaignId — see the plan doc's "why jobId is keyed on campaignBriefId"
+ * note: keying on campaignId would silently swallow a legitimate second
+ * re-render request made while a first is still processing.
+ */
+export interface CampaignBriefRenderJobData {
+  campaignBriefId: string;
+}
+
 export interface InboundEmailJobData {
   instanceId: string;
   /** The Nylas (or mock) message id — unique within emailAccountId. */

@@ -726,6 +726,13 @@ model CreatorRequirement {
   contentStyle  String?
   brandSafety   String?
 
+  /// PLU-139 §0/§1a: stub approval flag for including this table's content in
+  /// a rendered CampaignBrief. Defaults false on every existing and future
+  /// row — nothing in PLU-139 sets it true (no UI, no API endpoint to flip
+  /// it yet); buildCampaignBriefInput() only emits a creatorRequirements
+  /// section when true.
+  approvedForBrief Boolean @default(false)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -751,9 +758,31 @@ model CampaignBrief {
   campaignId             String
   campaignTermsSnapshotId String
 
+  /// PLU-139 §6a: client-supplied idempotency key (a UUID minted once per
+  /// "render" click), NOT derived from campaignTermsSnapshotId — the same
+  /// snapshot can legitimately produce multiple CampaignBrief rows over time
+  /// (re-render after a BrandIdentity edit), so snapshot id alone cannot be
+  /// the dedup key. NOT NULL: the only writer of this table is
+  /// POST /campaigns/:id/brief, which requires this field on every request.
+  renderRequestId String @unique
+
   renderedAssetRef String?
   status           CampaignBriefRenderStatus @default(GENERATING)
   generatedAt      DateTime?
+  /// PLU-139 §8/§9: set only when status = FAILED — DATA_INCOMPLETE (a
+  /// material field the snapshot should guarantee was missing),
+  /// RENDER_FAILED (Puppeteer/PDF conversion threw), or STALE (written by
+  /// §6b's crash-recovery sweep — the job never reported back at all).
+  /// Never surfaced as an HTTP error; these categories only ever exist here.
+  errorCategory String?
+  /// PLU-139 §7: creator-facing magic-link retrieval — same hashed-token
+  /// posture as PaymentInfo.token (BUG-S1): only the SHA-256 hash is ever
+  /// persisted, the raw token exists only at mint time (returned by
+  /// mintCampaignBriefCreatorToken(), never re-readable afterward). Minted
+  /// once this row goes READY. Nothing in this PR emails it to a creator
+  /// (route-only per the ticket's own resolution — no CONTENT_BRIEF executor
+  /// wiring); the worker logs the raw token at mint time as a testing seam.
+  creatorTokenHash String? @unique
 
   /// PLU-135 schema review §2.2 (Calvin, 2026-08-08) — named in review as the
   /// most important open concern. BrandIdentity is deliberately NOT locked at
@@ -786,6 +815,11 @@ model CampaignBrief {
   @@index([campaignId])
   @@index([campaignTermsSnapshotId])
   @@index([campaignId, renderedAt])
+  /// PLU-139 §6/§1a: the concurrency backstop — at most one CURRENT
+  /// (status='READY' AND supersededAt IS NULL) row per campaign. This is a
+  /// PARTIAL unique index; Prisma cannot model a WHERE clause on @@unique,
+  /// so it is created directly by the migration SQL as
+  /// "CampaignBrief_campaignId_current_key" and documented here only.
 }
 
 /// PLU-135 (1a): append-only campaign history. No updatedAt by design — nothing

@@ -875,6 +875,10 @@ export const creatorRequirements = pgTable("CreatorRequirement", {
   audienceNotes: text("audienceNotes"),
   contentStyle: text("contentStyle"),
   brandSafety: text("brandSafety"),
+  // PLU-139 §0/§1a: stub approval flag — defaults false everywhere; nothing
+  // sets it true yet (no UI, no API endpoint). buildCampaignBriefInput()
+  // only emits a creatorRequirements section when true.
+  approvedForBrief: boolean("approvedForBrief").notNull().default(false),
   createdAt: tsNow("createdAt"),
   updatedAt: tsUpdatedAt("updatedAt"),
 });
@@ -906,9 +910,22 @@ export const campaignBriefs = pgTable(
     id: cuidId("id"),
     campaignId: text("campaignId").notNull(),
     campaignTermsSnapshotId: text("campaignTermsSnapshotId").notNull(),
+    // PLU-139 §6a: client-supplied idempotency key (a UUID minted once per
+    // "render" click) — NOT derived from campaignTermsSnapshotId, since the
+    // same snapshot can legitimately produce multiple rows over time
+    // (re-render after a BrandIdentity edit). NOT NULL: the only writer is
+    // POST /campaigns/:id/brief, which requires this on every request.
+    renderRequestId: text("renderRequestId").notNull(),
     renderedAssetRef: text("renderedAssetRef"),
     status: campaignBriefRenderStatusEnum("status").notNull().default("GENERATING"),
     generatedAt: ts("generatedAt"),
+    // PLU-139 §8/§9: set only when status = FAILED — DATA_INCOMPLETE /
+    // RENDER_FAILED / STALE. Never surfaced as an HTTP error.
+    errorCategory: text("errorCategory"),
+    // PLU-139 §7: hashed magic-link token (BUG-S1 posture, mirrors
+    // paymentInfo.token) — only the hash is stored; the raw token exists
+    // only at mint time.
+    creatorTokenHash: text("creatorTokenHash"),
     brandIdentitySnapshot: jsonb("brandIdentitySnapshot").$type<JsonValue>().notNull(),
     templateVersion: text("templateVersion").notNull(),
     renderedAt: tsNow("renderedAt"),
@@ -920,6 +937,13 @@ export const campaignBriefs = pgTable(
     index("CampaignBrief_campaignId_idx").on(table.campaignId),
     index("CampaignBrief_campaignTermsSnapshotId_idx").on(table.campaignTermsSnapshotId),
     index("CampaignBrief_campaignId_renderedAt_idx").on(table.campaignId, table.renderedAt),
+    uniqueIndex("CampaignBrief_renderRequestId_key").on(table.renderRequestId),
+    uniqueIndex("CampaignBrief_creatorTokenHash_key").on(table.creatorTokenHash),
+    // PLU-139 §6/§1a: the concurrency backstop — at most one CURRENT
+    // (status='READY' AND supersededAt IS NULL) row per campaign.
+    uniqueIndex("CampaignBrief_campaignId_current_key")
+      .on(table.campaignId)
+      .where(sql`${table.status} = 'READY' AND ${table.supersededAt} IS NULL`),
     foreignKey({
       columns: [table.campaignId],
       foreignColumns: [campaigns.id],
@@ -1719,7 +1743,7 @@ export const llmCalls = pgTable(
 );
 
 /** The agent paths that produce LLM calls (LlmCall.role values). */
-export type LlmCallRole = "classify" | "negotiate" | "draft" | "summarize";
+export type LlmCallRole = "classify" | "negotiate" | "draft" | "summarize" | "brief_narrative";
 
 // ---------------------------------------------------------------------------
 // Attribution & Payout ledger (Phase 1+)

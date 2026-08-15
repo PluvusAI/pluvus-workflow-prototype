@@ -12,6 +12,8 @@ import queuesRouter from "./routes/queues.js";
 import webhooksRouter from "./routes/webhooks.js";
 import observabilityRouter from "./routes/observability.js";
 import campaignsRouter from "./routes/campaigns.js";
+import campaignBriefsRouter from "./routes/campaignBriefs.js";
+import campaignBriefTokenRouter from "./routes/campaignBriefToken.js";
 import workflowsRouter from "./routes/workflows.js";
 import emailAccountsRouter from "./routes/emailAccounts.js";
 import manualQueueRouter from "./routes/manualQueue.js";
@@ -130,6 +132,10 @@ export function createApp(): Express {
   app.use("/observability", requireOperatorKey, observabilityRouter);
   // Phase 10 — Workflow Builder APIs (create + cascade-DELETE a campaign).
   app.use("/campaigns", requireOperatorKey, campaignsRouter);
+  // PLU-139 §7 — CampaignBrief render/metadata/pdf/history routes, mounted
+  // at the same /campaigns prefix as a second router (Express tries routers
+  // in mount order; campaignsRouter's own routes don't overlap with /:id/brief*).
+  app.use("/campaigns", requireOperatorKey, campaignBriefsRouter);
   app.use("/workflows", requireOperatorKey, workflowsRouter);
   // PLU-121 — connected email accounts (multi-mailbox): register/list/manage the
   // Nylas grants outreach can be sent from.
@@ -166,6 +172,10 @@ export function createApp(): Express {
   // renders, POST mutates — same I-5 precedent). Token-gated; must reach the brand
   // with no operator key, same as the payout confirm/dispute pages.
   app.use("/brand-approval", publicLimiter, brandApprovalRouter);
+  // PLU-139 §7 — creator-facing CampaignBrief retrieval (magic-link token,
+  // same open posture as the routers above). Route only in this PR — see
+  // routes/campaignBriefToken.ts's own doc comment.
+  app.use("/brief", publicLimiter, campaignBriefTokenRouter);
 
   // -------------------------------------------------------------------------
   // Static SPA (single-origin deploy) — serve the built dashboard.
@@ -189,6 +199,7 @@ export function createApp(): Express {
     const apiRouter = express.Router();
     apiRouter.use("/observability", requireOperatorKey, observabilityRouter);
     apiRouter.use("/campaigns", requireOperatorKey, campaignsRouter);
+    apiRouter.use("/campaigns", requireOperatorKey, campaignBriefsRouter);
     apiRouter.use("/workflows", requireOperatorKey, workflowsRouter);
     apiRouter.use("/email-accounts", requireOperatorKey, emailAccountsRouter);
     apiRouter.use("/manual-queue", requireOperatorKey, manualQueueRouter);
