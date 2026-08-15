@@ -9,6 +9,7 @@ import {
   deleteCampaign,
   launchCampaign,
   duplicateCampaign,
+  computeReadiness,
   CampaignNotFoundError,
   CampaignDetailsMissingError,
   NegotiationPolicyMissingError,
@@ -1339,6 +1340,32 @@ router.get("/:id/brief-extraction", async (req: Request, res: Response) => {
     res.json({ ...record, createdAt: record.createdAt.toISOString() });
   } catch (err) {
     console.error("[campaigns] get brief extraction error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// GET /campaigns/:id/readiness — PLU-140 (2b): a read-only projection of the
+// SAME preconditions launchCampaign() enforces, so the review page can show
+// blockers up front instead of only discovering them via a failed POST /launch.
+// Uses the identical existence + CONFIRMED + validateCompensationReadiness
+// checks as launchCampaign (db/campaigns.ts) — one shared shape, so this can
+// never report ready:true while POST /launch would 409/422.
+// ponytail: recompute per request, cache if the review page ever polls it hot.
+router.get("/:id/readiness", async (req: Request, res: Response) => {
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const details = await getCampaignDetails(req.params["id"]!);
+    const policy = await getNegotiationPolicy(req.params["id"]!);
+    // computeReadiness (db/campaigns.ts) is the SINGLE source of the readiness
+    // shape — it mirrors launchCampaign's preconditions exactly, so this can't
+    // drift from what launch enforces.
+    res.json(computeReadiness(details, policy));
+  } catch (err) {
+    console.error("[campaigns] readiness error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });
