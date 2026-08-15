@@ -129,8 +129,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [savedTick, setSavedTick] = useState(0);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // The groups touched since the last successful save — only these get PATCHed.
-  const dirtyRef = useRef<Set<FieldGroup>>(new Set());
+  // Dirty groups as a per-group VERSION, not a boolean set: each edit bumps the
+  // group's counter. A save snapshots the versions it sends and, on success,
+  // clears a group only if its version is unchanged — so an edit that lands WHILE
+  // that group's PATCH is in flight (which a plain Set.add can't distinguish from
+  // the in-flight edit) bumps the version and survives, keeping its debounce live.
+  const dirtyRef = useRef<Map<FieldGroup, number>>(new Map());
   // Always points at the CURRENT-render doSave. The debounced timer fires this
   // instead of a captured closure, so the save reads the latest committed drafts
   // (a debounce scheduled from setField's render would otherwise PATCH pre-edit
@@ -415,7 +419,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   }, [creatorDraft, campaignDraft.deliverableQuantities]);
 
   const doSave = useCallback(async () => {
-    const groups = Array.from(dirtyRef.current);
+    // Snapshot the version of every dirty group at the START of this save. On
+    // success we clear a group only if its version is unchanged — an edit that
+    // lands during the PATCH bumps the version and stays dirty (its own debounce
+    // will save it), even a re-edit of the SAME group already in flight.
+    const snapshot = new Map(dirtyRef.current);
+    const groups = Array.from(snapshot.keys());
     if (groups.length === 0) return;
     setSaving(true);
     setSaveError(null);
@@ -427,10 +436,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
         await updateBrandIdentity(campaignId, buildBrandPayload());
       if (groups.includes("creatorRequirement"))
         await updateCreatorRequirement(campaignId, buildCreatorPayload());
-      // Clear ONLY the groups this save actually sent. A group marked dirty while
-      // the PATCH above was in flight must stay dirty so its queued debounce still
-      // fires — a blanket clear() would silently drop that intervening edit.
-      for (const g of groups) dirtyRef.current.delete(g);
+      // Clear a group only if it wasn't re-edited since the snapshot (same
+      // version). A re-edit during the in-flight PATCH bumped the version, so it
+      // stays dirty and its queued debounce still fires the follow-up PATCH.
+      for (const g of groups) {
+        if (dirtyRef.current.get(g) === snapshot.get(g)) dirtyRef.current.delete(g);
+      }
       setSavedTick((t) => t + 1);
     } catch (err) {
       // Keep the local draft AND the dirty set intact so nothing is lost and a
@@ -475,13 +486,19 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   }, []);
 
   // -- edit handlers -------------------------------------------------------
+  // Bump a group's dirty version. An in-flight save that already snapshotted the
+  // old version will then NOT clear this group on completion (version moved on).
+  const markDirty = (group: FieldGroup) => {
+    dirtyRef.current.set(group, (dirtyRef.current.get(group) ?? 0) + 1);
+  };
+
   const setField = useCallback(
     (group: FieldGroup, key: string, value: unknown, provenance: FieldProvenanceValue = "manual") => {
-      dirtyRef.current.add(group);
+      markDirty(group);
       // Editing the deliverable cards changes the DERIVED creatorRequirement
       // platforms too, so mark that group dirty so its PATCH re-sends them.
       if (group === "campaign" && key === "deliverableQuantities") {
-        dirtyRef.current.add("creatorRequirement");
+        markDirty("creatorRequirement");
       }
       const setter =
         group === "campaign"
