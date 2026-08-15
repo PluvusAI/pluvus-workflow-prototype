@@ -160,6 +160,45 @@ function projectCompensation(details: CampaignDetailsSnapshot): CompensationProj
   }
 }
 
+/**
+ * §8/§9 (PLU-141): "missing material snapshot data fails explicitly and
+ * identifies the missing category" — the public-field half of
+ * `validateCompensationReadiness()` (db/campaigns.ts), re-scoped to what the
+ * RENDERER specifically needs. Deliberately narrower than that function:
+ * this file never reads NegotiationPolicy (excluded by construction, §1), so
+ * it cannot and does not re-check negotiation-authority fields
+ * (floorCents/commissionFloorRate/etc.) — those are launchCampaign()'s job,
+ * not the brief's. This checks only "is there enough PUBLIC data, per
+ * campaignType, to render a real compensation section" — the same four
+ * branches (needsFee/needsCommission/needsGift), same field names, checked
+ * independently here rather than importing the launch-time function,
+ * because a launched campaign's snapshot is SUPPOSED to already guarantee
+ * this (validateCompensationReadiness() gates launchCampaign() itself) —
+ * this is the defensive, should-be-unreachable check for that invariant,
+ * not the primary enforcement of it.
+ */
+export function validateCampaignBriefCompleteness(details: CampaignDetailsSnapshot): string[] {
+  const missing: string[] = [];
+  const needsFee = details.campaignType === "PAID" || details.campaignType === "HYBRID";
+  const needsCommission = details.campaignType === "AFFILIATE" || details.campaignType === "HYBRID";
+  const needsGift = details.campaignType === "GIFT_ONLY" || details.includesGifting;
+
+  if (needsFee) {
+    if (!details.priceStrategy) missing.push("priceStrategy");
+    if (details.priceStrategy === "PROPOSE_STARTING_FEE" && details.publicStartingFeeCents == null) {
+      missing.push("publicStartingFeeCents (required when priceStrategy is PROPOSE_STARTING_FEE)");
+    }
+  }
+  if (needsCommission) {
+    if (details.publicCommissionRate == null) missing.push("publicCommissionRate");
+  }
+  if (needsGift) {
+    if (!details.productOrOffer) missing.push("productOrOffer");
+    if (!details.giftDisposition) missing.push("giftDisposition");
+  }
+  return missing;
+}
+
 // §5: neutral Pluvus-branded fallback — used whenever a campaign has no
 // BrandIdentity row, or every presentational field on it is null. Fixed
 // constant, baked into the template CSS the same way; not read from any
@@ -243,6 +282,15 @@ export async function buildCampaignBriefInput(
   }
 
   const details = snapshot.detailsSnapshot as CampaignDetailsSnapshot;
+
+  // §8/§9: fail loud rather than render an incomplete document. Checked
+  // before any projection work below — see validateCampaignBriefCompleteness()'s
+  // own doc comment for why this should be unreachable in practice and is
+  // checked anyway.
+  const missingFields = validateCampaignBriefCompleteness(details);
+  if (missingFields.length > 0) {
+    throw new CampaignBriefDataIncompleteError(campaignId, missingFields.join(", "));
+  }
 
   const creatorRequirementsProjection: CreatorRequirementsProjection | null =
     requirementRow?.approvedForBrief
@@ -508,7 +556,18 @@ export async function markCampaignBriefFailed(
 // §7: read paths the routes need
 // ---------------------------------------------------------------------------
 
-/** §7's "current (most recent, any status)" row for GET /campaigns/:id/brief and /brief/pdf. */
+/**
+ * §7's "current (most recent, any status)" row — for GET /campaigns/:id/brief
+ * (status/metadata) ONLY. Deliberately NOT used for /brief/pdf (see
+ * getCurrentReadyCampaignBrief() below): if a re-render is in flight or just
+ * failed, the "most recent attempt" is GENERATING/FAILED even though a
+ * perfectly good, un-superseded READY document still exists — the whole
+ * point of never overwriting/deleting a prior render is defeated if
+ * retrieval blocks on the newest attempt instead of serving the last
+ * known-good one. This function answers "what's happening right now,"
+ * for a UI to show "rendering…"/"failed"/"ready" — a different question
+ * from "what PDF should I actually serve."
+ */
 export async function getLatestCampaignBriefForCampaign(
   campaignId: string,
   client: Db | DbTx = db,
@@ -518,6 +577,38 @@ export async function getLatestCampaignBriefForCampaign(
     .from(campaignBriefs)
     .where(eq(campaignBriefs.campaignId, campaignId))
     .orderBy(desc(campaignBriefs.createdAt))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * The row PDF retrieval should actually serve: the one CURRENT row by the
+ * partial unique index's own definition (`status='READY' AND supersededAt
+ * IS NULL`) — at most one can ever exist per campaign, enforced by
+ * `CampaignBrief_campaignId_current_key` itself, not just by this query's
+ * own filter. A re-render in flight (GENERATING) or a re-render that just
+ * failed does not change what this returns — the previously-READY,
+ * not-yet-superseded row stays current until a NEW render actually
+ * finishes and finalizeCampaignBriefRender() supersedes it. Used by
+ * `GET /campaigns/:id/brief/pdf`; `GET /campaigns/:id/brief` (status)
+ * intentionally uses getLatestCampaignBriefForCampaign() instead — see
+ * that function's own doc comment for why they must stay two different
+ * queries, not one.
+ */
+export async function getCurrentReadyCampaignBrief(
+  campaignId: string,
+  client: Db | DbTx = db,
+): Promise<CampaignBrief | null> {
+  const [row] = await client
+    .select()
+    .from(campaignBriefs)
+    .where(
+      and(
+        eq(campaignBriefs.campaignId, campaignId),
+        eq(campaignBriefs.status, "READY"),
+        isNull(campaignBriefs.supersededAt),
+      ),
+    )
     .limit(1);
   return row ?? null;
 }

@@ -34,9 +34,13 @@ import {
   createOrGetCampaignBriefRenderRequest,
   finalizeCampaignBriefRender,
   getLatestCampaignBriefForCampaign,
+  getCurrentReadyCampaignBrief,
   listStaleGeneratingCampaignBriefs,
   markCampaignBriefStaleIfGenerating,
   resolveCampaignBriefByCreatorToken,
+  validateCampaignBriefCompleteness,
+  CampaignBriefDataIncompleteError,
+  type CampaignDetailsSnapshot,
 } from "./campaignBriefRender.js";
 import { renderCampaignBriefHtml } from "../templates/campaignBrief/index.js";
 import { defaultNarrative } from "../templates/campaignBrief/narrative.js";
@@ -58,6 +62,7 @@ async function seedLaunchedCampaign(
   pgdb: Db,
   suffix: string,
   details: Partial<schema.CampaignDetailsInsert> = {},
+  policy: Partial<schema.NegotiationPolicyInsert> = { floorCents: 10_000, ceilingCents: 30_000 },
 ): Promise<{ campaignId: string; campaignTermsSnapshotId: string }> {
   const [campaign] = await pgdb
     .insert(schema.campaigns)
@@ -81,9 +86,7 @@ async function seedLaunchedCampaign(
     publicPaymentTerms: "Net 30",
     ...details,
   });
-  await pgdb
-    .insert(schema.negotiationPolicies)
-    .values({ campaignId: campaign!.id, floorCents: 10_000, ceilingCents: 30_000 });
+  await pgdb.insert(schema.negotiationPolicies).values({ campaignId: campaign!.id, ...policy });
   const snapshot = await launchCampaign(campaign!.id, pgdb);
   return { campaignId: campaign!.id, campaignTermsSnapshotId: snapshot.id };
 }
@@ -132,6 +135,300 @@ async function main(): Promise<void> {
       giftDisposition: null,
     });
   });
+
+  // 1b. PLU-141 review (Calvin): CampaignBriefDataIncompleteError was declared
+  // but never actually thrown. A launched campaign's snapshot SHOULD already
+  // guarantee completeness (launchCampaign()'s validateCompensationReadiness()
+  // gate) — these seed a CampaignTermsSnapshot directly (bypassing
+  // launchCampaign()) to simulate the "should be unreachable" case the
+  // defensive check exists for.
+  await test("validateCampaignBriefCompleteness: PAID missing priceStrategy is reported", async () => {
+    const details = { campaignType: "PAID", includesGifting: false } as CampaignDetailsSnapshot;
+    const missing = validateCampaignBriefCompleteness(details);
+    assert.ok(missing.includes("priceStrategy"));
+  });
+
+  await test(
+    "validateCampaignBriefCompleteness: PROPOSE_STARTING_FEE without a fee amount is reported",
+    async () => {
+      const details = {
+        campaignType: "PAID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        publicStartingFeeCents: null,
+        includesGifting: false,
+      } as CampaignDetailsSnapshot;
+      const missing = validateCampaignBriefCompleteness(details);
+      assert.ok(missing.some((m) => m.includes("publicStartingFeeCents")));
+    },
+  );
+
+  await test("validateCampaignBriefCompleteness: AFFILIATE missing commission rate is reported", async () => {
+    const details = {
+      campaignType: "AFFILIATE",
+      publicCommissionRate: null,
+      includesGifting: false,
+    } as CampaignDetailsSnapshot;
+    const missing = validateCampaignBriefCompleteness(details);
+    assert.ok(missing.includes("publicCommissionRate"));
+  });
+
+  await test("validateCampaignBriefCompleteness: GIFT_ONLY missing product/disposition is reported", async () => {
+    const details = {
+      campaignType: "GIFT_ONLY",
+      productOrOffer: null,
+      giftDisposition: null,
+      includesGifting: false,
+    } as CampaignDetailsSnapshot;
+    const missing = validateCampaignBriefCompleteness(details);
+    assert.ok(missing.includes("productOrOffer"));
+    assert.ok(missing.includes("giftDisposition"));
+  });
+
+  await test("validateCampaignBriefCompleteness: a fully-specified PAID snapshot reports nothing missing", async () => {
+    const details = {
+      campaignType: "PAID",
+      priceStrategy: "REQUEST_RATE_CARD",
+      publicStartingFeeCents: null,
+      includesGifting: false,
+    } as CampaignDetailsSnapshot;
+    assert.deepEqual(validateCampaignBriefCompleteness(details), []);
+  });
+
+  await test(
+    "buildCampaignBriefInput: an incomplete snapshot throws CampaignBriefDataIncompleteError, categorized DATA_INCOMPLETE by the worker",
+    async () => {
+      // Seed a campaign + CampaignTermsSnapshot DIRECTLY, bypassing
+      // launchCampaign() (which would refuse to create this snapshot in the
+      // first place) — simulating the defensive, should-be-unreachable case.
+      const [campaign] = await pgdb
+        .insert(schema.campaigns)
+        .values({ name: "Incomplete Snapshot", brand: "Acme", status: "ACTIVE" })
+        .returning();
+      await pgdb.insert(schema.campaignTermsSnapshots).values({
+        campaignId: campaign!.id,
+        detailsSnapshot: {
+          campaignType: "AFFILIATE",
+          publicCommissionRate: null, // missing — AFFILIATE requires this
+          includesGifting: false,
+        },
+      });
+
+      await assert.rejects(
+        () => buildCampaignBriefInput(campaign!.id, pgdb),
+        (err: unknown) => err instanceof CampaignBriefDataIncompleteError,
+      );
+
+      // And through the actual worker entry point, which classifies this
+      // exact error type to the DATA_INCOMPLETE FAILED-row category.
+      const { campaignBrief } = await createOrGetCampaignBriefRenderRequest(
+        campaign!.id,
+        "req-incomplete-snapshot",
+        pgdb,
+      );
+      await assert.rejects(() => renderCampaignBrief(campaignBrief.id, pgdb));
+      const [reread] = await pgdb
+        .select()
+        .from(schema.campaignBriefs)
+        .where(eq(schema.campaignBriefs.id, campaignBrief.id));
+      assert.equal(reread!.status, "FAILED");
+      assert.equal(reread!.errorCategory, "DATA_INCOMPLETE");
+    },
+  );
+
+  // 1c. PLU-141 review (Calvin): full compensation-structure × gifting fixture
+  // matrix — the ticket's own required coverage (Paid, Affiliate, Hybrid,
+  // Gift-only, Paid+Gifting, Affiliate+Gifting, Hybrid+Gifting, and product
+  // supplied only for content production).
+  const compensationFixtures: {
+    name: string;
+    details: Partial<schema.CampaignDetailsInsert>;
+    policy: Partial<schema.NegotiationPolicyInsert>;
+    expectCompensation: Record<string, unknown>;
+    expectGiftMention: boolean;
+  }[] = [
+    {
+      name: "Paid",
+      details: { campaignType: "PAID", priceStrategy: "PROPOSE_STARTING_FEE", publicStartingFeeCents: 50_000 },
+      policy: { floorCents: 30_000, ceilingCents: 70_000 },
+      expectCompensation: {
+        kind: "PAID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        startingFeeCents: 50_000,
+        includesGifting: false,
+        giftDisposition: null,
+      },
+      expectGiftMention: false,
+    },
+    {
+      name: "Affiliate",
+      details: { campaignType: "AFFILIATE", publicCommissionRate: 0.12 },
+      policy: { commissionFloorRate: 0.08, commissionCeilingRate: 0.15 },
+      expectCompensation: {
+        kind: "AFFILIATE",
+        commissionRate: 0.12,
+        commissionDurationDays: null,
+        commissionConditions: null,
+        includesGifting: false,
+        giftDisposition: null,
+      },
+      expectGiftMention: false,
+    },
+    {
+      name: "Hybrid",
+      details: {
+        campaignType: "HYBRID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        publicStartingFeeCents: 40_000,
+        publicCommissionRate: 0.1,
+      },
+      policy: {
+        floorCents: 20_000,
+        ceilingCents: 60_000,
+        commissionFloorRate: 0.05,
+        commissionCeilingRate: 0.15,
+      },
+      expectCompensation: {
+        kind: "HYBRID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        startingFeeCents: 40_000,
+        commissionRate: 0.1,
+        commissionDurationDays: null,
+        commissionConditions: null,
+        includesGifting: false,
+        giftDisposition: null,
+      },
+      expectGiftMention: false,
+    },
+    {
+      name: "Gift-only",
+      details: { campaignType: "GIFT_ONLY", productOrOffer: "Full-size skincare set", giftDisposition: "KEEP" },
+      policy: { giftSubstitutionAllowed: true },
+      expectCompensation: { kind: "GIFT_ONLY", giftDisposition: "KEEP" },
+      expectGiftMention: true,
+    },
+    {
+      name: "Paid + Gifting",
+      details: {
+        campaignType: "PAID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        publicStartingFeeCents: 30_000,
+        includesGifting: true,
+        productOrOffer: "A skincare sample kit",
+        giftDisposition: "KEEP",
+      },
+      policy: { floorCents: 20_000, ceilingCents: 40_000, giftSubstitutionAllowed: true },
+      expectCompensation: {
+        kind: "PAID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        startingFeeCents: 30_000,
+        includesGifting: true,
+        giftDisposition: "KEEP",
+      },
+      expectGiftMention: true,
+    },
+    {
+      name: "Affiliate + Gifting",
+      details: {
+        campaignType: "AFFILIATE",
+        publicCommissionRate: 0.15,
+        includesGifting: true,
+        productOrOffer: "A starter bundle",
+        giftDisposition: "KEEP",
+      },
+      policy: { commissionFloorRate: 0.1, commissionCeilingRate: 0.2, giftSubstitutionAllowed: true },
+      expectCompensation: {
+        kind: "AFFILIATE",
+        commissionRate: 0.15,
+        commissionDurationDays: null,
+        commissionConditions: null,
+        includesGifting: true,
+        giftDisposition: "KEEP",
+      },
+      expectGiftMention: true,
+    },
+    {
+      name: "Hybrid + Gifting",
+      details: {
+        campaignType: "HYBRID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        publicStartingFeeCents: 35_000,
+        publicCommissionRate: 0.08,
+        includesGifting: true,
+        productOrOffer: "A full product line sample",
+        giftDisposition: "KEEP",
+      },
+      policy: {
+        floorCents: 20_000,
+        ceilingCents: 50_000,
+        commissionFloorRate: 0.05,
+        commissionCeilingRate: 0.12,
+        giftSubstitutionAllowed: true,
+      },
+      expectCompensation: {
+        kind: "HYBRID",
+        priceStrategy: "PROPOSE_STARTING_FEE",
+        startingFeeCents: 35_000,
+        commissionRate: 0.08,
+        commissionDurationDays: null,
+        commissionConditions: null,
+        includesGifting: true,
+        giftDisposition: "KEEP",
+      },
+      expectGiftMention: true,
+    },
+    {
+      // Distinct from "Gifting": shipsPhysicalProduct only means "collect a
+      // shipping address" (schema.ts's own doc comment) — the product is
+      // sent so the creator can film with it, NOT part of the compensation.
+      // Must render its own "Product or offer" section but NOT be mentioned
+      // in the compensation section.
+      name: "Product supplied only for content production (not compensation)",
+      details: {
+        campaignType: "PAID",
+        priceStrategy: "REQUEST_RATE_CARD",
+        shipsPhysicalProduct: true,
+        includesGifting: false,
+        productOrOffer: "A sample unit for filming",
+        giftDisposition: null,
+      },
+      policy: { floorCents: 20_000, ceilingCents: 40_000 },
+      expectCompensation: {
+        kind: "PAID",
+        priceStrategy: "REQUEST_RATE_CARD",
+        startingFeeCents: null,
+        includesGifting: false,
+        giftDisposition: null,
+      },
+      expectGiftMention: false,
+    },
+  ];
+
+  for (const fixture of compensationFixtures) {
+    await test(`compensation fixture: ${fixture.name}`, async () => {
+      const { campaignId } = await seedLaunchedCampaign(
+        pgdb,
+        `comp-${fixture.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`,
+        fixture.details,
+        fixture.policy,
+      );
+      const input = await buildCampaignBriefInput(campaignId, pgdb);
+      assert.deepEqual(input.compensation, fixture.expectCompensation, fixture.name);
+
+      const html = renderCampaignBriefHtml(input, defaultNarrative(input));
+      assert.ok(html.includes("Product or offer"), `${fixture.name}: Product or offer section always present`);
+      if (fixture.expectGiftMention) {
+        assert.ok(
+          html.includes("also includes a product") || fixture.expectCompensation["kind"] === "GIFT_ONLY",
+          `${fixture.name}: compensation section should reflect the gift`,
+        );
+      } else {
+        assert.ok(
+          !html.includes("also includes a product"),
+          `${fixture.name}: compensation section must NOT claim a product is part of compensation`,
+        );
+      }
+    });
+  }
 
   // 2. NegotiationPolicy is never read — private fields never leak into the input.
   await test("buildCampaignBriefInput: NegotiationPolicy fields never appear in the input", async () => {
@@ -324,6 +621,44 @@ async function main(): Promise<void> {
     assert.equal(current!.status, "READY");
     assert.equal(current!.supersededAt, null);
   });
+
+  // 11b. PLU-141 review (Calvin): PDF retrieval must serve the current READY
+  // asset, not the newest attempt — a re-render still GENERATING (or one
+  // that just FAILED) must not shadow a perfectly good, un-superseded prior
+  // PDF. getLatestCampaignBriefForCampaign() (the status/"what's happening
+  // now" query) and getCurrentReadyCampaignBrief() (the "what should /pdf
+  // serve" query) must diverge in exactly this scenario.
+  await test(
+    "getCurrentReadyCampaignBrief: a re-render still GENERATING does not shadow the prior READY asset",
+    async () => {
+      const { campaignId } = await seedLaunchedCampaign(pgdb, "pdf-retrieval-in-flight");
+      const { campaignBrief: first } = await createOrGetCampaignBriefRenderRequest(
+        campaignId,
+        "req-pdf-retrieval-1",
+        pgdb,
+      );
+      await renderCampaignBrief(first.id, pgdb);
+      const firstReady = await getCurrentReadyCampaignBrief(campaignId, pgdb);
+      assert.equal(firstReady!.id, first.id);
+      const firstRef = firstReady!.renderedAssetRef;
+
+      // Start a second render but DO NOT finish it — simulates "still
+      // generating" (and, by not calling renderCampaignBrief at all, also
+      // covers the FAILED case: neither status is READY/current).
+      await createOrGetCampaignBriefRenderRequest(campaignId, "req-pdf-retrieval-2", pgdb);
+
+      // The status endpoint's query now reports the NEW (GENERATING) row...
+      const latest = await getLatestCampaignBriefForCampaign(campaignId, pgdb);
+      assert.equal(latest!.status, "GENERATING");
+      assert.notEqual(latest!.id, first.id);
+
+      // ...but the PDF-serving query still correctly resolves to the OLD,
+      // still-current READY row — this is the fix for the review comment.
+      const stillCurrent = await getCurrentReadyCampaignBrief(campaignId, pgdb);
+      assert.equal(stillCurrent!.id, first.id);
+      assert.equal(stillCurrent!.renderedAssetRef, firstRef);
+    },
+  );
 
   // 12. Preview and retrieval represent the same result.
   await test("getLatestCampaignBriefForCampaign: resolves to byte-identical content as what renderCampaignBrief stored", async () => {

@@ -9,6 +9,7 @@ import {
 import {
   createOrGetCampaignBriefRenderRequest,
   getLatestCampaignBriefForCampaign,
+  getCurrentReadyCampaignBrief,
   listCampaignBriefsForCampaign,
   CampaignBriefRenderRequestConflictError,
 } from "../db/campaignBriefRender.js";
@@ -136,13 +137,24 @@ router.get("/:id/brief/pdf", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const brief = await getLatestCampaignBriefForCampaign(campaignId);
-    if (!brief) {
-      res.status(404).json({ error: "no brief has been rendered for this campaign yet" });
-      return;
-    }
-    if (brief.status !== "READY" || !brief.renderedAssetRef) {
-      res.status(409).json({ error: `brief is ${brief.status.toLowerCase()}, not ready`, status: brief.status });
+    // The CURRENT ready asset, not the newest attempt — a re-render still
+    // GENERATING (or one that just FAILED) must not shadow a perfectly good,
+    // un-superseded prior PDF. See getCurrentReadyCampaignBrief()'s own doc
+    // comment for why this is a different query from the status route below.
+    const brief = await getCurrentReadyCampaignBrief(campaignId);
+    if (!brief || !brief.renderedAssetRef) {
+      // Distinguish "nothing has ever rendered" from "a render exists but
+      // none has ever completed" for a clearer error, without changing
+      // which row actually gets served above.
+      const latest = await getLatestCampaignBriefForCampaign(campaignId);
+      if (!latest) {
+        res.status(404).json({ error: "no brief has been rendered for this campaign yet" });
+        return;
+      }
+      res.status(409).json({
+        error: `no ready brief is available yet (latest attempt is ${latest.status.toLowerCase()})`,
+        status: latest.status,
+      });
       return;
     }
 
