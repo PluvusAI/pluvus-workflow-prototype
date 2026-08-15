@@ -57,6 +57,8 @@ import {
 } from "../../ds";
 import {
   SECTIONS,
+  DRAFT_NAME_PLACEHOLDER,
+  DRAFT_BRAND_PLACEHOLDER,
   visibleFields,
   missingRequiredKeys,
   needsFee,
@@ -139,8 +141,10 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     if (seededRef.current || !campaignQ.data) return;
     const c = campaignQ.data;
     setCampaignDraft({
-      name: c.name,
-      brand: c.brand,
+      // A freshly-created draft holds the NOT-NULL placeholders — show page 1
+      // empty so the brand types the real name/brand (see sections.ts).
+      name: c.name === DRAFT_NAME_PLACEHOLDER ? "" : c.name,
+      brand: c.brand === DRAFT_BRAND_PLACEHOLDER ? "" : c.brand,
       targetUrl: c.targetUrl ?? "",
       objective: c.objective ?? "",
       brandDescription: c.brandDescription ?? "",
@@ -256,10 +260,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // wipes stale terms on the server (the backend owns truth).
   const buildCampaignPayload = useCallback((): Parameters<typeof updateCampaign>[1] => {
     const d = campaignDraft;
-    // NOTE: name/brand are set at create and are NOT in the PATCH surface
-    // (the server rejects them here), so the Start section shows them but the
-    // brief editor never re-sends them.
+    // name/brand are editable in the Start section (PLU-139) and PATCH through
+    // like any other field. Both are launch-hard, so only send a non-blank
+    // value — never overwrite a saved name/brand with an empty string.
     const p: Parameters<typeof updateCampaign>[1] = {
+      ...(String(d.name ?? "").trim() ? { name: String(d.name).trim() } : {}),
+      ...(String(d.brand ?? "").trim() ? { brand: String(d.brand).trim() } : {}),
       targetUrl: strOrNull(d.targetUrl),
       objective: strOrNull(d.objective),
       brandDescription: strOrNull(d.brandDescription),
@@ -485,23 +491,6 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     }
   }, [campaignId, onOpenCampaign, toast]);
 
-  // -- loading / error -----------------------------------------------------
-  if (campaignQ.isLoading) {
-    return <Center>Loading campaign…</Center>; // COPY:PLU-159
-  }
-  if (campaignQ.isError || !campaignQ.data) {
-    return (
-      <Center>
-        <div style={{ textAlign: "center" }}>
-          <div style={{ ...text.heading, marginBottom: 8 }}>Couldn't load this campaign</div>
-          <Button variant="secondary" onClick={onBack}>
-            Back to campaigns
-          </Button>
-        </div>
-      </Center>
-    );
-  }
-
   const section = SECTIONS.find((s) => s.key === activeSection)!;
   // Name+brand are the only launch-hard fields (mirrors create). Everything else
   // is optional for a Draft — an incomplete Draft is allowed.
@@ -557,6 +546,25 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     },
     [section, comp, readFieldValue, flushSave],
   );
+
+  // -- loading / error -----------------------------------------------------
+  // NB: all hooks above run unconditionally; these early returns come AFTER the
+  // last hook so hook order stays stable across the loading→loaded transition.
+  if (campaignQ.isLoading) {
+    return <Center>Loading campaign…</Center>; // COPY:PLU-159
+  }
+  if (campaignQ.isError || !campaignQ.data) {
+    return (
+      <Center>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ ...text.heading, marginBottom: 8 }}>Couldn't load this campaign</div>
+          <Button variant="secondary" onClick={onBack}>
+            Back to campaigns
+          </Button>
+        </div>
+      </Center>
+    );
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: colors.bg }}>
@@ -649,14 +657,6 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
               <BriefImport
                 campaignId={campaignId}
                 onApply={(fieldKey, textValue) => setField("campaign", fieldKey, textValue)}
-                onContinue={() => {
-                  // S1.6: "Use our campaign builder" — continue without waiting
-                  // for extraction. Flush any pending save, advance to page 2.
-                  flushSave();
-                  const idx = SECTIONS.findIndex((s) => s.key === activeSection);
-                  const next = SECTIONS[idx + 1];
-                  if (next) setActiveSection(next.key);
-                }}
               />
             )}
 
@@ -1255,12 +1255,9 @@ function Center({ children }: { children: React.ReactNode }) {
 function BriefImport({
   campaignId,
   onApply,
-  onContinue,
 }: {
   campaignId: string;
   onApply: (fieldKey: string, textValue: string) => void;
-  /** S1.6 — "Use our campaign builder": continue without waiting for extraction. */
-  onContinue: () => void;
 }) {
   const toast = useToast();
   const qc = useQueryClient();
@@ -1336,10 +1333,6 @@ function BriefImport({
           leftIcon={<Upload size={14} strokeWidth={2} />}
         >
           {busy ? "Reading…" : extraction ? "Upload another" : "Upload brief"} {/* COPY:PLU-159 */}
-        </Button>
-        {/* S1.6 — secondary action, always available (even mid-extraction). */}
-        <Button variant="ghost" onClick={onContinue}>
-          Use our campaign builder {/* COPY:PLU-159 */}
         </Button>
       </div>
 

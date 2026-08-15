@@ -530,6 +530,8 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
 // PATCH /campaigns/:id — update editable campaign fields (notifyEmail, etc.)
 router.patch("/:id", async (req: Request, res: Response) => {
   const {
+    name,
+    brand,
     notifyEmail,
     objective,
     notes,
@@ -586,6 +588,8 @@ router.patch("/:id", async (req: Request, res: Response) => {
     trackingDestinationUrl,
     trackingParameter,
   } = req.body as {
+    name?: string;
+    brand?: string;
     notifyEmail?: string | null;
     objective?: string | null;
     notes?: string | null;
@@ -661,6 +665,24 @@ router.patch("/:id", async (req: Request, res: Response) => {
     return;
   }
   Object.assign(patch, sendingSettings.value);
+
+  // name/brand are editable in the intake's first section (PLU-139). Both are
+  // launch-hard, so when present they must be non-blank — reject rather than
+  // null them (a blank name/brand can't be a valid campaign).
+  if (name !== undefined) {
+    if (typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name must be a non-empty string" });
+      return;
+    }
+    patch.name = name.trim();
+  }
+  if (brand !== undefined) {
+    if (typeof brand !== "string" || !brand.trim()) {
+      res.status(400).json({ error: "brand must be a non-empty string" });
+      return;
+    }
+    patch.brand = brand.trim();
+  }
 
   if (notifyEmail !== undefined) {
     const trimmed = typeof notifyEmail === "string" ? notifyEmail.trim() : "";

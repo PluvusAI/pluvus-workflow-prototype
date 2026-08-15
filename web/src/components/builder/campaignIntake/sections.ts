@@ -48,6 +48,13 @@ export type SectionKey =
   | "timelineRights"
   | "rewardStructure";
 
+// name/brand are NOT NULL on the campaign row, so "New Campaign" must create with
+// SOME value even though the brand hasn't named it yet. These sentinels are that
+// placeholder: the intake seeds an EMPTY page-1 field when it sees them, so the
+// brand types the real name/brand (autosave overwrites the sentinel ~1s later).
+export const DRAFT_NAME_PLACEHOLDER = "Untitled campaign";
+export const DRAFT_BRAND_PLACEHOLDER = "New brand";
+
 // The compensation-shape inputs the reward-structure conditionals key on. This
 // is the ONLY state the visibility predicates read — keep it minimal so the
 // "single edit point" stays legible.
@@ -423,21 +430,19 @@ export const SECTIONS: SectionSpec[] = [
         group: "campaign",
         control: "text",
         label: "Campaign name", // COPY:PLU-159
-        hint: "Set when the campaign was created.", // COPY:PLU-159
         placeholder: "e.g. Summer 2026 Launch", // COPY:PLU-159
         source: "S1.1",
         maxCount: 50, // S1.1 worksheet 50-char counter
-        readOnly: true,
+        required: true,
       },
       {
         key: "brand",
         group: "campaign",
         control: "text",
         label: "Brand", // COPY:PLU-159
-        hint: "Set when the campaign was created.", // COPY:PLU-159
         placeholder: "e.g. Acme Co", // COPY:PLU-159
         source: "P1.2/P2.2",
-        readOnly: true,
+        required: true,
       },
       {
         key: "targetUrl",
@@ -1122,6 +1127,9 @@ export function clearedRewardFieldKeys(comp: CompensationShape): string[] {
 // read-only evidence with no Apply target. Single edit point: if PLU-159 renames
 // a field key, the candidate mapping follows automatically.
 export function candidateFieldFor(sectionKey: string): FieldSpec | null {
+  // name/brand are campaign identity (set at create, editable on page 1), not
+  // brief content — a brief import must never retarget them.
+  if (sectionKey === "name" || sectionKey === "brand") return null;
   for (const section of SECTIONS) {
     for (const f of section.fields) {
       if (

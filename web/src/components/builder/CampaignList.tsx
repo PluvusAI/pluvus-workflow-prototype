@@ -1,6 +1,13 @@
 import { useState } from "react";
 import { Trash2, ChevronDown, FolderOpen, AlertTriangle, Pencil, Copy } from "lucide-react";
-import { useCampaigns, useCampaign, deleteCampaign, duplicateCampaign } from "../../api/builderClient";
+import {
+  useCampaigns,
+  useCampaign,
+  deleteCampaign,
+  duplicateCampaign,
+  createCampaign,
+  createWorkflowForCampaign,
+} from "../../api/builderClient";
 import { colors, radii, font, text, formatTimestamp } from "../../theme";
 import {
   Button,
@@ -13,7 +20,7 @@ import {
   IconButton,
   useToast,
 } from "../ds";
-import { StartCampaignModal } from "./campaignIntake/StartCampaignModal";
+import { DRAFT_NAME_PLACEHOLDER, DRAFT_BRAND_PLACEHOLDER } from "./campaignIntake/sections";
 import type { CampaignListItem } from "../../api/builderTypes";
 
 interface Props {
@@ -24,13 +31,37 @@ interface Props {
 
 export function CampaignList({ onSelectWorkflow, onOpenIntake }: Props) {
   const { data: campaigns, isLoading, isError, refetch } = useCampaigns();
-  const [showWizard, setShowWizard] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const toast = useToast();
 
-  // New campaign → mint a DRAFT + workflow, then open its brief intake.
-  function handleCreated(campaignId: string) {
-    setShowWizard(false);
-    void refetch();
-    onOpenIntake(campaignId);
+  // New campaign → mint a DRAFT + its starter workflow with placeholder
+  // name/brand and the default PAID reward shape, then drop straight into the
+  // sectioned intake. Name, brand, and reward structure are all editable there
+  // (page 1 for name/brand, the reward section for the structure), so nothing
+  // is collected up front — no modal. The starter workflow uses the fixed_fee
+  // template (PAID default); changing the reward structure later doesn't
+  // re-template it, same as before.
+  async function handleCreate() {
+    if (creating) return;
+    setCreating(true);
+    try {
+      const campaign = await createCampaign({
+        // NOT-NULL placeholders — the intake seeds page 1 empty (see sections.ts).
+        name: DRAFT_NAME_PLACEHOLDER,
+        brand: DRAFT_BRAND_PLACEHOLDER,
+        campaignType: "PAID",
+        compensationReviewStatus: "CONFIRMED",
+      });
+      await createWorkflowForCampaign(campaign.id, {
+        name: `${campaign.name} Outreach`, // COPY:PLU-159
+        templateKey: "fixed_fee",
+      });
+      void refetch();
+      onOpenIntake(campaign.id);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to create campaign.");
+      setCreating(false);
+    }
   }
 
   return (
@@ -54,8 +85,13 @@ export function CampaignList({ onSelectWorkflow, onOpenIntake }: Props) {
               Create and manage creator outreach campaigns
             </div>
           </div>
-          <Button variant="primary" onClick={() => setShowWizard(true)} leftIcon="+">
-            New Campaign
+          <Button
+            variant="primary"
+            onClick={() => void handleCreate()}
+            disabled={creating}
+            leftIcon="+"
+          >
+            {creating ? "Creating…" : "New Campaign"}
           </Button>
         </div>
       </div>
@@ -82,8 +118,8 @@ export function CampaignList({ onSelectWorkflow, onOpenIntake }: Props) {
             title="No campaigns yet"
             description="Create your first campaign to start building outreach workflows for creators."
             action={
-              <Button variant="primary" onClick={() => setShowWizard(true)}>
-                Create campaign
+              <Button variant="primary" onClick={() => void handleCreate()} disabled={creating}>
+                {creating ? "Creating…" : "Create campaign"}
               </Button>
             }
           />
@@ -112,9 +148,6 @@ export function CampaignList({ onSelectWorkflow, onOpenIntake }: Props) {
         </div>
       </div>
 
-      {showWizard && (
-        <StartCampaignModal onCreated={handleCreated} onClose={() => setShowWizard(false)} />
-      )}
     </div>
   );
 }

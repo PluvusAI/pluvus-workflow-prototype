@@ -308,7 +308,8 @@ test("candidateFieldFor returns null for unmapped / non-applicable keys", () => 
   // PLU-139 (B): prohibitedClaims was dropped (off-worksheet) — the parser may
   // still emit a "restrictions" section but it has no field to apply into now.
   assert.equal(candidateFieldFor("prohibitedClaims"), null);
-  // name/brand are readOnly → never an apply target even though they exist.
+  // name/brand are campaign identity, not brief content → never an apply target
+  // (editable on page 1, but a brief import must not retarget them).
   assert.equal(candidateFieldFor("name"), null);
   assert.equal(candidateFieldFor("brand"), null);
   // Closed-set controls aren't free-text candidates — the worksheet-spec pass
@@ -472,13 +473,17 @@ test("missingRequiredKeys: filled required fields pass; optional empties never f
   assert.deepEqual(missing, [], "no required field missing → gate passes");
 });
 
-test("missingRequiredKeys: readOnly required fields (name/brand) are exempt", () => {
-  // startSources has required targetUrl (S1.2), plus readOnly name/brand. Even
-  // with everything blank, only targetUrl is demanded — name/brand are set at
-  // create and would strand the user.
+test("missingRequiredKeys: name/brand are demanded on page 1 (editable, required)", () => {
+  // startSources requires name (S1.1), brand (P1.2/P2.2), and targetUrl (S1.2) —
+  // all editable in the intake now (no create-time modal), so a blank page 1
+  // blocks Save & continue on all three.
   const section = getSection("startSources");
   const missing = missingRequiredKeys(section, shape("PAID"), valuesFrom({}));
-  assert.deepEqual(missing, ["targetUrl"], "only the editable required field is demanded");
+  assert.deepEqual(
+    [...missing].sort(),
+    ["brand", "name", "targetUrl"],
+    "all three editable required fields are demanded",
+  );
 });
 
 test("missingRequiredKeys: a hidden required field is NOT demanded until its branch shows", () => {

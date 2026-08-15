@@ -161,6 +161,8 @@ export function createCampaign(data: {
 export function updateCampaign(
   id: string,
   data: {
+    name?: string;
+    brand?: string;
     notifyEmail?: string | null;
     objective?: string | null;
     notes?: string | null;
