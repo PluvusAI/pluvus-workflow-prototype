@@ -131,6 +131,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The groups touched since the last successful save — only these get PATCHed.
   const dirtyRef = useRef<Set<FieldGroup>>(new Set());
+  // Always points at the CURRENT-render doSave. The debounced timer fires this
+  // instead of a captured closure, so the save reads the latest committed drafts
+  // (a debounce scheduled from setField's render would otherwise PATCH pre-edit
+  // values). Kept current by the effect below.
+  const latestSaveRef = useRef<() => Promise<void>>(async () => {});
 
   const [duplicating, setDuplicating] = useState(false);
 
@@ -422,7 +427,10 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
         await updateBrandIdentity(campaignId, buildBrandPayload());
       if (groups.includes("creatorRequirement"))
         await updateCreatorRequirement(campaignId, buildCreatorPayload());
-      dirtyRef.current.clear();
+      // Clear ONLY the groups this save actually sent. A group marked dirty while
+      // the PATCH above was in flight must stay dirty so its queued debounce still
+      // fires — a blanket clear() would silently drop that intervening edit.
+      for (const g of groups) dirtyRef.current.delete(g);
       setSavedTick((t) => t + 1);
     } catch (err) {
       // Keep the local draft AND the dirty set intact so nothing is lost and a
@@ -441,19 +449,23 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     toast,
   ]);
 
+  // Keep the ref pointed at the current-render doSave so the debounced timer and
+  // flush always run the latest closure (newest drafts), not a stale one.
+  latestSaveRef.current = doSave;
+
   const scheduleSave = useCallback(() => {
     if (readOnly) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => void doSave(), 1000);
-  }, [doSave, readOnly]);
+    saveTimerRef.current = setTimeout(() => void latestSaveRef.current(), 1000);
+  }, [readOnly]);
 
   // Save & continue: cancel the pending debounce and persist now, so advancing a
   // section doesn't leave a redundant timer firing a second identical PATCH.
   const flushSave = useCallback(() => {
     if (readOnly) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    void doSave();
-  }, [doSave, readOnly]);
+    void latestSaveRef.current();
+  }, [readOnly]);
 
   // Flush any pending timer on unmount so a debounced edit isn't dropped.
   useEffect(() => {

@@ -21,7 +21,9 @@ const EXPECTED = {
   CampaignDetails: ["id", "campaignId", "campaignType", "priceStrategy", "publicStartingFeeCents", "publicCommissionRate", "includesGifting", "giftDisposition", "compensationReviewStatus"],
   NegotiationPolicy: ["id", "campaignId", "floorCents", "ceilingCents", "nonNegotiableTerms"],
   BrandIdentity: ["id", "campaignId", "logoRef", "primaryColor", "secondaryColor", "typography", "extractionSource", "extractedAt"],
-  CreatorRequirement: ["id", "campaignId", "platforms", "niches", "geography", "languages", "minFollowers", "audienceNotes", "contentStyle", "brandSafety"],
+  // PLU-139 (B) dropped niches/languages/audienceNotes/contentStyle/brandSafety —
+  // only the worksheet-backed criteria remain.
+  CreatorRequirement: ["id", "campaignId", "platforms", "geography", "minFollowers"],
 };
 const EXPECTED_ENUMS = {
   CampaignStatus: ["DRAFT", "ACTIVE"],       // CLOSING/ARCHIVED optional across branches
