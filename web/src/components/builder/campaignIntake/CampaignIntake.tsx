@@ -140,6 +140,13 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // (a debounce scheduled from setField's render would otherwise PATCH pre-edit
   // values). Kept current by the effect below.
   const latestSaveRef = useRef<() => Promise<void>>(async () => {});
+  // Serialize saves: at most ONE doSave runs at a time. A save requested while
+  // one is in flight sets rerunRef and returns; the in-flight save re-fires once
+  // it settles. Without this, two overlapping PATCHes for the same group could be
+  // reordered by the network so the OLDER payload lands last and overwrites the
+  // newer edit.
+  const savingInFlightRef = useRef(false);
+  const rerunSaveRef = useRef(false);
 
   const [duplicating, setDuplicating] = useState(false);
 
@@ -419,6 +426,13 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   }, [creatorDraft, campaignDraft.deliverableQuantities]);
 
   const doSave = useCallback(async () => {
+    // Serialize: if a save is already running, don't start a second concurrent
+    // PATCH for the same group (a network reorder could land the older payload
+    // last). Mark a rerun and let the in-flight save re-fire when it settles.
+    if (savingInFlightRef.current) {
+      rerunSaveRef.current = true;
+      return;
+    }
     // Snapshot the version of every dirty group at the START of this save. On
     // success we clear a group only if its version is unchanged — an edit that
     // lands during the PATCH bumps the version and stays dirty (its own debounce
@@ -426,8 +440,10 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     const snapshot = new Map(dirtyRef.current);
     const groups = Array.from(snapshot.keys());
     if (groups.length === 0) return;
+    savingInFlightRef.current = true;
     setSaving(true);
     setSaveError(null);
+    let succeeded = false;
     try {
       // PATCH only the dirty groups. Run them in sequence — the set is tiny (≤3)
       // and it keeps error attribution simple.
@@ -442,6 +458,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       for (const g of groups) {
         if (dirtyRef.current.get(g) === snapshot.get(g)) dirtyRef.current.delete(g);
       }
+      succeeded = true;
       setSavedTick((t) => t + 1);
     } catch (err) {
       // Keep the local draft AND the dirty set intact so nothing is lost and a
@@ -450,7 +467,18 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       setSaveError(msg);
       toast.error(`Couldn't save: ${msg}`); // COPY:PLU-159
     } finally {
+      savingInFlightRef.current = false;
       setSaving(false);
+      // Re-fire exactly once when there's fresh work AND this save succeeded: a
+      // save was queued while we ran, or an edit landed mid-flight (group still
+      // dirty). On FAILURE we do NOT auto-refire — the dirty set is kept intact
+      // for the manual "Retry" affordance, and refiring would spin-loop.
+      if (succeeded && (rerunSaveRef.current || dirtyRef.current.size > 0)) {
+        rerunSaveRef.current = false;
+        void latestSaveRef.current();
+      } else if (!succeeded) {
+        rerunSaveRef.current = false;
+      }
     }
   }, [
     campaignId,
