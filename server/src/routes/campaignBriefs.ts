@@ -68,17 +68,37 @@ router.post("/:id/brief", async (req: Request, res: Response) => {
       return;
     }
 
-    const { campaignBrief, isNew } = await createOrGetCampaignBriefRenderRequest(
+    const { campaignBrief } = await createOrGetCampaignBriefRenderRequest(
       campaignId,
       renderRequestId,
     );
 
-    // §6a: only a genuinely NEW row needs a job — an existing row (same
-    // renderRequestId seen before) already has one in flight or finished;
-    // enqueuing again would be redundant, not incorrect (BullMQ dedupes on
-    // jobId), but skipping it keeps the intent clear: this branch is "no new
-    // work," not "re-trigger."
-    if (isNew) {
+    // Review fix (Calvin): gated on `isNew` before, which assumed "row
+    // already existed" implies "a job was already successfully enqueued for
+    // it" — false. createOrGetCampaignBriefRenderRequest()'s DB insert and
+    // this enqueue call are two separate, non-atomic steps; if the process
+    // crashes or the enqueue call itself throws AFTER the row commits, the
+    // row is stuck GENERATING with no job ever dispatched, and a retry with
+    // the SAME renderRequestId used to hit isNew:false and skip enqueueing
+    // again — silently stranding the render until §6b's stale-render sweep
+    // (a ~10-minute grace window) eventually marks it FAILED/STALE.
+    //
+    // Fixed by gating on STATUS instead of isNew: any row still GENERATING
+    // — whether brand new or found via a retry — gets an enqueue attempt.
+    // Safe to call unconditionally for a row that already has a job running:
+    // enqueueCampaignBriefRender()'s jobId is deterministic
+    // (`brief-render|${campaignBriefId}`), and BullMQ dedupes on jobId
+    // within the active+waiting set (the same idempotency guarantee every
+    // other queue in this codebase already relies on — see
+    // enqueueNodeExecution()'s own doc comment) — so a duplicate enqueue
+    // against a job that's genuinely still in flight is a harmless no-op,
+    // while a duplicate enqueue against a row whose FIRST enqueue attempt
+    // never actually landed now correctly dispatches it for the first time.
+    // READY/FAILED rows are intentionally excluded: idempotency-key replay
+    // returns the terminal outcome as-is (Stripe-style), it does not retry
+    // a completed or already-failed operation — a caller who wants a fresh
+    // attempt after a real FAILED mints a new renderRequestId (§6a).
+    if (campaignBrief.status === "GENERATING") {
       await enqueueCampaignBriefRender({ campaignBriefId: campaignBrief.id });
     }
 

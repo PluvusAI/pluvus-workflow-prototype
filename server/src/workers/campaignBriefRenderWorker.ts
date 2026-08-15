@@ -39,11 +39,32 @@ import { db, type Db, type DbTx } from "../db/drizzle.js";
  * Phase 2 (finalizeCampaignBriefRender): one short locked transaction that
  * flips this row to READY and supersedes whatever was current before it.
  *
- * On any Phase 1 exception: marks the row FAILED with a category
+ * On any Phase 1/2 exception: marks the row FAILED with a category
  * (DATA_INCOMPLETE for a missing-data assertion, RENDER_FAILED for
  * anything else — Puppeteer/PDF/storage) and re-throws, so BullMQ's retry
  * policy (DEFAULT_JOB_OPTIONS) still applies. The retry re-enters this same
  * function against the SAME row id — never a fresh row per attempt.
+ *
+ * Review fix (Calvin): "token failure invalidates the finalized brief." The
+ * creator-token mint used to run INSIDE this same try/catch, after Phase 2
+ * had already committed the row as READY (and already superseded whatever
+ * was current before it). If the mint then threw, the catch below used to
+ * mark that same, already-successful row FAILED — leaving NO current READY
+ * row at all (the predecessor superseded, the successor now FAILED), even
+ * though a perfectly good PDF had just been rendered and stored. The render
+ * succeeding and the token mint succeeding are not the same event — a
+ * render that produced a real, stored, finalized PDF must never be
+ * retroactively invalidated by a failure in a step that comes after it.
+ * Token minting now runs in its OWN try/catch, below, outside this one:
+ * failure there is logged and swallowed, never re-thrown, never mapped to
+ * markCampaignBriefFailed() — matching how this codebase already treats
+ * other best-effort follow-up work after a primary operation has already
+ * succeeded (e.g. payment.ts's "Phase 1: show tracking link... non-fatal if
+ * lookup fails" and "content-brief enqueue error (non-fatal)" comments).
+ * markCampaignBriefFailed() itself also gained a defensive predicate guard
+ * (status = 'GENERATING' only) so this class of bug — anything added after
+ * Phase 2 throwing back into this catch — can't silently corrupt an
+ * already-finalized row again, even by a future mistake.
  */
 export async function renderCampaignBrief(
   campaignBriefId: string,
@@ -54,6 +75,7 @@ export async function renderCampaignBrief(
     throw new CampaignBriefNotFoundError(campaignBriefId);
   }
 
+  let finalizedId: string;
   try {
     // ── Phase 1 ────────────────────────────────────────────────────────────
     const input = await buildCampaignBriefInput(briefRow.campaignId, client);
@@ -92,17 +114,7 @@ export async function renderCampaignBrief(
       },
       client,
     );
-
-    // §7: mint the creator-access token as its own step, after Phase 2 has
-    // committed — not folded into that transaction, so its six-step
-    // contract stays exactly as documented. Nothing in this PR delivers the
-    // raw token to a creator (route-only, per the ticket's own resolution);
-    // logging it here is a testing seam until the executor-wiring PR sends
-    // it for real.
-    const rawToken = await mintCampaignBriefCreatorToken(finalized.id, client);
-    console.log(
-      `[campaign-brief-render] rendered ${finalized.id} for campaign ${briefRow.campaignId} — creator token (testing seam, not yet delivered): ${rawToken}`,
-    );
+    finalizedId = finalized.id;
   } catch (err) {
     const category =
       err instanceof CampaignSnapshotMissingError || err instanceof CampaignBriefDataIncompleteError
@@ -110,6 +122,39 @@ export async function renderCampaignBrief(
         : "RENDER_FAILED";
     await markCampaignBriefFailed(campaignBriefId, category, client);
     throw err;
+  }
+
+  // ── Post-finalize: creator-access token mint (§7) ─────────────────────────
+  // Deliberately OUTSIDE the try/catch above — the render already succeeded
+  // and committed (finalizedId is READY, its predecessor already
+  // superseded); a failure here must never undo that. Nothing in this PR
+  // delivers the raw token to a creator (route-only, per the ticket's own
+  // resolution), so a mint failure has no user-facing consequence today —
+  // logged for operator visibility, not treated as a render failure.
+  try {
+    // Security review fix (Calvin, separate finding): the raw token used to
+    // be logged here as a manual-testing seam — but possession of it alone
+    // authorizes the PUBLIC, unauthenticated GET /brief/:token route (§7),
+    // so printing it to a log line handed the exact same access to anyone
+    // who can read worker logs (log aggregators, shipping services, etc.),
+    // silently bypassing requireOperatorKey. Never log a bearer credential,
+    // even temporarily "for testing" — logs routinely outlive and outreach
+    // the access boundary the credential was meant to enforce. Only a
+    // non-sensitive correlation value (the CampaignBrief id) is logged now;
+    // an operator who needs the raw token to manually verify the route
+    // before real delivery is wired should read it via a secure, DB-scoped
+    // channel (e.g. a local debug query, never a shipped log stream) — the
+    // hash alone (creatorTokenHash, already persisted) is deliberately
+    // insufficient to reconstruct the raw token, by design.
+    await mintCampaignBriefCreatorToken(finalizedId, client);
+    console.log(
+      `[campaign-brief-render] rendered ${finalizedId} for campaign ${briefRow.campaignId} — creator token minted`,
+    );
+  } catch (err) {
+    console.error(
+      `[campaign-brief-render] creator token mint failed for ${finalizedId} (render itself succeeded — NOT marking the brief failed):`,
+      err instanceof Error ? err.message : err,
+    );
   }
 }
 

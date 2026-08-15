@@ -36,6 +36,7 @@ import {
   getLatestCampaignBriefForCampaign,
   getCurrentReadyCampaignBrief,
   listStaleGeneratingCampaignBriefs,
+  markCampaignBriefFailed,
   markCampaignBriefStaleIfGenerating,
   resolveCampaignBriefByCreatorToken,
   validateCampaignBriefCompleteness,
@@ -232,6 +233,83 @@ async function main(): Promise<void> {
         .where(eq(schema.campaignBriefs.id, campaignBrief.id));
       assert.equal(reread!.status, "FAILED");
       assert.equal(reread!.errorCategory, "DATA_INCOMPLETE");
+    },
+  );
+
+  // 1d. Review fix (Calvin): "token failure invalidates the finalized
+  // brief." markCampaignBriefFailed() must be a no-op once a row has left
+  // GENERATING — this is the structural guard that stops a failure in
+  // anything that runs AFTER Phase 2 (the §7 token mint, or any future
+  // post-finalize step) from retroactively invalidating an already-
+  // successful, already-committed render.
+  await test(
+    "markCampaignBriefFailed: is a no-op on a row that already left GENERATING (predicate-guarded)",
+    async () => {
+      const { campaignId } = await seedLaunchedCampaign(pgdb, "mark-failed-guard");
+      const { campaignBrief } = await createOrGetCampaignBriefRenderRequest(
+        campaignId,
+        "req-mark-failed-guard",
+        pgdb,
+      );
+
+      // Still GENERATING — the guard must allow this.
+      await markCampaignBriefFailed(campaignBrief.id, "RENDER_FAILED", pgdb);
+      const [afterGenerating] = await pgdb
+        .select()
+        .from(schema.campaignBriefs)
+        .where(eq(schema.campaignBriefs.id, campaignBrief.id));
+      assert.equal(afterGenerating!.status, "FAILED", "GENERATING -> FAILED must still work");
+      assert.equal(afterGenerating!.errorCategory, "RENDER_FAILED");
+
+      // Reset it to READY directly (simulating "Phase 2 already finalized
+      // this row" — the exact state a post-finalize failure, like a token
+      // mint error, would race against).
+      await pgdb
+        .update(schema.campaignBriefs)
+        .set({ status: "READY", errorCategory: null })
+        .where(eq(schema.campaignBriefs.id, campaignBrief.id));
+
+      // A later call (simulating the OLD bug: a post-finalize failure
+      // reaching markCampaignBriefFailed) must NOT flip this READY row back.
+      await markCampaignBriefFailed(campaignBrief.id, "RENDER_FAILED", pgdb);
+      const [afterReady] = await pgdb
+        .select()
+        .from(schema.campaignBriefs)
+        .where(eq(schema.campaignBriefs.id, campaignBrief.id));
+      assert.equal(afterReady!.status, "READY", "a READY row must never be flipped back to FAILED");
+      assert.equal(afterReady!.errorCategory, null);
+    },
+  );
+
+  // 1e. Review fix (Calvin), end-to-end: a token-mint failure after a
+  // successful render must leave the brief READY and retrievable — proven
+  // by actually rendering, then directly exercising the exact sequence the
+  // OLD (buggy) code would have hit (Phase 2 commits READY, then something
+  // after it fails), and confirming the row survives untouched.
+  await test(
+    "renderCampaignBrief: a successful render survives a simulated post-finalize failure — stays READY, current, and retrievable",
+    async () => {
+      const { campaignId } = await seedLaunchedCampaign(pgdb, "token-failure-survives");
+      const { campaignBrief } = await createOrGetCampaignBriefRenderRequest(
+        campaignId,
+        "req-token-failure-survives",
+        pgdb,
+      );
+      await renderCampaignBrief(campaignBrief.id, pgdb);
+
+      const readyBefore = await getCurrentReadyCampaignBrief(campaignId, pgdb);
+      assert.equal(readyBefore!.id, campaignBrief.id);
+      assert.equal(readyBefore!.status, "READY");
+      const assetRef = readyBefore!.renderedAssetRef;
+
+      // Simulate exactly what the OLD bug did: a post-finalize failure
+      // reaching the shared render-failure path for this ALREADY-READY row.
+      await markCampaignBriefFailed(campaignBrief.id, "RENDER_FAILED", pgdb);
+
+      const readyAfter = await getCurrentReadyCampaignBrief(campaignId, pgdb);
+      assert.ok(readyAfter, "a current READY brief must still exist for PDF retrieval");
+      assert.equal(readyAfter!.id, campaignBrief.id);
+      assert.equal(readyAfter!.renderedAssetRef, assetRef);
     },
   );
 
@@ -751,6 +829,44 @@ async function main(): Promise<void> {
       .where(eq(schema.campaignBriefs.campaignId, campaignId));
     assert.equal(all.length, 1);
   });
+
+  // 16b. Review fix (Calvin): "retry skips queue dispatch." The DB insert
+  // (createOrGetCampaignBriefRenderRequest) and the queue enqueue
+  // (enqueueCampaignBriefRender, called by the route) are two separate,
+  // non-atomic steps — if the enqueue call fails or the process crashes
+  // AFTER the row commits but BEFORE the job is dispatched, the row is
+  // stuck GENERATING with no job ever running. routes/campaignBriefs.ts
+  // used to gate the enqueue on `isNew`, which wrongly assumed "the row
+  // already existed" implies "a job was already dispatched for it" — a
+  // retry with the same renderRequestId hit isNew:false and silently
+  // skipped re-enqueueing, stranding the render until §6b's sweep (a
+  // ~10-minute grace window) eventually marked it FAILED/STALE. This is
+  // the DB-layer contract the fix (gate on STATUS, not isNew — see
+  // routes/campaignBriefs.ts's POST handler) depends on: a retry against a
+  // still-GENERATING row must return that SAME row, with its status still
+  // GENERATING, so the route can correctly decide to re-enqueue.
+  await test(
+    "createOrGetCampaignBriefRenderRequest: a retry against a still-GENERATING row returns isNew:false but status GENERATING — the route re-enqueues on this, not on isNew",
+    async () => {
+      const { campaignId } = await seedLaunchedCampaign(pgdb, "idem-retry-generating");
+      const first = await createOrGetCampaignBriefRenderRequest(campaignId, "req-idem-retry", pgdb);
+      assert.equal(first.isNew, true);
+      assert.equal(first.campaignBrief.status, "GENERATING");
+
+      // Simulates: the first POST's enqueue call failed after the DB commit
+      // above, and the client retried with the SAME renderRequestId —
+      // deliberately never calling renderCampaignBrief() here, so the row
+      // is still exactly as stuck as it would be in the real failure.
+      const retry = await createOrGetCampaignBriefRenderRequest(campaignId, "req-idem-retry", pgdb);
+      assert.equal(retry.campaignBrief.id, first.campaignBrief.id);
+      assert.equal(retry.isNew, false, "the row already existed — the OLD (buggy) gate would skip enqueueing here");
+      assert.equal(
+        retry.campaignBrief.status,
+        "GENERATING",
+        "the FIXED route gate (status === GENERATING) correctly re-enqueues on this row",
+      );
+    },
+  );
 
   await test(
     "createOrGetCampaignBriefRenderRequest: a NEW renderRequestId for the same snapshot creates a genuinely new row and supersedes on render (S2->B2, S2->B3)",

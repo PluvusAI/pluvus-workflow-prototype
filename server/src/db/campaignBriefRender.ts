@@ -534,12 +534,21 @@ export async function finalizeCampaignBriefRender(
 }
 
 /**
- * §8/§9: the FAILED path — set on any exception in Phase 1 (or by §6b's
+ * §8/§9: the FAILED path — set on any exception in Phase 1/2 (or by §6b's
  * crash-recovery sweep, which uses category "STALE" directly rather than
  * calling this). No lock needed: this only ever touches the row THIS job
  * owns, identified by its fixed id (never a fresh row per attempt — see the
  * plan doc's "why jobId is keyed on campaignBriefId" note), so it cannot
  * collide with another job's Phase 2.
+ *
+ * Review fix (Calvin): predicate-guarded on `status = 'GENERATING'` — same
+ * shape as markCampaignBriefStaleIfGenerating(). Before this guard, calling
+ * this on a row Phase 2 had ALREADY finalized to READY (e.g. from a bug in
+ * some future step added after Phase 2, the way the §7 token-mint step
+ * originally was) would silently flip a successfully-finalized brief back
+ * to FAILED — leaving no current READY row for retrieval even though a
+ * real PDF had already been rendered and stored. Now a no-op once the row
+ * has left GENERATING, structurally, not just by caller discipline.
  */
 export async function markCampaignBriefFailed(
   campaignBriefId: string,
@@ -549,7 +558,7 @@ export async function markCampaignBriefFailed(
   await client
     .update(campaignBriefs)
     .set({ status: "FAILED", errorCategory })
-    .where(eq(campaignBriefs.id, campaignBriefId));
+    .where(and(eq(campaignBriefs.id, campaignBriefId), eq(campaignBriefs.status, "GENERATING")));
 }
 
 // ---------------------------------------------------------------------------
