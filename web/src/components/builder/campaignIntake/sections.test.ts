@@ -15,6 +15,7 @@ import {
   SECTIONS,
   getSection,
   visibleFields,
+  missingRequiredKeys,
   clearedRewardFieldKeys,
   candidateFieldFor,
   needsFee,
@@ -25,7 +26,9 @@ import {
   showsStartingFee,
   showsAdditiveGiftToggle,
   CAMPAIGN_TYPE_OPTIONS,
+  DELIVERABLE_CARDS,
   type CompensationShape,
+  type FieldSpec,
 } from "./sections";
 import type { CampaignType } from "../../../api/builderTypes";
 
@@ -47,12 +50,14 @@ function shape(
   campaignType: CampaignType,
   includesGifting = false,
   giftDeliveryMethod = "",
+  selectedPlatforms: string[] = [],
 ): CompensationShape {
   return {
     campaignType,
     includesGifting,
     priceStrategy: "PROPOSE_STARTING_FEE",
     giftDeliveryMethod,
+    selectedPlatforms,
   };
 }
 
@@ -160,8 +165,8 @@ test("additive gift on Paid: toggle available; turning it on reveals gift + disp
 // -- price strategy conditional ----------------------------------------------
 
 test("starting fee only shows in PROPOSE_STARTING_FEE mode", () => {
-  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "PROPOSE_STARTING_FEE", giftDeliveryMethod: "" }), true);
-  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "" }), false);
+  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "PROPOSE_STARTING_FEE", giftDeliveryMethod: "", selectedPlatforms: [] }), true);
+  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [] }), false);
 });
 
 // -- switching structure hides AND clears ------------------------------------
@@ -210,11 +215,12 @@ test("no clear-list drift: every conditional reward field is clearable on switch
     shape("PAID", false),
     shape("AFFILIATE", false),
     shape("GIFT_ONLY", false), // no gift-delivery method → promo/contact both cleared
-    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "" },
+    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [] },
   ];
   const everCleared = new Set(structures.flatMap((s) => clearedRewardFieldKeys(s)));
   for (const f of reward.fields) {
     if (!f.visibleWhen) continue; // always-visible field, never needs clearing
+    if (f.display) continue; // display-only (no column) — nothing to clear
     assert.ok(
       everCleared.has(f.key),
       `reward field "${f.key}" is conditional but never appears in the cleared set — add it to REWARD_CLEAR_VALUES`,
@@ -286,17 +292,9 @@ test("every non-deferred worksheet Stage-1 question is covered by a field", () =
 // -- brief-import candidate mapping ------------------------------------------
 
 test("candidateFieldFor maps known parser keys to their editable campaign field", () => {
-  // These parser section keys share the name of an editable campaign text field.
-  for (const key of [
-    "usageRights",
-    "exclusivity",
-    "paymentTerms",
-    "attributionWindow",
-    "deliverables",
-    "contentRequirements",
-    "prohibitedClaims",
-    "keyMessages",
-  ]) {
+  // Free-text-backed fields (text/textarea/richText/repeatableLinks) can accept
+  // extracted brief text. deliverables/contentRequirements/keyMessages qualify.
+  for (const key of ["deliverables", "contentRequirements", "keyMessages"]) {
     const f = candidateFieldFor(key);
     assert.ok(f, `"${key}" should map to a field`);
     assert.equal(f!.key, key);
@@ -307,12 +305,209 @@ test("candidateFieldFor maps known parser keys to their editable campaign field"
 test("candidateFieldFor returns null for unmapped / non-applicable keys", () => {
   // Unknown key → no Apply target (shown as read-only evidence).
   assert.equal(candidateFieldFor("somethingWeDontModel"), null);
+  // PLU-139 (B): prohibitedClaims was dropped (off-worksheet) — the parser may
+  // still emit a "restrictions" section but it has no field to apply into now.
+  assert.equal(candidateFieldFor("prohibitedClaims"), null);
   // name/brand are readOnly → never an apply target even though they exist.
   assert.equal(candidateFieldFor("name"), null);
   assert.equal(candidateFieldFor("brand"), null);
+  // Closed-set controls aren't free-text candidates — the worksheet-spec pass
+  // moved these off text controls (durationSelect/attributionWindow/radioCards).
+  assert.equal(candidateFieldFor("usageRights"), null); // durationSelect (S6.5)
+  assert.equal(candidateFieldFor("exclusivity"), null); // durationSelect (S6.6)
+  assert.equal(candidateFieldFor("paymentTerms"), null); // radioCards (S7.P2)
+  assert.equal(candidateFieldFor("attributionWindow"), null); // attributionWindow (S7.A4)
   // radioCards/select/toggle fields aren't text candidates.
   assert.equal(candidateFieldFor("campaignType"), null);
   assert.equal(candidateFieldFor("includesGifting"), null);
+});
+
+// -- deliverable cards (S3.2–S3.9) -------------------------------------------
+
+test("DELIVERABLE_CARDS are the 8 worksheet cards, in order, with unique keys", () => {
+  const expected = [
+    ["instagram", "reel", "S3.2"],
+    ["instagram", "carousel", "S3.3"],
+    ["tiktok", "video", "S3.4"],
+    ["youtube", "dedicated", "S3.5"],
+    ["youtube", "integrated", "S3.6"],
+    ["linkedin", "post", "S3.7"],
+    ["linkedin", "video", "S3.8"],
+    ["twitter", "post", "S3.9"],
+  ];
+  assert.equal(DELIVERABLE_CARDS.length, 8);
+  DELIVERABLE_CARDS.forEach((c, i) => {
+    assert.equal(c.platform, expected[i]![0]);
+    assert.equal(c.format, expected[i]![1]);
+    assert.equal(c.source, expected[i]![2]);
+    assert.ok(c.label.length > 0, "card has a label");
+  });
+  // platform+format pair (the stored key) must be unique across all 8.
+  const keys = new Set(DELIVERABLE_CARDS.map((c) => `${c.platform}:${c.format}`));
+  assert.equal(keys.size, 8, "no duplicate platform/format pairs");
+});
+
+// -- S6.7 Instagram-collab conditional (gated on selected platforms) ---------
+
+test("S6.7 Instagram collab shows only when Instagram is a selected platform", () => {
+  const timeline = getSection("timelineRights");
+  const withIg = shape("PAID", false, "", ["instagram", "tiktok"]);
+  const withoutIg = shape("PAID", false, "", ["tiktok", "youtube"]);
+  const noneSelected = shape("PAID"); // selectedPlatforms defaults to []
+  assert.ok(
+    visibleFields(timeline, withIg).some((f) => f.key === "instagramCollab"),
+    "shown when Instagram selected",
+  );
+  assert.ok(
+    !visibleFields(timeline, withoutIg).some((f) => f.key === "instagramCollab"),
+    "hidden when Instagram not selected",
+  );
+  assert.ok(
+    !visibleFields(timeline, noneSelected).some((f) => f.key === "instagramCollab"),
+    "hidden when no platforms selected yet",
+  );
+});
+
+// -- Page 5/6 columns now have dedicated fields ------------------------------
+
+test("Page 5 granular brief fields (S5.2/S5.4/S5.5/S5.6) each have their own field", () => {
+  const guidelines = getSection("contentGuidelines");
+  const bySource = new Set(guidelines.fields.map((f) => f.source));
+  for (const id of ["S5.2", "S5.4", "S5.5", "S5.6", "S5.7"]) {
+    assert.ok(bySource.has(id), `${id} has a dedicated field`);
+  }
+  // contentRequirements is now S5.7 only — no longer the S5.2/S5.4 catch-all.
+  const cr = guidelines.fields.find((f) => f.key === "contentRequirements");
+  assert.equal(cr?.source, "S5.7", "contentRequirements maps to S5.7 alone");
+});
+
+test("Page 6 ad authorization (S6.3) is split out from repurpose rights (S6.5)", () => {
+  const timeline = getSection("timelineRights");
+  const adAuth = timeline.fields.find((f) => f.key === "adAuthorization");
+  const usage = timeline.fields.find((f) => f.key === "usageRights");
+  assert.equal(adAuth?.source, "S6.3", "adAuthorization maps to S6.3");
+  assert.equal(usage?.source, "S6.5", "usageRights now maps to S6.5 alone (un-merged)");
+});
+
+// -- worksheet-spec controls (interaction/component matches the worksheet) ----
+
+test("each field renders the control the worksheet specifies", () => {
+  // key → expected control, per docs/campaign-question-review-worksheet.md.
+  const expected: Record<string, string> = {
+    name: "text", // S1.1 (+ maxCount counter)
+    productType: "searchableSelect", // S2.4 searchable dropdown
+    creatorAccessNeeded: "radioCards", // S2.5 two radio cards
+    howToUse: "richText", // S2.9 rich-text
+    brandAssets: "richText", // S2.10 rich-text/link
+    minFollowers: "followerRanges", // S3.11 per-platform ranges
+    briefDeliveryMethod: "radioCards", // S5.1 radio cards
+    briefHighlight: "richText", // S5.2
+    creativeConcept: "richText", // S5.4
+    referenceVideos: "repeatableLinks", // S5.5 repeatable multi-link
+    scriptSubmission: "radioCards", // S5.6
+    contentRequirements: "richText", // S5.7
+    timeline: "durationSelect", // S6.1
+    linkInBioDuration: "durationSelect", // S6.2
+    adAuthorization: "durationSelect", // S6.3
+    postRetention: "durationSelect", // S6.4
+    usageRights: "durationSelect", // S6.5
+    exclusivity: "durationSelect", // S6.6
+    instagramCollab: "radioCards", // S6.7 (No/Yes)
+    priceStrategy: "radioCards", // S7.P1
+    publicStartingFeeCents: "pricingGrid", // S7.P1 grid
+    paymentTerms: "radioCards", // S7.P2 three cards
+    publicCommissionRate: "commissionAmount", // S7.A1 number + %/flat
+    variableCommission: "radioCards", // S7.A3 segmented
+    attributionWindow: "attributionWindow", // S7.A4
+    giftDeliveryMethod: "radioCards", // S7.G1
+    giftDisposition: "radioCards", // S7.G5
+    shipsPhysicalProduct: "radioCards", // S7.G6
+    trackingLinkMode: "radioCards", // S7.T1
+    trackingParameter: "select", // S7.T3 dropdown w/ default
+    trackingPreview: "trackingPreview", // S7.T4
+  };
+  const byKey = new Map<string, string>();
+  for (const s of SECTIONS) for (const f of s.fields) byKey.set(f.key, f.control);
+  for (const [key, control] of Object.entries(expected)) {
+    assert.equal(byKey.get(key), control, `${key} should render "${control}"`);
+  }
+});
+
+test("S1.1 campaign name carries the 50-char counter (maxCount)", () => {
+  const name = getSection("startSources").fields.find((f) => f.key === "name");
+  assert.equal(name?.maxCount, 50);
+});
+
+test("trackingPreview is display-only (no persistence, excluded from clear set)", () => {
+  const f = getSection("rewardStructure").fields.find((k) => k.key === "trackingPreview");
+  assert.equal(f?.display, true);
+  // not in any structure's cleared set (it has no column to clear)
+  assert.ok(!clearedRewardFieldKeys(shape("AFFILIATE")).includes("trackingPreview"));
+});
+
+// -- required-field gate (Save & continue enforcement) -----------------------
+
+// A value reader over a plain {key: value} map, defaulting missing keys to "".
+function valuesFrom(map: Record<string, unknown>): (f: FieldSpec) => unknown {
+  return (f) => (f.key in map ? map[f.key] : "");
+}
+
+test("missingRequiredKeys: empty visible required fields are flagged", () => {
+  // campaignProduct has required productName (S2.3), brandDescription (S2.6),
+  // productType (S2.4). All empty → all three flagged.
+  const section = getSection("campaignProduct");
+  const missing = missingRequiredKeys(section, shape("PAID"), valuesFrom({}));
+  assert.ok(missing.includes("productName"), "productName flagged");
+  assert.ok(missing.includes("brandDescription"), "brandDescription flagged");
+  assert.ok(missing.includes("productType"), "productType flagged");
+});
+
+test("missingRequiredKeys: filled required fields pass; optional empties never flag", () => {
+  const section = getSection("campaignProduct");
+  // Fill EVERY required field of the section (derived from the model, so this
+  // stays correct if PLU-159 adds/removes a required field), leave optionals blank.
+  const filled: Record<string, unknown> = {};
+  for (const f of section.fields) if (f.required && !f.readOnly) filled[f.key] = "x";
+  const missing = missingRequiredKeys(section, shape("PAID"), valuesFrom(filled));
+  assert.deepEqual(missing, [], "no required field missing → gate passes");
+});
+
+test("missingRequiredKeys: readOnly required fields (name/brand) are exempt", () => {
+  // startSources has required targetUrl (S1.2), plus readOnly name/brand. Even
+  // with everything blank, only targetUrl is demanded — name/brand are set at
+  // create and would strand the user.
+  const section = getSection("startSources");
+  const missing = missingRequiredKeys(section, shape("PAID"), valuesFrom({}));
+  assert.deepEqual(missing, ["targetUrl"], "only the editable required field is demanded");
+});
+
+test("missingRequiredKeys: a hidden required field is NOT demanded until its branch shows", () => {
+  // promoCode (S7.G2) is required but only visible under GIFT + promo_code. On a
+  // plain Paid campaign it's hidden → must not block the gate.
+  const reward = getSection("rewardStructure");
+  const paid = missingRequiredKeys(reward, shape("PAID"), valuesFrom({ campaignType: "PAID" }));
+  assert.ok(!paid.includes("promoCode"), "hidden promoCode not demanded on Paid");
+
+  // Now Gift-only + promo_code path → promoCode is visible & empty → demanded.
+  const gift = missingRequiredKeys(
+    reward,
+    shape("GIFT_ONLY", false, "promo_code"),
+    valuesFrom({ campaignType: "GIFT_ONLY", rewardDescription: "A free box", giftDeliveryMethod: "promo_code" }),
+  );
+  assert.ok(gift.includes("promoCode"), "visible+empty promoCode demanded under promo path");
+});
+
+test("missingRequiredKeys: empty array (no deliverable cards picked) counts as missing", () => {
+  // deliverableQuantities (S3.1–S3.9) is required; an empty array must flag.
+  const section = getSection("platformsDeliverables");
+  const empty = missingRequiredKeys(section, shape("PAID"), valuesFrom({ deliverableQuantities: [] }));
+  assert.ok(empty.includes("deliverableQuantities"), "empty deliverables flagged");
+  const filled = missingRequiredKeys(
+    section,
+    shape("PAID"),
+    valuesFrom({ deliverableQuantities: [{ platform: "instagram", format: "reel", quantity: 1 }] }),
+  );
+  assert.ok(!filled.includes("deliverableQuantities"), "non-empty deliverables pass");
 });
 
 console.log(`\n${passed} passed\n`);

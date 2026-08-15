@@ -95,8 +95,8 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     attributionWindow: details?.attributionWindow ?? null,
     keyMessages: details?.keyMessages ?? null,
     contentRequirements: details?.contentRequirements ?? null,
-    prohibitedClaims: details?.prohibitedClaims ?? null,
     // PLU-139 (2a): worksheet Stage-1 fields.
+    productName: details?.productName ?? null,
     productType: details?.productType ?? null,
     creatorAccessNeeded: details?.creatorAccessNeeded ?? null,
     uniqueSellingPoints: details?.uniqueSellingPoints ?? null,
@@ -105,11 +105,19 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     brandAssets: details?.brandAssets ?? null,
     brandMaterialsRef: details?.brandMaterialsRef ?? null,
     deliverableQuantities: details?.deliverableQuantities ?? null,
+    deliverablePricing: details?.deliverablePricing ?? null,
+    followerRanges: details?.followerRanges ?? null,
     briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
+    briefHighlight: details?.briefHighlight ?? null,
+    creativeConcept: details?.creativeConcept ?? null,
+    referenceVideos: details?.referenceVideos ?? null,
+    scriptSubmission: details?.scriptSubmission ?? null,
+    adAuthorization: details?.adAuthorization ?? null,
     linkInBioDuration: details?.linkInBioDuration ?? null,
     postRetention: details?.postRetention ?? null,
     instagramCollab: details?.instagramCollab ?? null,
     requireApproval: details?.requireApproval ?? null,
+    commissionMode: details?.commissionMode ?? null,
     variableCommission: details?.variableCommission ?? null,
     giftDeliveryMethod: details?.giftDeliveryMethod ?? null,
     promoCode: details?.promoCode ?? null,
@@ -545,8 +553,8 @@ router.patch("/:id", async (req: Request, res: Response) => {
     attributionWindow,
     keyMessages,
     contentRequirements,
-    prohibitedClaims,
     // PLU-139 (2a): worksheet Stage-1 fields.
+    productName,
     productType,
     creatorAccessNeeded,
     uniqueSellingPoints,
@@ -555,11 +563,19 @@ router.patch("/:id", async (req: Request, res: Response) => {
     brandAssets,
     brandMaterialsRef,
     deliverableQuantities,
+    deliverablePricing,
+    followerRanges,
     briefDeliveryMethod,
+    briefHighlight,
+    creativeConcept,
+    referenceVideos,
+    scriptSubmission,
+    adAuthorization,
     linkInBioDuration,
     postRetention,
     instagramCollab,
     requireApproval,
+    commissionMode,
     variableCommission,
     giftDeliveryMethod,
     promoCode,
@@ -595,11 +611,11 @@ router.patch("/:id", async (req: Request, res: Response) => {
     paymentTerms?: string | null;
     attributionWindow?: string | null;
     keyMessages?: string | null;
-    // CampaignDetails columns that existed but had no read/write path at all
-    // (not in flatten/create/PATCH) — the last two unreachable content fields.
+    // CampaignDetails column that existed but had no read/write path at all
+    // (not in flatten/create/PATCH) — the last unreachable content field.
     contentRequirements?: string | null;
-    prohibitedClaims?: string | null;
     // PLU-139 (2a): worksheet Stage-1 fields.
+    productName?: string | null;
     productType?: string | null;
     creatorAccessNeeded?: boolean | null;
     uniqueSellingPoints?: string | null;
@@ -608,11 +624,19 @@ router.patch("/:id", async (req: Request, res: Response) => {
     brandAssets?: string | null;
     brandMaterialsRef?: string | null;
     deliverableQuantities?: unknown;
+    deliverablePricing?: unknown;
+    followerRanges?: unknown;
     briefDeliveryMethod?: string | null;
+    briefHighlight?: string | null;
+    creativeConcept?: string | null;
+    referenceVideos?: string | null;
+    scriptSubmission?: string | null;
+    adAuthorization?: string | null;
     linkInBioDuration?: string | null;
     postRetention?: string | null;
     instagramCollab?: boolean | null;
     requireApproval?: boolean | null;
+    commissionMode?: string | null;
     variableCommission?: string | null;
     giftDeliveryMethod?: string | null;
     promoCode?: string | null;
@@ -744,10 +768,6 @@ router.patch("/:id", async (req: Request, res: Response) => {
     detailsPatch.contentRequirements =
       typeof contentRequirements === "string" ? contentRequirements.trim() || null : null;
   }
-  if (prohibitedClaims !== undefined) {
-    detailsPatch.prohibitedClaims =
-      typeof prohibitedClaims === "string" ? prohibitedClaims.trim() || null : null;
-  }
 
   // PLU-139 (2a): worksheet Stage-1 fields. Plain free-text and boolean columns
   // (closed-set values are validated in the UI pre-PLU-159; the server accepts
@@ -759,6 +779,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
   const boolOrNull = (v: unknown): boolean | null =>
     typeof v === "boolean" ? v : null;
   const stringFields139 = {
+    productName,
     productType,
     uniqueSellingPoints,
     whyTrust,
@@ -766,8 +787,14 @@ router.patch("/:id", async (req: Request, res: Response) => {
     brandAssets,
     brandMaterialsRef,
     briefDeliveryMethod,
+    briefHighlight,
+    creativeConcept,
+    referenceVideos,
+    scriptSubmission,
+    adAuthorization,
     linkInBioDuration,
     postRetention,
+    commissionMode,
     variableCommission,
     giftDeliveryMethod,
     promoCode,
@@ -802,6 +829,18 @@ router.patch("/:id", async (req: Request, res: Response) => {
     }
     (detailsPatch as Record<string, unknown>)["deliverableQuantities"] =
       deliverableQuantities as JsonValue | null;
+  }
+  // S7.P1 pricing map / S3.11 follower-ranges map — plain JSON objects keyed by
+  // deliverable or platform. Accept an object or null; reject arrays/scalars at
+  // the trust boundary (mirrors the deliverableQuantities array guard).
+  const jsonObjectFields139 = { deliverablePricing, followerRanges } as const;
+  for (const [key, value] of Object.entries(jsonObjectFields139)) {
+    if (value === undefined) continue;
+    if (value !== null && (typeof value !== "object" || Array.isArray(value))) {
+      res.status(400).json({ error: `${key} must be an object or null` });
+      return;
+    }
+    (detailsPatch as Record<string, unknown>)[key] = value as JsonValue | null;
   }
 
   if (compensationReviewStatus !== undefined) {
@@ -1118,27 +1157,16 @@ router.get("/:id/creator-requirement", async (req: Request, res: Response) => {
 });
 
 // PATCH /campaigns/:id/creator-requirement — insert-or-update the one
-// CreatorRequirement row. Lists (platforms/niches/geography/languages) are jsonb
-// string[]; validated as string arrays at the trust boundary.
+// CreatorRequirement row. Lists (platforms/geography) are jsonb string[];
+// validated as string arrays at the trust boundary. PLU-139 (B): only the
+// worksheet-backed criteria remain — platforms (S3.1), geography (S3.10),
+// minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/brandSafety
+// were legacy off-worksheet fields with no downstream reader; dropped.
 router.patch("/:id/creator-requirement", async (req: Request, res: Response) => {
-  const {
-    platforms,
-    niches,
-    geography,
-    languages,
-    minFollowers,
-    audienceNotes,
-    contentStyle,
-    brandSafety,
-  } = req.body as {
+  const { platforms, geography, minFollowers } = req.body as {
     platforms?: unknown;
-    niches?: unknown;
     geography?: unknown;
-    languages?: unknown;
     minFollowers?: number | null;
-    audienceNotes?: string | null;
-    contentStyle?: string | null;
-    brandSafety?: string | null;
   };
 
   const isStringArray = (v: unknown): v is string[] =>
@@ -1147,9 +1175,7 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
   const patch: Parameters<typeof upsertCreatorRequirement>[1] = {};
   for (const [key, value] of [
     ["platforms", platforms],
-    ["niches", niches],
     ["geography", geography],
-    ["languages", languages],
   ] as const) {
     if (value === undefined) continue;
     if (value !== null && !isStringArray(value)) {
@@ -1173,15 +1199,6 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
       return;
     }
     patch.minFollowers = minFollowers;
-  }
-  if (audienceNotes !== undefined) {
-    patch.audienceNotes = typeof audienceNotes === "string" ? audienceNotes.trim() || null : null;
-  }
-  if (contentStyle !== undefined) {
-    patch.contentStyle = typeof contentStyle === "string" ? contentStyle.trim() || null : null;
-  }
-  if (brandSafety !== undefined) {
-    patch.brandSafety = typeof brandSafety === "string" ? brandSafety.trim() || null : null;
   }
 
   try {

@@ -469,10 +469,6 @@ model CampaignDetails {
   /// read by executors. Dropping it silently would be a real regression, not a
   /// simplification.
   attributionWindow   String?
-  /// New — no existing column covers this. Flagged as a genuine gap by the
-  /// vault's own "Decision - Persist Full Extraction" note (prohibited claims
-  /// was never persisted even when extracted from a brief).
-  prohibitedClaims    String?
   /// PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
   /// proposed fee shown to the creator before negotiation, when priceStrategy
   /// is PROPOSE_STARTING_FEE (required then) or null when REQUEST_RATE_CARD.
@@ -505,6 +501,7 @@ model CampaignDetails {
   /// giftDeliveryMethod, trackingLinkMode) are stored as plain String/Boolean and
   /// validated at the route, not as PG enums, so PLU-159 can retune the option
   /// sets without another migration.
+  productName          String? /// S2.3
   productType          String? /// S2.4
   creatorAccessNeeded  Boolean? /// S2.5
   uniqueSellingPoints  String? /// S2.7
@@ -514,11 +511,21 @@ model CampaignDetails {
   brandMaterialsRef    String? /// S1.4 supporting-materials upload reference
   /// S3.2–S3.9 per-platform deliverable quantities: [{ platform, format, quantity }].
   deliverableQuantities Json?
+  /// S7.P1 per-deliverable pricing: { "<platform>:<format>": cents }.
+  deliverablePricing   Json?
+  /// S3.11 per-platform follower ranges: { "<platform>": { min, max } }.
+  followerRanges       Json?
   briefDeliveryMethod  String? /// S5.1
+  briefHighlight       String? /// S5.2
+  creativeConcept      String? /// S5.4
+  referenceVideos      String? /// S5.5 (one link per line)
+  scriptSubmission     String? /// S5.6 ("require" | "skip")
+  adAuthorization      String? /// S6.3 (split out from usageRights)
   linkInBioDuration    String? /// S6.2
   postRetention        String? /// S6.4
   instagramCollab      Boolean? /// S6.7
   requireApproval      Boolean? /// S7.3
+  commissionMode       String? /// S7.A1 ("percent" | "flat")
   variableCommission   String? /// S7.A3
   giftDeliveryMethod   String? /// S7.G1
   promoCode            String? /// S7.G2
@@ -747,14 +754,12 @@ model CreatorRequirement {
   id         String @id @default(cuid())
   campaignId String @unique
 
-  platforms     Json?
-  niches        Json?
-  geography     Json?
-  languages     Json?
-  minFollowers  Int?
-  audienceNotes String?
-  contentStyle  String?
-  brandSafety   String?
+  // PLU-139 (B): only worksheet-backed criteria remain — platforms (S3.1),
+  // geography (S3.10), minFollowers (S3.11). niches/languages/audienceNotes/
+  // contentStyle/brandSafety were legacy off-worksheet fields, no reader; dropped.
+  platforms    Json?
+  geography    Json?
+  minFollowers Int?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

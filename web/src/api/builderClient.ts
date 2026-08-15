@@ -41,6 +41,8 @@ import type {
   CreatorRequirementInput,
   BriefExtractionFields,
   DeliverableQuantity,
+  DeliverablePricing,
+  FollowerRanges,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -174,8 +176,8 @@ export function updateCampaign(
     attributionWindow?: string | null;
     keyMessages?: string | null;
     contentRequirements?: string | null;
-    prohibitedClaims?: string | null;
     // PLU-139 (2a): worksheet Stage-1 fields (all CampaignDetails, editable DRAFT).
+    productName?: string | null;
     productType?: string | null;
     creatorAccessNeeded?: boolean | null;
     uniqueSellingPoints?: string | null;
@@ -184,11 +186,19 @@ export function updateCampaign(
     brandAssets?: string | null;
     brandMaterialsRef?: string | null;
     deliverableQuantities?: DeliverableQuantity[] | null;
+    deliverablePricing?: DeliverablePricing | null;
+    followerRanges?: FollowerRanges | null;
     briefDeliveryMethod?: string | null;
+    briefHighlight?: string | null;
+    creativeConcept?: string | null;
+    referenceVideos?: string | null;
+    scriptSubmission?: string | null;
+    adAuthorization?: string | null;
     linkInBioDuration?: string | null;
     postRetention?: string | null;
     instagramCollab?: boolean | null;
     requireApproval?: boolean | null;
+    commissionMode?: string | null;
     variableCommission?: string | null;
     giftDeliveryMethod?: string | null;
     promoCode?: string | null;

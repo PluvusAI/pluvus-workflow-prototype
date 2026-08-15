@@ -101,10 +101,8 @@ async function main(): Promise<void> {
       id,
       {
         platforms: ["youtube", "instagram"],
-        niches: ["fitness"],
         geography: ["US", "CA"],
         minFollowers: 10000,
-        audienceNotes: "18-34, US-based",
       },
       pgdb,
     );
@@ -112,15 +110,15 @@ async function main(): Promise<void> {
     assert.deepEqual(r.geography, ["US", "CA"]);
     assert.equal(r.minFollowers, 10000);
     const round = await getCreatorRequirement(id, pgdb);
-    assert.equal(round?.audienceNotes, "18-34, US-based");
-    assert.deepEqual(round?.niches, ["fitness"]);
+    assert.deepEqual(round?.platforms, ["youtube", "instagram"]);
+    assert.deepEqual(round?.geography, ["US", "CA"]);
   });
 
   await test("getCreatorRequirementsByCampaignIds batches", async () => {
     const a = await seedCampaign(pgdb);
-    await upsertCreatorRequirement(a, { contentStyle: "UGC" }, pgdb);
+    await upsertCreatorRequirement(a, { minFollowers: 25000 }, pgdb);
     const map = await getCreatorRequirementsByCampaignIds([a], pgdb);
-    assert.equal(map.get(a)?.contentStyle, "UGC");
+    assert.equal(map.get(a)?.minFollowers, 25000);
   });
 
   // ── Draft-only lock (reused guard) ────────────────────────────────────────────
@@ -136,7 +134,7 @@ async function main(): Promise<void> {
   await test("upsertCreatorRequirement throws CampaignLockedError once ACTIVE", async () => {
     const id = await seedCampaign(pgdb, "ACTIVE");
     await assert.rejects(
-      () => upsertCreatorRequirement(id, { niches: ["x"] }, pgdb),
+      () => upsertCreatorRequirement(id, { platforms: ["x"] }, pgdb),
       CampaignLockedError,
     );
     assert.equal(await getCreatorRequirement(id, pgdb), null, "no row written");
@@ -163,7 +161,6 @@ async function main(): Promise<void> {
         attributionWindow: "30 days",
         keyMessages: "Lightest shoe under $120",
         contentRequirements: "Add captions; product in first 3s",
-        prohibitedClaims: "No medical claims",
       },
       pgdb,
     );
@@ -172,7 +169,6 @@ async function main(): Promise<void> {
     assert.equal(d?.attributionWindow, "30 days");
     assert.equal(d?.keyMessages, "Lightest shoe under $120");
     assert.equal(d?.contentRequirements, "Add captions; product in first 3s");
-    assert.equal(d?.prohibitedClaims, "No medical claims");
   });
 
   // ── the ~18 worksheet Stage-1 columns (PLU-139) round-trip incl. jsonb list ──
@@ -181,6 +177,7 @@ async function main(): Promise<void> {
     await upsertCampaignDetails(
       id,
       {
+        productName: "Cloudstride 2",
         productType: "Running shoes",
         creatorAccessNeeded: true,
         uniqueSellingPoints: "Lightest in class",
@@ -192,7 +189,21 @@ async function main(): Promise<void> {
           { platform: "instagram", format: "reel", quantity: 3 },
           { platform: "youtube", format: "integration", quantity: 1 },
         ] as unknown as (typeof schema.campaignDetails.$inferInsert)["deliverableQuantities"],
+        deliverablePricing: {
+          "instagram:reel": 50000,
+          "youtube:integration": 120000,
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["deliverablePricing"],
+        followerRanges: {
+          instagram: { min: 1500, max: null },
+          youtube: { min: 400, max: 400000 },
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["followerRanges"],
+        commissionMode: "percent",
         briefDeliveryMethod: "pluvus_builder",
+        briefHighlight: "Feature the product in the first 3s",
+        creativeConcept: "Warm, handheld, day-in-the-life",
+        referenceVideos: "https://tiktok.com/@a/1\nhttps://tiktok.com/@b/2",
+        scriptSubmission: "require",
+        adAuthorization: "30 days",
         linkInBioDuration: "30 days",
         postRetention: "90 days",
         instagramCollab: true,
@@ -209,7 +220,21 @@ async function main(): Promise<void> {
       pgdb,
     );
     const d = await getCampaignDetails(id, pgdb);
+    assert.equal(d?.productName, "Cloudstride 2");
     assert.equal(d?.productType, "Running shoes");
+    assert.equal(d?.briefHighlight, "Feature the product in the first 3s");
+    assert.equal(d?.creativeConcept, "Warm, handheld, day-in-the-life");
+    assert.equal(d?.scriptSubmission, "require");
+    assert.equal(d?.adAuthorization, "30 days");
+    assert.equal(d?.commissionMode, "percent");
+    assert.deepEqual(d?.deliverablePricing, {
+      "instagram:reel": 50000,
+      "youtube:integration": 120000,
+    });
+    assert.deepEqual(d?.followerRanges, {
+      instagram: { min: 1500, max: null },
+      youtube: { min: 400, max: 400000 },
+    });
     assert.equal(d?.creatorAccessNeeded, true);
     assert.equal(d?.instagramCollab, true);
     assert.equal(d?.requireApproval, true);
@@ -258,7 +283,7 @@ async function main(): Promise<void> {
   await test("ON DELETE CASCADE removes both section rows with the campaign", async () => {
     const id = await seedCampaign(pgdb);
     await upsertBrandIdentity(id, { logoRef: "y" }, pgdb);
-    await upsertCreatorRequirement(id, { niches: ["y"] }, pgdb);
+    await upsertCreatorRequirement(id, { platforms: ["y"] }, pgdb);
     await pgdb.delete(schema.campaigns).where(eq(schema.campaigns.id, id));
     assert.equal(await getBrandIdentity(id, pgdb), null);
     assert.equal(await getCreatorRequirement(id, pgdb), null);

@@ -37,6 +37,8 @@ import type {
   CampaignType,
   CreatorRequirementInput,
   DeliverableQuantity,
+  DeliverablePricing,
+  FollowerRanges,
   GiftDisposition,
   PriceStrategy,
 } from "../../../api/builderTypes";
@@ -56,17 +58,23 @@ import {
 import {
   SECTIONS,
   visibleFields,
+  missingRequiredKeys,
   needsFee,
   needsCommission,
   showsGiftDetails,
+  showsInstagramCollab,
   isGiftOnly,
   candidateFieldFor,
+  BOOL_RADIO_KEYS,
+  DELIVERABLE_CARDS,
   type CompensationShape,
   type FieldGroup,
   type FieldSpec,
   type SectionKey,
   type SectionSpec,
+  type SelectOption,
 } from "./sections";
+import { COUNTRIES, countryLabel } from "./countries";
 
 interface Props {
   campaignId: string;
@@ -88,15 +96,6 @@ type Draft = Record<string, unknown>;
 function centsToDollars(v: number | null | undefined): string {
   return typeof v === "number" ? String(v / 100) : "";
 }
-function chipsToString(v: string[] | null | undefined): string {
-  return Array.isArray(v) ? v.join(", ") : "";
-}
-function stringToChips(v: string): string[] {
-  return v
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
 
 export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const toast = useToast();
@@ -108,6 +107,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const creatorQ = useCreatorRequirement(campaignId);
 
   const [activeSection, setActiveSection] = useState<SectionKey>("startSources");
+  // Keys of required fields the user tried to skip via "Save & continue" while
+  // empty. Cleared on a successful advance or when leaving the section via Back /
+  // the rail. Only these keys render an inline error — validation is on-demand
+  // (at the gate), never eager, so an untouched draft shows no red.
+  const [errorKeys, setErrorKeys] = useState<Set<string>>(new Set());
 
   // One draft per persisted group. Seeded from the queries on first load.
   const [campaignDraft, setCampaignDraft] = useState<Draft>({});
@@ -144,7 +148,6 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       notes: c.notes ?? "",
       keyMessages: c.keyMessages ?? "",
       contentRequirements: c.contentRequirements ?? "",
-      prohibitedClaims: c.prohibitedClaims ?? "",
       timeline: c.timeline ?? "",
       usageRights: c.usageRights ?? "",
       exclusivity: c.exclusivity ?? "",
@@ -161,20 +164,31 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       includesGifting: c.includesGifting ?? false,
       giftDisposition: c.giftDisposition ?? "",
       rewardDescription: c.rewardDescription ?? "",
+      // shipsPhysicalProduct is NOT NULL (default false) on the API, so false IS
+      // a real value — seed it as the boolean; the S7.G6 radio shows No/Yes.
       shipsPhysicalProduct: c.shipsPhysicalProduct ?? false,
       // PLU-139 (2a): worksheet Stage-1 fields.
       brandMaterialsRef: c.brandMaterialsRef ?? "",
+      productName: c.productName ?? "",
       productType: c.productType ?? "",
-      creatorAccessNeeded: c.creatorAccessNeeded ?? false,
+      creatorAccessNeeded: c.creatorAccessNeeded ?? null,
       uniqueSellingPoints: c.uniqueSellingPoints ?? "",
       whyTrust: c.whyTrust ?? "",
       howToUse: c.howToUse ?? "",
       brandAssets: c.brandAssets ?? "",
       deliverableQuantities: c.deliverableQuantities ?? [],
+      deliverablePricing: c.deliverablePricing ?? {},
+      followerRanges: c.followerRanges ?? {},
+      commissionMode: c.commissionMode ?? "percent",
       briefDeliveryMethod: c.briefDeliveryMethod ?? "",
+      briefHighlight: c.briefHighlight ?? "",
+      creativeConcept: c.creativeConcept ?? "",
+      referenceVideos: c.referenceVideos ?? "",
+      scriptSubmission: c.scriptSubmission ?? "",
+      adAuthorization: c.adAuthorization ?? "",
       linkInBioDuration: c.linkInBioDuration ?? "",
       postRetention: c.postRetention ?? "",
-      instagramCollab: c.instagramCollab ?? false,
+      instagramCollab: c.instagramCollab ?? null,
       requireApproval: c.requireApproval ?? false,
       variableCommission: c.variableCommission ?? "",
       giftDeliveryMethod: c.giftDeliveryMethod ?? "",
@@ -194,15 +208,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       typography: b?.typography ?? "",
     });
     const cr = creatorQ.data;
+    // platforms is derived from the deliverable cards, not seeded/edited here.
+    // geography is a string[] of ISO codes (the country picker works on the
+    // array directly — no comma round-trip).
     setCreatorDraft({
-      platforms: chipsToString(cr?.platforms),
-      niches: chipsToString(cr?.niches),
-      geography: chipsToString(cr?.geography),
-      languages: chipsToString(cr?.languages),
+      geography: Array.isArray(cr?.geography) ? cr.geography : [],
       minFollowers: cr?.minFollowers != null ? String(cr.minFollowers) : "",
-      audienceNotes: cr?.audienceNotes ?? "",
-      contentStyle: cr?.contentStyle ?? "",
-      brandSafety: cr?.brandSafety ?? "",
     });
     // Only mark seeded once campaign loaded; the two sub-queries settling later
     // is fine — a fresh draft has no rows and stays empty (matches the API).
@@ -215,12 +226,24 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       includesGifting: Boolean(campaignDraft.includesGifting),
       priceStrategy: (campaignDraft.priceStrategy as PriceStrategy) ?? "REQUEST_RATE_CARD",
       giftDeliveryMethod: String(campaignDraft.giftDeliveryMethod ?? ""),
+      // Distinct platforms across the selected deliverable cards — drives the
+      // S6.7 Instagram-collab conditional (sections.showsInstagramCollab).
+      selectedPlatforms: Array.isArray(campaignDraft.deliverableQuantities)
+        ? [
+            ...new Set(
+              (campaignDraft.deliverableQuantities as DeliverableQuantity[])
+                .map((r) => r.platform)
+                .filter(Boolean),
+            ),
+          ]
+        : [],
     }),
     [
       campaignDraft.campaignType,
       campaignDraft.includesGifting,
       campaignDraft.priceStrategy,
       campaignDraft.giftDeliveryMethod,
+      campaignDraft.deliverableQuantities,
     ],
   );
 
@@ -244,14 +267,14 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       notes: strOrNull(d.notes),
       keyMessages: strOrNull(d.keyMessages),
       contentRequirements: strOrNull(d.contentRequirements),
-      prohibitedClaims: strOrNull(d.prohibitedClaims),
       timeline: strOrNull(d.timeline),
       usageRights: strOrNull(d.usageRights),
       exclusivity: strOrNull(d.exclusivity),
       // PLU-139 (2a): always-on worksheet fields (not structure-conditional).
       brandMaterialsRef: strOrNull(d.brandMaterialsRef),
+      productName: strOrNull(d.productName),
       productType: strOrNull(d.productType),
-      creatorAccessNeeded: Boolean(d.creatorAccessNeeded),
+      creatorAccessNeeded: boolOrNull(d.creatorAccessNeeded),
       uniqueSellingPoints: strOrNull(d.uniqueSellingPoints),
       whyTrust: strOrNull(d.whyTrust),
       howToUse: strOrNull(d.howToUse),
@@ -259,10 +282,19 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       deliverableQuantities: Array.isArray(d.deliverableQuantities)
         ? (d.deliverableQuantities as DeliverableQuantity[])
         : null,
+      // S3.11 per-platform follower ranges — always-on; empty map → null.
+      followerRanges: objOrNull(d.followerRanges),
       briefDeliveryMethod: strOrNull(d.briefDeliveryMethod),
+      briefHighlight: strOrNull(d.briefHighlight),
+      creativeConcept: strOrNull(d.creativeConcept),
+      referenceVideos: strOrNull(d.referenceVideos),
+      scriptSubmission: strOrNull(d.scriptSubmission),
+      adAuthorization: strOrNull(d.adAuthorization),
       linkInBioDuration: strOrNull(d.linkInBioDuration),
       postRetention: strOrNull(d.postRetention),
-      instagramCollab: Boolean(d.instagramCollab),
+      // S6.7 is conditional on Instagram being a requested platform; when it's
+      // hidden, clear it so a stale "yes" can't outlive deselecting Instagram.
+      instagramCollab: showsInstagramCollab(comp) ? boolOrNull(d.instagramCollab) : null,
       requireApproval: Boolean(d.requireApproval),
       // Compensation shape is always sent — it's the switch itself.
       campaignType: comp.campaignType,
@@ -276,16 +308,21 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.publicStartingFeeCents =
         comp.priceStrategy === "PROPOSE_STARTING_FEE" ? dollarsToCents(d.publicStartingFeeCents) : null;
       p.paymentTerms = strOrNull(d.paymentTerms);
+      // S7.P1 per-deliverable pricing map — only meaningful with the fee grid.
+      p.deliverablePricing =
+        comp.priceStrategy === "PROPOSE_STARTING_FEE" ? objOrNull(d.deliverablePricing) : null;
     } else {
       p.priceStrategy = null;
       p.publicStartingFeeCents = null;
       p.paymentTerms = null;
+      p.deliverablePricing = null;
     }
 
     // Commission — only for affiliate/hybrid; cleared otherwise. Public tracking
     // (T-series) + variable commission share this condition.
     if (needsCommission(comp.campaignType)) {
       p.publicCommissionRate = numOrNull(d.publicCommissionRate);
+      p.commissionMode = strOrNull(d.commissionMode) ?? "percent"; // S7.A1 %/flat
       p.commissionDurationDays = numOrNull(d.commissionDurationDays);
       p.commissionConditions = strOrNull(d.commissionConditions);
       p.attributionWindow = strOrNull(d.attributionWindow);
@@ -296,6 +333,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.trackingParameter = strOrNull(d.trackingParameter);
     } else {
       p.publicCommissionRate = null;
+      p.commissionMode = null;
       p.commissionDurationDays = null;
       p.commissionConditions = null;
       p.attributionWindow = null;
@@ -345,17 +383,19 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
 
   const buildCreatorPayload = useCallback((): CreatorRequirementInput => {
     const d = creatorDraft;
+    // platforms (S3.1) is DERIVED from the selected deliverable cards — the
+    // distinct platforms across the chosen {platform, format, quantity} rows.
+    // Order-stable dedupe so the same selection always yields the same array.
+    const rows = Array.isArray(campaignDraft.deliverableQuantities)
+      ? (campaignDraft.deliverableQuantities as DeliverableQuantity[])
+      : [];
+    const platforms = [...new Set(rows.map((r) => r.platform).filter(Boolean))];
     return {
-      platforms: stringToChips(String(d.platforms ?? "")),
-      niches: stringToChips(String(d.niches ?? "")),
-      geography: stringToChips(String(d.geography ?? "")),
-      languages: stringToChips(String(d.languages ?? "")),
+      platforms,
+      geography: Array.isArray(d.geography) ? (d.geography as string[]) : [],
       minFollowers: numOrNull(d.minFollowers),
-      audienceNotes: strOrNull(d.audienceNotes),
-      contentStyle: strOrNull(d.contentStyle),
-      brandSafety: strOrNull(d.brandSafety),
     };
-  }, [creatorDraft]);
+  }, [creatorDraft, campaignDraft.deliverableQuantities]);
 
   const doSave = useCallback(async () => {
     const groups = Array.from(dirtyRef.current);
@@ -414,6 +454,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const setField = useCallback(
     (group: FieldGroup, key: string, value: unknown) => {
       dirtyRef.current.add(group);
+      // Editing the deliverable cards changes the DERIVED creatorRequirement
+      // platforms too, so mark that group dirty so its PATCH re-sends them.
+      if (group === "campaign" && key === "deliverableQuantities") {
+        dirtyRef.current.add("creatorRequirement");
+      }
       const setter =
         group === "campaign"
           ? setCampaignDraft
@@ -462,6 +507,56 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // is optional for a Draft — an incomplete Draft is allowed.
   const nameMissing = !String(campaignDraft.name ?? "").trim();
   const brandMissing = !String(campaignDraft.brand ?? "").trim();
+
+  // S7.T4 — derive the read-only tracking-URL preview from the affiliate URL +
+  // parameter, with a placeholder creator code. Pure display; not persisted.
+  const trackingPreview = useMemo(() => {
+    const base = String(campaignDraft.affiliateTrackingUrl ?? campaignDraft.targetUrl ?? "").trim();
+    if (!base) return "";
+    const param = String(campaignDraft.trackingParameter ?? "_from").trim() || "_from";
+    const sep = base.includes("?") ? "&" : "?";
+    return `${base}${sep}${param}=CREATOR_CODE`;
+  }, [campaignDraft.affiliateTrackingUrl, campaignDraft.targetUrl, campaignDraft.trackingParameter]);
+
+  // Read a field's raw draft value by its group (for required-field validation).
+  const readFieldValue = useCallback(
+    (f: FieldSpec): unknown => draftValue(f, campaignDraft, brandDraft, creatorDraft),
+    [campaignDraft, brandDraft, creatorDraft],
+  );
+
+  // Leaving the section (Back, or a rail jump) drops any pending validation
+  // errors — we only block the forward "Save & continue", never trap the user.
+  const leaveSection = useCallback((key: SectionKey) => {
+    setErrorKeys(new Set());
+    setActiveSection(key);
+  }, []);
+
+  // The worksheet's enforcement rule: "Save & continue validates the active
+  // substage" — block on empty *required* fields, surface an error summary +
+  // inline errors + focus the first invalid control; otherwise flush and advance.
+  // Draft-first still holds elsewhere (Back and the rail never validate; nothing
+  // is force-required until this gate), so a partially filled page is fine until
+  // the user chooses to move forward.
+  const validateAndAdvance = useCallback(
+    (next: SectionKey) => {
+      const missing = missingRequiredKeys(section, comp, readFieldValue);
+      if (missing.length > 0) {
+        setErrorKeys(new Set(missing));
+        // Focus the first invalid control (its id matches FieldRenderer's).
+        const first = visibleFields(section, comp).find((f) => missing.includes(f.key));
+        if (first) {
+          requestAnimationFrame(() => {
+            document.getElementById(`intake-${first.group}-${first.key}`)?.focus();
+          });
+        }
+        return;
+      }
+      setErrorKeys(new Set());
+      flushSave();
+      setActiveSection(next);
+    },
+    [section, comp, readFieldValue, flushSave],
+  );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", background: colors.bg }}>
@@ -534,7 +629,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       <div style={{ flex: 1, minHeight: 0, display: "flex" }}>
         <SectionRail
           active={activeSection}
-          onSelect={setActiveSection}
+          onSelect={leaveSection}
           nameMissing={nameMissing}
           brandMissing={brandMissing}
           comp={comp}
@@ -554,7 +649,38 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
               <BriefImport
                 campaignId={campaignId}
                 onApply={(fieldKey, textValue) => setField("campaign", fieldKey, textValue)}
+                onContinue={() => {
+                  // S1.6: "Use our campaign builder" — continue without waiting
+                  // for extraction. Flush any pending save, advance to page 2.
+                  flushSave();
+                  const idx = SECTIONS.findIndex((s) => s.key === activeSection);
+                  const next = SECTIONS[idx + 1];
+                  if (next) setActiveSection(next.key);
+                }}
               />
+            )}
+
+            {/* Validation summary: shown only after a blocked "Save & continue".
+                role="alert" announces it without moving focus (focus goes to the
+                first invalid control). Per the worksheet enforcement table. */}
+            {errorKeys.size > 0 && (
+              <div
+                role="alert"
+                style={{
+                  marginBottom: 18,
+                  padding: "10px 14px",
+                  background: `${colors.danger}12`,
+                  border: `1px solid ${colors.danger}55`,
+                  borderRadius: radii.sm,
+                  color: colors.danger,
+                  fontSize: font.size.sm,
+                }}
+              >
+                {/* COPY:PLU-159 */}
+                {errorKeys.size === 1
+                  ? "1 required field needs a value before you continue."
+                  : `${errorKeys.size} required fields need a value before you continue.`}
+              </div>
             )}
 
             <Card variant="flat" padding={22} style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -563,18 +689,47 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
                   key={`${f.group}:${f.key}`}
                   field={f}
                   value={draftValue(f, campaignDraft, brandDraft, creatorDraft)}
-                  onChange={(v) => setField(f.group, f.key, v)}
+                  onChange={(v) => {
+                    setField(f.group, f.key, v);
+                    // Clear this field's error as soon as the user starts fixing it.
+                    if (errorKeys.has(f.key)) {
+                      setErrorKeys((prev) => {
+                        const nextSet = new Set(prev);
+                        nextSet.delete(f.key);
+                        return nextSet;
+                      });
+                    }
+                  }}
                   disabled={readOnly}
                   invalid={
-                    (f.key === "name" && nameMissing) || (f.key === "brand" && brandMissing)
+                    (f.key === "name" && nameMissing) ||
+                    (f.key === "brand" && brandMissing) ||
+                    errorKeys.has(f.key)
                   }
+                  error={errorKeys.has(f.key) ? "This field is required." /* COPY:PLU-159 */ : undefined}
+                  extra={{
+                    deliverableQuantities: Array.isArray(campaignDraft.deliverableQuantities)
+                      ? (campaignDraft.deliverableQuantities as DeliverableQuantity[])
+                      : [],
+                    trackingPreview: trackingPreview,
+                    pricing: (campaignDraft.deliverablePricing as DeliverablePricing) ?? {},
+                    ranges: (campaignDraft.followerRanges as FollowerRanges) ?? {},
+                    commissionMode: String(campaignDraft.commissionMode ?? "percent"),
+                  }}
+                  onExtraChange={(k, v) => setField("campaign", k, v)}
                 />
               ))}
             </Card>
 
             {/* Footer: Back / Save & continue */}
             <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 22 }}>
-              <SectionStepper active={activeSection} onSelect={setActiveSection} readOnly={readOnly} onFlush={flushSave} />
+              <SectionStepper
+                active={activeSection}
+                onBack={leaveSection}
+                onContinue={validateAndAdvance}
+                onSave={flushSave}
+                readOnly={readOnly}
+              />
             </div>
           </div>
         </div>
@@ -678,14 +833,19 @@ function sectionNavLabel(s: SectionSpec, _comp: CompensationShape): string {
 // immediately, then advances; an incomplete Draft is still allowed to advance.
 function SectionStepper({
   active,
-  onSelect,
+  onBack,
+  onContinue,
+  onSave,
   readOnly,
-  onFlush,
 }: {
   active: SectionKey;
-  onSelect: (k: SectionKey) => void;
+  /** Go to the previous section (never validates). */
+  onBack: (k: SectionKey) => void;
+  /** Attempt to advance to the next section — the shell validates first. */
+  onContinue: (k: SectionKey) => void;
+  /** Flush a pending save on the last section (no advance). */
+  onSave: () => void;
   readOnly: boolean;
-  onFlush: () => void;
 }) {
   const idx = SECTIONS.findIndex((s) => s.key === active);
   const prev = idx > 0 ? SECTIONS[idx - 1] : null;
@@ -693,24 +853,20 @@ function SectionStepper({
   return (
     <>
       {prev && (
-        <Button variant="secondary" onClick={() => onSelect(prev.key)}>
+        <Button variant="secondary" onClick={() => onBack(prev.key)}>
           Back
         </Button>
       )}
       <div style={{ flex: 1 }} />
       {next ? (
-        <Button
-          variant="primary"
-          onClick={() => {
-            if (!readOnly) onFlush();
-            onSelect(next.key);
-          }}
-          rightIcon="→"
-        >
+        // Validation lives in the shell (onContinue); even in read-only mode the
+        // gate is a no-op advance because required fields are already satisfied
+        // on an ACTIVE campaign — but keep the click routed through it for one path.
+        <Button variant="primary" onClick={() => onContinue(next.key)} rightIcon="→">
           Save & continue {/* COPY:PLU-159 */}
         </Button>
       ) : (
-        <Button variant="primary" onClick={() => !readOnly && onFlush()} disabled={readOnly}>
+        <Button variant="primary" onClick={() => !readOnly && onSave()} disabled={readOnly}>
           Save {/* COPY:PLU-159 */}
         </Button>
       )}
@@ -728,12 +884,30 @@ function FieldRenderer({
   onChange,
   disabled,
   invalid,
+  error,
+  extra,
+  onExtraChange,
 }: {
   field: FieldSpec;
   value: unknown;
   onChange: (v: unknown) => void;
   disabled: boolean;
   invalid?: boolean;
+  /** Inline validation message (required-field gate). */
+  error?: string | undefined;
+  /** Cross-field context a few controls need: the selected deliverables (pricing
+   *  grid), the derived tracking preview, and the structured pricing/ranges/mode
+   *  values those controls read and write via onExtraChange. */
+  extra?: {
+    deliverableQuantities?: DeliverableQuantity[];
+    trackingPreview?: string;
+    pricing?: DeliverablePricing;
+    ranges?: FollowerRanges;
+    commissionMode?: string;
+  };
+  /** Write a sibling campaign field (for controls that own more than one column,
+   *  e.g. the pricing grid writes both publicStartingFeeCents and the map). */
+  onExtraChange?: (key: string, value: unknown) => void;
 }) {
   const id = `intake-${field.group}-${field.key}`;
   // A field can be locked either by the lifecycle (whole form read-only when
@@ -778,21 +952,158 @@ function FieldRenderer({
         </Select>
       );
       break;
-    case "radioCards":
+    case "radioCards": {
+      // Boolean-backed fields (S2.5, S6.7, S7.G6) store true/false; the radio
+      // uses "true"/"false" string values and coerces on change.
+      const isBool = BOOL_RADIO_KEYS.has(field.key);
+      const cur = isBool
+        ? value === true
+          ? "true"
+          : value === false
+            ? "false"
+            : null
+        : String(value ?? "") || null;
       control = (
         <RadioCardGroup
           ariaLabel={field.label}
           options={(field.options ?? []).map((o) => ({ value: o.value, label: o.label }))}
-          value={String(value ?? "") || null}
+          value={cur}
+          onChange={(v) => onChange(isBool ? v === "true" : v)}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    }
+    case "richText":
+      // Worksheet asks for a rich-text editor; a real WYSIWYG is PLU-159 design
+      // work. Until then this is a multi-line editor over the same string column
+      // (data shape identical). Roomier than a plain textarea to signal intent.
+      control = (
+        <Textarea
+          {...common}
+          value={String(value ?? "")}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={field.placeholder}
+          rows={5}
+        />
+      );
+      break;
+    case "searchableSelect":
+      control = (
+        <SearchableSelect
+          id={id}
+          value={String(value ?? "")}
+          options={field.options ?? []}
+          placeholder={field.placeholder}
           onChange={onChange}
           disabled={isDisabled}
         />
       );
       break;
+    case "durationSelect":
+      control = (
+        <DurationSelect
+          id={id}
+          value={String(value ?? "")}
+          options={field.options ?? []}
+          customPlaceholder={field.placeholder}
+          onChange={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "commissionAmount":
+      control = (
+        <CommissionAmount
+          id={id}
+          rate={String(value ?? "")}
+          mode={extra?.commissionMode === "flat" ? "flat" : "percent"}
+          onChangeRate={onChange}
+          onChangeMode={(m) => onExtraChange?.("commissionMode", m)}
+          placeholder={field.placeholder}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "attributionWindow":
+      control = (
+        <AttributionWindow
+          value={String(value ?? "")}
+          onChange={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "repeatableLinks":
+      control = (
+        <RepeatableLinks
+          value={String(value ?? "")}
+          placeholder={field.placeholder}
+          onChange={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "pricingGrid":
+      control = (
+        <PricingGrid
+          firstFeeDollars={String(value ?? "")}
+          pricing={extra?.pricing ?? {}}
+          deliverables={extra?.deliverableQuantities ?? []}
+          onChangeFirstFee={onChange}
+          onChangePricing={(m) => onExtraChange?.("deliverablePricing", m)}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "followerRanges":
+      control = (
+        <FollowerRanges
+          ranges={extra?.ranges ?? {}}
+          platforms={(extra?.deliverableQuantities ?? []).map((d) => d.platform)}
+          minFollowers={String(value ?? "")}
+          onChangeRanges={(r) => onExtraChange?.("followerRanges", r)}
+          onChangeMin={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "trackingPreview":
+      control = <TrackingPreview preview={extra?.trackingPreview ?? ""} />;
+      break;
     case "quantityRows":
       control = (
         <QuantityRows
           value={Array.isArray(value) ? (value as DeliverableQuantity[]) : []}
+          onChange={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "deliverableCards":
+      control = (
+        <DeliverableCards
+          value={Array.isArray(value) ? (value as DeliverableQuantity[]) : []}
+          onChange={onChange}
+          disabled={isDisabled}
+        />
+      );
+      break;
+    case "countryPicker":
+      control = (
+        <CountryPicker
+          value={Array.isArray(value) ? (value as string[]) : []}
+          onChange={onChange}
+          disabled={isDisabled}
+          inputId={id}
+        />
+      );
+      break;
+    case "file":
+      control = (
+        <FileField
+          value={String(value ?? "")}
+          accept={field.accept}
           onChange={onChange}
           disabled={isDisabled}
         />
@@ -813,33 +1124,49 @@ function FieldRenderer({
         />
       );
       break;
-    case "chips":
     case "text":
     case "url":
     case "email":
-    default:
+    default: {
+      const strVal = String(value ?? "");
+      const over = field.maxCount != null && strVal.length > field.maxCount;
       control = (
-        <Input
-          {...common}
-          type={field.control === "url" ? "url" : field.control === "email" ? "email" : "text"}
-          value={String(value ?? "")}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={field.placeholder}
-          {...invalidProps}
-        />
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <Input
+            {...common}
+            type={field.control === "url" ? "url" : field.control === "email" ? "email" : "text"}
+            value={strVal}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={field.placeholder}
+            {...(invalid || over ? { invalid: true as const } : {})}
+          />
+          {field.maxCount != null && !isDisabled && (
+            // S1.1 — live character counter with soft over-limit state.
+            <span
+              style={{
+                alignSelf: "flex-end",
+                fontSize: font.size.xs,
+                color: over ? colors.danger : colors.textDim,
+              }}
+            >
+              {strVal.length}/{field.maxCount}
+            </span>
+          )}
+        </div>
       );
+    }
   }
 
   // Toggle already renders its own label; wrap the rest in a FormField.
   if (field.control === "toggle") {
     return (
-      <FormField label={field.label} hint={field.hint}>
+      <FormField label={field.label} hint={field.hint} required={field.required} error={error}>
         {control}
       </FormField>
     );
   }
   return (
-    <FormField label={field.label} htmlFor={id} hint={field.hint}>
+    <FormField label={field.label} htmlFor={id} hint={field.hint} required={field.required} error={error}>
       {control}
     </FormField>
   );
@@ -928,9 +1255,12 @@ function Center({ children }: { children: React.ReactNode }) {
 function BriefImport({
   campaignId,
   onApply,
+  onContinue,
 }: {
   campaignId: string;
   onApply: (fieldKey: string, textValue: string) => void;
+  /** S1.6 — "Use our campaign builder": continue without waiting for extraction. */
+  onContinue: () => void;
 }) {
   const toast = useToast();
   const qc = useQueryClient();
@@ -984,9 +1314,9 @@ function BriefImport({
         <div style={{ flex: 1 }}>
           <div style={{ ...text.subheading }}>Import from a brief {/* COPY:PLU-159 */}</div>
           <div style={{ ...text.caption }}>
-            {/* COPY:PLU-159 */}
-            Upload an existing brief PDF. We pull out fields for you to review — nothing is saved
-            until you apply it.
+            {/* COPY:PLU-159 — S1.3/S1.5: upload auto-starts extraction. */}
+            Upload an existing brief PDF and we'll read it automatically, pulling out fields for you
+            to review — nothing is saved until you apply it.
           </div>
         </div>
         <input
@@ -1007,7 +1337,24 @@ function BriefImport({
         >
           {busy ? "Reading…" : extraction ? "Upload another" : "Upload brief"} {/* COPY:PLU-159 */}
         </Button>
+        {/* S1.6 — secondary action, always available (even mid-extraction). */}
+        <Button variant="ghost" onClick={onContinue}>
+          Use our campaign builder {/* COPY:PLU-159 */}
+        </Button>
       </div>
+
+      {/* S1.5: automatic extraction runs with a visible progress state. It fires
+          on upload (below) — failure surfaces but never blocks manual entry. */}
+      {busy && (
+        <div
+          role="status"
+          className="ds-pulse"
+          style={{ display: "flex", alignItems: "center", gap: 8, fontSize: font.size.sm, color: colors.textMuted }}
+        >
+          <span aria-hidden style={{ width: 7, height: 7, borderRadius: "50%", background: colors.accent, display: "inline-block" }} />
+          Reading the brief and extracting fields… {/* COPY:PLU-159 */}
+        </div>
+      )}
 
       {error && (
         <div role="alert" style={{ fontSize: font.size.sm, color: colors.danger }}>
@@ -1175,6 +1522,732 @@ function QuantityRows({
 }
 
 // ---------------------------------------------------------------------------
+// DeliverableCards — the 8 worksheet platform/format checkbox cards (S3.2–S3.9).
+// ---------------------------------------------------------------------------
+// Each card toggles a { platform, format, quantity } row in the SAME
+// deliverableQuantities jsonb the generic QuantityRows wrote — so the storage
+// contract is unchanged; only the UI is worksheet-exact now. A card is selected
+// iff a row with its platform+format exists; selecting adds a row (qty 1),
+// deselecting removes it, and the quantity input edits it in place.
+function DeliverableCards({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: DeliverableQuantity[];
+  onChange: (v: DeliverableQuantity[]) => void;
+  disabled: boolean;
+}) {
+  const indexOf = (platform: string, format: string) =>
+    value.findIndex((r) => r.platform === platform && r.format === format);
+
+  function toggle(platform: string, format: string) {
+    const i = indexOf(platform, format);
+    if (i >= 0) onChange(value.filter((_, idx) => idx !== i));
+    else onChange([...value, { platform, format, quantity: 1 }]);
+  }
+  function setQty(platform: string, format: string, quantity: number) {
+    const i = indexOf(platform, format);
+    if (i < 0) return;
+    onChange(value.map((r, idx) => (idx === i ? { ...r, quantity } : r)));
+  }
+
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+        gap: 8,
+      }}
+    >
+      {DELIVERABLE_CARDS.map((card) => {
+        const i = indexOf(card.platform, card.format);
+        const selected = i >= 0;
+        return (
+          <div
+            key={`${card.platform}:${card.format}`}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
+              padding: "10px 12px",
+              background: selected ? colors.accentWash : colors.panel,
+              border: `1px solid ${selected ? colors.accent : colors.border}`,
+              borderRadius: radii.sm,
+              opacity: disabled ? 0.6 : 1,
+            }}
+          >
+            <label
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                flex: 1,
+                minWidth: 0,
+                cursor: disabled ? "default" : "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={selected}
+                disabled={disabled}
+                onChange={() => toggle(card.platform, card.format)}
+              />
+              <span
+                style={{
+                  fontSize: font.size.sm,
+                  fontWeight: selected ? font.weight.semibold : font.weight.medium,
+                  color: colors.text,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {card.label}
+              </span>
+            </label>
+            {selected && (
+              <Input
+                aria-label={`${card.label} quantity`}
+                type="number"
+                min={1}
+                value={String(value[i]?.quantity ?? "")}
+                disabled={disabled}
+                onChange={(e) => setQty(card.platform, card.format, Number(e.target.value) || 0)}
+                style={{ width: 64, flexShrink: 0 }}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CountryPicker — searchable multi-select for S3.10 (countries / markets).
+// ---------------------------------------------------------------------------
+// A text input backed by a native <datalist> for type-to-filter search (no
+// combobox dependency), plus removable chips for the selected countries. The
+// value is a string[] of ISO alpha-2 codes — exactly what CreatorRequirement.
+// geography stores. Selecting adds a code; a code already chosen is skipped.
+function CountryPicker({
+  value,
+  onChange,
+  disabled,
+  inputId,
+}: {
+  value: string[];
+  onChange: (v: string[]) => void;
+  disabled: boolean;
+  inputId: string;
+}) {
+  const [text, setText] = useState("");
+  const listId = `${inputId}-countries`;
+  const selected = new Set(value);
+
+  // Resolve typed text (a country name, or a raw code) to an ISO code to add.
+  function tryAdd(raw: string) {
+    const q = raw.trim().toLowerCase();
+    if (!q) return;
+    const match = COUNTRIES.find(
+      (c) => c.name.toLowerCase() === q || c.code.toLowerCase() === q,
+    );
+    if (!match || selected.has(match.code)) {
+      setText("");
+      return;
+    }
+    onChange([...value, match.code]);
+    setText("");
+  }
+
+  // Only offer not-yet-selected countries in the search list.
+  const available = COUNTRIES.filter((c) => !selected.has(c.code));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {value.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {value.map((code) => (
+            <span
+              key={code}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "3px 8px",
+                background: colors.accentWash,
+                border: `1px solid ${colors.accent}`,
+                borderRadius: radii.pill,
+                fontSize: font.size.sm,
+                color: colors.text,
+              }}
+            >
+              {countryLabel(code)}
+              {!disabled && (
+                <button
+                  type="button"
+                  aria-label={`Remove ${countryLabel(code)}`}
+                  onClick={() => onChange(value.filter((c) => c !== code))}
+                  className="ds-focusable"
+                  style={{ border: "none", background: "transparent", cursor: "pointer", color: colors.textMuted, padding: 0, display: "inline-flex" }}
+                >
+                  <X size={12} strokeWidth={2.25} />
+                </button>
+              )}
+            </span>
+          ))}
+        </div>
+      )}
+      <Input
+        id={inputId}
+        list={listId}
+        disabled={disabled}
+        value={text}
+        placeholder="Search countries…" // COPY:PLU-159
+        onChange={(e) => {
+          setText(e.target.value);
+          // A datalist pick fires onChange with the full value — auto-add it.
+          if (COUNTRIES.some((c) => c.name === e.target.value)) tryAdd(e.target.value);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            tryAdd(text);
+          }
+        }}
+      />
+      <datalist id={listId}>
+        {available.map((c) => (
+          <option key={c.code} value={c.name} />
+        ))}
+      </datalist>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FileField — upload one file via the shared /uploads route (PLU-139 B).
+// ---------------------------------------------------------------------------
+// The value IS the stored reference string, so it round-trips through the same
+// draft → PATCH plumbing as any text field (logoRef / brandMaterialsRef). Server
+// validates by magic bytes; a rejected file surfaces inline and never clears an
+// existing reference. No AI prefill from the asset — that's a later step.
+function FileField({
+  value,
+  accept,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  accept?: string | undefined;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  const toast = useToast();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [name, setName] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  async function handleFile(file: File) {
+    setError(null);
+    setBusy(true);
+    try {
+      const uploaded = await uploadFile(file);
+      setName(uploaded.originalName);
+      onChange(uploaded.reference); // marks the group dirty → autosave
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Upload failed"; // COPY:PLU-159
+      setError(msg);
+      toast.error(msg);
+    } finally {
+      setBusy(false);
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <input
+        ref={fileRef}
+        type="file"
+        accept={accept}
+        disabled={disabled || busy}
+        style={{ display: "none" }}
+        onChange={(e) => {
+          const f = e.target.files?.[0];
+          if (f) void handleFile(f);
+        }}
+      />
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => fileRef.current?.click()}
+          disabled={disabled || busy}
+          leftIcon={<Upload size={14} strokeWidth={2} />}
+        >
+          {busy ? "Uploading…" : value ? "Replace file" : "Upload file"} {/* COPY:PLU-159 */}
+        </Button>
+        {value && (
+          <span style={{ fontSize: font.size.sm, color: colors.textMuted, display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {name ?? value}
+            </span>
+            {!disabled && (
+              <Button variant="ghost" size="sm" onClick={() => { setName(null); onChange(""); }} leftIcon={<X size={12} strokeWidth={2.25} />}>
+                {""}
+              </Button>
+            )}
+          </span>
+        )}
+      </div>
+      {error && (
+        <div role="alert" style={{ fontSize: font.size.sm, color: colors.danger }}>
+          {error} {/* COPY:PLU-159 */}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// SearchableSelect (S2.4) — a filterable dropdown that also accepts a custom
+// typed value. Native <datalist> gives type-to-filter + free entry for free.
+// ---------------------------------------------------------------------------
+function SearchableSelect({
+  id,
+  value,
+  options,
+  placeholder,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  value: string;
+  options: SelectOption[];
+  placeholder?: string | undefined;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  const listId = `${id}-list`;
+  return (
+    <>
+      <Input
+        id={id}
+        list={listId}
+        value={value}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <datalist id={listId}>
+        {options.map((o) => (
+          <option key={o.value} value={o.value} />
+        ))}
+      </datalist>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DurationSelect (S6.1–S6.6) — a preset dropdown plus an "Others…" custom
+// escape. The stored value is EITHER a preset option value OR the free custom
+// string (single-column persistence). "Others" is selected when the current
+// value isn't one of the preset options (and isn't empty).
+// ---------------------------------------------------------------------------
+const OTHERS = "__others__";
+function DurationSelect({
+  id,
+  value,
+  options,
+  customPlaceholder,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  value: string;
+  options: SelectOption[];
+  customPlaceholder?: string | undefined;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  const isPreset = options.some((o) => o.value === value);
+  const custom = value !== "" && !isPreset;
+  const [othersOpen, setOthersOpen] = useState(custom);
+  const showCustom = othersOpen || custom;
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <Select
+        id={id}
+        disabled={disabled}
+        value={showCustom ? OTHERS : value}
+        onChange={(e) => {
+          if (e.target.value === OTHERS) {
+            setOthersOpen(true);
+            onChange(""); // clear so the custom field starts empty
+          } else {
+            setOthersOpen(false);
+            onChange(e.target.value);
+          }
+        }}
+      >
+        <option value="">Choose one…</option> {/* COPY:PLU-159 */}
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+        <option value={OTHERS}>Others…</option> {/* COPY:PLU-159 */}
+      </Select>
+      {showCustom && (
+        <Input
+          value={value}
+          disabled={disabled}
+          placeholder={customPlaceholder ?? "Enter a custom value"} // COPY:PLU-159
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CommissionAmount (S7.A1) — a number with a percentage / flat-amount mode
+// toggle. The mode persists to the commissionMode column (via onChangeMode).
+// ---------------------------------------------------------------------------
+function CommissionAmount({
+  id,
+  rate,
+  mode,
+  onChangeRate,
+  onChangeMode,
+  placeholder,
+  disabled,
+}: {
+  id: string;
+  rate: string;
+  mode: "percent" | "flat";
+  onChangeRate: (v: string) => void;
+  onChangeMode: (m: string) => void;
+  placeholder?: string | undefined;
+  disabled: boolean;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+      {mode === "flat" && <span style={{ color: colors.textMuted }}>$</span>}
+      <Input
+        id={id}
+        type="number"
+        min={0}
+        value={rate}
+        placeholder={placeholder}
+        disabled={disabled}
+        onChange={(e) => onChangeRate(e.target.value)}
+        style={{ maxWidth: 160 }}
+      />
+      {mode === "percent" && <span style={{ color: colors.textMuted }}>%</span>}
+      <div style={{ marginLeft: 6 }}>
+        <RadioCardGroup
+          ariaLabel="Commission mode" // COPY:PLU-159
+          options={[
+            { value: "percent", label: "%" },
+            { value: "flat", label: "Flat $" },
+          ]}
+          value={mode}
+          onChange={(v) => onChangeMode(v === "flat" ? "flat" : "percent")}
+          disabled={disabled}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// AttributionWindow (S7.A4) — two cards (Days / Customer lifetime); Days reveals
+// a numeric days input. Stored value: "lifetime" or a plain day-count string.
+// ---------------------------------------------------------------------------
+function AttributionWindow({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  const isLifetime = value === "lifetime";
+  const mode = isLifetime ? "lifetime" : "days";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <RadioCardGroup
+        ariaLabel="Attribution window" // COPY:PLU-159
+        options={[
+          { value: "days", label: "Days" },
+          { value: "lifetime", label: "Customer lifetime" },
+        ]}
+        value={mode}
+        onChange={(v) => onChange(v === "lifetime" ? "lifetime" : "")}
+        disabled={disabled}
+      />
+      {mode === "days" && (
+        <Input
+          type="number"
+          min={1}
+          value={value}
+          placeholder="e.g. 30" // COPY:PLU-159
+          disabled={disabled}
+          onChange={(e) => onChange(e.target.value)}
+          style={{ maxWidth: 160 }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RepeatableLinks (S5.5) — a repeatable list of link inputs. Stored as
+// newline-joined text in the existing string column (single-column scope).
+// ---------------------------------------------------------------------------
+function RepeatableLinks({
+  value,
+  placeholder,
+  onChange,
+  disabled,
+}: {
+  value: string;
+  placeholder?: string | undefined;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  // Split on newlines; always show at least one row. Trailing blank kept so the
+  // user can type into the "next" row.
+  const links = value ? value.split("\n") : [""];
+  const commit = (next: string[]) => onChange(next.join("\n").replace(/\n+$/, (m) => (m.length > 1 ? "\n" : m)));
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {links.map((link, i) => (
+        <div key={i} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <Input
+            type="url"
+            value={link}
+            placeholder={placeholder}
+            disabled={disabled}
+            onChange={(e) => {
+              const next = [...links];
+              next[i] = e.target.value;
+              commit(next);
+            }}
+          />
+          {!disabled && links.length > 1 && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => commit(links.filter((_, j) => j !== i))}
+              leftIcon={<X size={12} strokeWidth={2.25} />}
+            >
+              {""}
+            </Button>
+          )}
+        </div>
+      ))}
+      {!disabled && (
+        <div>
+          <Button variant="secondary" size="sm" onClick={() => commit([...links, ""])}>
+            Add another link {/* COPY:PLU-159 */}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PricingGrid (S7.P1) — one currency row per selected deliverable format. Each
+// row's price persists to the deliverablePricing map (cents, keyed
+// "<platform>:<format>"); the FIRST row's price also mirrors to
+// publicStartingFeeCents (the public starting fee). Values shown in dollars.
+// ---------------------------------------------------------------------------
+function PricingGrid({
+  firstFeeDollars,
+  pricing,
+  deliverables,
+  onChangeFirstFee,
+  onChangePricing,
+  disabled,
+}: {
+  firstFeeDollars: string;
+  pricing: DeliverablePricing;
+  deliverables: DeliverableQuantity[];
+  onChangeFirstFee: (v: string) => void;
+  onChangePricing: (m: DeliverablePricing) => void;
+  disabled: boolean;
+}) {
+  const rows = deliverables.filter((d) => d.platform && d.format);
+  if (rows.length === 0) {
+    return (
+      <span style={{ fontSize: font.size.sm, color: colors.textMuted }}>
+        {/* COPY:PLU-159 */}
+        Select at least one platform & content type first, then set a price here.
+      </span>
+    );
+  }
+  const keyOf = (d: DeliverableQuantity) => `${d.platform}:${d.format}`;
+  // Dollars shown per row: the first row reflects publicStartingFeeCents (dollars
+  // string) so the two stay in sync; the rest read from the cents map.
+  const dollarsFor = (d: DeliverableQuantity, first: boolean): string => {
+    if (first) return firstFeeDollars;
+    const cents = pricing[keyOf(d)];
+    return typeof cents === "number" ? String(cents / 100) : "";
+  };
+  const setDollars = (d: DeliverableQuantity, first: boolean, raw: string) => {
+    const cents = raw.trim() === "" ? undefined : Math.round(Number(raw) * 100);
+    const nextMap: DeliverablePricing = { ...pricing };
+    if (cents == null || !Number.isFinite(cents)) delete nextMap[keyOf(d)];
+    else nextMap[keyOf(d)] = cents;
+    onChangePricing(nextMap);
+    if (first) onChangeFirstFee(raw); // mirror the first row to the public fee
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {rows.map((d, i) => {
+        const first = i === 0;
+        return (
+          <div key={keyOf(d)} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ flex: 1, fontSize: font.size.sm, color: colors.text, textTransform: "capitalize" }}>
+              {d.platform} · {d.format}
+            </span>
+            <span style={{ color: colors.textMuted }}>$</span>
+            <Input
+              type="number"
+              min={0}
+              disabled={disabled}
+              value={dollarsFor(d, first)}
+              placeholder="e.g. 500" // COPY:PLU-159
+              onChange={(e) => setDollars(d, first, e.target.value)}
+              style={{ maxWidth: 140 }}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// FollowerRanges (S3.11) — per-platform min/max ranges. The full map persists to
+// the followerRanges column (via onChangeRanges); the first platform's min also
+// mirrors to minFollowers (the launch-relevant floor). Blank max = no limit.
+// ---------------------------------------------------------------------------
+function FollowerRanges({
+  ranges,
+  platforms,
+  minFollowers,
+  onChangeRanges,
+  onChangeMin,
+  disabled,
+}: {
+  ranges: FollowerRanges;
+  platforms: string[];
+  minFollowers: string;
+  onChangeRanges: (r: FollowerRanges) => void;
+  onChangeMin: (v: string) => void;
+  disabled: boolean;
+}) {
+  const uniquePlatforms = [...new Set(platforms.filter(Boolean))];
+  // With no platforms chosen yet, still let the brand set a global minimum so
+  // the field is never dead — it writes minFollowers directly.
+  if (uniquePlatforms.length === 0) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <span style={{ fontSize: font.size.sm, color: colors.textMuted }}>Min</span>
+        <Input
+          type="number"
+          min={0}
+          max={2147483647}
+          value={minFollowers}
+          placeholder="e.g. 10000" // COPY:PLU-159
+          disabled={disabled}
+          onChange={(e) => onChangeMin(e.target.value)}
+          style={{ maxWidth: 160 }}
+        />
+        <span style={{ fontSize: font.size.xs, color: colors.textDim }}>
+          {/* COPY:PLU-159 */}
+          Select platforms above to set per-platform ranges.
+        </span>
+      </div>
+    );
+  }
+  const numOr = (raw: string): number | null => (raw.trim() === "" ? null : Number(raw));
+  const setRange = (platform: string, side: "min" | "max", raw: string) => {
+    const cur = ranges[platform] ?? { min: null, max: null };
+    const next: FollowerRanges = { ...ranges, [platform]: { ...cur, [side]: numOr(raw) } };
+    onChangeRanges(next);
+    // Mirror the first platform's min to the scalar minFollowers floor.
+    if (side === "min" && platform === uniquePlatforms[0]) onChangeMin(raw);
+  };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {uniquePlatforms.map((platform) => {
+        const r = ranges[platform] ?? { min: null, max: null };
+        return (
+          <div key={platform} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ width: 84, fontSize: font.size.sm, color: colors.text, textTransform: "capitalize" }}>
+              {platform}
+            </span>
+            <span style={{ fontSize: font.size.xs, color: colors.textMuted }}>Min</span>
+            <Input
+              type="number"
+              min={0}
+              max={2147483647}
+              value={r.min == null ? "" : String(r.min)}
+              placeholder="e.g. 1500" // COPY:PLU-159
+              disabled={disabled}
+              onChange={(e) => setRange(platform, "min", e.target.value)}
+              style={{ maxWidth: 130 }}
+            />
+            <span style={{ fontSize: font.size.xs, color: colors.textMuted }}>Max</span>
+            <Input
+              type="number"
+              min={0}
+              max={2147483647}
+              value={r.max == null ? "" : String(r.max)}
+              placeholder="No upper limit" // COPY:PLU-159
+              disabled={disabled}
+              onChange={(e) => setRange(platform, "max", e.target.value)}
+              style={{ maxWidth: 140 }}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TrackingPreview (S7.T4) — read-only preview of the creator-specific link.
+// ---------------------------------------------------------------------------
+function TrackingPreview({ preview }: { preview: string }) {
+  return (
+    <div
+      style={{
+        padding: "10px 12px",
+        background: colors.panelAlt,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radii.sm,
+        fontFamily: "monospace",
+        fontSize: font.size.sm,
+        color: preview ? colors.text : colors.textMuted,
+        wordBreak: "break-all",
+      }}
+    >
+      {preview || "Set a tracking URL and parameter above to preview the creator link."} {/* COPY:PLU-159 */}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
 function draftValue(f: FieldSpec, campaign: Draft, brand: Draft, creator: Draft): unknown {
@@ -1190,6 +2263,17 @@ function numOrNull(v: unknown): number | null {
   if (!s) return null;
   const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+/** For radio-backed boolean fields: preserve null when the user hasn't chosen,
+ *  so an unanswered question stays unanswered rather than defaulting to false. */
+function boolOrNull(v: unknown): boolean | null {
+  return typeof v === "boolean" ? v : null;
+}
+/** For JSONB map fields (pricing, follower ranges): an empty/absent object → null
+ *  so we don't persist a meaningless {}; a populated object passes through. */
+function objOrNull<T extends object>(v: unknown): T | null {
+  if (v == null || typeof v !== "object" || Array.isArray(v)) return null;
+  return Object.keys(v).length > 0 ? (v as T) : null;
 }
 function dollarsToCents(v: unknown): number | null {
   const n = numOrNull(v);

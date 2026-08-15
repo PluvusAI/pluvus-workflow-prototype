@@ -174,10 +174,18 @@ export interface DeliverableQuantity {
   quantity: number;
 }
 
+/** PLU-139 (2a): S7.P1 per-deliverable pricing — cents keyed by "<platform>:<format>". */
+export type DeliverablePricing = Record<string, number>;
+
+/** PLU-139 (2a): S3.11 per-platform follower ranges — keyed by platform. `max`
+ *  null = no upper limit. */
+export type FollowerRanges = Record<string, { min: number | null; max: number | null }>;
+
 /** PLU-139 (2a): the worksheet Stage-1 public-brief fields that gained
  *  CampaignDetails columns. All nullable — an incomplete Draft is valid. Shared
  *  by CampaignListItem and CampaignDetail (both flatten the same row). */
 export interface WorksheetStage1Fields {
+  productName: string | null; // S2.3
   productType: string | null; // S2.4
   creatorAccessNeeded: boolean | null; // S2.5
   uniqueSellingPoints: string | null; // S2.7
@@ -186,11 +194,19 @@ export interface WorksheetStage1Fields {
   brandAssets: string | null; // S2.10
   brandMaterialsRef: string | null; // S1.4
   deliverableQuantities: DeliverableQuantity[] | null; // S3.2–S3.9
+  deliverablePricing: DeliverablePricing | null; // S7.P1
+  followerRanges: FollowerRanges | null; // S3.11
   briefDeliveryMethod: string | null; // S5.1
+  briefHighlight: string | null; // S5.2
+  creativeConcept: string | null; // S5.4
+  referenceVideos: string | null; // S5.5
+  scriptSubmission: string | null; // S5.6
+  adAuthorization: string | null; // S6.3
   linkInBioDuration: string | null; // S6.2
   postRetention: string | null; // S6.4
   instagramCollab: boolean | null; // S6.7
   requireApproval: boolean | null; // S7.3
+  commissionMode: string | null; // S7.A1 ("percent" | "flat")
   variableCommission: string | null; // S7.A3
   giftDeliveryMethod: string | null; // S7.G1
   promoCode: string | null; // S7.G2
@@ -247,7 +263,6 @@ export interface CampaignListItem extends WorksheetStage1Fields {
   attributionWindow: string | null;
   keyMessages: string | null;
   contentRequirements: string | null;
-  prohibitedClaims: string | null;
   targetUrl: string | null;
   hiddenParamKey: string | null;
   /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
@@ -323,7 +338,6 @@ export interface CampaignDetail extends WorksheetStage1Fields {
   attributionWindow: string | null;
   keyMessages: string | null;
   contentRequirements: string | null;
-  prohibitedClaims: string | null;
   targetUrl: string | null;
   hiddenParamKey: string | null;
   /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
@@ -360,13 +374,8 @@ export interface CreatorRequirementFields {
   id: string;
   campaignId: string;
   platforms: string[] | null;
-  niches: string[] | null;
   geography: string[] | null;
-  languages: string[] | null;
   minFollowers: number | null;
-  audienceNotes: string | null;
-  contentStyle: string | null;
-  brandSafety: string | null;
   createdAt: string;
   updatedAt: string;
 }

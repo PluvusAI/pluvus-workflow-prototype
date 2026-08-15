@@ -632,9 +632,6 @@ export const campaignDetails = pgTable("CampaignDetails", {
   // one of the same HARD-K1 creator-facing fields as usageRights/exclusivity,
   // still actively read by executors — dropping it would be a regression.
   attributionWindow: text("attributionWindow"),
-  // New — no existing column covered this (flagged as a gap by the vault's
-  // "Decision - Persist Full Extraction" note).
-  prohibitedClaims: text("prohibitedClaims"),
   // PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
   // proposed fee shown to the creator before negotiation, when priceStrategy
   // is PROPOSE_STARTING_FEE (required then) or null when REQUEST_RATE_CARD.
@@ -663,6 +660,7 @@ export const campaignDetails = pgTable("CampaignDetails", {
   // at the route) rather than PG enums so PLU-159 can retune options without a
   // migration.
   // Page 2 — Campaign & product.
+  productName: text("productName"), // S2.3
   productType: text("productType"), // S2.4
   creatorAccessNeeded: boolean("creatorAccessNeeded"), // S2.5 (enable access / none)
   uniqueSellingPoints: text("uniqueSellingPoints"), // S2.7
@@ -674,15 +672,26 @@ export const campaignDetails = pgTable("CampaignDetails", {
   // [{ platform, format, quantity }]. jsonb, following the CreatorRequirement
   // string[] list precedent.
   deliverableQuantities: jsonb("deliverableQuantities").$type<JsonValue>(),
-  // Page 5 — brief delivery (S5.1: "own_doc" | "pluvus_builder").
+  // Page 7 — S7.P1 per-deliverable pricing: { "<platform>:<format>": cents }.
+  deliverablePricing: jsonb("deliverablePricing").$type<JsonValue>(),
+  // Page 3 — S3.11 per-platform follower ranges: { "<platform>": { min, max } }.
+  followerRanges: jsonb("followerRanges").$type<JsonValue>(),
+  // Page 5 — brief delivery (S5.1: "own_doc" | "pluvus_builder") + the granular
+  // brief fields (free text pre-PLU-159's rich-text brief builder).
   briefDeliveryMethod: text("briefDeliveryMethod"),
+  briefHighlight: text("briefHighlight"), // S5.2
+  creativeConcept: text("creativeConcept"), // S5.4
+  referenceVideos: text("referenceVideos"), // S5.5 (one link per line)
+  scriptSubmission: text("scriptSubmission"), // S5.6 ("require" | "skip")
   // Page 6 — rights durations not previously modelled (free text; worksheet
   // shows dropdown+custom, kept as text pre-PLU-159).
+  adAuthorization: text("adAuthorization"), // S6.3 (split out from usageRights)
   linkInBioDuration: text("linkInBioDuration"), // S6.2
   postRetention: text("postRetention"), // S6.4
   instagramCollab: boolean("instagramCollab"), // S6.7
   // Page 7 — shared onboarding + affiliate/gift specifics.
   requireApproval: boolean("requireApproval"), // S7.3
+  commissionMode: text("commissionMode"), // S7.A1 "percent" | "flat"
   variableCommission: text("variableCommission"), // S7.A3 (free text pre-PLU-159)
   giftDeliveryMethod: text("giftDeliveryMethod"), // S7.G1 "promo_code" | "manual_contact"
   promoCode: text("promoCode"), // S7.G2
@@ -906,14 +915,13 @@ export const creatorRequirements = pgTable("CreatorRequirement", {
     .notNull()
     .unique()
     .references(() => campaigns.id, { onDelete: "cascade" }),
+  // PLU-139 (B): only the worksheet-backed creator criteria remain — platforms
+  // (S3.1), geography (S3.10), minFollowers (S3.11). niches/languages/
+  // audienceNotes/contentStyle/brandSafety were legacy fields with no worksheet
+  // row and no downstream reader; dropped to keep the intake worksheet-exact.
   platforms: jsonb("platforms").$type<JsonValue>(),
-  niches: jsonb("niches").$type<JsonValue>(),
   geography: jsonb("geography").$type<JsonValue>(),
-  languages: jsonb("languages").$type<JsonValue>(),
   minFollowers: integer("minFollowers"),
-  audienceNotes: text("audienceNotes"),
-  contentStyle: text("contentStyle"),
-  brandSafety: text("brandSafety"),
   createdAt: tsNow("createdAt"),
   updatedAt: tsUpdatedAt("updatedAt"),
 });
