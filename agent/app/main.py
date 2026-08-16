@@ -7,6 +7,7 @@ load_dotenv(Path(__file__).parent.parent.parent / ".env")
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.routes.brief_narrative import router as brief_narrative_router
 from app.routes.classify import router as classify_router
 from app.routes.negotiate import router as negotiate_router
 from app.routes.negotiate import warn_knowledge_flag_dependency
@@ -57,3 +58,4 @@ app.include_router(classify_router)
 app.include_router(negotiate_router)
 app.include_router(outreach_template_router)
 app.include_router(summarize_router)
+app.include_router(brief_narrative_router)

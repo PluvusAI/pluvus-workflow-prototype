@@ -6,6 +6,7 @@ import { redriveInboundDeadLetters } from "./inboundRedrive.js";
 import { sweepAutoSettlePayouts } from "./payoutSweep.js";
 import { sweepStrandedSends } from "./sendDelaySweep.js";
 import { sweepStaleBrandApprovalClaims } from "./brandApprovalSweep.js";
+import { sweepStaleCampaignBriefRenders } from "./campaignBriefRenderSweep.js";
 import { logWorkerMetrics } from "../workers/workerMetrics.js";
 import { acquireOrRenewLeadership } from "./lock.js";
 
@@ -80,6 +81,20 @@ async function poll(): Promise<void> {
   } catch (err) {
     console.error(
       "[scheduler/poller] brand-approval stale-claim sweep failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  // PLU-139 §6b: CampaignBrief crash-recovery sweep — marks a render job's
+  // GENERATING row FAILED (category STALE) if its worker died mid-render
+  // (see campaignBriefRenderSweep.ts for why this is FAILED, not a retry).
+  // Runs under the leader lease; wrapped so a sweep DB blip can never
+  // disturb the due-instance path.
+  try {
+    await sweepStaleCampaignBriefRenders();
+  } catch (err) {
+    console.error(
+      "[scheduler/poller] campaign-brief-render sweep failed:",
       err instanceof Error ? err.message : err,
     );
   }

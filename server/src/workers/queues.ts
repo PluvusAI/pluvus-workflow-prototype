@@ -1,6 +1,11 @@
 import { Queue } from "bullmq";
 import { redisConnection } from "./redis.js";
-import type { NodeExecutionJobData, InboundEmailJobData, DelayedSendJobData } from "./jobs.js";
+import type {
+  NodeExecutionJobData,
+  InboundEmailJobData,
+  DelayedSendJobData,
+  CampaignBriefRenderJobData,
+} from "./jobs.js";
 
 // ---------------------------------------------------------------------------
 // Queue names — single source of truth
@@ -10,6 +15,9 @@ export const QUEUE_NODE_EXECUTION = "node-execution";
 export const QUEUE_INBOUND_EMAIL = "inbound-email";
 // Randomized Send Delay (§4.2): delayed flush of reserved OUTBOUND AI replies.
 export const QUEUE_DELAYED_SEND = "delayed-send";
+// PLU-139 §6: async CampaignBrief rendering — Puppeteer can crash the whole
+// worker process, so this must never run inline in an HTTP handler.
+export const QUEUE_CAMPAIGN_BRIEF_RENDER = "campaign-brief-render";
 
 // ---------------------------------------------------------------------------
 // Worker concurrency (HARD-S1)
@@ -41,6 +49,19 @@ function positiveEnvInt(name: string, fallback: number): number {
 export function workerConcurrency(specificEnv?: string): number {
   const base = positiveEnvInt("WORKER_CONCURRENCY", DEFAULT_WORKER_CONCURRENCY);
   return specificEnv ? positiveEnvInt(specificEnv, base) : base;
+}
+
+// PLU-139 §6: the brief-render worker does NOT inherit WORKER_CONCURRENCY's
+// default of 5 the way every other worker's `specificEnv` override does
+// (workerConcurrency() above falls back to the shared default when the
+// specific env is unset) — each concurrent job here is a full headless
+// Chromium instance, a meaningfully different memory footprint than 5
+// concurrent node-execution jobs. CAMPAIGN_BRIEF_RENDER_CONCURRENCY has its
+// OWN low default (2), independent of WORKER_CONCURRENCY.
+const DEFAULT_CAMPAIGN_BRIEF_RENDER_CONCURRENCY = 2;
+
+export function campaignBriefRenderConcurrency(): number {
+  return positiveEnvInt("CAMPAIGN_BRIEF_RENDER_CONCURRENCY", DEFAULT_CAMPAIGN_BRIEF_RENDER_CONCURRENCY);
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +100,8 @@ let _nodeExecutionQueue: Queue<any> | undefined;
 let _inboundEmailQueue: Queue<any> | undefined;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let _delayedSendQueue: Queue<any> | undefined;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _campaignBriefRenderQueue: Queue<any> | undefined;
 
 export function getNodeExecutionQueue(): Queue<NodeExecutionJobData> {
   if (!_nodeExecutionQueue) {
@@ -108,6 +131,25 @@ export function getDelayedSendQueue(): Queue<DelayedSendJobData> {
     });
   }
   return _delayedSendQueue as Queue<DelayedSendJobData>;
+}
+
+export function getCampaignBriefRenderQueue(): Queue<CampaignBriefRenderJobData> {
+  if (!_campaignBriefRenderQueue) {
+    // PLU-139 §6 open question #5: reuses the shared DEFAULT_JOB_OPTIONS
+    // (3 attempts, exponential backoff from 5s) rather than a bespoke
+    // retry policy — a single transient failure (a momentary resource
+    // spike) shouldn't need a human to intervene, and §6b's stale-render
+    // sweep is the real backstop for the "worker process died" case that
+    // `attempts` can't help with either way (a dead process can't retry
+    // itself). Flagged explicitly in the plan doc rather than inherited
+    // silently, since this is the one queue where "just reuse what
+    // everything else uses" isn't obviously correct by analogy alone.
+    _campaignBriefRenderQueue = new Queue(QUEUE_CAMPAIGN_BRIEF_RENDER, {
+      connection: redisConnection(),
+      defaultJobOptions: DEFAULT_JOB_OPTIONS,
+    });
+  }
+  return _campaignBriefRenderQueue as Queue<CampaignBriefRenderJobData>;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +229,21 @@ export async function enqueueDelayedSend(
   await queue.add("flush", data, { jobId, delay: Math.max(0, Math.floor(delayMs)) });
 }
 
+/**
+ * Enqueue a CampaignBrief render job. jobId is keyed on `campaignBriefId`
+ * (the row THIS job exists to complete), NOT `campaignId` or
+ * `renderRequestId` — see CampaignBriefRenderJobData's doc comment. BullMQ
+ * dedupes on jobId, so a producer retry (the route calling this again after
+ * an ambiguous failure) is a safe no-op against the same row.
+ */
+export async function enqueueCampaignBriefRender(
+  data: CampaignBriefRenderJobData,
+): Promise<void> {
+  const queue = getCampaignBriefRenderQueue();
+  const jobId = `brief-render|${data.campaignBriefId}`;
+  await queue.add("render", data, { jobId });
+}
+
 // ---------------------------------------------------------------------------
 // Graceful shutdown
 // ---------------------------------------------------------------------------
@@ -196,5 +253,6 @@ export async function closeQueues(): Promise<void> {
     _nodeExecutionQueue?.close(),
     _inboundEmailQueue?.close(),
     _delayedSendQueue?.close(),
+    _campaignBriefRenderQueue?.close(),
   ]);
 }
