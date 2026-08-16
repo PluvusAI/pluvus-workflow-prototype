@@ -469,6 +469,10 @@ model CampaignDetails {
   /// read by executors. Dropping it silently would be a real regression, not a
   /// simplification.
   attributionWindow   String?
+  /// PLU-141: read by the campaign brief renderer (campaignBriefRender.ts) and
+  /// rendered into the creator-facing brief, so it stays a live column even
+  /// though the Stage-1 intake no longer writes it.
+  prohibitedClaims    String?
   /// PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
   /// proposed fee shown to the creator before negotiation, when priceStrategy
   /// is PROPOSE_STARTING_FEE (required then) or null when REQUEST_RATE_CARD.
@@ -761,12 +765,25 @@ model CreatorRequirement {
   id         String @id @default(cuid())
   campaignId String @unique
 
-  // PLU-139 (B): only worksheet-backed criteria remain — platforms (S3.1),
-  // geography (S3.10), minFollowers (S3.11). niches/languages/audienceNotes/
-  // contentStyle/brandSafety were legacy off-worksheet fields, no reader; dropped.
-  platforms    Json?
-  geography    Json?
-  minFollowers Int?
+  // PLU-139 (B): worksheet-backed criteria — platforms (S3.1), geography
+  // (S3.10), minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/
+  // brandSafety were slated to drop as off-worksheet, but PLU-141's campaign
+  // brief renderer (campaignBriefRender.ts) now reads all of them, so they stay.
+  platforms     Json?
+  niches        Json?
+  geography     Json?
+  languages     Json?
+  minFollowers  Int?
+  audienceNotes String?
+  contentStyle  String?
+  brandSafety   String?
+
+  /// PLU-139 §0/§1a: stub approval flag for including this table's content in
+  /// a rendered CampaignBrief. Defaults false on every existing and future
+  /// row — nothing in PLU-139 sets it true (no UI, no API endpoint to flip
+  /// it yet); buildCampaignBriefInput() only emits a creatorRequirements
+  /// section when true.
+  approvedForBrief Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -793,9 +810,35 @@ model CampaignBrief {
   campaignId             String
   campaignTermsSnapshotId String
 
+  /// PLU-139 §6a: client-supplied idempotency key (a UUID minted once per
+  /// "render" click), NOT derived from campaignTermsSnapshotId — the same
+  /// snapshot can legitimately produce multiple CampaignBrief rows over time
+  /// (re-render after a BrandIdentity edit), so snapshot id alone cannot be
+  /// the dedup key. NOT NULL: the only writer of this table is
+  /// POST /campaigns/:id/brief, which requires this field on every request.
+  renderRequestId String @unique
+
   renderedAssetRef String?
   status           CampaignBriefRenderStatus @default(GENERATING)
   generatedAt      DateTime?
+  /// PLU-139 §8/§9: set only when status = FAILED — DATA_INCOMPLETE (a
+  /// material field the snapshot should guarantee was missing),
+  /// RENDER_FAILED (Puppeteer/PDF conversion threw), or STALE (written by
+  /// §6b's crash-recovery sweep — the job never reported back at all).
+  /// Never surfaced as an HTTP error; these categories only ever exist here.
+  errorCategory String?
+  /// PLU-139 §7: creator-facing magic-link retrieval — same hashed-token
+  /// posture as PaymentInfo.token (BUG-S1): only the SHA-256 hash is ever
+  /// persisted, the raw token exists only at mint time (returned by
+  /// mintCampaignBriefCreatorToken(), never re-readable afterward). Minted
+  /// once this row goes READY. Nothing in this PR emails it to a creator
+  /// (route-only per the ticket's own resolution — no CONTENT_BRIEF executor
+  /// wiring). Security review fix (Calvin): the raw token is NEVER logged —
+  /// possession of it alone authorizes the public /brief/:token route, so a
+  /// log line would hand the same access to anyone who can read logs. A
+  /// manual pre-delivery verification reads it via a secure, DB-scoped
+  /// channel, never a shipped log stream.
+  creatorTokenHash String? @unique
 
   /// PLU-135 schema review §2.2 (Calvin, 2026-08-08) — named in review as the
   /// most important open concern. BrandIdentity is deliberately NOT locked at
@@ -828,6 +871,11 @@ model CampaignBrief {
   @@index([campaignId])
   @@index([campaignTermsSnapshotId])
   @@index([campaignId, renderedAt])
+  /// PLU-139 §6/§1a: the concurrency backstop — at most one CURRENT
+  /// (status='READY' AND supersededAt IS NULL) row per campaign. This is a
+  /// PARTIAL unique index; Prisma cannot model a WHERE clause on @@unique,
+  /// so it is created directly by the migration SQL as
+  /// "CampaignBrief_campaignId_current_key" and documented here only.
 }
 
 /// PLU-135 (1a): append-only campaign history. No updatedAt by design — nothing

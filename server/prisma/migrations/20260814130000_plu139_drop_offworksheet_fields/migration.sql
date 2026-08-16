@@ -1,17 +1,16 @@
--- PLU-139 (B): drop the six fields that had no worksheet row and no downstream
--- reader, so the Stage-1 intake matches docs/campaign-question-review-worksheet.md
--- exactly. Five were legacy CreatorRequirement criteria (never fed matching/
--- ranking/outreach — informational-only, by construction); prohibitedClaims was a
--- CampaignDetails column populated only from the brief parser's "restrictions"
--- section, which is removed in the same change (agent/app/brief.py).
+-- PLU-139 (B): originally dropped six off-worksheet fields with no downstream
+-- reader (CreatorRequirement.niches/languages/audienceNotes/contentStyle/
+-- brandSafety and CampaignDetails.prohibitedClaims), so the Stage-1 intake
+-- matched docs/campaign-question-review-worksheet.md exactly.
 --
--- Destructive but low-risk: all six were nullable and unread outside the intake
--- PATCH plumbing. DROP COLUMN IF EXISTS → safe to re-run.
+-- Reverted to a no-op after the merge with PLU-141: that branch's campaign brief
+-- renderer (campaignBriefRender.ts) now reads all six — the five CreatorRequirement
+-- criteria via a full-row select, and prohibitedClaims into the creator-facing
+-- brief. Dropping any of them would break the renderer, so every DROP is removed
+-- and the columns stay. The migration directory is kept (never deleted from
+-- _prisma_migrations history) but does nothing.
+--
+-- The intake simply no longer writes these columns; they remain valid, nullable,
+-- and readable.
 
-ALTER TABLE "CreatorRequirement" DROP COLUMN IF EXISTS "niches";
-ALTER TABLE "CreatorRequirement" DROP COLUMN IF EXISTS "languages";
-ALTER TABLE "CreatorRequirement" DROP COLUMN IF EXISTS "audienceNotes";
-ALTER TABLE "CreatorRequirement" DROP COLUMN IF EXISTS "contentStyle";
-ALTER TABLE "CreatorRequirement" DROP COLUMN IF EXISTS "brandSafety";
-
-ALTER TABLE "CampaignDetails" DROP COLUMN IF EXISTS "prohibitedClaims";
+-- (intentionally empty)
