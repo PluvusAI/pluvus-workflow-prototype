@@ -365,7 +365,6 @@ _SINGLE_KEYS = (
     "exclusivity",
     "paymentTerms",
     "requiredTalkingPoints",
-    "prohibitedClaims",
     "shipping",
     "contentExamples",
 )
@@ -394,10 +393,6 @@ _HEADING_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     (
         "requiredTalkingPoints",
         re.compile(r"^(talking points?|key messages?|required (talking|messaging|mentions?)|do'?s|must (mention|include))\b", re.I),
-    ),
-    (
-        "prohibitedClaims",
-        re.compile(r"^(prohibited( claims?| topics?)?|do'?s?\s*[/&]\s*don'?ts?|do'?s and don'?ts|don'?ts|do not|restrictions?|what not to|avoid|disclaimers?)\b", re.I),
     ),
     ("contentExamples", re.compile(r"^(content examples?|examples?|inspiration|references?|creative examples?|mood ?board)\b", re.I)),
     (

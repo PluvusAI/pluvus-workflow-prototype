@@ -25,31 +25,40 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB — plenty for a brief PDF.
 });
 
-// MED-S3: the real PDF header. A PDF file MUST begin with "%PDF-" (bytes 25 50
-// 44 46 2D) followed by a version. The extension + mimetype are attacker- or
-// browser-controlled and prove nothing about the CONTENT; without a content
-// check, an unvalidated file (an HTML page, a script, or garbage) named ".pdf"
-// could be stored and later EMAILED to creators as the brand's official brief.
-const PDF_MAGIC = Buffer.from("%PDF-", "latin1");
+// MED-S3: content-type is proven by MAGIC BYTES, never by the extension or
+// mimetype (both attacker/browser-controlled). Without a content check an
+// unvalidated file (an HTML page, a script, garbage) named ".pdf"/".png" could
+// be stored and later EMAILED to creators or rendered as the brand's asset.
+//
+// PLU-139 (B): the same generic /uploads route now backs brand-asset uploads
+// (logo, supporting materials) as well as the brief PDF, so it accepts the
+// common image types in addition to PDF. Each is gated on its real signature.
+// SVG is deliberately NOT accepted — it's XML that can carry script; a logo
+// upload doesn't need it, and allowing it would reopen the content hole.
+const MAGIC: ReadonlyArray<{ label: string; sig: Buffer; offset?: number }> = [
+  { label: "pdf", sig: Buffer.from("%PDF-", "latin1") },
+  { label: "png", sig: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) },
+  { label: "jpg", sig: Buffer.from([0xff, 0xd8, 0xff]) },
+  { label: "gif", sig: Buffer.from("GIF8", "latin1") },
+  { label: "webp", sig: Buffer.from("WEBP", "latin1"), offset: 8 }, // RIFF....WEBP
+];
+
+/** True when the buffer begins (at `offset`) with `sig`. */
+function startsWith(buffer: Buffer, sig: Buffer, offset = 0): boolean {
+  return (
+    buffer.length >= offset + sig.length &&
+    buffer.subarray(offset, offset + sig.length).equals(sig)
+  );
+}
 
 /** True when the file's bytes actually begin with the %PDF- signature. */
 export function hasPdfMagicBytes(buffer: Buffer): boolean {
-  // Compare only the first 5 bytes; a valid PDF header is at offset 0 per spec.
-  return buffer.length >= PDF_MAGIC.length && buffer.subarray(0, PDF_MAGIC.length).equals(PDF_MAGIC);
+  return startsWith(buffer, MAGIC[0]!.sig);
 }
 
-function isPdf(file: Express.Multer.File): boolean {
-  const nameIsPdf = /\.pdf$/i.test(file.originalname);
-  const mimeIsPdf = file.mimetype === "application/pdf";
-  // Require the extension; accept the common PDF mimetype OR a generic
-  // octet-stream (some browsers/tools omit the precise type). AND require the
-  // actual %PDF- magic bytes (MED-S3) — extension/mime alone are not evidence of
-  // real PDF content, and this file is later emailed to creators as the brief.
-  return (
-    nameIsPdf &&
-    (mimeIsPdf || file.mimetype === "application/octet-stream") &&
-    hasPdfMagicBytes(file.buffer)
-  );
+/** The detected type by magic bytes, or null if it matches no accepted type. */
+export function detectAssetType(buffer: Buffer): string | null {
+  return MAGIC.find((m) => startsWith(buffer, m.sig, m.offset))?.label ?? null;
 }
 
 // POST /uploads — store one PDF and return its reference.
@@ -60,8 +69,8 @@ router.post("/", upload.single("file"), async (req: Request, res: Response) => {
       res.status(400).json({ error: "no file provided (expected multipart field 'file')" });
       return;
     }
-    if (!isPdf(file)) {
-      res.status(400).json({ error: "only PDF files are accepted" });
+    if (!detectAssetType(file.buffer)) {
+      res.status(400).json({ error: "only PDF or image (PNG/JPG/GIF/WebP) files are accepted" });
       return;
     }
 

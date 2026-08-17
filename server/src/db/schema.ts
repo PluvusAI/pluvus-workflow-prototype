@@ -632,8 +632,9 @@ export const campaignDetails = pgTable("CampaignDetails", {
   // one of the same HARD-K1 creator-facing fields as usageRights/exclusivity,
   // still actively read by executors — dropping it would be a regression.
   attributionWindow: text("attributionWindow"),
-  // New — no existing column covered this (flagged as a gap by the vault's
-  // "Decision - Persist Full Extraction" note).
+  // PLU-141: read by the campaign brief renderer (campaignBriefRender.ts) and
+  // rendered into the creator-facing brief, so it stays a live CampaignDetails
+  // column even though the Stage-1 intake no longer writes it.
   prohibitedClaims: text("prohibitedClaims"),
   // PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
   // proposed fee shown to the creator before negotiation, when priceStrategy
@@ -656,6 +657,61 @@ export const campaignDetails = pgTable("CampaignDetails", {
   publicPaymentTerms: text("publicPaymentTerms"),
   shipsPhysicalProduct: boolean("shipsPhysicalProduct").notNull().default(false),
   brandDescription: text("brandDescription"),
+  // PLU-139 (2a): worksheet Stage-1 questions that had no CampaignDetails column
+  // until now — all creator-facing public brief fields, all nullable (an
+  // incomplete Draft is valid). Grouped by worksheet page. Free-text unless a
+  // closed set is noted; the closed sets are stored as plain strings (validated
+  // at the route) rather than PG enums so PLU-159 can retune options without a
+  // migration.
+  // Page 2 — Campaign & product.
+  productName: text("productName"), // S2.3
+  productType: text("productType"), // S2.4
+  creatorAccessNeeded: boolean("creatorAccessNeeded"), // S2.5 (enable access / none)
+  uniqueSellingPoints: text("uniqueSellingPoints"), // S2.7
+  whyTrust: text("whyTrust"), // S2.8
+  howToUse: text("howToUse"), // S2.9
+  brandAssets: text("brandAssets"), // S2.10 (links)
+  brandMaterialsRef: text("brandMaterialsRef"), // S1.4 uploaded supporting materials
+  // Page 3 — per-platform deliverable quantities (S3.2–S3.9). Structured list:
+  // [{ platform, format, quantity }]. jsonb, following the CreatorRequirement
+  // string[] list precedent.
+  deliverableQuantities: jsonb("deliverableQuantities").$type<JsonValue>(),
+  // Page 7 — S7.P1 per-deliverable pricing: { "<platform>:<format>": cents }.
+  deliverablePricing: jsonb("deliverablePricing").$type<JsonValue>(),
+  // Page 3 — S3.11 per-platform follower ranges: { "<platform>": { min, max } }.
+  followerRanges: jsonb("followerRanges").$type<JsonValue>(),
+  // Page 5 — brief delivery (S5.1: "own_doc" | "pluvus_builder") + the granular
+  // brief fields (free text pre-PLU-159's rich-text brief builder).
+  briefDeliveryMethod: text("briefDeliveryMethod"),
+  briefHighlight: text("briefHighlight"), // S5.2
+  creativeConcept: text("creativeConcept"), // S5.4
+  referenceVideos: text("referenceVideos"), // S5.5 (one link per line)
+  scriptSubmission: text("scriptSubmission"), // S5.6 ("require" | "skip")
+  // Page 6 — rights durations not previously modelled (free text; worksheet
+  // shows dropdown+custom, kept as text pre-PLU-159).
+  adAuthorization: text("adAuthorization"), // S6.3 (split out from usageRights)
+  linkInBioDuration: text("linkInBioDuration"), // S6.2
+  postRetention: text("postRetention"), // S6.4
+  instagramCollab: boolean("instagramCollab"), // S6.7
+  // Page 7 — shared onboarding + affiliate/gift specifics.
+  requireApproval: boolean("requireApproval"), // S7.3
+  commissionMode: text("commissionMode"), // S7.A1 "percent" | "flat"
+  variableCommission: text("variableCommission"), // S7.A3 (free text pre-PLU-159)
+  giftDeliveryMethod: text("giftDeliveryMethod"), // S7.G1 "promo_code" | "manual_contact"
+  promoCode: text("promoCode"), // S7.G2
+  giftContactEmail: text("giftContactEmail"), // S7.G4
+  requiresShippingInfo: boolean("requiresShippingInfo"), // S7.G7
+  // Page 7 — public affiliate tracking (T-series). targetUrl/hiddenParamKey on
+  // the Campaign row remain the create-time source; these are the public,
+  // brief-level tracking fields the worksheet surfaces.
+  affiliateTrackingUrl: text("affiliateTrackingUrl"), // S7.T0
+  trackingLinkMode: text("trackingLinkMode"), // S7.T1 "pluvus" | "own"
+  trackingDestinationUrl: text("trackingDestinationUrl"), // S7.T2
+  trackingParameter: text("trackingParameter"), // S7.T3
+  // PLU-139 field-level provenance: { "<fieldKey>": "manual" | "pdf_extracted" }.
+  // How each creator-facing value got here (typed = manual, applied from a brief
+  // candidate = pdf_extracted). Absent key = no provenance recorded.
+  fieldProvenance: jsonb("fieldProvenance").$type<JsonValue>(),
   // PLU-135 schema review §2.1 (Calvin, 2026-08-08): which extraction the
   // fields above were actually confirmed from — the missing link in the
   // extraction -> confirmation -> snapshot chain. Without this,
@@ -867,6 +923,10 @@ export const creatorRequirements = pgTable("CreatorRequirement", {
     .notNull()
     .unique()
     .references(() => campaigns.id, { onDelete: "cascade" }),
+  // PLU-139 (B): worksheet-backed criteria — platforms (S3.1), geography
+  // (S3.10), minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/
+  // brandSafety were slated to drop as off-worksheet, but PLU-141's campaign
+  // brief renderer (campaignBriefRender.ts) now reads all of them, so they stay.
   platforms: jsonb("platforms").$type<JsonValue>(),
   niches: jsonb("niches").$type<JsonValue>(),
   geography: jsonb("geography").$type<JsonValue>(),

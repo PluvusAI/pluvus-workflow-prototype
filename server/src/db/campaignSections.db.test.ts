@@ -15,7 +15,11 @@ import { drizzle } from "drizzle-orm/pglite";
 import { eq } from "drizzle-orm";
 import * as schema from "./schema.js";
 import type { Db } from "./drizzle.js";
-import { CampaignLockedError } from "./campaignDetails.js";
+import {
+  CampaignLockedError,
+  upsertCampaignDetails,
+  getCampaignDetails,
+} from "./campaignDetails.js";
 import {
   getBrandIdentity,
   getBrandIdentitiesByCampaignIds,
@@ -26,6 +30,10 @@ import {
   getCreatorRequirementsByCampaignIds,
   upsertCreatorRequirement,
 } from "./creatorRequirement.js";
+import {
+  insertBriefExtraction,
+  getLatestBriefExtraction,
+} from "./campaignBriefExtraction.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
@@ -106,6 +114,8 @@ async function main(): Promise<void> {
     const round = await getCreatorRequirement(id, pgdb);
     assert.equal(round?.audienceNotes, "18-34, US-based");
     assert.deepEqual(round?.niches, ["fitness"]);
+    assert.deepEqual(round?.platforms, ["youtube", "instagram"]);
+    assert.deepEqual(round?.geography, ["US", "CA"]);
   });
 
   await test("getCreatorRequirementsByCampaignIds batches", async () => {
@@ -113,6 +123,9 @@ async function main(): Promise<void> {
     await upsertCreatorRequirement(a, { contentStyle: "UGC" }, pgdb);
     const map = await getCreatorRequirementsByCampaignIds([a], pgdb);
     assert.equal(map.get(a)?.contentStyle, "UGC");
+    await upsertCreatorRequirement(a, { minFollowers: 25000 }, pgdb);
+    const map2 = await getCreatorRequirementsByCampaignIds([a], pgdb);
+    assert.equal(map2.get(a)?.minFollowers, 25000);
   });
 
   // ── Draft-only lock (reused guard) ────────────────────────────────────────────
@@ -128,7 +141,7 @@ async function main(): Promise<void> {
   await test("upsertCreatorRequirement throws CampaignLockedError once ACTIVE", async () => {
     const id = await seedCampaign(pgdb, "ACTIVE");
     await assert.rejects(
-      () => upsertCreatorRequirement(id, { niches: ["x"] }, pgdb),
+      () => upsertCreatorRequirement(id, { platforms: ["x"] }, pgdb),
       CampaignLockedError,
     );
     assert.equal(await getCreatorRequirement(id, pgdb), null, "no row written");
@@ -140,6 +153,148 @@ async function main(): Promise<void> {
     await upsertCreatorRequirement(id, { minFollowers: 5000 }, pgdb);
     assert.equal((await getBrandIdentity(id, pgdb))?.logoRef, "ok");
     assert.equal((await getCreatorRequirement(id, pgdb))?.minFollowers, 5000);
+  });
+
+  // ── previously-unreachable CampaignDetails columns now editable (PLU-139 2a) ──
+  // publicPaymentTerms / attributionWindow / keyMessages existed as columns but no
+  // PATCH wrote them, so the sectioned intake could never edit them. Prove they
+  // round-trip through the upsert the route now delegates to.
+  await test("upsertCampaignDetails persists the previously-unreachable content columns", async () => {
+    const id = await seedCampaign(pgdb);
+    await upsertCampaignDetails(
+      id,
+      {
+        publicPaymentTerms: "50% upfront / 50% after",
+        attributionWindow: "30 days",
+        keyMessages: "Lightest shoe under $120",
+        contentRequirements: "Add captions; product in first 3s",
+      },
+      pgdb,
+    );
+    const d = await getCampaignDetails(id, pgdb);
+    assert.equal(d?.publicPaymentTerms, "50% upfront / 50% after");
+    assert.equal(d?.attributionWindow, "30 days");
+    assert.equal(d?.keyMessages, "Lightest shoe under $120");
+    assert.equal(d?.contentRequirements, "Add captions; product in first 3s");
+  });
+
+  // ── the ~18 worksheet Stage-1 columns (PLU-139) round-trip incl. jsonb list ──
+  await test("upsertCampaignDetails persists the worksheet Stage-1 columns", async () => {
+    const id = await seedCampaign(pgdb);
+    await upsertCampaignDetails(
+      id,
+      {
+        productName: "Cloudstride 2",
+        productType: "Running shoes",
+        creatorAccessNeeded: true,
+        uniqueSellingPoints: "Lightest in class",
+        whyTrust: "10 years in market",
+        howToUse: "Lace up and run",
+        brandAssets: "https://drive.example/assets",
+        brandMaterialsRef: "upload-ref-1",
+        deliverableQuantities: [
+          { platform: "instagram", format: "reel", quantity: 3 },
+          { platform: "youtube", format: "integration", quantity: 1 },
+        ] as unknown as (typeof schema.campaignDetails.$inferInsert)["deliverableQuantities"],
+        deliverablePricing: {
+          "instagram:reel": 50000,
+          "youtube:integration": 120000,
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["deliverablePricing"],
+        followerRanges: {
+          instagram: { min: 1500, max: null },
+          youtube: { min: 400, max: 400000 },
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["followerRanges"],
+        commissionMode: "percent",
+        briefDeliveryMethod: "pluvus_builder",
+        briefHighlight: "Feature the product in the first 3s",
+        creativeConcept: "Warm, handheld, day-in-the-life",
+        referenceVideos: "https://tiktok.com/@a/1\nhttps://tiktok.com/@b/2",
+        scriptSubmission: "require",
+        adAuthorization: "30 days",
+        linkInBioDuration: "30 days",
+        postRetention: "90 days",
+        instagramCollab: true,
+        requireApproval: true,
+        variableCommission: "20% then 10%",
+        giftDeliveryMethod: "promo_code",
+        promoCode: "CREATOR30",
+        requiresShippingInfo: true,
+        affiliateTrackingUrl: "https://example.com/shop",
+        trackingLinkMode: "pluvus",
+        trackingDestinationUrl: "https://example.com/landing",
+        trackingParameter: "_from",
+      },
+      pgdb,
+    );
+    const d = await getCampaignDetails(id, pgdb);
+    assert.equal(d?.productName, "Cloudstride 2");
+    assert.equal(d?.productType, "Running shoes");
+    assert.equal(d?.briefHighlight, "Feature the product in the first 3s");
+    assert.equal(d?.creativeConcept, "Warm, handheld, day-in-the-life");
+    assert.equal(d?.scriptSubmission, "require");
+    assert.equal(d?.adAuthorization, "30 days");
+    assert.equal(d?.commissionMode, "percent");
+    assert.deepEqual(d?.deliverablePricing, {
+      "instagram:reel": 50000,
+      "youtube:integration": 120000,
+    });
+    assert.deepEqual(d?.followerRanges, {
+      instagram: { min: 1500, max: null },
+      youtube: { min: 400, max: 400000 },
+    });
+    assert.equal(d?.creatorAccessNeeded, true);
+    assert.equal(d?.instagramCollab, true);
+    assert.equal(d?.requireApproval, true);
+    assert.equal(d?.giftDeliveryMethod, "promo_code");
+    assert.equal(d?.promoCode, "CREATOR30");
+    assert.equal(d?.trackingParameter, "_from");
+    // jsonb list round-trips structurally.
+    const dq = d?.deliverableQuantities as Array<{ platform: string; quantity: number }> | null;
+    assert.equal(Array.isArray(dq), true);
+    assert.equal(dq?.[0]?.platform, "instagram");
+    assert.equal(dq?.[0]?.quantity, 3);
+    assert.equal(dq?.length, 2);
+  });
+
+  // PLU-139 field provenance: the jsonb map recording how each value got here
+  // (manual = typed, pdf_extracted = applied from an uploaded brief candidate).
+  // Proves it round-trips as a structured map and that a re-save updates it.
+  await test("upsertCampaignDetails persists field provenance (manual + pdf_extracted)", async () => {
+    const id = await seedCampaign(pgdb);
+    await upsertCampaignDetails(
+      id,
+      {
+        objective: "Drive awareness",
+        deliverables: "2 reels, 3 stories",
+        fieldProvenance: {
+          objective: "manual",
+          deliverables: "pdf_extracted",
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["fieldProvenance"],
+      },
+      pgdb,
+    );
+    const d = await getCampaignDetails(id, pgdb);
+    assert.deepEqual(d?.fieldProvenance, {
+      objective: "manual",
+      deliverables: "pdf_extracted",
+    });
+
+    // A later save overwrites the provenance map (edited value flips to manual).
+    await upsertCampaignDetails(
+      id,
+      {
+        fieldProvenance: {
+          objective: "manual",
+          deliverables: "manual",
+        } as unknown as (typeof schema.campaignDetails.$inferInsert)["fieldProvenance"],
+      },
+      pgdb,
+    );
+    const d2 = await getCampaignDetails(id, pgdb);
+    assert.deepEqual(d2?.fieldProvenance, {
+      objective: "manual",
+      deliverables: "manual",
+    });
   });
 
   // ── draft-lock atomicity (Greptile P1) ───────────────────────────────────────
@@ -176,10 +331,62 @@ async function main(): Promise<void> {
   await test("ON DELETE CASCADE removes both section rows with the campaign", async () => {
     const id = await seedCampaign(pgdb);
     await upsertBrandIdentity(id, { logoRef: "y" }, pgdb);
-    await upsertCreatorRequirement(id, { niches: ["y"] }, pgdb);
+    await upsertCreatorRequirement(id, { platforms: ["y"] }, pgdb);
     await pgdb.delete(schema.campaigns).where(eq(schema.campaigns.id, id));
     assert.equal(await getBrandIdentity(id, pgdb), null);
     assert.equal(await getCreatorRequirement(id, pgdb), null);
+  });
+
+  // ── CampaignBriefExtraction (append-only import evidence, PLU-139) ────────────
+  await test("brief extraction: insert is append-only and getLatest returns newest", async () => {
+    const id = await seedCampaign(pgdb);
+    assert.equal(await getLatestBriefExtraction(id, pgdb), null, "none before upload");
+    const first = await insertBriefExtraction(
+      id,
+      {
+        flatText: "first brief text",
+        sections: { usageRights: { text: "90 days paid" } },
+        sourceFileReference: "ref-1",
+        parserVersion: "brief-parser-v1.1",
+      },
+      pgdb,
+    );
+    const second = await insertBriefExtraction(
+      id,
+      {
+        flatText: "second brief text",
+        sections: { paymentTerms: { text: "net 30" } },
+        sourceFileReference: "ref-2",
+        parserVersion: "brief-parser-v1.1",
+      },
+      pgdb,
+    );
+    assert.notEqual(first.id, second.id, "each upload is a NEW row (append-only)");
+    const latest = await getLatestBriefExtraction(id, pgdb);
+    assert.equal(latest?.id, second.id, "latest is the most recent insert");
+    assert.equal(latest?.sourceFileReference, "ref-2");
+  });
+
+  await test("brief extraction is draft-locked: rejected once campaign is ACTIVE", async () => {
+    const id = await seedCampaign(pgdb, "DRAFT");
+    await insertBriefExtraction(
+      id,
+      { flatText: "t", sections: {}, sourceFileReference: "r", parserVersion: "v" },
+      pgdb,
+    );
+    await pgdb
+      .update(schema.campaigns)
+      .set({ status: "ACTIVE" })
+      .where(eq(schema.campaigns.id, id));
+    await assert.rejects(
+      () =>
+        insertBriefExtraction(
+          id,
+          { flatText: "t2", sections: {}, sourceFileReference: "r2", parserVersion: "v" },
+          pgdb,
+        ),
+      CampaignLockedError,
+    );
   });
 
   console.log(`\n✓ campaignSections.db: all ${n} tests passed\n`);

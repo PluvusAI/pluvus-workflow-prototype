@@ -39,6 +39,11 @@ import type {
   BrandIdentityInput,
   CreatorRequirementFields,
   CreatorRequirementInput,
+  BriefExtractionFields,
+  DeliverableQuantity,
+  DeliverablePricing,
+  FollowerRanges,
+  FieldProvenance,
 } from "./builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -147,9 +152,18 @@ export function createCampaign(data: {
   return postJson<{ id: string; name: string }>("/api/campaigns", data);
 }
 
+// PATCH /campaigns/:id. The server (routes/campaigns.ts) routes each field to the
+// Campaign row or its CampaignDetails row and rejects everything with 409 once the
+// campaign is ACTIVE. This type was previously narrower than the route: the
+// CampaignDetails knowledge fields (usageRights/…) and the whole PLU-136
+// compensation block were already accepted server-side but not typed here. Widened
+// (additively) so the sectioned intake (PLU-139 2a) can PATCH them. Returns the
+// full flattened CampaignDetail-shaped object.
 export function updateCampaign(
   id: string,
   data: {
+    name?: string;
+    brand?: string;
     notifyEmail?: string | null;
     objective?: string | null;
     notes?: string | null;
@@ -158,6 +172,58 @@ export function updateCampaign(
     timeline?: string | null;
     rewardDescription?: string | null;
     shipsPhysicalProduct?: boolean;
+    // PLU-135 creator-facing knowledge fields (CampaignDetails).
+    usageRights?: string | null;
+    exclusivity?: string | null;
+    paymentTerms?: string | null;
+    attributionWindow?: string | null;
+    keyMessages?: string | null;
+    contentRequirements?: string | null;
+    // PLU-139 (2a): worksheet Stage-1 fields (all CampaignDetails, editable DRAFT).
+    productName?: string | null;
+    productType?: string | null;
+    creatorAccessNeeded?: boolean | null;
+    uniqueSellingPoints?: string | null;
+    whyTrust?: string | null;
+    howToUse?: string | null;
+    brandAssets?: string | null;
+    brandMaterialsRef?: string | null;
+    deliverableQuantities?: DeliverableQuantity[] | null;
+    deliverablePricing?: DeliverablePricing | null;
+    followerRanges?: FollowerRanges | null;
+    fieldProvenance?: FieldProvenance | null;
+    briefDeliveryMethod?: string | null;
+    briefHighlight?: string | null;
+    creativeConcept?: string | null;
+    referenceVideos?: string | null;
+    scriptSubmission?: string | null;
+    adAuthorization?: string | null;
+    linkInBioDuration?: string | null;
+    postRetention?: string | null;
+    instagramCollab?: boolean | null;
+    requireApproval?: boolean | null;
+    commissionMode?: string | null;
+    variableCommission?: string | null;
+    giftDeliveryMethod?: string | null;
+    promoCode?: string | null;
+    giftContactEmail?: string | null;
+    requiresShippingInfo?: boolean | null;
+    affiliateTrackingUrl?: string | null;
+    trackingLinkMode?: string | null;
+    trackingDestinationUrl?: string | null;
+    trackingParameter?: string | null;
+    targetUrl?: string | null;
+    hiddenParamKey?: string | null;
+    // PLU-136 compensation contract (CampaignDetails). Editable while DRAFT.
+    campaignType?: CampaignType;
+    includesGifting?: boolean;
+    giftDisposition?: GiftDisposition | null;
+    priceStrategy?: PriceStrategy | null;
+    publicStartingFeeCents?: number | null;
+    publicCommissionRate?: number | null;
+    commissionDurationDays?: number | null;
+    commissionConditions?: string | null;
+    compensationReviewStatus?: CompensationReviewStatus;
     postAcceptanceMode?: PostAcceptanceMode;
   dailyInitialOutreachLimit?: number;
   outreachPacingMinMinutes?: number;
@@ -168,18 +234,18 @@ export function updateCampaign(
   emailAccountId?: string | null;
   },
 ) {
-  return apiFetch<{
-    id: string;
-    dailyInitialOutreachLimit: number | null;
-    outreachPacingMinMinutes: number | null;
-    outreachPacingMaxMinutes: number | null;
-    negotiationReplyPacingMinMinutes: number | null;
-    negotiationReplyPacingMaxMinutes: number | null;
-  }>(`/api/campaigns/${id}`, {
+  return apiFetch<CampaignDetail>(`/api/campaigns/${id}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
   });
+}
+
+/** PLU-136 (1b) / PLU-139: "Duplicate as new campaign" — POST to the existing
+ *  server route, which copies scalars + CampaignDetails + BrandIdentity +
+ *  CreatorRequirement + policy into a fresh DRAFT (no history) and returns it. */
+export function duplicateCampaign(id: string) {
+  return postJson<CampaignDetail>(`/api/campaigns/${id}/duplicate`, {});
 }
 
 export function deleteCampaign(id: string): Promise<void> {
@@ -219,6 +285,29 @@ export function updateCreatorRequirement(id: string, data: CreatorRequirementInp
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(data),
+  });
+}
+
+// PLU-139 (2a): brief import / candidate extraction. GET returns the latest
+// stored extraction (404 when none — treated as "no candidates yet", not an
+// error, like the section GETs). POST parses an already-uploaded PDF (its
+// reference from uploadFile()) into a stored candidate record — evidence only,
+// never auto-written to CampaignDetails.
+export function useBriefExtraction(id: string | null) {
+  return useQuery({
+    queryKey: ["campaign", id, "brief-extraction"],
+    queryFn: () =>
+      apiFetch<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`),
+    enabled: !!id,
+    // A 404 (no extraction yet) is a normal empty state, not a transient error —
+    // don't retry it.
+    retry: false,
+  });
+}
+
+export function createBriefExtraction(id: string, sourceFileReference: string) {
+  return postJson<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`, {
+    sourceFileReference,
   });
 }
 

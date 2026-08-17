@@ -6,6 +6,8 @@ export { IconButton } from "./IconButton";
 export { Input, Textarea, Select } from "./Input";
 export { FormField } from "./FormField";
 export { Toggle } from "./Toggle";
+export { RadioCardGroup } from "./RadioCardGroup";
+export type { RadioCardOption } from "./RadioCardGroup";
 export { Slider } from "./Slider";
 export { Card } from "./Card";
 export { Badge, Chip, StatusBadge } from "./Badge";

@@ -28,11 +28,21 @@ import {
   upsertCreatorRequirement,
 } from "../db/creatorRequirement.js";
 import {
+  getLatestBriefExtraction,
+  insertBriefExtraction,
+} from "../db/campaignBriefExtraction.js";
+import {
   createWorkflow,
   updateWorkflow,
 } from "../db/workflows.js";
 import { findEmailAccountById } from "../db/emailAccounts.js";
 import { getTemplate } from "../templates/index.js";
+import { readStoredFile } from "../storage/localFileStorage.js";
+import { agentBaseUrl, agentPostJson } from "../adapters/agentServiceClient.js";
+import {
+  expectedBriefParseMode,
+  expectedParserVersion,
+} from "../engine/executors/briefKnowledge.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
 import { validateInt4 } from "../validation/int4.js";
 import {
@@ -84,6 +94,41 @@ function flattenCampaign(campaign: Campaign, details: CampaignDetails | null) {
     exclusivity: details?.exclusivity ?? null,
     paymentTerms: details?.publicPaymentTerms ?? null,
     attributionWindow: details?.attributionWindow ?? null,
+    keyMessages: details?.keyMessages ?? null,
+    contentRequirements: details?.contentRequirements ?? null,
+    // PLU-139 (2a): worksheet Stage-1 fields.
+    productName: details?.productName ?? null,
+    productType: details?.productType ?? null,
+    creatorAccessNeeded: details?.creatorAccessNeeded ?? null,
+    uniqueSellingPoints: details?.uniqueSellingPoints ?? null,
+    whyTrust: details?.whyTrust ?? null,
+    howToUse: details?.howToUse ?? null,
+    brandAssets: details?.brandAssets ?? null,
+    brandMaterialsRef: details?.brandMaterialsRef ?? null,
+    deliverableQuantities: details?.deliverableQuantities ?? null,
+    deliverablePricing: details?.deliverablePricing ?? null,
+    followerRanges: details?.followerRanges ?? null,
+    fieldProvenance: details?.fieldProvenance ?? null,
+    briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
+    briefHighlight: details?.briefHighlight ?? null,
+    creativeConcept: details?.creativeConcept ?? null,
+    referenceVideos: details?.referenceVideos ?? null,
+    scriptSubmission: details?.scriptSubmission ?? null,
+    adAuthorization: details?.adAuthorization ?? null,
+    linkInBioDuration: details?.linkInBioDuration ?? null,
+    postRetention: details?.postRetention ?? null,
+    instagramCollab: details?.instagramCollab ?? null,
+    requireApproval: details?.requireApproval ?? null,
+    commissionMode: details?.commissionMode ?? null,
+    variableCommission: details?.variableCommission ?? null,
+    giftDeliveryMethod: details?.giftDeliveryMethod ?? null,
+    promoCode: details?.promoCode ?? null,
+    giftContactEmail: details?.giftContactEmail ?? null,
+    requiresShippingInfo: details?.requiresShippingInfo ?? null,
+    affiliateTrackingUrl: details?.affiliateTrackingUrl ?? null,
+    trackingLinkMode: details?.trackingLinkMode ?? null,
+    trackingDestinationUrl: details?.trackingDestinationUrl ?? null,
+    trackingParameter: details?.trackingParameter ?? null,
     targetUrl: campaign.targetUrl,
     hiddenParamKey: campaign.hiddenParamKey,
     postAcceptanceMode: campaign.postAcceptanceMode,
@@ -487,6 +532,8 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
 // PATCH /campaigns/:id — update editable campaign fields (notifyEmail, etc.)
 router.patch("/:id", async (req: Request, res: Response) => {
   const {
+    name,
+    brand,
     notifyEmail,
     objective,
     notes,
@@ -506,7 +553,46 @@ router.patch("/:id", async (req: Request, res: Response) => {
     commissionDurationDays,
     commissionConditions,
     compensationReviewStatus,
+    paymentTerms,
+    attributionWindow,
+    keyMessages,
+    contentRequirements,
+    // PLU-139 (2a): worksheet Stage-1 fields.
+    productName,
+    productType,
+    creatorAccessNeeded,
+    uniqueSellingPoints,
+    whyTrust,
+    howToUse,
+    brandAssets,
+    brandMaterialsRef,
+    deliverableQuantities,
+    deliverablePricing,
+    followerRanges,
+    fieldProvenance,
+    briefDeliveryMethod,
+    briefHighlight,
+    creativeConcept,
+    referenceVideos,
+    scriptSubmission,
+    adAuthorization,
+    linkInBioDuration,
+    postRetention,
+    instagramCollab,
+    requireApproval,
+    commissionMode,
+    variableCommission,
+    giftDeliveryMethod,
+    promoCode,
+    giftContactEmail,
+    requiresShippingInfo,
+    affiliateTrackingUrl,
+    trackingLinkMode,
+    trackingDestinationUrl,
+    trackingParameter,
   } = req.body as {
+    name?: string;
+    brand?: string;
     notifyEmail?: string | null;
     objective?: string | null;
     notes?: string | null;
@@ -527,6 +613,47 @@ router.patch("/:id", async (req: Request, res: Response) => {
     commissionDurationDays?: number | null;
     commissionConditions?: string | null;
     compensationReviewStatus?: string;
+    // Public offer fields the create path already accepts but PATCH did not,
+    // so the sectioned intake (PATCH-based autosave) could never edit them.
+    paymentTerms?: string | null;
+    attributionWindow?: string | null;
+    keyMessages?: string | null;
+    // CampaignDetails column that existed but had no read/write path at all
+    // (not in flatten/create/PATCH) — the last unreachable content field.
+    contentRequirements?: string | null;
+    // PLU-139 (2a): worksheet Stage-1 fields.
+    productName?: string | null;
+    productType?: string | null;
+    creatorAccessNeeded?: boolean | null;
+    uniqueSellingPoints?: string | null;
+    whyTrust?: string | null;
+    howToUse?: string | null;
+    brandAssets?: string | null;
+    brandMaterialsRef?: string | null;
+    deliverableQuantities?: unknown;
+    deliverablePricing?: unknown;
+    followerRanges?: unknown;
+    fieldProvenance?: unknown;
+    briefDeliveryMethod?: string | null;
+    briefHighlight?: string | null;
+    creativeConcept?: string | null;
+    referenceVideos?: string | null;
+    scriptSubmission?: string | null;
+    adAuthorization?: string | null;
+    linkInBioDuration?: string | null;
+    postRetention?: string | null;
+    instagramCollab?: boolean | null;
+    requireApproval?: boolean | null;
+    commissionMode?: string | null;
+    variableCommission?: string | null;
+    giftDeliveryMethod?: string | null;
+    promoCode?: string | null;
+    giftContactEmail?: string | null;
+    requiresShippingInfo?: boolean | null;
+    affiliateTrackingUrl?: string | null;
+    trackingLinkMode?: string | null;
+    trackingDestinationUrl?: string | null;
+    trackingParameter?: string | null;
   };
 
   const patch: Parameters<typeof updateCampaign>[1] = {};
@@ -542,6 +669,24 @@ router.patch("/:id", async (req: Request, res: Response) => {
     return;
   }
   Object.assign(patch, sendingSettings.value);
+
+  // name/brand are editable in the intake's first section (PLU-139). Both are
+  // launch-hard, so when present they must be non-blank — reject rather than
+  // null them (a blank name/brand can't be a valid campaign).
+  if (name !== undefined) {
+    if (typeof name !== "string" || !name.trim()) {
+      res.status(400).json({ error: "name must be a non-empty string" });
+      return;
+    }
+    patch.name = name.trim();
+  }
+  if (brand !== undefined) {
+    if (typeof brand !== "string" || !brand.trim()) {
+      res.status(400).json({ error: "brand must be a non-empty string" });
+      return;
+    }
+    patch.brand = brand.trim();
+  }
 
   if (notifyEmail !== undefined) {
     const trimmed = typeof notifyEmail === "string" ? notifyEmail.trim() : "";
@@ -633,6 +778,97 @@ router.patch("/:id", async (req: Request, res: Response) => {
     detailsPatch.commissionConditions =
       typeof commissionConditions === "string" ? commissionConditions.trim() || null : null;
   }
+  if (paymentTerms !== undefined) {
+    detailsPatch.publicPaymentTerms =
+      typeof paymentTerms === "string" ? paymentTerms.trim() || null : null;
+  }
+  if (attributionWindow !== undefined) {
+    detailsPatch.attributionWindow =
+      typeof attributionWindow === "string" ? attributionWindow.trim() || null : null;
+  }
+  if (keyMessages !== undefined) {
+    detailsPatch.keyMessages =
+      typeof keyMessages === "string" ? keyMessages.trim() || null : null;
+  }
+  if (contentRequirements !== undefined) {
+    detailsPatch.contentRequirements =
+      typeof contentRequirements === "string" ? contentRequirements.trim() || null : null;
+  }
+
+  // PLU-139 (2a): worksheet Stage-1 fields. Plain free-text and boolean columns
+  // (closed-set values are validated in the UI pre-PLU-159; the server accepts
+  // any string so PLU-159 can change the option sets without a server change).
+  // Each is applied only when present, and trimmed/coerced-to-null like every
+  // other CampaignDetails field.
+  const trimToNull = (v: unknown): string | null =>
+    typeof v === "string" ? v.trim() || null : null;
+  const boolOrNull = (v: unknown): boolean | null =>
+    typeof v === "boolean" ? v : null;
+  const stringFields139 = {
+    productName,
+    productType,
+    uniqueSellingPoints,
+    whyTrust,
+    howToUse,
+    brandAssets,
+    brandMaterialsRef,
+    briefDeliveryMethod,
+    briefHighlight,
+    creativeConcept,
+    referenceVideos,
+    scriptSubmission,
+    adAuthorization,
+    linkInBioDuration,
+    postRetention,
+    commissionMode,
+    variableCommission,
+    giftDeliveryMethod,
+    promoCode,
+    giftContactEmail,
+    affiliateTrackingUrl,
+    trackingLinkMode,
+    trackingDestinationUrl,
+    trackingParameter,
+  } as const;
+  for (const [key, value] of Object.entries(stringFields139)) {
+    if (value !== undefined) {
+      (detailsPatch as Record<string, unknown>)[key] = trimToNull(value);
+    }
+  }
+  const boolFields139 = {
+    creatorAccessNeeded,
+    instagramCollab,
+    requireApproval,
+    requiresShippingInfo,
+  } as const;
+  for (const [key, value] of Object.entries(boolFields139)) {
+    if (value !== undefined) {
+      (detailsPatch as Record<string, unknown>)[key] = boolOrNull(value);
+    }
+  }
+  if (deliverableQuantities !== undefined) {
+    // Structured list [{ platform, format, quantity }] — accept an array or
+    // null; reject anything else at the trust boundary.
+    if (deliverableQuantities !== null && !Array.isArray(deliverableQuantities)) {
+      res.status(400).json({ error: "deliverableQuantities must be an array or null" });
+      return;
+    }
+    (detailsPatch as Record<string, unknown>)["deliverableQuantities"] =
+      deliverableQuantities as JsonValue | null;
+  }
+  // S7.P1 pricing map / S3.11 follower-ranges map — plain JSON objects keyed by
+  // deliverable or platform. Accept an object or null; reject arrays/scalars at
+  // the trust boundary (mirrors the deliverableQuantities array guard).
+  const jsonObjectFields139 = { deliverablePricing, followerRanges, fieldProvenance } as const;
+  for (const [key, value] of Object.entries(jsonObjectFields139)) {
+    if (value === undefined) continue;
+    if (value !== null && (typeof value !== "object" || Array.isArray(value))) {
+      res.status(400).json({ error: `${key} must be an object or null` });
+      return;
+    }
+    (detailsPatch as Record<string, unknown>)[key] = value as JsonValue | null;
+  }
+
   if (compensationReviewStatus !== undefined) {
     if (!isCompensationReviewStatus(compensationReviewStatus)) {
       res.status(400).json({
@@ -981,27 +1217,18 @@ router.get("/:id/creator-requirement", async (req: Request, res: Response) => {
 });
 
 // PATCH /campaigns/:id/creator-requirement — insert-or-update the one
-// CreatorRequirement row. Lists (platforms/niches/geography/languages) are jsonb
-// string[]; validated as string arrays at the trust boundary.
+// CreatorRequirement row. Lists (platforms/geography) are jsonb string[];
+// validated as string arrays at the trust boundary. PLU-139 (B): only the
+// worksheet-backed criteria remain — platforms (S3.1), geography (S3.10),
+// minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/brandSafety
+// were legacy off-worksheet fields with no downstream reader in intake; the
+// columns themselves stay (campaignBriefRender.ts still reads them), this
+// route just no longer writes them.
 router.patch("/:id/creator-requirement", async (req: Request, res: Response) => {
-  const {
-    platforms,
-    niches,
-    geography,
-    languages,
-    minFollowers,
-    audienceNotes,
-    contentStyle,
-    brandSafety,
-  } = req.body as {
+  const { platforms, geography, minFollowers } = req.body as {
     platforms?: unknown;
-    niches?: unknown;
     geography?: unknown;
-    languages?: unknown;
     minFollowers?: number | null;
-    audienceNotes?: string | null;
-    contentStyle?: string | null;
-    brandSafety?: string | null;
   };
 
   const isStringArray = (v: unknown): v is string[] =>
@@ -1010,9 +1237,7 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
   const patch: Parameters<typeof upsertCreatorRequirement>[1] = {};
   for (const [key, value] of [
     ["platforms", platforms],
-    ["niches", niches],
     ["geography", geography],
-    ["languages", languages],
   ] as const) {
     if (value === undefined) continue;
     if (value !== null && !isStringArray(value)) {
@@ -1027,15 +1252,6 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
     // business-rule check is needed on top of it.
     if (minFollowers !== null && !validateInt4(minFollowers, "minFollowers", res)) return;
     patch.minFollowers = minFollowers;
-  }
-  if (audienceNotes !== undefined) {
-    patch.audienceNotes = typeof audienceNotes === "string" ? audienceNotes.trim() || null : null;
-  }
-  if (contentStyle !== undefined) {
-    patch.contentStyle = typeof contentStyle === "string" ? contentStyle.trim() || null : null;
-  }
-  if (brandSafety !== undefined) {
-    patch.brandSafety = typeof brandSafety === "string" ? brandSafety.trim() || null : null;
   }
 
   try {
