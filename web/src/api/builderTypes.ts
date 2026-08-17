@@ -384,13 +384,8 @@ export interface CreatorRequirementFields {
   id: string;
   campaignId: string;
   platforms: string[] | null;
-  niches: string[] | null;
   geography: string[] | null;
-  languages: string[] | null;
   minFollowers: number | null;
-  audienceNotes: string | null;
-  contentStyle: string | null;
-  brandSafety: string | null;
   createdAt: string;
   updatedAt: string;
 }
