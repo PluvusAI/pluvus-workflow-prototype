@@ -30,15 +30,21 @@ import type {
   CampaignType,
   GiftDisposition,
   PriceStrategy,
+  NegotiationCategory,
 } from "../../../api/builderTypes";
 
 // ---------------------------------------------------------------------------
-// Which persisted group a field lives in. Each maps to one PR-A1 endpoint:
+// Which persisted group a field lives in. Each maps to one endpoint:
 //   campaign          → PATCH /campaigns/:id            (scalars + CampaignDetails)
 //   brandIdentity     → PATCH /campaigns/:id/brand-identity
 //   creatorRequirement→ PATCH /campaigns/:id/creator-requirement
+//   negotiationPolicy → PATCH /campaigns/:id/negotiation-policy   (PLU-140, PRIVATE)
 // ---------------------------------------------------------------------------
-export type FieldGroup = "campaign" | "brandIdentity" | "creatorRequirement";
+export type FieldGroup =
+  | "campaign"
+  | "brandIdentity"
+  | "creatorRequirement"
+  | "negotiationPolicy";
 
 export type SectionKey =
   | "startSources"
@@ -46,7 +52,10 @@ export type SectionKey =
   | "platformsDeliverables"
   | "contentGuidelines"
   | "timelineRights"
-  | "rewardStructure";
+  | "rewardStructure"
+  // PLU-140 (2b): the private policy editor and the terminal review/activate step.
+  | "negotiationSettings"
+  | "reviewActivate";
 
 // name/brand are NOT NULL on the campaign row, so "New Campaign" must create with
 // SOME value even though the brand hasn't named it yet. These sentinels are that
@@ -69,6 +78,10 @@ export interface CompensationShape {
   // (S3.1–S3.9). Drives the S6.7 Instagram-collab conditional — that control is
   // only relevant when Instagram is one of the requested platforms.
   selectedPlatforms: string[];
+  // PLU-140 recheck: whether the gift is a physical product (S7.G6). Drives the
+  // S7.G7 shipping-info conditional — the worksheet shows "Require shipping info"
+  // only when S7.G6 = "Yes, it needs to be shipped".
+  shipsPhysicalProduct: boolean;
 }
 
 export type FieldControl =
@@ -95,7 +108,8 @@ export type FieldControl =
   | "pricingGrid" // one currency row per selected deliverable format (S7.P1). Stores { "<platform>:<format>": cents }.
   | "followerRanges" // per-platform min/max numeric ranges (S3.11). Stores { "<platform>": { min, max } }.
   | "repeatableLinks" // repeatable multi-link input (S5.5). Stores newline-joined links in the existing string column.
-  | "trackingPreview"; // read-only creator-code preview (S7.T4). Renders, never edits.
+  | "trackingPreview" // read-only creator-code preview (S7.T4). Renders, never edits.
+  | "categoryChips"; // PLU-140: multi-select of fee/commission/gift categories → string[] (nonNegotiableTerms).
 
 export interface SelectOption {
   value: string;
@@ -158,6 +172,25 @@ export interface FieldSpec {
   /** Display-only: derived from other fields, has no column, never persisted
    *  (e.g. S7.T4 tracking preview). Excluded from clear/validation contracts. */
   display?: boolean;
+  /**
+   * PLU-140 — INTENTIONALLY UI-ONLY, MUST NOT BE ENABLED. These controls exist
+   * so the full Page-8 layout is in place and easy to wire later, but they are
+   * NOT connected to anything: there is no NegotiationPolicy column to persist
+   * them, no launch-snapshot logic to freeze them, and no negotiation-engine
+   * behavior that reads them. They render DISABLED and are excluded from every
+   * data path (payload build, required-field validation, clear-on-switch map).
+   *
+   * DO NOT flip a field from uiOnly to live until ALL THREE exist for it:
+   *   1. database persistence (a column on NegotiationPolicy),
+   *   2. launch snapshot logic (the same column on NegotiationPolicySnapshot +
+   *      the copy line in launchCampaign()), and
+   *   3. negotiation-engine behavior (the agent actually reads and honors it).
+   * Enabling one earlier would give the brand a control that silently does
+   * nothing — see docs/PLU-140-future-only-fields.md. Deferred work is tracked
+   * in the follow-up Linear issues (DB/snapshots, engine wiring, negotiation
+   * behavior, approval/rejection logic, e2e testing).
+   */
+  uiOnly?: boolean;
 }
 
 export interface SectionSpec {
@@ -205,6 +238,12 @@ export function showsGiftDispositionPicker(comp: CompensationShape): boolean {
 export function showsStartingFee(comp: CompensationShape): boolean {
   return needsFee(comp.campaignType) && comp.priceStrategy === "PROPOSE_STARTING_FEE";
 }
+// PLU-140 recheck (S7.G7): the "require shipping info" toggle shows only when a
+// gift is present AND it's a physical product needing shipping (S7.G6 = Yes) —
+// per the worksheet, not on every gift.
+export function showsShippingInfo(comp: CompensationShape): boolean {
+  return showsGiftDetails(comp) && comp.shipsPhysicalProduct;
+}
 // PLU-139 gift-delivery path (S7.G1). The method picker shows whenever gift
 // details show; the promo-code / manual-contact fields show per chosen method.
 export function showsGiftDelivery(comp: CompensationShape): boolean {
@@ -225,6 +264,45 @@ export function showsTracking(comp: CompensationShape): boolean {
 export function showsInstagramCollab(comp: CompensationShape): boolean {
   return comp.selectedPlatforms.includes("instagram");
 }
+
+// PLU-140 (2b): the private-policy conditionals reuse the SAME structure
+// predicates as the public reward section, so the private fee/commission/gift
+// bands appear exactly when — and only when — their public counterpart does.
+// (validateCompensationReadiness on the server keys the required authority off
+// the same campaignType, so this can't drift from what launch enforces.)
+export function showsFeeOrCommission(comp: CompensationShape): boolean {
+  return needsFee(comp.campaignType) || needsCommission(comp.campaignType);
+}
+
+// The three negotiation categories the readiness check recognizes (the
+// nonNegotiableTerms authority path). One source of truth for the chips + tests.
+export const NEGOTIATION_CATEGORY_OPTIONS: { value: NegotiationCategory; label: string }[] = [
+  // COPY:PLU-159
+  { value: "fee", label: "Fee" },
+  { value: "commission", label: "Commission" },
+  { value: "gift", label: "Gift / product" },
+];
+
+// PLU-140 — options for the UI-ONLY (disabled) deferred Page-8 controls. They
+// exist only so the layout is complete; nothing reads these values. Copy is
+// verbatim from worksheet Page 8. See FieldSpec.uiOnly.
+export const APPROVAL_MODE_OPTIONS: SelectOption[] = [
+  // COPY:PLU-159 — S8.E0
+  { value: "fully_autonomous", label: "Fully autonomous" },
+  { value: "approve_first", label: "Approve the first deal, then run autonomously" },
+  { value: "approve_every", label: "Approve every deal" },
+];
+export const OUT_OF_POLICY_OPTIONS: SelectOption[] = [
+  // COPY:PLU-159 — S8.E1
+  { value: "escalate", label: "Escalate to you" },
+  { value: "reject", label: "Reject automatically" },
+];
+export const COMMISSION_DURATION_BAND_OPTIONS: SelectOption[] = [
+  // COPY:PLU-159 — S8.A2 (mirrors the public S7.A2 commission-length semantics)
+  { value: "customer_lifetime", label: "Customer lifetime" },
+  { value: "time_span", label: "By time span" },
+  { value: "count", label: "By count" },
+];
 
 export const GIFT_DELIVERY_OPTIONS: SelectOption[] = [
   // COPY:PLU-159 — S7.G1
@@ -1033,7 +1111,8 @@ export const SECTIONS: SectionSpec[] = [
         label: "Require shipping info from the creator", // COPY:PLU-159
         hint: "When on, the creator is asked for name and address as part of accepting, so the brand can fulfill.", // COPY:PLU-159
         source: "S7.G7",
-        visibleWhen: (c) => showsGiftDetails(c),
+        // Worksheet S7.G7: shown only when S7.G6 (physical product) = Yes.
+        visibleWhen: showsShippingInfo,
       },
       // Shared onboarding control (S7.3).
       {
@@ -1046,7 +1125,271 @@ export const SECTIONS: SectionSpec[] = [
       },
     ],
   },
+  // -------------------------------------------------------------------------
+  // PLU-140 (2b), worksheet Page 8 — Private Negotiation Settings. Every field
+  // here is group:"negotiationPolicy" → PATCHes the PRIVATE policy endpoint,
+  // never the creator-facing campaign row. The conditionals reuse the public
+  // reward predicates (needsFee/needsCommission/showsGiftDetails) so each
+  // private band shows exactly when its public term does. Copy is verbatim from
+  // worksheet Page 8. Future-only bands (S8.A2 duration, S8.C1–C5, S8.E0
+  // approval mode, S8.E1 escalate/reject) have NO backing column and NO engine
+  // support, so they are OMITTED with one "coming soon" note rather than faked —
+  // see the deferral note below and PLAN "Known worksheet deviations".
+  // -------------------------------------------------------------------------
+  {
+    key: "negotiationSettings",
+    title: "Private negotiation settings", // COPY:PLU-159 (worksheet Page 8 header)
+    blurb:
+      "Tell Pluvus what it may negotiate on your behalf. Creators will never see your limits, fallback positions, or approval rules.", // COPY:PLU-159 (worksheet Page 8 header copy, verbatim)
+    fields: [
+      // --- Paid / Hybrid fee flexibility (S8.P1) -----------------------------
+      {
+        key: "ceilingCents",
+        group: "negotiationPolicy",
+        control: "money",
+        label: "Highest fee Pluvus can agree to without asking you", // COPY:PLU-159 (S8.P1)
+        hint: "A ceiling only — Pluvus negotiates autonomously up to this amount and always tries to close at or below the listed price. Setting it equal to the public price means no headroom.", // COPY:PLU-159 (S8.P1 behavior)
+        min: 0,
+        source: "S8.P1",
+        required: true,
+        visibleWhen: (c) => needsFee(c.campaignType),
+      },
+      {
+        key: "preferredFeeCents",
+        group: "negotiationPolicy",
+        control: "money",
+        label: "Preferred fee", // COPY:PLU-159
+        hint: "The fee Pluvus opens at and tries to close on before conceding upward.", // COPY:PLU-159
+        min: 0,
+        source: "S8.P1",
+        visibleWhen: (c) => needsFee(c.campaignType),
+      },
+      {
+        key: "floorCents",
+        group: "negotiationPolicy",
+        control: "money",
+        label: "Lowest fee floor", // COPY:PLU-159
+        hint: "The lowest fee Pluvus should propose (optional).", // COPY:PLU-159
+        min: 0,
+        source: "S8.P1",
+        visibleWhen: (c) => needsFee(c.campaignType),
+      },
+      // --- Affiliate / Hybrid commission flexibility (S8.A1) -----------------
+      {
+        key: "commissionCeilingRate",
+        group: "negotiationPolicy",
+        control: "number",
+        label: "Highest commission Pluvus can agree to without asking you", // COPY:PLU-159 (S8.A1)
+        hint: "A ceiling only — Pluvus negotiates autonomously up to this and always tries to close at or below the public rate. In the same unit as your public commission (percent or flat amount).", // COPY:PLU-159 (S8.A1 behavior; matches the public commission mode)
+        placeholder: "e.g. 20", // COPY:PLU-159
+        min: 0,
+        source: "S8.A1",
+        required: true,
+        visibleWhen: (c) => needsCommission(c.campaignType),
+      },
+      {
+        key: "preferredCommissionRate",
+        group: "negotiationPolicy",
+        control: "number",
+        label: "Preferred commission", // COPY:PLU-159
+        hint: "The commission Pluvus opens at, in the same unit as your public commission.", // COPY:PLU-159
+        placeholder: "e.g. 15", // COPY:PLU-159
+        min: 0,
+        source: "S8.A1",
+        visibleWhen: (c) => needsCommission(c.campaignType),
+      },
+      {
+        key: "commissionFloorRate",
+        group: "negotiationPolicy",
+        control: "number",
+        label: "Lowest commission floor", // COPY:PLU-159
+        hint: "The lowest commission Pluvus should propose, in the same unit as your public commission (optional).", // COPY:PLU-159
+        placeholder: "e.g. 10", // COPY:PLU-159
+        min: 0,
+        source: "S8.A1",
+        visibleWhen: (c) => needsCommission(c.campaignType),
+      },
+      // --- Gift / product-access flexibility (S8.G1 / S8.G2) -----------------
+      {
+        // Worksheet S8.G1 asks for multi-select chips of substitutions; the
+        // backing column is a single boolean (giftSubstitutionAllowed), so this
+        // narrows to a yes/no toggle. Semantic narrowing — noted for Calvin.
+        key: "giftSubstitutionAllowed",
+        group: "negotiationPolicy",
+        control: "toggle",
+        label: "Allow Pluvus to offer an equivalent substitute product", // COPY:PLU-159 (S8.G1, narrowed to boolean)
+        hint: "When on, the agent may offer an equivalent alternative in place of the public product. Off means no substitution.", // COPY:PLU-159 (S8.G1)
+        source: "S8.G1",
+        visibleWhen: showsGiftDetails,
+      },
+      {
+        key: "giftValueFlexibilityCents",
+        group: "negotiationPolicy",
+        control: "money",
+        label: "If a creator requests cash instead of the product", // COPY:PLU-159 (S8.G2)
+        hint: "A ceiling on the cash value Pluvus may offer. Leaving it empty (or zero) means Pluvus never offers cash.", // COPY:PLU-159 (S8.G2)
+        min: 0,
+        source: "S8.G2",
+        visibleWhen: showsGiftDetails,
+      },
+      // --- Global negotiation controls (Page 8, always) ----------------------
+      {
+        key: "maxRounds",
+        group: "negotiationPolicy",
+        control: "number",
+        label: "Maximum negotiation rounds", // COPY:PLU-159 (Page 8)
+        hint: "How many back-and-forth rounds Pluvus may run before escalating.", // COPY:PLU-159
+        placeholder: "e.g. 3", // COPY:PLU-159
+        min: 1,
+        source: "Page 8",
+      },
+      {
+        key: "overCeilingTolerance",
+        group: "negotiationPolicy",
+        control: "number",
+        label: "Over-ceiling tolerance (%)", // COPY:PLU-159 (Page 8 tolerances)
+        hint: "How far above the ceiling an ask may be and still be countered at the ceiling instead of escalated. 0 = escalate the moment an ask exceeds the ceiling.", // COPY:PLU-159
+        placeholder: "e.g. 5", // COPY:PLU-159
+        min: 0,
+        source: "Page 8",
+        visibleWhen: showsFeeOrCommission,
+      },
+      {
+        // The nonNegotiableTerms authority path — a campaign with no permitted
+        // flexibility still needs a way to say "these are fixed" (core product
+        // rule / PLU-158 contract). Marking a category here satisfies the
+        // readiness authority for that category without setting a band.
+        key: "nonNegotiableTerms",
+        group: "negotiationPolicy",
+        control: "categoryChips",
+        label: "Terms Pluvus may not negotiate", // COPY:PLU-159 (S8.E1 non-negotiable)
+        hint: "Mark any category as fixed — Pluvus will hold the public term and never move on it.", // COPY:PLU-159
+        source: "S8.E1",
+      },
+      {
+        key: "negotiationGuidance",
+        group: "negotiationPolicy",
+        control: "richText",
+        label: "Negotiation guidance", // COPY:PLU-159 (Page 8 guidance)
+        hint: "Optional free-text guidance for how Pluvus should negotiate this campaign.", // COPY:PLU-159
+        placeholder: "e.g. Prefer keeping the fee flat and conceding on timeline instead.", // COPY:PLU-159
+        source: "Page 8",
+      },
+
+      // =====================================================================
+      // PLU-140 — DEFERRED, UI-ONLY (DISABLED). Do NOT enable any field below
+      // until it has a NegotiationPolicy column, launch-snapshot copy, AND
+      // negotiation-engine behavior (see FieldSpec.uiOnly + the follow-up Linear
+      // issues). These are laid out now so Harshit can wire them in place; today
+      // they render disabled and never touch any data path. `key`s are prefixed
+      // `uiOnly_` so they can never be mistaken for a real column.
+      // =====================================================================
+      {
+        // S8.A2 — commission duration band. No column (we store rate bounds, not
+        // a duration range) and no engine support.
+        key: "uiOnly_commissionDurationBand",
+        group: "negotiationPolicy",
+        control: "radioCards",
+        label: "Commission duration band", // COPY:PLU-159 (S8.A2)
+        hint: "The shortest and longest commission duration Pluvus may accept.", // COPY:PLU-159
+        options: COMMISSION_DURATION_BAND_OPTIONS,
+        source: "S8.A2",
+        uiOnly: true,
+        visibleWhen: (c) => needsCommission(c.campaignType),
+      },
+      {
+        // S8.C2 — latest posting date Pluvus can accept (schedule slack). No column, no engine.
+        key: "uiOnly_maxPostingDelayDays",
+        group: "negotiationPolicy",
+        control: "number",
+        label: "Latest posting date Pluvus can accept (+ days)", // COPY:PLU-159 (S8.C2)
+        hint: "A ceiling on delay — how many days beyond the requested deadline Pluvus may accept.", // COPY:PLU-159
+        placeholder: "e.g. 7", // COPY:PLU-159
+        min: 0,
+        source: "S8.C2",
+        uiOnly: true,
+      },
+      {
+        // S8.C1 — deliverable flexibility band. No column, no engine.
+        key: "uiOnly_deliverableFlexibility",
+        group: "negotiationPolicy",
+        control: "richText",
+        label: "Deliverable flexibility", // COPY:PLU-159 (S8.C1)
+        hint: "Which deliverable changes Pluvus may accept (e.g. fewer posts, alternate format). Unmarked items stay fixed.", // COPY:PLU-159
+        source: "S8.C1",
+        uiOnly: true,
+      },
+      {
+        // S8.C3 — usage-rights / exclusivity minimums (per-term duration floor). No column, no engine.
+        key: "uiOnly_rightsMinimums",
+        group: "negotiationPolicy",
+        control: "richText",
+        label: "Usage-rights and exclusivity minimums", // COPY:PLU-159 (S8.C3)
+        hint: "The shortest rights/exclusivity duration Pluvus may accept. The floor cannot exceed the public term.", // COPY:PLU-159
+        source: "S8.C3",
+        uiOnly: true,
+      },
+      {
+        // S8.C5 — script/idea submission waiver. No column, no engine.
+        key: "uiOnly_scriptWaivable",
+        group: "negotiationPolicy",
+        control: "toggle",
+        label: "Allow Pluvus to waive the script/idea submission", // COPY:PLU-159 (S8.C5)
+        hint: "Whether Pluvus may drop the script-submission requirement in-band.", // COPY:PLU-159
+        source: "S8.C5",
+        uiOnly: true,
+      },
+      {
+        // S8.E0 — approval mode. No column, and the engine has no approval-pause step.
+        key: "uiOnly_approvalMode",
+        group: "negotiationPolicy",
+        control: "radioCards",
+        label: "How much do you want to be in the loop?", // COPY:PLU-159 (S8.E0)
+        hint: "How much Pluvus checks in before closing a deal.", // COPY:PLU-159
+        options: APPROVAL_MODE_OPTIONS,
+        source: "S8.E0",
+        uiOnly: true,
+      },
+      {
+        // S8.E1 — out-of-policy escalate/reject. No column, and the engine only
+        // escalates today (no auto-reject branch). Worksheet marks this Required.
+        key: "uiOnly_outOfPolicyAction",
+        group: "negotiationPolicy",
+        control: "radioCards",
+        label: "When Pluvus can't close a deal within your limits", // COPY:PLU-159 (S8.E1)
+        hint: "What Pluvus does with an out-of-policy request. Today every out-of-policy request escalates to you.", // COPY:PLU-159
+        options: OUT_OF_POLICY_OPTIONS,
+        source: "S8.E1",
+        uiOnly: true,
+      },
+    ],
+  },
+  // -------------------------------------------------------------------------
+  // PLU-140 (2b), worksheet Page 9 — Review + Approve, the Stage-1 approval
+  // checkpoint (NOT the campaign launch). A MARKER section: it has no editable
+  // fields (fields: []) and is rendered by the dedicated <LaunchReview>
+  // component, not the field stepper. The public/private split, approval
+  // checkboxes, and readiness blockers live there. Approving keeps the
+  // campaign in DRAFT and fully editable — it only persists
+  // compensationReviewStatus; the actual DRAFT→ACTIVE transition (immutable
+  // snapshots) happens separately, later, once the campaign is actually ready
+  // to run.
+  // -------------------------------------------------------------------------
+  {
+    key: "reviewActivate",
+    title: "Review & approve", // COPY:PLU-159 (worksheet Page 9)
+    blurb:
+      "Verify the public Campaign Brief creators will see and the private authority that stays internal, then approve to move on to building the workflow. You can still come back and adjust anything here later.", // COPY:PLU-159 (worksheet Page 9 purpose)
+    fields: [],
+  },
 ];
+
+// PLU-140: the worksheet Page-8 bands (S8.A2, S8.C1–C5, S8.E0, S8.E1) that have
+// NO backing NegotiationPolicy column, NO launch-snapshot logic, and NO
+// negotiation-engine support today are rendered as DISABLED, UI-only fields
+// (FieldSpec.uiOnly) so the full Page-8 layout is in place and easy to wire
+// later — NOT as persisted controls. Do not enable any until all three exist.
+// See docs/PLU-140-future-only-fields.md and the follow-up Linear issues.
 
 /** Fields of a section that are visible under the current compensation shape.
  *  The single helper the shell (and tests) use to decide what to render/clear. */
@@ -1080,7 +1423,9 @@ export function missingRequiredKeys(
   getValue: (f: FieldSpec) => unknown,
 ): string[] {
   return visibleFields(section, comp)
-    .filter((f) => f.required && !f.readOnly && isEmptyValue(getValue(f)))
+    // PLU-140: uiOnly (disabled, unwired) fields never block the flow — they
+    // have no data path at all.
+    .filter((f) => f.required && !f.readOnly && !f.uiOnly && isEmptyValue(getValue(f)))
     .map((f) => f.key);
 }
 
@@ -1120,6 +1465,36 @@ export function clearedRewardFieldKeys(comp: CompensationShape): string[] {
   return Object.keys(REWARD_CLEAR_VALUES).filter((k) => !visible.has(k));
 }
 
+// PLU-140: the same clear-on-structure-switch contract for the PRIVATE policy
+// group. launchCampaign snapshots WHATEVER columns the policy row holds, so a
+// stale fee ceiling left on a campaign switched PAID→AFFILIATE would freeze into
+// NegotiationPolicySnapshot. buildPolicyPayload nulls hidden fields inline (the
+// runtime clearer, same as buildCampaignPayload); this map is the tested guard
+// that the inline nulling stays complete — every conditional policy field that
+// can be hidden appears here with its cleared value. Fields that are ALWAYS
+// visible (maxRounds, nonNegotiableTerms, negotiationGuidance) are not here —
+// they're never hidden, so never cleared by a structure switch.
+export const POLICY_CLEAR_VALUES: Record<string, null> = {
+  ceilingCents: null,
+  preferredFeeCents: null,
+  floorCents: null,
+  commissionCeilingRate: null,
+  preferredCommissionRate: null,
+  commissionFloorRate: null,
+  giftSubstitutionAllowed: null,
+  giftValueFlexibilityCents: null,
+  overCeilingTolerance: null,
+};
+
+/** The policy-section field keys HIDDEN under `comp` and therefore sent cleared.
+ *  Pure — the shell's policy PATCH builder and the tests rely on this being the
+ *  single definition of "what a structure switch wipes" for the private group. */
+export function clearedPolicyFieldKeys(comp: CompensationShape): string[] {
+  const policy = getSection("negotiationSettings");
+  const visible = new Set(visibleFields(policy, comp).map((f) => f.key));
+  return Object.keys(POLICY_CLEAR_VALUES).filter((k) => !visible.has(k));
+}
+
 // PLU-139 import review: map a parser section key (usageRights, paymentTerms,
 // deliverables, …) to the editable campaign FieldSpec it can fill, if any. The
 // parser's canonical keys are the SAME strings as the campaign field keys, so
@@ -1155,4 +1530,19 @@ export function getSection(key: SectionKey): SectionSpec {
   const s = SECTIONS.find((x) => x.key === key);
   if (!s) throw new Error(`unknown section: ${key}`);
   return s;
+}
+
+// PLU-140: map a readiness blocker string (from GET /readiness →
+// validateCompensationReadiness + the existence/CONFIRMED checks) to the intake
+// section that fixes it, so the review page links each blocker to where it's
+// editable. Matched by substring since the server strings are descriptive, not
+// codes. Pure so LaunchReview and the tests share one definition.
+export function blockerSection(blocker: string): SectionKey {
+  const b = blocker.toLowerCase();
+  if (b.includes("negotiationpolicy") || b.includes("policy") || b.includes("non-negotiable")) {
+    return "negotiationSettings";
+  }
+  // Everything else — CampaignDetails public fields + the review-status gate —
+  // is fixed in the public reward section.
+  return "rewardStructure";
 }
