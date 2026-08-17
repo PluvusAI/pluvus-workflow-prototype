@@ -45,6 +45,7 @@ import {
   expectedParserVersion,
 } from "../engine/executors/briefKnowledge.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
+import { validateInt4 } from "../validation/int4.js";
 import {
   validateCreateSendingSettings,
   validatePatchSendingSettings,
@@ -1036,6 +1037,40 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     return;
   }
 
+  // floorCents/ceilingCents/preferredFeeCents/maxRounds/giftValueFlexibilityCents
+  // back PostgreSQL `integer` (int4) columns: a value outside int4 range passes
+  // this route's `number`-typed destructure above but overflows at
+  // INSERT/UPDATE (SQLSTATE 22003), which the catch-all below would turn into
+  // a 500 instead of a 400. Same int4 guard as minFollowers on
+  // /:id/creator-requirement, generalized into validateInt4.
+  if (floorCents !== undefined && floorCents !== null && !validateInt4(floorCents, "floorCents", res)) {
+    return;
+  }
+  if (
+    ceilingCents !== undefined &&
+    ceilingCents !== null &&
+    !validateInt4(ceilingCents, "ceilingCents", res)
+  ) {
+    return;
+  }
+  if (
+    preferredFeeCents !== undefined &&
+    preferredFeeCents !== null &&
+    !validateInt4(preferredFeeCents, "preferredFeeCents", res)
+  ) {
+    return;
+  }
+  if (maxRounds !== undefined && maxRounds !== null && !validateInt4(maxRounds, "maxRounds", res)) {
+    return;
+  }
+  if (
+    giftValueFlexibilityCents !== undefined &&
+    giftValueFlexibilityCents !== null &&
+    !validateInt4(giftValueFlexibilityCents, "giftValueFlexibilityCents", res)
+  ) {
+    return;
+  }
+
   const patch: Parameters<typeof upsertNegotiationPolicy>[1] = {};
   if (floorCents !== undefined) patch.floorCents = floorCents;
   if (ceilingCents !== undefined) patch.ceilingCents = ceilingCents;
@@ -1187,7 +1222,9 @@ router.get("/:id/creator-requirement", async (req: Request, res: Response) => {
 // validated as string arrays at the trust boundary. PLU-139 (B): only the
 // worksheet-backed criteria remain — platforms (S3.1), geography (S3.10),
 // minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/brandSafety
-// were legacy off-worksheet fields with no downstream reader; dropped.
+// were legacy off-worksheet fields with no downstream reader in intake; the
+// columns themselves stay (campaignBriefRender.ts still reads them), this
+// route just no longer writes them.
 router.patch("/:id/creator-requirement", async (req: Request, res: Response) => {
   const { platforms, geography, minFollowers } = req.body as {
     platforms?: unknown;
@@ -1211,19 +1248,10 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
     patch[key] = (value as string[] | null) as JsonValue | null;
   }
   if (minFollowers !== undefined) {
-    // Upper bound = PostgreSQL int4 max: the minFollowers column is `integer`,
-    // so a larger value overflows (SQLSTATE 22003) and the catch-all would 500
-    // instead of rejecting bad input. No real follower count approaches 2.1B.
-    if (
-      minFollowers !== null &&
-      (typeof minFollowers !== "number" ||
-        !Number.isInteger(minFollowers) ||
-        minFollowers < 0 ||
-        minFollowers > 2147483647)
-    ) {
-      res.status(400).json({ error: "minFollowers must be an integer between 0 and 2147483647" });
-      return;
-    }
+    // minFollowers is `integer` (int4). validateInt4's [0, 2147483647] range
+    // already encodes "can't be negative" (a follower count), so no separate
+    // business-rule check is needed on top of it.
+    if (minFollowers !== null && !validateInt4(minFollowers, "minFollowers", res)) return;
     patch.minFollowers = minFollowers;
   }
 
@@ -1245,127 +1273,6 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
       return;
     }
     console.error("[campaigns] update creator requirement error:", err);
-    res.status(500).json({ error: "internal server error" });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Brief import / candidate extraction (PLU-139 2a)
-// ---------------------------------------------------------------------------
-// The IMPORT half of the sectioned intake: a brand uploads a brief PDF (via the
-// shared POST /uploads route, which returns a reference), then POSTs that
-// reference here. We parse it best-effort into a structured section map and
-// store a CampaignBriefExtraction record — EVIDENCE, never authoritative. The
-// intake then reads the latest record and shows its sections as CANDIDATES the
-// brand confirms/edits/rejects into CampaignDetails through the normal PATCH.
-// Nothing here writes CampaignDetails, so re-uploading never overwrites a
-// confirmed value, and a failed/empty parse never blocks the manual path.
-
-/** Best-effort parse of a stored PDF into flatText + a section map. Fail-soft:
- *  any transport/parse error yields an empty-but-valid result so the evidence
- *  record still stores and the brand falls back to manual entry — per the
- *  ticket's "OCR/extraction limitations must not block the manual path". */
-async function parseBriefBestEffort(
-  reference: string,
-): Promise<{ flatText: string; sections: JsonValue; parserVersion: string }> {
-  try {
-    const bytes = await readStoredFile(reference);
-    const data = (await agentPostJson(agentBaseUrl(), "/parse-brief", {
-      pdfBase64: bytes.toString("base64"),
-      parseMode: expectedBriefParseMode(),
-    })) as Record<string, unknown>;
-    const flatText = typeof data["text"] === "string" ? (data["text"] as string) : "";
-    const sections = (data["sections"] ?? {}) as JsonValue;
-    const parserVersion =
-      typeof data["parserVersion"] === "string" && (data["parserVersion"] as string).trim()
-        ? (data["parserVersion"] as string)
-        : expectedParserVersion();
-    return { flatText, sections, parserVersion };
-  } catch (err) {
-    console.warn(
-      `[campaigns] brief parse failed for ${reference}, storing empty evidence: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-    return { flatText: "", sections: {} as JsonValue, parserVersion: expectedParserVersion() };
-  }
-}
-
-// POST /campaigns/:id/brief-extraction — parse an uploaded brief and store the
-// candidate record. Body: { sourceFileReference } (from POST /uploads).
-router.post("/:id/brief-extraction", async (req: Request, res: Response) => {
-  const { sourceFileReference } = req.body as { sourceFileReference?: unknown };
-  if (typeof sourceFileReference !== "string" || !sourceFileReference.trim()) {
-    res.status(400).json({ error: "sourceFileReference is required" });
-    return;
-  }
-  try {
-    const campaign = await findCampaignById(req.params["id"]!);
-    if (!campaign) {
-      res.status(404).json({ error: "campaign not found" });
-      return;
-    }
-    const parsed = await parseBriefBestEffort(sourceFileReference.trim());
-    const record = await insertBriefExtraction(req.params["id"]!, {
-      flatText: parsed.flatText,
-      sections: parsed.sections,
-      sourceFileReference: sourceFileReference.trim(),
-      parserVersion: parsed.parserVersion,
-    });
-    res.status(201).json({ ...record, createdAt: record.createdAt.toISOString() });
-  } catch (err) {
-    if (err instanceof CampaignLockedError) {
-      res.status(409).json({ error: err.message });
-      return;
-    }
-    console.error("[campaigns] create brief extraction error:", err);
-    res.status(500).json({ error: "internal server error" });
-  }
-});
-
-// GET /campaigns/:id/brief-extraction — the latest stored extraction (candidates
-// the brand can still review), or 404 when none has been uploaded yet.
-router.get("/:id/brief-extraction", async (req: Request, res: Response) => {
-  try {
-    const campaign = await findCampaignById(req.params["id"]!);
-    if (!campaign) {
-      res.status(404).json({ error: "campaign not found" });
-      return;
-    }
-    const record = await getLatestBriefExtraction(req.params["id"]!);
-    if (!record) {
-      res.status(404).json({ error: "no brief extraction for this campaign yet" });
-      return;
-    }
-    res.json({ ...record, createdAt: record.createdAt.toISOString() });
-  } catch (err) {
-    console.error("[campaigns] get brief extraction error:", err);
-    res.status(500).json({ error: "internal server error" });
-  }
-});
-
-// GET /campaigns/:id/readiness — PLU-140 (2b): a read-only projection of the
-// SAME preconditions launchCampaign() enforces, so the review page can show
-// blockers up front instead of only discovering them via a failed POST /launch.
-// Uses the identical existence + CONFIRMED + validateCompensationReadiness
-// checks as launchCampaign (db/campaigns.ts) — one shared shape, so this can
-// never report ready:true while POST /launch would 409/422.
-// ponytail: recompute per request, cache if the review page ever polls it hot.
-router.get("/:id/readiness", async (req: Request, res: Response) => {
-  try {
-    const campaign = await findCampaignById(req.params["id"]!);
-    if (!campaign) {
-      res.status(404).json({ error: "campaign not found" });
-      return;
-    }
-    const details = await getCampaignDetails(req.params["id"]!);
-    const policy = await getNegotiationPolicy(req.params["id"]!);
-    // computeReadiness (db/campaigns.ts) is the SINGLE source of the readiness
-    // shape — it mirrors launchCampaign's preconditions exactly, so this can't
-    // drift from what launch enforces.
-    res.json(computeReadiness(details, policy));
-  } catch (err) {
-    console.error("[campaigns] readiness error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });
