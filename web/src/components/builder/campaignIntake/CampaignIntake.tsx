@@ -507,9 +507,15 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   }, [readOnly]);
 
   // Flush any pending timer on unmount so a debounced edit isn't dropped.
+  // Same clear-then-invoke shape as flushSave: cancel the timer (so it can't
+  // also fire redundantly) and run the save immediately instead of letting
+  // the edit die with dirtyRef when the component goes away.
   useEffect(() => {
     return () => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        void latestSaveRef.current();
+      }
     };
   }, []);
 
