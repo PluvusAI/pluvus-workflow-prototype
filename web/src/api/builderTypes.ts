@@ -404,6 +404,60 @@ export type CreatorRequirementInput = Partial<
 >;
 
 // ---------------------------------------------------------------------------
+// PLU-140 (2b): NegotiationPolicy — the ONE private negotiation policy per
+// Draft campaign. Fetched/patched via its own sub-endpoint (never folded into
+// the creator-facing campaign payload — that separation is the privacy
+// boundary), draft-only (409 once ACTIVE). Mirrors the NegotiationPolicy table
+// columns (server/src/db/schema.ts): cents as ints, rates as 0..1 doubles.
+// ---------------------------------------------------------------------------
+
+/** The negotiable/non-negotiable category markers the readiness check reads. */
+export type NegotiationCategory = "fee" | "commission" | "gift";
+
+export interface NegotiationPolicyFields {
+  id: string;
+  campaignId: string;
+  floorCents: number | null;
+  ceilingCents: number | null;
+  preferredFeeCents: number | null;
+  commissionFloorRate: number | null;
+  commissionCeilingRate: number | null;
+  preferredCommissionRate: number | null;
+  maxRounds: number | null;
+  openingOfferPosition: number | null;
+  overCeilingTolerance: number | null;
+  negotiationGuidance: string | null;
+  giftSubstitutionAllowed: boolean | null;
+  giftValueFlexibilityCents: number | null;
+  negotiableTerms: NegotiationCategory[] | null;
+  nonNegotiableTerms: NegotiationCategory[] | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** The write shape for the policy PATCH (all optional/nullable). */
+export type NegotiationPolicyInput = Partial<
+  Omit<NegotiationPolicyFields, "id" | "campaignId" | "createdAt" | "updatedAt">
+>;
+
+/** PLU-140: read-only projection of launchCampaign's preconditions, so the
+ *  review page shows blockers before Activate. `ready` ⇒ POST /launch succeeds. */
+export interface CampaignReadiness {
+  ready: boolean;
+  blockers: string[];
+  reviewConfirmed: boolean;
+  hasPolicy: boolean;
+  hasDetails: boolean;
+}
+
+/** PLU-140: the successful DRAFT→ACTIVE launch result (POST /launch). */
+export interface LaunchResult {
+  campaignId: string;
+  campaignTermsSnapshotId: string;
+  launchedAt: string;
+}
+
+// ---------------------------------------------------------------------------
 // PLU-139 (2a): brief import / candidate extraction. A stored, append-only
 // EVIDENCE record of one brief-PDF parse — never authoritative. The intake shows
 // its `sections` as candidates the brand confirms into CampaignDetails; it never

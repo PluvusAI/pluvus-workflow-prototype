@@ -17,7 +17,9 @@ import {
   visibleFields,
   missingRequiredKeys,
   clearedRewardFieldKeys,
+  clearedPolicyFieldKeys,
   candidateFieldFor,
+  blockerSection,
   needsFee,
   needsCommission,
   isGiftOnly,
@@ -27,8 +29,10 @@ import {
   showsAdditiveGiftToggle,
   CAMPAIGN_TYPE_OPTIONS,
   DELIVERABLE_CARDS,
+  POLICY_CLEAR_VALUES,
   type CompensationShape,
   type FieldSpec,
+  type SectionSpec,
 } from "./sections";
 import type { CampaignType } from "../../../api/builderTypes";
 
@@ -51,6 +55,7 @@ function shape(
   includesGifting = false,
   giftDeliveryMethod = "",
   selectedPlatforms: string[] = [],
+  shipsPhysicalProduct = false,
 ): CompensationShape {
   return {
     campaignType,
@@ -58,6 +63,7 @@ function shape(
     priceStrategy: "PROPOSE_STARTING_FEE",
     giftDeliveryMethod,
     selectedPlatforms,
+    shipsPhysicalProduct,
   };
 }
 
@@ -65,7 +71,7 @@ console.log("\nPLU-139 sections model\n");
 
 // -- structure completeness --------------------------------------------------
 
-test("exactly the six shipped Stage-1 substages, in worksheet order", () => {
+test("the six public Stage-1 substages + PLU-140's two, in worksheet order", () => {
   assert.deepEqual(
     SECTIONS.map((s) => s.key),
     [
@@ -75,13 +81,16 @@ test("exactly the six shipped Stage-1 substages, in worksheet order", () => {
       "contentGuidelines",
       "timelineRights",
       "rewardStructure",
+      // PLU-140 (2b): private policy + review/activate, after the public reward step.
+      "negotiationSettings",
+      "reviewActivate",
     ],
   );
 });
 
-test("the deferred/2b substages are absent (no Content Angles / negotiation / review)", () => {
+test("Content Angles (substage 4) is still deferred — no angle section leaked in", () => {
   const keys = SECTIONS.map((s) => s.key).join(",");
-  assert.ok(!/angle|negotiat|review/i.test(keys), "no substage 4/8/9 leaked in");
+  assert.ok(!/angle/i.test(keys), "no substage 4 (Content Angles) present");
 });
 
 // -- Paid --------------------------------------------------------------------
@@ -165,8 +174,8 @@ test("additive gift on Paid: toggle available; turning it on reveals gift + disp
 // -- price strategy conditional ----------------------------------------------
 
 test("starting fee only shows in PROPOSE_STARTING_FEE mode", () => {
-  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "PROPOSE_STARTING_FEE", giftDeliveryMethod: "", selectedPlatforms: [] }), true);
-  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [] }), false);
+  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "PROPOSE_STARTING_FEE", giftDeliveryMethod: "", selectedPlatforms: [], shipsPhysicalProduct: false }), true);
+  assert.equal(showsStartingFee({ campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [], shipsPhysicalProduct: false }), false);
 });
 
 // -- switching structure hides AND clears ------------------------------------
@@ -189,9 +198,10 @@ test("switch to Gift-only clears BOTH fee and commission fields", () => {
 });
 
 test("Hybrid clears nothing on the reward side when all conditionals resolve", () => {
-  // Fee + commission both apply (Hybrid), gifting on, AND a gift-delivery method
-  // chosen so promo-code shows — every reward field is then visible.
-  const cleared = clearedRewardFieldKeys(shape("HYBRID", true, "promo_code"));
+  // Fee + commission both apply (Hybrid), gifting on, a gift-delivery method
+  // chosen so promo-code shows, AND a physical product so S7.G7 shipping-info
+  // shows — every reward field is then visible.
+  const cleared = clearedRewardFieldKeys(shape("HYBRID", true, "promo_code", [], true));
   // giftContactEmail is the OTHER path (manual_contact), so it's still hidden.
   assert.deepEqual(cleared, ["giftContactEmail"], "only the unused gift path is cleared");
 });
@@ -215,7 +225,8 @@ test("no clear-list drift: every conditional reward field is clearable on switch
     shape("PAID", false),
     shape("AFFILIATE", false),
     shape("GIFT_ONLY", false), // no gift-delivery method → promo/contact both cleared
-    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [] },
+    shape("GIFT_ONLY", false, "", [], true), // physical gift → requiresShippingInfo visible here
+    { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [], shipsPhysicalProduct: false },
   ];
   const everCleared = new Set(structures.flatMap((s) => clearedRewardFieldKeys(s)));
   for (const f of reward.fields) {
@@ -238,7 +249,12 @@ test("turning additive gift OFF clears the gift fields", () => {
 // -- field→group mapping is in-contract --------------------------------------
 
 test("every field maps to a real persisted group", () => {
-  const groups = new Set(["campaign", "brandIdentity", "creatorRequirement"]);
+  const groups = new Set([
+    "campaign",
+    "brandIdentity",
+    "creatorRequirement",
+    "negotiationPolicy",
+  ]);
   for (const s of SECTIONS) {
     for (const f of s.fields) {
       assert.ok(groups.has(f.group), `${s.key}.${f.key} has a valid group`);
@@ -367,6 +383,23 @@ test("S6.7 Instagram collab shows only when Instagram is a selected platform", (
     !visibleFields(timeline, noneSelected).some((f) => f.key === "instagramCollab"),
     "hidden when no platforms selected yet",
   );
+});
+
+// -- S7.G7 shipping-info conditional (gated on S7.G6 physical product) --------
+
+test("S7.G7 require-shipping shows only when a gift is a physical product (S7.G6=Yes)", () => {
+  const reward = getSection("rewardStructure");
+  const hasKey = (comp: CompensationShape) =>
+    visibleFields(reward, comp).some((f) => f.key === "requiresShippingInfo");
+  // Gift present + physical → shown.
+  assert.ok(hasKey(shape("GIFT_ONLY", false, "", [], true)), "shown for a physical gift");
+  // Gift present but NOT physical (digital / nothing ships) → hidden.
+  assert.ok(!hasKey(shape("GIFT_ONLY", false, "", [], false)), "hidden for a non-physical gift");
+  // No gift at all → hidden regardless.
+  assert.ok(!hasKey(shape("PAID", false, "", [], true)), "hidden when there is no gift");
+  // Hidden → it must be in the cleared set (never left stale when digital).
+  const cleared = new Set(clearedRewardFieldKeys(shape("GIFT_ONLY", false, "", [], false)));
+  assert.ok(cleared.has("requiresShippingInfo"), "cleared when the gift is non-physical");
 });
 
 // -- Page 5/6 columns now have dedicated fields ------------------------------
@@ -513,6 +546,209 @@ test("missingRequiredKeys: empty array (no deliverable cards picked) counts as m
     valuesFrom({ deliverableQuantities: [{ platform: "instagram", format: "reel", quantity: 1 }] }),
   );
   assert.ok(!filled.includes("deliverableQuantities"), "non-empty deliverables pass");
+});
+
+// ===========================================================================
+// PLU-140 (2b) — private negotiation policy + review/activate
+// ===========================================================================
+
+const policy = getSection("negotiationSettings");
+
+/** Visible policy-field keys under a given shape. */
+function policyKeys(comp: CompensationShape): Set<string> {
+  return new Set(visibleFields(policy, comp).map((f) => f.key));
+}
+
+// -- contract separation: public review never renders a policy field ---------
+
+test("every negotiationSettings field is group:negotiationPolicy (private endpoint)", () => {
+  for (const f of policy.fields) {
+    assert.equal(f.group, "negotiationPolicy", `${f.key} routes to the policy endpoint`);
+  }
+});
+
+test("no PUBLIC section field is group:negotiationPolicy (privacy boundary)", () => {
+  // The public sections (everything except the private policy editor) must not
+  // carry a single policy-group field — the split is structural, by group.
+  const publicSections = SECTIONS.filter((s) => s.key !== "negotiationSettings");
+  for (const s of publicSections) {
+    for (const f of s.fields) {
+      assert.notEqual(
+        f.group,
+        "negotiationPolicy",
+        `${s.key}.${f.key} must not be a private policy field`,
+      );
+    }
+  }
+});
+
+test("reviewActivate is a marker section (no editable fields)", () => {
+  assert.deepEqual(getSection("reviewActivate").fields, []);
+});
+
+// -- conditional policy requirements per campaign type -----------------------
+// Requiredness is by STRUCTURE, never by whether a fee amount was entered
+// (issue AC: "Fixed fee is never treated as the opposite of negotiated").
+
+test("Paid requires a fee ceiling, no commission ceiling", () => {
+  const k = policyKeys(shape("PAID"));
+  assert.ok(k.has("ceilingCents"), "fee ceiling shown");
+  assert.ok(!k.has("commissionCeilingRate"), "no commission ceiling");
+  const req = policy.fields.find((f) => f.key === "ceilingCents");
+  assert.equal(req?.required, true, "fee ceiling is required for Paid");
+});
+
+test("Affiliate requires a commission ceiling and NOT a fee ceiling", () => {
+  const k = policyKeys(shape("AFFILIATE"));
+  assert.ok(k.has("commissionCeilingRate"), "commission ceiling shown");
+  assert.ok(!k.has("ceilingCents"), "no fee ceiling for Affiliate");
+  const req = policy.fields.find((f) => f.key === "commissionCeilingRate");
+  assert.equal(req?.required, true, "commission ceiling is required for Affiliate");
+});
+
+test("Hybrid requires BOTH fee and commission ceilings", () => {
+  const k = policyKeys(shape("HYBRID"));
+  assert.ok(k.has("ceilingCents"), "fee ceiling shown");
+  assert.ok(k.has("commissionCeilingRate"), "commission ceiling shown");
+});
+
+test("Gift-only shows gift flexibility and neither fee nor commission ceiling", () => {
+  const k = policyKeys(shape("GIFT_ONLY"));
+  assert.ok(k.has("giftSubstitutionAllowed"), "gift substitution shown");
+  assert.ok(k.has("giftValueFlexibilityCents"), "gift cash ceiling shown");
+  assert.ok(!k.has("ceilingCents"), "no fee ceiling for gift-only");
+  assert.ok(!k.has("commissionCeilingRate"), "no commission ceiling for gift-only");
+});
+
+test("required policy set is structural: Paid demands the fee ceiling regardless of amounts", () => {
+  // No fee amount is entered anywhere — the ceiling is still demanded, proving
+  // requiredness is by structure, not by a fixed-fee value existing.
+  const missing = missingRequiredKeys(policy, shape("PAID"), valuesFrom({}));
+  assert.ok(missing.includes("ceilingCents"), "Paid fee ceiling demanded with no amounts set");
+  // A filled ceiling clears the requirement.
+  const ok = missingRequiredKeys(policy, shape("PAID"), valuesFrom({ ceilingCents: "500" }));
+  assert.ok(!ok.includes("ceilingCents"), "filled fee ceiling satisfies the gate");
+});
+
+// -- clear-hidden-values contract (mirror of the reward clear guard) ---------
+
+test("POLICY_CLEAR_VALUES lists every hideable persisted policy field with its cleared value", () => {
+  // Every PERSISTED policy field that has a visibleWhen (i.e. can be hidden by a
+  // structure switch) MUST appear in POLICY_CLEAR_VALUES, or buildPolicyPayload
+  // would leave it stale to be snapshotted at launch. Always-visible ones must
+  // NOT. uiOnly (disabled, unwired) fields are outside the data path entirely —
+  // never persisted, never cleared — so they must NEVER appear here regardless
+  // of their visibleWhen.
+  for (const f of policy.fields) {
+    if (f.uiOnly) {
+      assert.ok(
+        !(f.key in POLICY_CLEAR_VALUES),
+        `${f.key} is uiOnly → must NOT be in POLICY_CLEAR_VALUES`,
+      );
+      continue;
+    }
+    const hideable = typeof f.visibleWhen === "function";
+    if (hideable) {
+      assert.ok(
+        f.key in POLICY_CLEAR_VALUES,
+        `${f.key} is conditional → must be in POLICY_CLEAR_VALUES`,
+      );
+    } else {
+      assert.ok(
+        !(f.key in POLICY_CLEAR_VALUES),
+        `${f.key} is always visible → must NOT be in POLICY_CLEAR_VALUES`,
+      );
+    }
+  }
+  // Every clear value is null (policy has no boolean-defaulting columns like the
+  // reward `false` ones — the gift toggle clears to null, not false).
+  for (const v of Object.values(POLICY_CLEAR_VALUES)) {
+    assert.equal(v, null, "policy fields clear to null");
+  }
+});
+
+test("switching PAID→AFFILIATE clears the fee ceiling; AFFILIATE→PAID clears the commission ceiling", () => {
+  const affiliateClears = new Set(clearedPolicyFieldKeys(shape("AFFILIATE")));
+  assert.ok(affiliateClears.has("ceilingCents"), "fee ceiling cleared on Affiliate");
+  assert.ok(!affiliateClears.has("commissionCeilingRate"), "commission ceiling kept on Affiliate");
+
+  const paidClears = new Set(clearedPolicyFieldKeys(shape("PAID")));
+  assert.ok(paidClears.has("commissionCeilingRate"), "commission ceiling cleared on Paid");
+  assert.ok(!paidClears.has("ceilingCents"), "fee ceiling kept on Paid");
+});
+
+test("gift fields are cleared when the structure has no gift", () => {
+  const paidNoGift = new Set(clearedPolicyFieldKeys(shape("PAID", false)));
+  assert.ok(paidNoGift.has("giftSubstitutionAllowed"), "gift toggle cleared");
+  assert.ok(paidNoGift.has("giftValueFlexibilityCents"), "gift cash ceiling cleared");
+  // With additive gifting ON, they stay.
+  const paidGift = new Set(clearedPolicyFieldKeys(shape("PAID", true)));
+  assert.ok(!paidGift.has("giftSubstitutionAllowed"), "gift toggle kept with additive gift");
+});
+
+// -- deferred UI-only fields (disabled, unwired) -----------------------------
+
+test("the deferred Page-8 controls exist and are ALL flagged uiOnly", () => {
+  // Layout is present so it's easy to wire later; each must be uiOnly so it's
+  // disabled + excluded from every data path until DB/snapshot/engine land.
+  const expected = [
+    "uiOnly_commissionDurationBand", // S8.A2
+    "uiOnly_maxPostingDelayDays", // S8.C2
+    "uiOnly_deliverableFlexibility", // S8.C1
+    "uiOnly_rightsMinimums", // S8.C3
+    "uiOnly_scriptWaivable", // S8.C5
+    "uiOnly_approvalMode", // S8.E0
+    "uiOnly_outOfPolicyAction", // S8.E1
+  ];
+  const byKey = new Map(policy.fields.map((f) => [f.key, f]));
+  for (const key of expected) {
+    const f = byKey.get(key);
+    assert.ok(f, `${key} is laid out in the section`);
+    assert.equal(f!.uiOnly, true, `${key} must be uiOnly (disabled/unwired)`);
+  }
+});
+
+test("uiOnly fields are excluded from EVERY data path (validation, clear map, keys are namespaced)", () => {
+  const uiOnly = policy.fields.filter((f) => f.uiOnly);
+  assert.ok(uiOnly.length > 0, "there are deferred fields to check");
+  for (const f of uiOnly) {
+    // Never persisted → never in the clear map.
+    assert.ok(!(f.key in POLICY_CLEAR_VALUES), `${f.key} must not be in POLICY_CLEAR_VALUES`);
+    // Namespaced so it can't be mistaken for a real NegotiationPolicy column.
+    assert.ok(f.key.startsWith("uiOnly_"), `${f.key} must use the uiOnly_ namespace`);
+    // Not required (a disabled field must never block Save & continue).
+    assert.ok(!f.required, `${f.key} must not be required`);
+  }
+  // Even a uiOnly field marked required would be ignored by the gate — prove the
+  // filter is on uiOnly, not just on `required` being absent.
+  const fakeRequiredUiOnly: FieldSpec = {
+    key: "uiOnly_probe",
+    group: "negotiationPolicy",
+    control: "number",
+    label: "probe",
+    source: "S8.X",
+    required: true,
+    uiOnly: true,
+  };
+  const probeSection: SectionSpec = {
+    key: "negotiationSettings",
+    title: "t",
+    fields: [fakeRequiredUiOnly],
+  };
+  const missing = missingRequiredKeys(probeSection, shape("PAID"), () => "");
+  assert.deepEqual(missing, [], "a uiOnly field is never demanded, even if marked required");
+});
+
+// -- readiness blocker → section link ----------------------------------------
+
+test("blockerSection routes policy blockers to negotiationSettings, else rewardStructure", () => {
+  assert.equal(
+    blockerSection("NegotiationPolicy fee bounds (floorCents/ceilingCents) or an explicit non-negotiable fee marker"),
+    "negotiationSettings",
+  );
+  assert.equal(blockerSection("NegotiationPolicy is missing"), "negotiationSettings");
+  assert.equal(blockerSection("CampaignDetails.publicCommissionRate"), "rewardStructure");
+  assert.equal(blockerSection("Compensation review is not confirmed"), "rewardStructure");
 });
 
 console.log(`\n${passed} passed\n`);
