@@ -161,6 +161,14 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // newer edit.
   const savingInFlightRef = useRef(false);
   const rerunSaveRef = useRef(false);
+  // PLU-140 (Greptile P1): the Page-9 approve schedules a CONFIRMED draft update
+  // then flushes synchronously — but the flush runs the current render's save
+  // closure BEFORE React commits the draft, so buildCampaignPayload would read
+  // the stale NEEDS_REVIEW and the campaign group would clear dirty with the
+  // wrong value written (no follow-up PATCH → activation stays blocked). This
+  // one-shot ref carries the approved value into that immediate PATCH; the build
+  // prefers it over the not-yet-committed draft and consumes it.
+  const pendingReviewStatusRef = useRef<"NEEDS_REVIEW" | "CONFIRMED" | null>(null);
 
   const [duplicating, setDuplicating] = useState(false);
 
@@ -318,6 +326,10 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // wipes stale terms on the server (the backend owns truth).
   const buildCampaignPayload = useCallback((): Parameters<typeof updateCampaign>[1] => {
     const d = campaignDraft;
+    // Greptile P1: prefer the one-shot approve override over the draft (which
+    // may not have committed the CONFIRMED update yet when a flush fires this
+    // build synchronously). Absent both → we don't touch the persisted status.
+    const reviewStatus = pendingReviewStatusRef.current ?? campaignDraft.compensationReviewStatus;
     // name/brand are editable in the Start section (PLU-139) and PATCH through
     // like any other field. Both are launch-hard, so only send a non-blank
     // value — never overwrite a saved name/brand with an empty string.
@@ -370,8 +382,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       // compensationReviewStatus ONLY when the shell set one — a Page-9 approve
       // (→CONFIRMED) or a material edit after approval (→NEEDS_REVIEW, set in
       // setField). Absent → we don't touch the persisted status at all.
-      ...(campaignDraft.compensationReviewStatus
-        ? { compensationReviewStatus: campaignDraft.compensationReviewStatus as "NEEDS_REVIEW" | "CONFIRMED" }
+      ...(reviewStatus
+        ? { compensationReviewStatus: reviewStatus as "NEEDS_REVIEW" | "CONFIRMED" }
         : {}),
     };
 
@@ -530,7 +542,14 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     try {
       // PATCH only the dirty groups. Run them in sequence — the set is tiny (≤3)
       // and it keeps error attribution simple.
-      if (groups.includes("campaign")) await updateCampaign(campaignId, buildCampaignPayload());
+      if (groups.includes("campaign")) {
+        await updateCampaign(campaignId, buildCampaignPayload());
+        // The approved review status is now persisted — consume the one-shot
+        // override. On a PATCH failure we skip this (throw jumps to catch), so a
+        // retry still carries it. By the time a follow-up PATCH runs, the draft
+        // has committed CONFIRMED, so the ref is no longer needed.
+        pendingReviewStatusRef.current = null;
+      }
       if (groups.includes("brandIdentity"))
         await updateBrandIdentity(campaignId, buildBrandPayload());
       if (groups.includes("creatorRequirement"))
@@ -881,11 +900,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
                 readOnly={readOnly}
                 onEditSection={leaveSection}
                 onConfirmReview={(confirmed) => {
-                  setField(
-                    "campaign",
-                    "compensationReviewStatus",
-                    confirmed ? "CONFIRMED" : "NEEDS_REVIEW",
-                  );
+                  const next = confirmed ? "CONFIRMED" : "NEEDS_REVIEW";
+                  // Set the override BEFORE flushSave so the synchronous PATCH
+                  // that flush fires carries `next` even though the draft update
+                  // scheduled by setField hasn't committed yet (Greptile P1).
+                  pendingReviewStatusRef.current = next;
+                  setField("campaign", "compensationReviewStatus", next);
                   flushSave();
                 }}
                 onLaunched={() => {
