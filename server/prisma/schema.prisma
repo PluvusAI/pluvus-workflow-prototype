@@ -469,9 +469,9 @@ model CampaignDetails {
   /// read by executors. Dropping it silently would be a real regression, not a
   /// simplification.
   attributionWindow   String?
-  /// New — no existing column covers this. Flagged as a genuine gap by the
-  /// vault's own "Decision - Persist Full Extraction" note (prohibited claims
-  /// was never persisted even when extracted from a brief).
+  /// PLU-141: read by the campaign brief renderer (campaignBriefRender.ts) and
+  /// rendered into the creator-facing brief, so it stays a live column even
+  /// though the Stage-1 intake no longer writes it.
   prohibitedClaims    String?
   /// PLU-136: renamed from fixedCompensationCents — the PUBLIC starting/
   /// proposed fee shown to the creator before negotiation, when priceStrategy
@@ -498,6 +498,54 @@ model CampaignDetails {
   publicPaymentTerms     String?
   shipsPhysicalProduct   Boolean @default(false)
   brandDescription       String?
+
+  /// PLU-139 (2a): worksheet Stage-1 questions with no prior CampaignDetails
+  /// column. All creator-facing public brief fields, all nullable (incomplete
+  /// Draft is valid). Closed-set fields (creatorAccessNeeded, briefDeliveryMethod,
+  /// giftDeliveryMethod, trackingLinkMode) are stored as plain String/Boolean and
+  /// validated at the route, not as PG enums, so PLU-159 can retune the option
+  /// sets without another migration.
+  productName          String? /// S2.3
+  productType          String? /// S2.4
+  creatorAccessNeeded  Boolean? /// S2.5
+  uniqueSellingPoints  String? /// S2.7
+  whyTrust             String? /// S2.8
+  howToUse             String? /// S2.9
+  brandAssets          String? /// S2.10
+  brandMaterialsRef    String? /// S1.4 supporting-materials upload reference
+  /// S3.2–S3.9 per-platform deliverable quantities: [{ platform, format, quantity }].
+  deliverableQuantities Json?
+  /// S7.P1 per-deliverable pricing: { "<platform>:<format>": cents }.
+  deliverablePricing   Json?
+  /// S3.11 per-platform follower ranges: { "<platform>": { min, max } }.
+  followerRanges       Json?
+  briefDeliveryMethod  String? /// S5.1
+  briefHighlight       String? /// S5.2
+  creativeConcept      String? /// S5.4
+  referenceVideos      String? /// S5.5 (one link per line)
+  scriptSubmission     String? /// S5.6 ("require" | "skip")
+  adAuthorization      String? /// S6.3 (split out from usageRights)
+  linkInBioDuration    String? /// S6.2
+  postRetention        String? /// S6.4
+  instagramCollab      Boolean? /// S6.7
+  requireApproval      Boolean? /// S7.3
+  commissionMode       String? /// S7.A1 ("percent" | "flat")
+  variableCommission   String? /// S7.A3
+  giftDeliveryMethod   String? /// S7.G1
+  promoCode            String? /// S7.G2
+  giftContactEmail     String? /// S7.G4
+  requiresShippingInfo Boolean? /// S7.G7
+  affiliateTrackingUrl   String? /// S7.T0
+  trackingLinkMode       String? /// S7.T1
+  trackingDestinationUrl String? /// S7.T2
+  trackingParameter      String? /// S7.T3
+
+  /// PLU-139 field-level provenance: { "<fieldKey>": "manual" | "pdf_extracted" }.
+  /// How each creator-facing value got here — a field the brand typed/edited is
+  /// "manual"; a value applied from an uploaded brief candidate is "pdf_extracted".
+  /// Only the reachable sources are recorded (no website crawl / copy-flow yet).
+  /// An absent key means "no provenance recorded" (e.g. seeded default).
+  fieldProvenance Json?
 
   /// PLU-135 schema review §2.1 (Calvin, 2026-08-08): the missing link in the
   /// extraction → confirmation → snapshot chain. Without this, launchCampaign()
@@ -717,6 +765,10 @@ model CreatorRequirement {
   id         String @id @default(cuid())
   campaignId String @unique
 
+  // PLU-139 (B): worksheet-backed criteria — platforms (S3.1), geography
+  // (S3.10), minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/
+  // brandSafety were slated to drop as off-worksheet, but PLU-141's campaign
+  // brief renderer (campaignBriefRender.ts) now reads all of them, so they stay.
   platforms     Json?
   niches        Json?
   geography     Json?

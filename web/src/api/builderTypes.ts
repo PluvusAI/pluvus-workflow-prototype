@@ -163,10 +163,75 @@ export type PriceStrategy = "REQUEST_RATE_CARD" | "PROPOSE_STARTING_FEE";
  *  automatically (an explicit, verified selection). */
 export type CompensationReviewStatus = "NEEDS_REVIEW" | "CONFIRMED";
 
-export interface CampaignListItem {
+/** PLU-135 (1a): campaign lifecycle. DRAFT is editable; ACTIVE means launched —
+ *  CampaignDetails/BrandIdentity/CreatorRequirement writes are rejected (409). */
+export type CampaignStatus = "DRAFT" | "ACTIVE";
+
+/** PLU-139 (2a): one row of the per-platform deliverable quantity list (S3.2–S3.9). */
+export interface DeliverableQuantity {
+  platform: string;
+  format: string;
+  quantity: number;
+}
+
+/** PLU-139 (2a): S7.P1 per-deliverable pricing — cents keyed by "<platform>:<format>". */
+export type DeliverablePricing = Record<string, number>;
+
+/** PLU-139 (2a): S3.11 per-platform follower ranges — keyed by platform. `max`
+ *  null = no upper limit. */
+export type FollowerRanges = Record<string, { min: number | null; max: number | null }>;
+
+/** PLU-139: how a creator-facing value got here. Only the reachable sources are
+ *  recorded today — a field the brand typed/edited is "manual"; a value applied
+ *  from an uploaded brief candidate is "pdf_extracted". */
+export type FieldProvenanceValue = "manual" | "pdf_extracted";
+
+/** PLU-139: field-key → provenance. An absent key means "no provenance recorded". */
+export type FieldProvenance = Record<string, FieldProvenanceValue>;
+
+/** PLU-139 (2a): the worksheet Stage-1 public-brief fields that gained
+ *  CampaignDetails columns. All nullable — an incomplete Draft is valid. Shared
+ *  by CampaignListItem and CampaignDetail (both flatten the same row). */
+export interface WorksheetStage1Fields {
+  productName: string | null; // S2.3
+  productType: string | null; // S2.4
+  creatorAccessNeeded: boolean | null; // S2.5
+  uniqueSellingPoints: string | null; // S2.7
+  whyTrust: string | null; // S2.8
+  howToUse: string | null; // S2.9
+  brandAssets: string | null; // S2.10
+  brandMaterialsRef: string | null; // S1.4
+  deliverableQuantities: DeliverableQuantity[] | null; // S3.2–S3.9
+  deliverablePricing: DeliverablePricing | null; // S7.P1
+  followerRanges: FollowerRanges | null; // S3.11
+  briefDeliveryMethod: string | null; // S5.1
+  briefHighlight: string | null; // S5.2
+  creativeConcept: string | null; // S5.4
+  referenceVideos: string | null; // S5.5
+  scriptSubmission: string | null; // S5.6
+  adAuthorization: string | null; // S6.3
+  linkInBioDuration: string | null; // S6.2
+  postRetention: string | null; // S6.4
+  instagramCollab: boolean | null; // S6.7
+  requireApproval: boolean | null; // S7.3
+  commissionMode: string | null; // S7.A1 ("percent" | "flat")
+  variableCommission: string | null; // S7.A3
+  giftDeliveryMethod: string | null; // S7.G1
+  promoCode: string | null; // S7.G2
+  giftContactEmail: string | null; // S7.G4
+  requiresShippingInfo: boolean | null; // S7.G7
+  affiliateTrackingUrl: string | null; // S7.T0
+  trackingLinkMode: string | null; // S7.T1
+  trackingDestinationUrl: string | null; // S7.T2
+  trackingParameter: string | null; // S7.T3
+}
+
+export interface CampaignListItem extends WorksheetStage1Fields {
   id: string;
   name: string;
   brand: string;
+  /** PLU-135 (1a): DRAFT (editable) | ACTIVE (launched, locked). */
+  status: CampaignStatus;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;
@@ -198,6 +263,18 @@ export interface CampaignListItem {
   commissionDurationDays: number | null;
   commissionConditions: string | null;
   compensationReviewStatus: CompensationReviewStatus | null;
+  // PLU-135: creator-facing knowledge fields (live on CampaignDetails). Stated
+  // verbatim by the agent when a creator asks; deferred honestly when null.
+  usageRights: string | null;
+  exclusivity: string | null;
+  paymentTerms: string | null;
+  attributionWindow: string | null;
+  keyMessages: string | null;
+  contentRequirements: string | null;
+  targetUrl: string | null;
+  hiddenParamKey: string | null;
+  /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
+  duplicatedFromCampaignId: string | null;
   createdAt: string;
   updatedAt: string;
   workflowCount: number;
@@ -228,10 +305,14 @@ export interface CampaignWorkflowItem {
   updatedAt: string;
 }
 
-export interface CampaignDetail {
+export interface CampaignDetail extends WorksheetStage1Fields {
   id: string;
   name: string;
   brand: string;
+  /** PLU-135 (1a): DRAFT (editable) | ACTIVE (launched, locked). */
+  status: CampaignStatus;
+  /** PLU-139: field-key → how that value got here (manual | pdf_extracted). */
+  fieldProvenance: FieldProvenance | null;
   objective: string | null;
   notes: string | null;
   notifyEmail: string | null;
@@ -260,6 +341,17 @@ export interface CampaignDetail {
   commissionDurationDays: number | null;
   commissionConditions: string | null;
   compensationReviewStatus: CompensationReviewStatus | null;
+  // PLU-135: creator-facing knowledge fields (live on CampaignDetails).
+  usageRights: string | null;
+  exclusivity: string | null;
+  paymentTerms: string | null;
+  attributionWindow: string | null;
+  keyMessages: string | null;
+  contentRequirements: string | null;
+  targetUrl: string | null;
+  hiddenParamKey: string | null;
+  /** PLU-136 (1b): set on a campaign minted via "Duplicate as new campaign". */
+  duplicatedFromCampaignId: string | null;
   createdAt: string;
   updatedAt: string;
   workflows: CampaignWorkflowItem[];
@@ -310,6 +402,36 @@ export type BrandIdentityInput = Partial<
 export type CreatorRequirementInput = Partial<
   Omit<CreatorRequirementFields, "id" | "campaignId" | "createdAt" | "updatedAt">
 >;
+
+// ---------------------------------------------------------------------------
+// PLU-139 (2a): brief import / candidate extraction. A stored, append-only
+// EVIDENCE record of one brief-PDF parse — never authoritative. The intake shows
+// its `sections` as candidates the brand confirms into CampaignDetails; it never
+// auto-writes. `sections` is the parser's section map (keys like usageRights,
+// paymentTerms, deliverables → { text, ... }); shape is best-effort so it's typed
+// loosely and read defensively.
+// ---------------------------------------------------------------------------
+export interface BriefExtractionSection {
+  type?: string;
+  text?: string;
+  pageStart?: number;
+  pageEnd?: number;
+  extractionConfidence?: number;
+  sourceFileReference?: string;
+  parserVersion?: string;
+}
+
+export interface BriefExtractionFields {
+  id: string;
+  campaignId: string;
+  flatText: string;
+  /** Parser section map. Keys are canonical field names (usageRights, etc.). */
+  sections: Record<string, BriefExtractionSection> | null;
+  other: unknown;
+  sourceFileReference: string;
+  parserVersion: string;
+  createdAt: string;
+}
 
 // ---------------------------------------------------------------------------
 // Workflow

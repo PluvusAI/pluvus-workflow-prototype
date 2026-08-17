@@ -9,10 +9,12 @@ interface Props {
   htmlFor?: string;
   hint?: ReactNode;
   error?: ReactNode;
+  /** Show a required marker (*) after the label. Visual only — no validation. */
+  required?: boolean | undefined;
   children: ReactNode;
 }
 
-export function FormField({ label, htmlFor, hint, error, children }: Props) {
+export function FormField({ label, htmlFor, hint, error, required, children }: Props) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
       <label
@@ -25,6 +27,11 @@ export function FormField({ label, htmlFor, hint, error, children }: Props) {
         }}
       >
         {label}
+        {required && (
+          <span aria-hidden style={{ color: colors.danger, marginLeft: 3 }}>
+            *
+          </span>
+        )}
       </label>
       {children}
       {hint && !error && (

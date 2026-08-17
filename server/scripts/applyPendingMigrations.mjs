@@ -35,9 +35,16 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 
 const migDir = resolve(__dirname, "../prisma/migrations");
 const FILES = [
-  "20260721160000_plu70_operator_handoff/migration.sql",
-  "20260722120000_send_delay_redrive_count/migration.sql",
-  "20260722140000_plu111_conversation_obligations/migration.sql",
+  // 2026-08-14: the three PLU-139 migrations that drifted out of sync with the
+  // Drizzle schema — `select()` in getCampaignDetailsByCampaignIds 42703'd on
+  // each new column in turn. All idempotent (ADD/DROP COLUMN IF [NOT] EXISTS),
+  // listed in order, so re-running an already-applied one is harmless.
+  "20260814120000_plu139_worksheet_stage1_fields/migration.sql", // +20 Stage-1 cols
+  "20260814130000_plu139_drop_offworksheet_fields/migration.sql", // -6 off-worksheet cols
+  "20260814140000_plu139_product_name/migration.sql", // +productName (S2.3)
+  "20260814150000_plu139_page5_page6_fields/migration.sql", // +5 Page-5/6 cols (S5.2/4/5/6, S6.3)
+  "20260814160000_plu139_pricing_ranges_mode/migration.sql", // +3 cols (S7.P1 pricing, S3.11 ranges, S7.A1 mode)
+  "20260815120000_plu139_field_provenance/migration.sql", // +fieldProvenance (jsonb map)
 ];
 
 // Split SQL into top-level statements. Tracks $$...$$ dollar-quoting so the

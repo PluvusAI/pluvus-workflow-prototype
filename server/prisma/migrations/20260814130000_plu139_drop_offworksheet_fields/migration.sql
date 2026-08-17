@@ -1,0 +1,16 @@
+-- PLU-139 (B): originally dropped six off-worksheet fields with no downstream
+-- reader (CreatorRequirement.niches/languages/audienceNotes/contentStyle/
+-- brandSafety and CampaignDetails.prohibitedClaims), so the Stage-1 intake
+-- matched docs/campaign-question-review-worksheet.md exactly.
+--
+-- Reverted to a no-op after the merge with PLU-141: that branch's campaign brief
+-- renderer (campaignBriefRender.ts) now reads all six — the five CreatorRequirement
+-- criteria via a full-row select, and prohibitedClaims into the creator-facing
+-- brief. Dropping any of them would break the renderer, so every DROP is removed
+-- and the columns stay. The migration directory is kept (never deleted from
+-- _prisma_migrations history) but does nothing.
+--
+-- The intake simply no longer writes these columns; they remain valid, nullable,
+-- and readable.
+
+-- (intentionally empty)
