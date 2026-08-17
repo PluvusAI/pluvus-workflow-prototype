@@ -260,15 +260,20 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     seededCampaignRef.current = true;
   }, [campaignQ.data]);
 
-  // Seed the brand-identity draft once ITS OWN query settles — not the moment
-  // campaignQ.data resolves. `isLoading` (true only during the initial fetch)
-  // covers both real outcomes: a genuine row (data present) and the "no row
-  // yet" 404 (this hook surfaces that as an error, not empty data — see the
-  // hook comment above — so `b` is undefined in both the loading AND the
-  // 404 cases; only `isLoading` distinguishes "still in flight" from
-  // "settled, absent").
+  // Seed the brand-identity draft once ITS OWN query SUCCEEDS — not merely once
+  // it settles. useBrandIdentity resolves a 404 (no row yet) to `{}` inside its
+  // own queryFn, so `isError` here means a GENUINE read failure (5xx, network),
+  // not "no row." On a genuine failure we must NOT seed an empty draft: `b`
+  // would be undefined for the same reason it's undefined while loading, but
+  // here real persisted values may exist server-side that we simply failed to
+  // read — seeding "" for them and letting an edit autosave would PATCH those
+  // fields to null, silently wiping data that was never actually empty. Stay
+  // unseeded (seededBrandRef.current stays false) so a later successful
+  // read/retry seeds correctly instead; doSave separately refuses to save an
+  // unseeded group at all (see below), so no edit can slip through as a
+  // destructive save while this is still unresolved.
   useEffect(() => {
-    if (seededBrandRef.current || brandQ.isLoading) return;
+    if (seededBrandRef.current || brandQ.isLoading || brandQ.isError) return;
     const b = brandQ.data;
     setBrandDraft({
       logoRef: b?.logoRef ?? "",
@@ -277,12 +282,12 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       typography: b?.typography ?? "",
     });
     seededBrandRef.current = true;
-  }, [brandQ.data, brandQ.isLoading]);
+  }, [brandQ.data, brandQ.isLoading, brandQ.isError]);
 
-  // Seed the creator-requirement draft once ITS OWN query settles (same
-  // absent-row-vs-still-loading reasoning as brand, above).
+  // Seed the creator-requirement draft once ITS OWN query SUCCEEDS (same
+  // genuine-failure-vs-absent-row reasoning as brand, above).
   useEffect(() => {
-    if (seededCreatorRef.current || creatorQ.isLoading) return;
+    if (seededCreatorRef.current || creatorQ.isLoading || creatorQ.isError) return;
     const cr = creatorQ.data;
     // platforms is derived from the deliverable cards, not seeded/edited here.
     // geography is a string[] of ISO codes (the country picker works on the
@@ -292,16 +297,18 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       minFollowers: cr?.minFollowers != null ? String(cr.minFollowers) : "",
     });
     seededCreatorRef.current = true;
-  }, [creatorQ.data, creatorQ.isLoading]);
+  }, [creatorQ.data, creatorQ.isLoading, creatorQ.isError]);
 
   // Seed the private-policy draft once ITS OWN query settles. useNegotiationPolicy
-  // converts a 404 into a resolved `{}` inside its queryFn (not an error state),
-  // so `isLoading` alone is enough here — no separate error-vs-loading split
-  // needed. Money columns show in dollars (cents→dollars); commission rates
-  // are the same percentage scale as publicCommissionRate (no /100). A null
-  // column seeds "" so the control renders empty, not "null".
+  // converts a 404 into a resolved `{}` inside its queryFn (not an error
+  // state) — but a genuine failure (5xx, network) still rethrows and lands the
+  // query in isError, so that split still matters here too (same reasoning as
+  // brand/creator above: never seed an empty draft from a failed read). Money
+  // columns show in dollars (cents→dollars); commission rates are the same
+  // percentage scale as publicCommissionRate (no /100). A null column seeds ""
+  // so the control renders empty, not "null".
   useEffect(() => {
-    if (seededPolicyRef.current || policyQ.isLoading) return;
+    if (seededPolicyRef.current || policyQ.isLoading || policyQ.isError) return;
     const pol = policyQ.data;
     setPolicyDraft({
       ceilingCents: centsToDollars(pol?.ceilingCents),
@@ -321,7 +328,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       negotiationGuidance: pol?.negotiationGuidance ?? "",
     });
     seededPolicyRef.current = true;
-  }, [policyQ.data, policyQ.isLoading]);
+  }, [policyQ.data, policyQ.isLoading, policyQ.isError]);
 
   const comp: CompensationShape = useMemo(
     () => ({
@@ -578,6 +585,27 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     setSaveError(null);
     let succeeded = false;
     try {
+      // Refuse to PATCH a group before its own initial read has actually
+      // succeeded (see the seeding effects above). A dirty-but-unseeded group
+      // means its draft never received the group's real persisted values —
+      // sending it now would PATCH every OTHER field in that group as
+      // empty/null, silently wiping data we simply haven't read yet (rather
+      // than data that's genuinely absent). Fail this round the same way a
+      // network error would: the dirty set stays intact, the existing
+      // "Couldn't save · Retry" affordance shows, and no auto-refire spins —
+      // a manual retry (or the read finally succeeding) tries again.
+      const unseeded: string[] = [];
+      if (groups.includes("brandIdentity") && !seededBrandRef.current) unseeded.push("brand identity");
+      if (groups.includes("creatorRequirement") && !seededCreatorRef.current) {
+        unseeded.push("creator requirement");
+      }
+      if (groups.includes("negotiationPolicy") && !seededPolicyRef.current) {
+        unseeded.push("negotiation policy");
+      }
+      if (unseeded.length > 0) {
+        throw new Error(`${unseeded.join(", ")} hasn't finished loading yet — retry once it loads`);
+      }
+
       // PATCH only the dirty groups. Run them in sequence — the set is tiny (≤3)
       // and it keeps error attribution simple.
       if (groups.includes("campaign")) {

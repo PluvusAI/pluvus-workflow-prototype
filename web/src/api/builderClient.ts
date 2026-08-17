@@ -259,11 +259,24 @@ export function deleteCampaign(id: string): Promise<void> {
 // PLU-139 (2a): BrandIdentity + CreatorRequirement sections. Each has its own
 // GET + draft-only PATCH sub-endpoint (409 once the campaign is ACTIVE). GET is a
 // hook (react-query) like useCampaign; the PATCH is a plain one-shot mutation.
+// A 404 (no row yet, a fresh draft) is resolved to `{}` inside the queryFn — the
+// same "empty means no row" contract useNegotiationPolicy uses — so `isError`
+// is reserved for a GENUINE read failure (5xx, network) that the intake must
+// NOT treat as "confirmed empty" (CampaignIntake.tsx's seeding effects key off
+// this: they only seed, and only mark the group seeded, on a real success).
 export function useBrandIdentity(id: string | null) {
   return useQuery({
     queryKey: ["campaign", id, "brand-identity"],
-    queryFn: () => apiFetch<BrandIdentityFields>(`/api/campaigns/${id}/brand-identity`),
+    queryFn: async (): Promise<Partial<BrandIdentityFields>> => {
+      try {
+        return await apiFetch<BrandIdentityFields>(`/api/campaigns/${id}/brand-identity`);
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("404")) return {};
+        throw err;
+      }
+    },
     enabled: !!id,
+    retry: false,
   });
 }
 
@@ -278,9 +291,16 @@ export function updateBrandIdentity(id: string, data: BrandIdentityInput) {
 export function useCreatorRequirement(id: string | null) {
   return useQuery({
     queryKey: ["campaign", id, "creator-requirement"],
-    queryFn: () =>
-      apiFetch<CreatorRequirementFields>(`/api/campaigns/${id}/creator-requirement`),
+    queryFn: async (): Promise<Partial<CreatorRequirementFields>> => {
+      try {
+        return await apiFetch<CreatorRequirementFields>(`/api/campaigns/${id}/creator-requirement`);
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("404")) return {};
+        throw err;
+      }
+    },
     enabled: !!id,
+    retry: false,
   });
 }
 
