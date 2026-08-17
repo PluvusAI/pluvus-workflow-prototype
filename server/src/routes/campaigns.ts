@@ -45,6 +45,7 @@ import {
   expectedParserVersion,
 } from "../engine/executors/briefKnowledge.js";
 import { validateTargetUrl } from "../validation/targetUrl.js";
+import { validateInt4 } from "../validation/int4.js";
 import {
   validateCreateSendingSettings,
   validatePatchSendingSettings,
@@ -1036,6 +1037,40 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     return;
   }
 
+  // floorCents/ceilingCents/preferredFeeCents/maxRounds/giftValueFlexibilityCents
+  // back PostgreSQL `integer` (int4) columns: a value outside int4 range passes
+  // this route's `number`-typed destructure above but overflows at
+  // INSERT/UPDATE (SQLSTATE 22003), which the catch-all below would turn into
+  // a 500 instead of a 400. Same int4 guard as minFollowers on
+  // /:id/creator-requirement, generalized into validateInt4.
+  if (floorCents !== undefined && floorCents !== null && !validateInt4(floorCents, "floorCents", res)) {
+    return;
+  }
+  if (
+    ceilingCents !== undefined &&
+    ceilingCents !== null &&
+    !validateInt4(ceilingCents, "ceilingCents", res)
+  ) {
+    return;
+  }
+  if (
+    preferredFeeCents !== undefined &&
+    preferredFeeCents !== null &&
+    !validateInt4(preferredFeeCents, "preferredFeeCents", res)
+  ) {
+    return;
+  }
+  if (maxRounds !== undefined && maxRounds !== null && !validateInt4(maxRounds, "maxRounds", res)) {
+    return;
+  }
+  if (
+    giftValueFlexibilityCents !== undefined &&
+    giftValueFlexibilityCents !== null &&
+    !validateInt4(giftValueFlexibilityCents, "giftValueFlexibilityCents", res)
+  ) {
+    return;
+  }
+
   const patch: Parameters<typeof upsertNegotiationPolicy>[1] = {};
   if (floorCents !== undefined) patch.floorCents = floorCents;
   if (ceilingCents !== undefined) patch.ceilingCents = ceilingCents;
@@ -1187,7 +1222,9 @@ router.get("/:id/creator-requirement", async (req: Request, res: Response) => {
 // validated as string arrays at the trust boundary. PLU-139 (B): only the
 // worksheet-backed criteria remain — platforms (S3.1), geography (S3.10),
 // minFollowers (S3.11). niches/languages/audienceNotes/contentStyle/brandSafety
-// were legacy off-worksheet fields with no downstream reader; dropped.
+// were legacy off-worksheet fields with no downstream reader in intake; the
+// columns themselves stay (campaignBriefRender.ts still reads them), this
+// route just no longer writes them.
 router.patch("/:id/creator-requirement", async (req: Request, res: Response) => {
   const { platforms, geography, minFollowers } = req.body as {
     platforms?: unknown;
@@ -1211,19 +1248,10 @@ router.patch("/:id/creator-requirement", async (req: Request, res: Response) => 
     patch[key] = (value as string[] | null) as JsonValue | null;
   }
   if (minFollowers !== undefined) {
-    // Upper bound = PostgreSQL int4 max: the minFollowers column is `integer`,
-    // so a larger value overflows (SQLSTATE 22003) and the catch-all would 500
-    // instead of rejecting bad input. No real follower count approaches 2.1B.
-    if (
-      minFollowers !== null &&
-      (typeof minFollowers !== "number" ||
-        !Number.isInteger(minFollowers) ||
-        minFollowers < 0 ||
-        minFollowers > 2147483647)
-    ) {
-      res.status(400).json({ error: "minFollowers must be an integer between 0 and 2147483647" });
-      return;
-    }
+    // minFollowers is `integer` (int4). validateInt4's [0, 2147483647] range
+    // already encodes "can't be negative" (a follower count), so no separate
+    // business-rule check is needed on top of it.
+    if (minFollowers !== null && !validateInt4(minFollowers, "minFollowers", res)) return;
     patch.minFollowers = minFollowers;
   }
 

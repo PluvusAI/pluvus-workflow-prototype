@@ -101,8 +101,10 @@ async function main(): Promise<void> {
       id,
       {
         platforms: ["youtube", "instagram"],
+        niches: ["fitness"],
         geography: ["US", "CA"],
         minFollowers: 10000,
+        audienceNotes: "18-34, US-based",
       },
       pgdb,
     );
@@ -110,15 +112,20 @@ async function main(): Promise<void> {
     assert.deepEqual(r.geography, ["US", "CA"]);
     assert.equal(r.minFollowers, 10000);
     const round = await getCreatorRequirement(id, pgdb);
+    assert.equal(round?.audienceNotes, "18-34, US-based");
+    assert.deepEqual(round?.niches, ["fitness"]);
     assert.deepEqual(round?.platforms, ["youtube", "instagram"]);
     assert.deepEqual(round?.geography, ["US", "CA"]);
   });
 
   await test("getCreatorRequirementsByCampaignIds batches", async () => {
     const a = await seedCampaign(pgdb);
-    await upsertCreatorRequirement(a, { minFollowers: 25000 }, pgdb);
+    await upsertCreatorRequirement(a, { contentStyle: "UGC" }, pgdb);
     const map = await getCreatorRequirementsByCampaignIds([a], pgdb);
-    assert.equal(map.get(a)?.minFollowers, 25000);
+    assert.equal(map.get(a)?.contentStyle, "UGC");
+    await upsertCreatorRequirement(a, { minFollowers: 25000 }, pgdb);
+    const map2 = await getCreatorRequirementsByCampaignIds([a], pgdb);
+    assert.equal(map2.get(a)?.minFollowers, 25000);
   });
 
   // ── Draft-only lock (reused guard) ────────────────────────────────────────────
