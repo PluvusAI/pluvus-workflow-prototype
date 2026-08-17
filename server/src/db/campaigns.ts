@@ -312,6 +312,47 @@ export function validateCompensationReadiness(
 }
 
 /**
+ * PLU-140 (2b): the read-only readiness projection GET /campaigns/:id/readiness
+ * returns. Deliberately mirrors launchCampaign()'s preconditions EXACTLY, in the
+ * same order and with the same semantics, so the review page can never report
+ * `ready: true` while POST /launch would 409/422:
+ *   - CampaignDetails row must exist   (launch → CampaignDetailsMissingError, 422)
+ *   - NegotiationPolicy row must exist (launch → NegotiationPolicyMissingError, 422)
+ *   - compensationReviewStatus CONFIRMED (launch → CompensationReviewPendingError, 409)
+ *   - validateCompensationReadiness empty (launch → CompensationIncompleteError, 422)
+ * Missing rows / unconfirmed review surface as BLOCKERS here rather than throwing
+ * — the whole point is to show them up front. Pure: no DB, no throw. `ready` is
+ * exactly "POST /launch would succeed".
+ */
+export interface CampaignReadiness {
+  ready: boolean;
+  blockers: string[];
+  reviewConfirmed: boolean;
+  hasPolicy: boolean;
+  hasDetails: boolean;
+}
+
+export function computeReadiness(
+  details: CampaignDetails | null,
+  policy: NegotiationPolicy | null,
+): CampaignReadiness {
+  const hasDetails = details != null;
+  const hasPolicy = policy != null;
+  const reviewConfirmed = details?.compensationReviewStatus === "CONFIRMED";
+
+  const blockers: string[] = [];
+  if (!hasDetails) blockers.push("CampaignDetails row is missing");
+  if (!hasPolicy) blockers.push("NegotiationPolicy is missing");
+  if (!reviewConfirmed) blockers.push("Compensation review is not confirmed");
+  // Field-completeness only makes sense once both rows exist.
+  if (hasDetails && hasPolicy) {
+    blockers.push(...validateCompensationReadiness(details, policy));
+  }
+
+  return { ready: blockers.length === 0, blockers, reviewConfirmed, hasPolicy, hasDetails };
+}
+
+/**
  * PLU-135 (1a): THE launch transition — Draft → Active. Creates the ONE
  * immutable CampaignTermsSnapshot and NegotiationPolicySnapshot this campaign
  * will ever have (Calvin review, 2026-08-08: never at enrollment, which could

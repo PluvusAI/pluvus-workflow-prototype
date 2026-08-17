@@ -111,7 +111,14 @@ export default function App() {
             <CampaignList onSelectWorkflow={openWorkflow} onOpenIntake={openIntake} />
           )}
           {view === "intake" && activeCampaignId && (
+            // Keyed by campaignId: navigating directly between two campaigns'
+            // intake (e.g. Duplicate's onOpenCampaign while already here) only
+            // changes this prop, not the JSX position — without a key, React
+            // reuses the same instance and every draft/seed/dirty/timer ref
+            // (all mount-lifetime state) would carry over from the old
+            // campaign into the new one. The key forces a full remount instead.
             <CampaignIntake
+              key={activeCampaignId}
               campaignId={activeCampaignId}
               onBack={backToCampaigns}
               onOpenCampaign={openIntake}

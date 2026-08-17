@@ -39,6 +39,10 @@ import type {
   BrandIdentityInput,
   CreatorRequirementFields,
   CreatorRequirementInput,
+  NegotiationPolicyFields,
+  NegotiationPolicyInput,
+  CampaignReadiness,
+  LaunchResult,
   BriefExtractionFields,
   DeliverableQuantity,
   DeliverablePricing,
@@ -255,11 +259,24 @@ export function deleteCampaign(id: string): Promise<void> {
 // PLU-139 (2a): BrandIdentity + CreatorRequirement sections. Each has its own
 // GET + draft-only PATCH sub-endpoint (409 once the campaign is ACTIVE). GET is a
 // hook (react-query) like useCampaign; the PATCH is a plain one-shot mutation.
+// A 404 (no row yet, a fresh draft) is resolved to `{}` inside the queryFn — the
+// same "empty means no row" contract useNegotiationPolicy uses — so `isError`
+// is reserved for a GENUINE read failure (5xx, network) that the intake must
+// NOT treat as "confirmed empty" (CampaignIntake.tsx's seeding effects key off
+// this: they only seed, and only mark the group seeded, on a real success).
 export function useBrandIdentity(id: string | null) {
   return useQuery({
     queryKey: ["campaign", id, "brand-identity"],
-    queryFn: () => apiFetch<BrandIdentityFields>(`/api/campaigns/${id}/brand-identity`),
+    queryFn: async (): Promise<Partial<BrandIdentityFields>> => {
+      try {
+        return await apiFetch<BrandIdentityFields>(`/api/campaigns/${id}/brand-identity`);
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("404")) return {};
+        throw err;
+      }
+    },
     enabled: !!id,
+    retry: false,
   });
 }
 
@@ -274,9 +291,16 @@ export function updateBrandIdentity(id: string, data: BrandIdentityInput) {
 export function useCreatorRequirement(id: string | null) {
   return useQuery({
     queryKey: ["campaign", id, "creator-requirement"],
-    queryFn: () =>
-      apiFetch<CreatorRequirementFields>(`/api/campaigns/${id}/creator-requirement`),
+    queryFn: async (): Promise<Partial<CreatorRequirementFields>> => {
+      try {
+        return await apiFetch<CreatorRequirementFields>(`/api/campaigns/${id}/creator-requirement`);
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("404")) return {};
+        throw err;
+      }
+    },
     enabled: !!id,
+    retry: false,
   });
 }
 
@@ -309,6 +333,86 @@ export function createBriefExtraction(id: string, sourceFileReference: string) {
   return postJson<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`, {
     sourceFileReference,
   });
+}
+
+// ---------------------------------------------------------------------------
+// PLU-140 (2b): NegotiationPolicy + readiness + launch.
+// ---------------------------------------------------------------------------
+
+/** The one private policy per Draft campaign. A 404 means "no policy row yet"
+ *  — a normal empty state for a fresh draft, not an error — so it resolves to
+ *  an empty partial shape (same intent as useBriefExtraction's 404 handling),
+ *  which the intake fills in as the brand edits and the PATCH upserts. */
+export function useNegotiationPolicy(id: string | null) {
+  return useQuery({
+    queryKey: ["campaign", id, "negotiation-policy"],
+    queryFn: async (): Promise<Partial<NegotiationPolicyFields>> => {
+      try {
+        return await apiFetch<NegotiationPolicyFields>(
+          `/api/campaigns/${id}/negotiation-policy`,
+        );
+      } catch (err) {
+        if (err instanceof Error && err.message.startsWith("404")) return {};
+        throw err;
+      }
+    },
+    enabled: !!id,
+    retry: false,
+  });
+}
+
+export function updateNegotiationPolicy(id: string, data: NegotiationPolicyInput) {
+  return apiFetch<NegotiationPolicyFields>(`/api/campaigns/${id}/negotiation-policy`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+/** Pre-launch readiness — the same blockers POST /launch would raise, shown up
+ *  front on the review page. Polls nothing; refetched on demand after edits. */
+export function useReadiness(id: string | null) {
+  return useQuery({
+    queryKey: ["campaign", id, "readiness"],
+    queryFn: () => apiFetch<CampaignReadiness>(`/api/campaigns/${id}/readiness`),
+    enabled: !!id,
+  });
+}
+
+/** A launch that failed a precondition. `missing` is present on a 422
+ *  CompensationIncompleteError; `status` distinguishes 409 (needs confirm) from
+ *  422 (incomplete) so the UI can message each precisely. */
+export class LaunchError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly missing?: string[],
+  ) {
+    super(message);
+    this.name = "LaunchError";
+  }
+}
+
+/** POST /launch — the authoritative DRAFT→ACTIVE transition. On non-2xx, parse
+ *  {error, missing?} and throw a LaunchError carrying status + missing. */
+export async function launchCampaign(id: string): Promise<LaunchResult> {
+  const res = await fetch(
+    `/api/campaigns/${id}/launch`,
+    withOperatorKey({ method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }),
+  );
+  if (!res.ok) {
+    let error = `${res.status} ${res.statusText}`;
+    let missing: string[] | undefined;
+    try {
+      const j = (await res.json()) as { error?: string; missing?: string[] };
+      if (j.error) error = j.error;
+      if (Array.isArray(j.missing)) missing = j.missing;
+    } catch {
+      /* ignore non-JSON body */
+    }
+    throw new LaunchError(error, res.status, missing);
+  }
+  return res.json() as Promise<LaunchResult>;
 }
 
 // ---------------------------------------------------------------------------

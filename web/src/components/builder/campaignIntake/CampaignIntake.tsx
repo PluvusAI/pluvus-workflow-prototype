@@ -23,10 +23,12 @@ import {
   useCampaign,
   useBrandIdentity,
   useCreatorRequirement,
+  useNegotiationPolicy,
   useBriefExtraction,
   updateCampaign,
   updateBrandIdentity,
   updateCreatorRequirement,
+  updateNegotiationPolicy,
   duplicateCampaign,
   createBriefExtraction,
   uploadFile,
@@ -36,6 +38,8 @@ import type {
   BriefExtractionFields,
   CampaignType,
   CreatorRequirementInput,
+  NegotiationPolicyInput,
+  NegotiationCategory,
   DeliverableQuantity,
   DeliverablePricing,
   FollowerRanges,
@@ -66,11 +70,15 @@ import {
   needsFee,
   needsCommission,
   showsGiftDetails,
+  showsShippingInfo,
+  showsFeeOrCommission,
   showsInstagramCollab,
   isGiftOnly,
   candidateFieldFor,
+  clearedPolicyFieldKeys,
   BOOL_RADIO_KEYS,
   DELIVERABLE_CARDS,
+  NEGOTIATION_CATEGORY_OPTIONS,
   type CompensationShape,
   type FieldGroup,
   type FieldSpec,
@@ -79,6 +87,7 @@ import {
   type SelectOption,
 } from "./sections";
 import { COUNTRIES, countryLabel } from "./countries";
+import { LaunchReview } from "./LaunchReview";
 
 interface Props {
   campaignId: string;
@@ -103,12 +112,16 @@ function centsToDollars(v: number | null | undefined): string {
 
 export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const toast = useToast();
+  const qc = useQueryClient();
   const campaignQ = useCampaign(campaignId);
   // These two sub-endpoints 404 when no row exists yet (a fresh draft). That 404
   // is NOT an error for us — it just means "empty group"; PATCH upserts. So we
   // read `.data` and never surface these queries' error state.
   const brandQ = useBrandIdentity(campaignId);
   const creatorQ = useCreatorRequirement(campaignId);
+  // PLU-140: the private policy (same 404-means-empty contract, handled inside
+  // the hook so `.data` is an empty {} for a fresh draft rather than an error).
+  const policyQ = useNegotiationPolicy(campaignId);
 
   const [activeSection, setActiveSection] = useState<SectionKey>("startSources");
   // Keys of required fields the user tried to skip via "Save & continue" while
@@ -121,7 +134,20 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const [campaignDraft, setCampaignDraft] = useState<Draft>({});
   const [brandDraft, setBrandDraft] = useState<Draft>({});
   const [creatorDraft, setCreatorDraft] = useState<Draft>({});
-  const seededRef = useRef(false);
+  const [policyDraft, setPolicyDraft] = useState<Draft>({});
+  // Seeded independently PER GROUP (not one shared flag) — each subgroup query
+  // settles on its own schedule. A shared flag would seed brand/creator/policy
+  // from whatever `.data` happened to be in hand the moment campaignQ.data
+  // first resolved: if a subgroup's own fetch was still in flight at that
+  // instant, it would be seeded empty and then NEVER re-seeded when its real
+  // data arrived a moment later (the guard would already be tripped). The next
+  // edit to any field in that subgroup would then autosave the empty-derived
+  // draft for every OTHER field in the group — silently clearing whatever was
+  // actually persisted there.
+  const seededCampaignRef = useRef(false);
+  const seededBrandRef = useRef(false);
+  const seededCreatorRef = useRef(false);
+  const seededPolicyRef = useRef(false);
 
   // Per-group save status. Errors persist (never auto-cleared) until a retry
   // succeeds, so the "not saved" affordance stays put.
@@ -147,16 +173,23 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // newer edit.
   const savingInFlightRef = useRef(false);
   const rerunSaveRef = useRef(false);
+  // PLU-140 (Greptile P1): the Page-9 approve schedules a CONFIRMED draft update
+  // then flushes synchronously — but the flush runs the current render's save
+  // closure BEFORE React commits the draft, so buildCampaignPayload would read
+  // the stale NEEDS_REVIEW and the campaign group would clear dirty with the
+  // wrong value written (no follow-up PATCH → activation stays blocked). This
+  // one-shot ref carries the approved value into that immediate PATCH; the build
+  // prefers it over the not-yet-committed draft and consumes it.
+  const pendingReviewStatusRef = useRef<"NEEDS_REVIEW" | "CONFIRMED" | null>(null);
 
   const [duplicating, setDuplicating] = useState(false);
 
   const status = campaignQ.data?.status ?? "DRAFT";
   const readOnly = status !== "DRAFT";
 
-  // Seed drafts once the three loads settle (campaign is required; the two
-  // sub-groups may legitimately be absent → empty).
+  // Seed the campaign draft once its (required) query resolves.
   useEffect(() => {
-    if (seededRef.current || !campaignQ.data) return;
+    if (seededCampaignRef.current || !campaignQ.data) return;
     const c = campaignQ.data;
     setCampaignDraft({
       // A freshly-created draft holds the NOT-NULL placeholders — show page 1
@@ -224,6 +257,23 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       trackingDestinationUrl: c.trackingDestinationUrl ?? "",
       trackingParameter: c.trackingParameter ?? "",
     });
+    seededCampaignRef.current = true;
+  }, [campaignQ.data]);
+
+  // Seed the brand-identity draft once ITS OWN query SUCCEEDS — not merely once
+  // it settles. useBrandIdentity resolves a 404 (no row yet) to `{}` inside its
+  // own queryFn, so `isError` here means a GENUINE read failure (5xx, network),
+  // not "no row." On a genuine failure we must NOT seed an empty draft: `b`
+  // would be undefined for the same reason it's undefined while loading, but
+  // here real persisted values may exist server-side that we simply failed to
+  // read — seeding "" for them and letting an edit autosave would PATCH those
+  // fields to null, silently wiping data that was never actually empty. Stay
+  // unseeded (seededBrandRef.current stays false) so a later successful
+  // read/retry seeds correctly instead; doSave separately refuses to save an
+  // unseeded group at all (see below), so no edit can slip through as a
+  // destructive save while this is still unresolved.
+  useEffect(() => {
+    if (seededBrandRef.current || brandQ.isLoading || brandQ.isError) return;
     const b = brandQ.data;
     setBrandDraft({
       logoRef: b?.logoRef ?? "",
@@ -231,6 +281,13 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       secondaryColor: b?.secondaryColor ?? "",
       typography: b?.typography ?? "",
     });
+    seededBrandRef.current = true;
+  }, [brandQ.data, brandQ.isLoading, brandQ.isError]);
+
+  // Seed the creator-requirement draft once ITS OWN query SUCCEEDS (same
+  // genuine-failure-vs-absent-row reasoning as brand, above).
+  useEffect(() => {
+    if (seededCreatorRef.current || creatorQ.isLoading || creatorQ.isError) return;
     const cr = creatorQ.data;
     // platforms is derived from the deliverable cards, not seeded/edited here.
     // geography is a string[] of ISO codes (the country picker works on the
@@ -239,10 +296,39 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       geography: Array.isArray(cr?.geography) ? cr.geography : [],
       minFollowers: cr?.minFollowers != null ? String(cr.minFollowers) : "",
     });
-    // Only mark seeded once campaign loaded; the two sub-queries settling later
-    // is fine — a fresh draft has no rows and stays empty (matches the API).
-    seededRef.current = true;
-  }, [campaignQ.data, brandQ.data, creatorQ.data]);
+    seededCreatorRef.current = true;
+  }, [creatorQ.data, creatorQ.isLoading, creatorQ.isError]);
+
+  // Seed the private-policy draft once ITS OWN query settles. useNegotiationPolicy
+  // converts a 404 into a resolved `{}` inside its queryFn (not an error
+  // state) — but a genuine failure (5xx, network) still rethrows and lands the
+  // query in isError, so that split still matters here too (same reasoning as
+  // brand/creator above: never seed an empty draft from a failed read). Money
+  // columns show in dollars (cents→dollars); commission rates are the same
+  // percentage scale as publicCommissionRate (no /100). A null column seeds ""
+  // so the control renders empty, not "null".
+  useEffect(() => {
+    if (seededPolicyRef.current || policyQ.isLoading || policyQ.isError) return;
+    const pol = policyQ.data;
+    setPolicyDraft({
+      ceilingCents: centsToDollars(pol?.ceilingCents),
+      preferredFeeCents: centsToDollars(pol?.preferredFeeCents),
+      floorCents: centsToDollars(pol?.floorCents),
+      commissionCeilingRate: pol?.commissionCeilingRate != null ? String(pol.commissionCeilingRate) : "",
+      preferredCommissionRate:
+        pol?.preferredCommissionRate != null ? String(pol.preferredCommissionRate) : "",
+      commissionFloorRate: pol?.commissionFloorRate != null ? String(pol.commissionFloorRate) : "",
+      // Toggle: null (never set) stays null so a required gift toggle reads as
+      // unanswered; a real true/false passes through.
+      giftSubstitutionAllowed: pol?.giftSubstitutionAllowed ?? null,
+      giftValueFlexibilityCents: centsToDollars(pol?.giftValueFlexibilityCents),
+      maxRounds: pol?.maxRounds != null ? String(pol.maxRounds) : "",
+      overCeilingTolerance: pol?.overCeilingTolerance != null ? String(pol.overCeilingTolerance) : "",
+      nonNegotiableTerms: Array.isArray(pol?.nonNegotiableTerms) ? pol.nonNegotiableTerms : [],
+      negotiationGuidance: pol?.negotiationGuidance ?? "",
+    });
+    seededPolicyRef.current = true;
+  }, [policyQ.data, policyQ.isLoading, policyQ.isError]);
 
   const comp: CompensationShape = useMemo(
     () => ({
@@ -261,6 +347,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
             ),
           ]
         : [],
+      // S7.G6 → drives the S7.G7 shipping-info conditional.
+      shipsPhysicalProduct: Boolean(campaignDraft.shipsPhysicalProduct),
     }),
     [
       campaignDraft.campaignType,
@@ -268,6 +356,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       campaignDraft.priceStrategy,
       campaignDraft.giftDeliveryMethod,
       campaignDraft.deliverableQuantities,
+      campaignDraft.shipsPhysicalProduct,
     ],
   );
 
@@ -280,6 +369,10 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // wipes stale terms on the server (the backend owns truth).
   const buildCampaignPayload = useCallback((): Parameters<typeof updateCampaign>[1] => {
     const d = campaignDraft;
+    // Greptile P1: prefer the one-shot approve override over the draft (which
+    // may not have committed the CONFIRMED update yet when a flush fires this
+    // build synchronously). Absent both → we don't touch the persisted status.
+    const reviewStatus = pendingReviewStatusRef.current ?? campaignDraft.compensationReviewStatus;
     // name/brand are editable in the Start section (PLU-139) and PATCH through
     // like any other field. Both are launch-hard, so only send a non-blank
     // value — never overwrite a saved name/brand with an empty string.
@@ -327,7 +420,16 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       // Compensation shape is always sent — it's the switch itself.
       campaignType: comp.campaignType,
       includesGifting: !isGiftOnly(comp.campaignType) ? comp.includesGifting : true,
-      compensationReviewStatus: "CONFIRMED",
+      // PLU-140 (Defect 1): do NOT force-confirm on every autosave. CONFIRMED is
+      // written ONLY by the Page-9 approve (§S4). The draft carries an explicit
+      // compensationReviewStatus ONLY when the shell set one — a Page-9 approve
+      // (→CONFIRMED) or a material edit after approval (→NEEDS_REVIEW, set in
+      // setField). Absent → we don't touch the persisted status at all. Reads
+      // `reviewStatus` (the ref-preferring value), not the draft directly — see
+      // its declaration above (Greptile P1).
+      ...(reviewStatus
+        ? { compensationReviewStatus: reviewStatus as "NEEDS_REVIEW" | "CONFIRMED" }
+        : {}),
     };
 
     // Fee/strategy — only when the structure needs a fee.
@@ -381,7 +483,9 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       p.giftDisposition = isGiftOnly(comp.campaignType)
         ? "KEEP"
         : ((d.giftDisposition as GiftDisposition) || null);
-      p.requiresShippingInfo = Boolean(d.requiresShippingInfo);
+      // S7.G7 shows only for a physical product (S7.G6=Yes); when it's hidden,
+      // clear it so a stale "require shipping" can't outlive switching to digital.
+      p.requiresShippingInfo = showsShippingInfo(comp) ? Boolean(d.requiresShippingInfo) : false;
       const method = String(d.giftDeliveryMethod ?? "");
       p.giftDeliveryMethod = method || null;
       // Only the chosen path's field is sent; the other is cleared.
@@ -425,6 +529,42 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     };
   }, [creatorDraft, campaignDraft.deliverableQuantities]);
 
+  // PLU-140: build the PRIVATE policy PATCH. Same inline-clear discipline as
+  // buildCampaignPayload — launchCampaign snapshots whatever columns the policy
+  // row holds, so any field hidden by the current structure is sent NULL, never
+  // left stale (a fee ceiling on an affiliate campaign would freeze into the
+  // NegotiationPolicySnapshot). Money dollars→cents; commission rates pass
+  // through as the same percentage scale as publicCommissionRate.
+  const buildPolicyPayload = useCallback((): NegotiationPolicyInput => {
+    const d = policyDraft;
+    const hidden = new Set(clearedPolicyFieldKeys(comp));
+    const money = (k: string) => (hidden.has(k) ? null : dollarsToCents(d[k]));
+    const num = (k: string) => (hidden.has(k) ? null : numOrNull(d[k]));
+    const terms = Array.isArray(d.nonNegotiableTerms)
+      ? (d.nonNegotiableTerms as NegotiationCategory[])
+      : [];
+    return {
+      ceilingCents: money("ceilingCents"),
+      preferredFeeCents: money("preferredFeeCents"),
+      floorCents: money("floorCents"),
+      commissionCeilingRate: num("commissionCeilingRate"),
+      preferredCommissionRate: num("preferredCommissionRate"),
+      commissionFloorRate: num("commissionFloorRate"),
+      // Toggle: null when hidden or unanswered, else the boolean choice.
+      giftSubstitutionAllowed: hidden.has("giftSubstitutionAllowed")
+        ? null
+        : typeof d.giftSubstitutionAllowed === "boolean"
+          ? d.giftSubstitutionAllowed
+          : null,
+      giftValueFlexibilityCents: money("giftValueFlexibilityCents"),
+      maxRounds: numOrNull(d.maxRounds), // always visible
+      overCeilingTolerance: num("overCeilingTolerance"),
+      // Always-visible fields — never cleared by a structure switch.
+      nonNegotiableTerms: terms.length > 0 ? terms : null,
+      negotiationGuidance: strOrNull(d.negotiationGuidance),
+    };
+  }, [policyDraft, comp]);
+
   const doSave = useCallback(async () => {
     // Serialize: if a save is already running, don't start a second concurrent
     // PATCH for the same group (a network reorder could land the older payload
@@ -445,13 +585,43 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     setSaveError(null);
     let succeeded = false;
     try {
+      // Refuse to PATCH a group before its own initial read has actually
+      // succeeded (see the seeding effects above). A dirty-but-unseeded group
+      // means its draft never received the group's real persisted values —
+      // sending it now would PATCH every OTHER field in that group as
+      // empty/null, silently wiping data we simply haven't read yet (rather
+      // than data that's genuinely absent). Fail this round the same way a
+      // network error would: the dirty set stays intact, the existing
+      // "Couldn't save · Retry" affordance shows, and no auto-refire spins —
+      // a manual retry (or the read finally succeeding) tries again.
+      const unseeded: string[] = [];
+      if (groups.includes("brandIdentity") && !seededBrandRef.current) unseeded.push("brand identity");
+      if (groups.includes("creatorRequirement") && !seededCreatorRef.current) {
+        unseeded.push("creator requirement");
+      }
+      if (groups.includes("negotiationPolicy") && !seededPolicyRef.current) {
+        unseeded.push("negotiation policy");
+      }
+      if (unseeded.length > 0) {
+        throw new Error(`${unseeded.join(", ")} hasn't finished loading yet — retry once it loads`);
+      }
+
       // PATCH only the dirty groups. Run them in sequence — the set is tiny (≤3)
       // and it keeps error attribution simple.
-      if (groups.includes("campaign")) await updateCampaign(campaignId, buildCampaignPayload());
+      if (groups.includes("campaign")) {
+        await updateCampaign(campaignId, buildCampaignPayload());
+        // The approved review status is now persisted — consume the one-shot
+        // override. On a PATCH failure we skip this (throw jumps to catch), so a
+        // retry still carries it. By the time a follow-up PATCH runs, the draft
+        // has committed CONFIRMED, so the ref is no longer needed.
+        pendingReviewStatusRef.current = null;
+      }
       if (groups.includes("brandIdentity"))
         await updateBrandIdentity(campaignId, buildBrandPayload());
       if (groups.includes("creatorRequirement"))
         await updateCreatorRequirement(campaignId, buildCreatorPayload());
+      if (groups.includes("negotiationPolicy"))
+        await updateNegotiationPolicy(campaignId, buildPolicyPayload());
       // Clear a group only if it wasn't re-edited since the snapshot (same
       // version). A re-edit during the in-flight PATCH bumped the version, so it
       // stays dirty and its queued debounce still fires the follow-up PATCH.
@@ -485,6 +655,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     buildCampaignPayload,
     buildBrandPayload,
     buildCreatorPayload,
+    buildPolicyPayload,
     toast,
   ]);
 
@@ -534,15 +705,38 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       if (group === "campaign" && key === "deliverableQuantities") {
         markDirty("creatorRequirement");
       }
-      const setter =
+      // PLU-140 (Defect 1): a material edit to a public (campaign) or private
+      // (policy) term after the brand approved on Page 9 must re-open review.
+      // The single persisted flag lives on the campaign, so downgrade it there
+      // and mark the campaign group dirty so its PATCH carries the reset — even
+      // when the edit itself was to a policy field (a different endpoint).
+      // Skip the review-status key itself and provenance bookkeeping. Only acts
+      // when currently CONFIRMED, so ordinary drafting never spams the PATCH.
+      const materialGroup = group === "campaign" || group === "negotiationPolicy";
+      const isReviewKey = key === "compensationReviewStatus" || key === "fieldProvenance";
+      if (
+        materialGroup &&
+        !isReviewKey &&
+        campaignQ.data?.compensationReviewStatus === "CONFIRMED" &&
+        campaignDraft.compensationReviewStatus !== "NEEDS_REVIEW"
+      ) {
+        markDirty("campaign");
+        setCampaignDraft((prev) => ({ ...prev, compensationReviewStatus: "NEEDS_REVIEW" }));
+      }
+      // Explicit per-group setter — a nested-ternary fallthrough would silently
+      // route negotiationPolicy edits into the creator draft (never saved).
+      const setter: React.Dispatch<React.SetStateAction<Draft>> =
         group === "campaign"
           ? setCampaignDraft
           : group === "brandIdentity"
             ? setBrandDraft
-            : setCreatorDraft;
+            : group === "creatorRequirement"
+              ? setCreatorDraft
+              : setPolicyDraft;
       // PLU-139 provenance: record how each campaign-group value got here. A
       // normal edit is "manual"; applying a brief candidate passes "pdf_extracted"
-      // (see BriefImport onApply). Skip the provenance map key itself.
+      // (see BriefImport onApply). Skip the provenance map key itself. Policy is
+      // private and never provenance-tracked.
       if (group === "campaign" && key !== "fieldProvenance") {
         setCampaignDraft((prev) => ({
           ...prev,
@@ -555,7 +749,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       setter((prev) => ({ ...prev, [key]: value }));
       scheduleSave();
     },
-    [scheduleSave],
+    [scheduleSave, campaignQ.data, campaignDraft.compensationReviewStatus],
   );
 
   // Duplicate → clone on the server, open the new draft's intake.
@@ -590,8 +784,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
 
   // Read a field's raw draft value by its group (for required-field validation).
   const readFieldValue = useCallback(
-    (f: FieldSpec): unknown => draftValue(f, campaignDraft, brandDraft, creatorDraft),
-    [campaignDraft, brandDraft, creatorDraft],
+    (f: FieldSpec): unknown => draftValue(f, campaignDraft, brandDraft, creatorDraft, policyDraft),
+    [campaignDraft, brandDraft, creatorDraft, policyDraft],
   );
 
   // Leaving the section (Back, or a rail jump) drops any pending validation
@@ -764,54 +958,108 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
               </div>
             )}
 
-            <Card variant="flat" padding={22} style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-              {visibleFields(section, comp).map((f) => (
-                <FieldRenderer
-                  key={`${f.group}:${f.key}`}
-                  field={f}
-                  value={draftValue(f, campaignDraft, brandDraft, creatorDraft)}
-                  onChange={(v) => {
-                    setField(f.group, f.key, v);
-                    // Clear this field's error as soon as the user starts fixing it.
-                    if (errorKeys.has(f.key)) {
-                      setErrorKeys((prev) => {
-                        const nextSet = new Set(prev);
-                        nextSet.delete(f.key);
-                        return nextSet;
-                      });
-                    }
-                  }}
-                  disabled={readOnly}
-                  invalid={
-                    (f.key === "name" && nameMissing) ||
-                    (f.key === "brand" && brandMissing) ||
-                    errorKeys.has(f.key)
-                  }
-                  error={errorKeys.has(f.key) ? "This field is required." /* COPY:PLU-159 */ : undefined}
-                  extra={{
-                    deliverableQuantities: Array.isArray(campaignDraft.deliverableQuantities)
-                      ? (campaignDraft.deliverableQuantities as DeliverableQuantity[])
-                      : [],
-                    trackingPreview: trackingPreview,
-                    pricing: (campaignDraft.deliverablePricing as DeliverablePricing) ?? {},
-                    ranges: (campaignDraft.followerRanges as FollowerRanges) ?? {},
-                    commissionMode: String(campaignDraft.commissionMode ?? "percent"),
-                  }}
-                  onExtraChange={(k, v) => setField("campaign", k, v)}
-                />
-              ))}
-            </Card>
-
-            {/* Footer: Back / Save & continue */}
-            <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 22 }}>
-              <SectionStepper
-                active={activeSection}
-                onBack={leaveSection}
-                onContinue={validateAndAdvance}
-                onSave={flushSave}
+            {/* PLU-140: the Review & Activate marker section has no editable
+                fields — it's rendered by <LaunchReview>, which owns its own
+                panels, checkboxes, and Activate action (and its own frozen
+                post-launch view). The field-list card + stepper below are for
+                the ordinary field sections only, so they're skipped here to
+                avoid the stepper's advance-validation/flush over an empty
+                section (Defect 5). */}
+            {activeSection === "reviewActivate" ? (
+              <LaunchReview
+                campaignId={campaignId}
+                campaign={campaignQ.data}
                 readOnly={readOnly}
+                onEditSection={leaveSection}
+                onConfirmReview={(confirmed) => {
+                  // Approving here only ever writes compensationReviewStatus —
+                  // it never launches the campaign (LaunchReview.tsx no longer
+                  // calls POST /launch), so there's no ACTIVE flip to re-read
+                  // for.
+                  setField(
+                    "campaign",
+                    "compensationReviewStatus",
+                    confirmed ? "CONFIRMED" : "NEEDS_REVIEW",
+                  );
+                  flushSave();
+                }}
+                onDuplicate={() => void handleDuplicate()}
+                duplicating={duplicating}
               />
-            </div>
+            ) : (
+              <>
+                <Card variant="flat" padding={22} style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+                  {visibleFields(section, comp).map((f, i, arr) => {
+                    // PLU-140: render a subtle internal divider before the first
+                    // uiOnly (disabled, unwired) field so the live vs deferred
+                    // controls are easy to tell apart. Internal-only — not a
+                    // user-facing "coming soon" (see FieldSpec.uiOnly).
+                    const firstUiOnly = f.uiOnly && !arr[i - 1]?.uiOnly;
+                    return (
+                      <div key={`${f.group}:${f.key}`} style={{ display: "contents" }}>
+                        {firstUiOnly && (
+                          <div
+                            style={{
+                              marginTop: 6,
+                              paddingTop: 14,
+                              borderTop: `1px dashed ${colors.border}`,
+                              ...text.label,
+                              color: colors.textDim,
+                            }}
+                          >
+                            Deferred — UI only, not yet wired {/* internal marker; needs DB + snapshot + engine (PLU-140 follow-ups) */}
+                          </div>
+                        )}
+                        <FieldRenderer
+                          field={f}
+                          value={draftValue(f, campaignDraft, brandDraft, creatorDraft, policyDraft)}
+                          onChange={(v) => {
+                            setField(f.group, f.key, v);
+                            // Clear this field's error as soon as the user starts fixing it.
+                            if (errorKeys.has(f.key)) {
+                              setErrorKeys((prev) => {
+                                const nextSet = new Set(prev);
+                                nextSet.delete(f.key);
+                                return nextSet;
+                              });
+                            }
+                          }}
+                          disabled={readOnly}
+                          invalid={
+                            (f.key === "name" && nameMissing) ||
+                            (f.key === "brand" && brandMissing) ||
+                            errorKeys.has(f.key)
+                          }
+                          error={errorKeys.has(f.key) ? "This field is required." /* COPY:PLU-159 */ : undefined}
+                          extra={{
+                            deliverableQuantities: Array.isArray(campaignDraft.deliverableQuantities)
+                              ? (campaignDraft.deliverableQuantities as DeliverableQuantity[])
+                              : [],
+                            trackingPreview: trackingPreview,
+                            pricing: (campaignDraft.deliverablePricing as DeliverablePricing) ?? {},
+                            ranges: (campaignDraft.followerRanges as FollowerRanges) ?? {},
+                            commissionMode: String(campaignDraft.commissionMode ?? "percent"),
+                            categoryOptions: NEGOTIATION_CATEGORY_OPTIONS,
+                          }}
+                          onExtraChange={(k, v) => setField("campaign", k, v)}
+                        />
+                      </div>
+                    );
+                  })}
+                </Card>
+
+                {/* Footer: Back / Save & continue */}
+                <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: 22 }}>
+                  <SectionStepper
+                    active={activeSection}
+                    onBack={leaveSection}
+                    onContinue={validateAndAdvance}
+                    onSave={flushSave}
+                    readOnly={readOnly}
+                  />
+                </div>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -985,6 +1233,8 @@ function FieldRenderer({
     pricing?: DeliverablePricing;
     ranges?: FollowerRanges;
     commissionMode?: string;
+    /** PLU-140: the fee/commission/gift options for the categoryChips control. */
+    categoryOptions?: { value: NegotiationCategory; label: string }[];
   };
   /** Write a sibling campaign field (for controls that own more than one column,
    *  e.g. the pricing grid writes both publicStartingFeeCents and the map). */
@@ -992,8 +1242,10 @@ function FieldRenderer({
 }) {
   const id = `intake-${field.group}-${field.key}`;
   // A field can be locked either by the lifecycle (whole form read-only when
-  // ACTIVE) or by being a create-only field (name/brand).
-  const isDisabled = disabled || !!field.readOnly;
+  // ACTIVE), by being a create-only field (name/brand), or by being a PLU-140
+  // uiOnly placeholder (disabled + unwired until its column/snapshot/engine
+  // exist — see FieldSpec.uiOnly).
+  const isDisabled = disabled || !!field.readOnly || !!field.uiOnly;
   const common = { id, disabled: isDisabled } as const;
   // exactOptionalPropertyTypes: pass `invalid` only when true.
   const invalidProps = invalid ? { invalid: true as const } : {};
@@ -1152,6 +1404,38 @@ function FieldRenderer({
     case "trackingPreview":
       control = <TrackingPreview preview={extra?.trackingPreview ?? ""} />;
       break;
+    case "categoryChips": {
+      // PLU-140: a small checkbox group over fee/commission/gift → string[].
+      // Native checkboxes (no new dependency) since it's a 3-item multi-select.
+      const selected = new Set(Array.isArray(value) ? (value as string[]) : []);
+      const opts = extra?.categoryOptions ?? [];
+      control = (
+        <div role="group" aria-label={field.label} style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+          {opts.map((o) => (
+            <label
+              key={o.value}
+              style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: isDisabled ? "default" : "pointer", fontSize: font.size.md }}
+            >
+              <input
+                type="checkbox"
+                disabled={isDisabled}
+                checked={selected.has(o.value)}
+                onChange={(e) => {
+                  const nextSet = new Set(selected);
+                  if (e.target.checked) nextSet.add(o.value);
+                  else nextSet.delete(o.value);
+                  // Stable order = the option order, so the same selection always
+                  // serializes identically.
+                  onChange(opts.filter((x) => nextSet.has(x.value)).map((x) => x.value));
+                }}
+              />
+              {o.label}
+            </label>
+          ))}
+        </div>
+      );
+      break;
+    }
     case "quantityRows":
       control = (
         <QuantityRows
@@ -1238,16 +1522,23 @@ function FieldRenderer({
     }
   }
 
+  // PLU-140: uiOnly fields are disabled placeholders (no backend/engine yet).
+  // A subtle internal marker on the hint differentiates them at a glance without
+  // a user-facing "coming soon" — see FieldSpec.uiOnly.
+  const hint = field.uiOnly
+    ? `${field.hint ? `${field.hint} · ` : ""}Not yet wired (UI only)`
+    : field.hint;
+
   // Toggle already renders its own label; wrap the rest in a FormField.
   if (field.control === "toggle") {
     return (
-      <FormField label={field.label} hint={field.hint} required={field.required} error={error}>
+      <FormField label={field.label} hint={hint} required={field.required} error={error}>
         {control}
       </FormField>
     );
   }
   return (
-    <FormField label={field.label} htmlFor={id} hint={field.hint} required={field.required} error={error}>
+    <FormField label={field.label} htmlFor={id} hint={hint} required={field.required} error={error}>
       {control}
     </FormField>
   );
@@ -2324,8 +2615,23 @@ function TrackingPreview({ preview }: { preview: string }) {
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
-function draftValue(f: FieldSpec, campaign: Draft, brand: Draft, creator: Draft): unknown {
-  const src = f.group === "campaign" ? campaign : f.group === "brandIdentity" ? brand : creator;
+function draftValue(
+  f: FieldSpec,
+  campaign: Draft,
+  brand: Draft,
+  creator: Draft,
+  policy: Draft,
+): unknown {
+  // Explicit per-group read — a nested-ternary fallthrough would read
+  // negotiationPolicy fields from the creator draft (always undefined).
+  const src =
+    f.group === "campaign"
+      ? campaign
+      : f.group === "brandIdentity"
+        ? brand
+        : f.group === "creatorRequirement"
+          ? creator
+          : policy;
   return src[f.key];
 }
 function strOrNull(v: unknown): string | null {
