@@ -135,7 +135,19 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const [brandDraft, setBrandDraft] = useState<Draft>({});
   const [creatorDraft, setCreatorDraft] = useState<Draft>({});
   const [policyDraft, setPolicyDraft] = useState<Draft>({});
-  const seededRef = useRef(false);
+  // Seeded independently PER GROUP (not one shared flag) — each subgroup query
+  // settles on its own schedule. A shared flag would seed brand/creator/policy
+  // from whatever `.data` happened to be in hand the moment campaignQ.data
+  // first resolved: if a subgroup's own fetch was still in flight at that
+  // instant, it would be seeded empty and then NEVER re-seeded when its real
+  // data arrived a moment later (the guard would already be tripped). The next
+  // edit to any field in that subgroup would then autosave the empty-derived
+  // draft for every OTHER field in the group — silently clearing whatever was
+  // actually persisted there.
+  const seededCampaignRef = useRef(false);
+  const seededBrandRef = useRef(false);
+  const seededCreatorRef = useRef(false);
+  const seededPolicyRef = useRef(false);
 
   // Per-group save status. Errors persist (never auto-cleared) until a retry
   // succeeds, so the "not saved" affordance stays put.
@@ -175,10 +187,9 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   const status = campaignQ.data?.status ?? "DRAFT";
   const readOnly = status !== "DRAFT";
 
-  // Seed drafts once the three loads settle (campaign is required; the two
-  // sub-groups may legitimately be absent → empty).
+  // Seed the campaign draft once its (required) query resolves.
   useEffect(() => {
-    if (seededRef.current || !campaignQ.data) return;
+    if (seededCampaignRef.current || !campaignQ.data) return;
     const c = campaignQ.data;
     setCampaignDraft({
       // A freshly-created draft holds the NOT-NULL placeholders — show page 1
@@ -246,6 +257,18 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       trackingDestinationUrl: c.trackingDestinationUrl ?? "",
       trackingParameter: c.trackingParameter ?? "",
     });
+    seededCampaignRef.current = true;
+  }, [campaignQ.data]);
+
+  // Seed the brand-identity draft once ITS OWN query settles — not the moment
+  // campaignQ.data resolves. `isLoading` (true only during the initial fetch)
+  // covers both real outcomes: a genuine row (data present) and the "no row
+  // yet" 404 (this hook surfaces that as an error, not empty data — see the
+  // hook comment above — so `b` is undefined in both the loading AND the
+  // 404 cases; only `isLoading` distinguishes "still in flight" from
+  // "settled, absent").
+  useEffect(() => {
+    if (seededBrandRef.current || brandQ.isLoading) return;
     const b = brandQ.data;
     setBrandDraft({
       logoRef: b?.logoRef ?? "",
@@ -253,6 +276,13 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       secondaryColor: b?.secondaryColor ?? "",
       typography: b?.typography ?? "",
     });
+    seededBrandRef.current = true;
+  }, [brandQ.data, brandQ.isLoading]);
+
+  // Seed the creator-requirement draft once ITS OWN query settles (same
+  // absent-row-vs-still-loading reasoning as brand, above).
+  useEffect(() => {
+    if (seededCreatorRef.current || creatorQ.isLoading) return;
     const cr = creatorQ.data;
     // platforms is derived from the deliverable cards, not seeded/edited here.
     // geography is a string[] of ISO codes (the country picker works on the
@@ -261,9 +291,17 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       geography: Array.isArray(cr?.geography) ? cr.geography : [],
       minFollowers: cr?.minFollowers != null ? String(cr.minFollowers) : "",
     });
-    // PLU-140: private policy. Money columns show in dollars (cents→dollars);
-    // commission rates are the same percentage scale as publicCommissionRate
-    // (no /100). A null column seeds "" so the control renders empty, not "null".
+    seededCreatorRef.current = true;
+  }, [creatorQ.data, creatorQ.isLoading]);
+
+  // Seed the private-policy draft once ITS OWN query settles. useNegotiationPolicy
+  // converts a 404 into a resolved `{}` inside its queryFn (not an error state),
+  // so `isLoading` alone is enough here — no separate error-vs-loading split
+  // needed. Money columns show in dollars (cents→dollars); commission rates
+  // are the same percentage scale as publicCommissionRate (no /100). A null
+  // column seeds "" so the control renders empty, not "null".
+  useEffect(() => {
+    if (seededPolicyRef.current || policyQ.isLoading) return;
     const pol = policyQ.data;
     setPolicyDraft({
       ceilingCents: centsToDollars(pol?.ceilingCents),
@@ -282,10 +320,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       nonNegotiableTerms: Array.isArray(pol?.nonNegotiableTerms) ? pol.nonNegotiableTerms : [],
       negotiationGuidance: pol?.negotiationGuidance ?? "",
     });
-    // Only mark seeded once campaign loaded; the sub-queries settling later is
-    // fine — a fresh draft has no rows and stays empty (matches the API).
-    seededRef.current = true;
-  }, [campaignQ.data, brandQ.data, creatorQ.data, policyQ.data]);
+    seededPolicyRef.current = true;
+  }, [policyQ.data, policyQ.isLoading]);
 
   const comp: CompensationShape = useMemo(
     () => ({
