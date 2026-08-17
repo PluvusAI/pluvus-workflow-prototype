@@ -381,9 +381,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       // written ONLY by the Page-9 approve (§S4). The draft carries an explicit
       // compensationReviewStatus ONLY when the shell set one — a Page-9 approve
       // (→CONFIRMED) or a material edit after approval (→NEEDS_REVIEW, set in
-      // setField). Absent → we don't touch the persisted status at all.
-      ...(campaignDraft.compensationReviewStatus
-        ? { compensationReviewStatus: campaignDraft.compensationReviewStatus as "NEEDS_REVIEW" | "CONFIRMED" }
+      // setField). Absent → we don't touch the persisted status at all. Reads
+      // `reviewStatus` (the ref-preferring value), not the draft directly — see
+      // its declaration above (Greptile P1).
+      ...(reviewStatus
+        ? { compensationReviewStatus: reviewStatus as "NEEDS_REVIEW" | "CONFIRMED" }
         : {}),
     };
 

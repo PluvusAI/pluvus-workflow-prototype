@@ -53,7 +53,7 @@ export type SectionKey =
   | "contentGuidelines"
   | "timelineRights"
   | "rewardStructure"
-  // PLU-140 (2b): the private policy editor and the terminal review/activate step.
+  // PLU-140 (2b): the private policy editor and the terminal review/approve step.
   | "negotiationSettings"
   | "reviewActivate";
 

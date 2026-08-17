@@ -292,6 +292,29 @@ export function updateCreatorRequirement(id: string, data: CreatorRequirementInp
   });
 }
 
+// PLU-139 (2a): brief import / candidate extraction. GET returns the latest
+// stored extraction (404 when none — treated as "no candidates yet", not an
+// error, like the section GETs). POST parses an already-uploaded PDF (its
+// reference from uploadFile()) into a stored candidate record — evidence only,
+// never auto-written to CampaignDetails.
+export function useBriefExtraction(id: string | null) {
+  return useQuery({
+    queryKey: ["campaign", id, "brief-extraction"],
+    queryFn: () =>
+      apiFetch<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`),
+    enabled: !!id,
+    // A 404 (no extraction yet) is a normal empty state, not a transient error —
+    // don't retry it.
+    retry: false,
+  });
+}
+
+export function createBriefExtraction(id: string, sourceFileReference: string) {
+  return postJson<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`, {
+    sourceFileReference,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // PLU-140 (2b): NegotiationPolicy + readiness + launch.
 // ---------------------------------------------------------------------------
@@ -370,29 +393,6 @@ export async function launchCampaign(id: string): Promise<LaunchResult> {
     throw new LaunchError(error, res.status, missing);
   }
   return res.json() as Promise<LaunchResult>;
-}
-
-// PLU-139 (2a): brief import / candidate extraction. GET returns the latest
-// stored extraction (404 when none — treated as "no candidates yet", not an
-// error, like the section GETs). POST parses an already-uploaded PDF (its
-// reference from uploadFile()) into a stored candidate record — evidence only,
-// never auto-written to CampaignDetails.
-export function useBriefExtraction(id: string | null) {
-  return useQuery({
-    queryKey: ["campaign", id, "brief-extraction"],
-    queryFn: () =>
-      apiFetch<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`),
-    enabled: !!id,
-    // A 404 (no extraction yet) is a normal empty state, not a transient error —
-    // don't retry it.
-    retry: false,
-  });
-}
-
-export function createBriefExtraction(id: string, sourceFileReference: string) {
-  return postJson<BriefExtractionFields>(`/api/campaigns/${id}/brief-extraction`, {
-    sourceFileReference,
-  });
 }
 
 // ---------------------------------------------------------------------------
