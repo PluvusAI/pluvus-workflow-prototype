@@ -22,15 +22,45 @@ export class CampaignLockedError extends Error {
   }
 }
 
-async function assertCampaignIsDraft(campaignId: string, client: Db | DbTx): Promise<void> {
-  const [campaign] = await client
+// Exported so the sibling draft-only tables (BrandIdentity, CreatorRequirement)
+// reuse the ONE guard rather than re-implementing the status check (PLU-139 2a).
+//
+// MUST run inside a transaction that also performs the section write (see
+// withDraftLock): the SELECT ... FOR UPDATE takes the SAME Campaign-row lock
+// launchCampaign() takes, so a concurrent launch either (a) holds the lock and
+// commits ACTIVE before we read — we then see ACTIVE and throw, or (b) blocks
+// behind us until our write commits. Without the lock + shared transaction the
+// status read and the write are two statements a launch can interleave between,
+// letting a write land on an already-launched campaign.
+export async function assertCampaignIsDraft(campaignId: string, tx: Db | DbTx): Promise<void> {
+  const [campaign] = await tx
     .select({ status: campaigns.status })
     .from(campaigns)
     .where(eq(campaigns.id, campaignId))
+    .for("update")
     .limit(1);
   if (campaign?.status === "ACTIVE") {
     throw new CampaignLockedError(campaignId);
   }
+}
+
+/**
+ * Run `write` atomically with the draft-status check, holding the Campaign-row
+ * lock across both so a concurrent launchCampaign() cannot flip the campaign to
+ * ACTIVE between them (see assertCampaignIsDraft). Opens a transaction; nested
+ * on an existing tx (drizzle savepoint) so it composes inside a caller's tx.
+ * The three draft-only upserts (CampaignDetails, BrandIdentity, CreatorRequirement)
+ * all route through this so the lock lives in ONE place.
+ */
+export async function withDraftLock<T>(
+  campaignId: string,
+  client: Db | DbTx,
+  write: (tx: Db | DbTx) => Promise<T>,
+): Promise<T> {
+  return client.transaction(async (tx) => {
+    await assertCampaignIsDraft(campaignId, tx);
+    return write(tx);
+  });
 }
 
 export async function getCampaignDetails(
@@ -72,14 +102,15 @@ export async function upsertCampaignDetails(
   data: Omit<Partial<CampaignDetailsInsert>, "id" | "campaignId">,
   client: Db | DbTx = db,
 ): Promise<CampaignDetails> {
-  await assertCampaignIsDraft(campaignId, client);
-  const rows = await client
-    .insert(campaignDetails)
-    .values({ campaignId, ...data })
-    .onConflictDoUpdate({
-      target: campaignDetails.campaignId,
-      set: data,
-    })
-    .returning();
-  return rows[0]!;
+  return withDraftLock(campaignId, client, async (tx) => {
+    const rows = await tx
+      .insert(campaignDetails)
+      .values({ campaignId, ...data })
+      .onConflictDoUpdate({
+        target: campaignDetails.campaignId,
+        set: data,
+      })
+      .returning();
+    return rows[0]!;
+  });
 }

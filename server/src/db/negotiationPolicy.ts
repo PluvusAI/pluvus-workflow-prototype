@@ -1,23 +1,11 @@
 import { eq } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
-import { CampaignLockedError } from "./campaignDetails.js";
+import { withDraftLock } from "./campaignDetails.js";
 import {
-  campaigns,
   negotiationPolicies,
   type NegotiationPolicy,
   type NegotiationPolicyInsert,
 } from "./schema.js";
-
-async function assertCampaignIsDraft(campaignId: string, client: Db | DbTx): Promise<void> {
-  const [campaign] = await client
-    .select({ status: campaigns.status })
-    .from(campaigns)
-    .where(eq(campaigns.id, campaignId))
-    .limit(1);
-  if (campaign?.status === "ACTIVE") {
-    throw new CampaignLockedError(campaignId);
-  }
-}
 
 export async function getNegotiationPolicy(
   campaignId: string,
@@ -50,14 +38,15 @@ export async function upsertNegotiationPolicy(
   data: Omit<Partial<NegotiationPolicyInsert>, "id" | "campaignId">,
   client: Db | DbTx = db,
 ): Promise<NegotiationPolicy> {
-  await assertCampaignIsDraft(campaignId, client);
-  const rows = await client
-    .insert(negotiationPolicies)
-    .values({ campaignId, ...data })
-    .onConflictDoUpdate({
-      target: negotiationPolicies.campaignId,
-      set: data,
-    })
-    .returning();
-  return rows[0]!;
+  return withDraftLock(campaignId, client, async (tx) => {
+    const rows = await tx
+      .insert(negotiationPolicies)
+      .values({ campaignId, ...data })
+      .onConflictDoUpdate({
+        target: negotiationPolicies.campaignId,
+        set: data,
+      })
+      .returning();
+    return rows[0]!;
+  });
 }

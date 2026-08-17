@@ -22,6 +22,11 @@ import {
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
 import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
+import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
+import {
+  getCreatorRequirement,
+  upsertCreatorRequirement,
+} from "../db/creatorRequirement.js";
 import {
   createWorkflow,
   updateWorkflow,
@@ -835,6 +840,196 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
       return;
     }
     console.error("[campaigns] update negotiation policy error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// PLU-139 (2a): BrandIdentity + CreatorRequirement — the two remaining public
+// intake sections PLU-135 created the tables for but left unwired. Same shape as
+// the negotiation-policy pair above: a GET + a draft-only PATCH per table,
+// upsert-on-unique-campaignId, locked (409) once the campaign is ACTIVE via the
+// shared assertCampaignIsDraft guard (CampaignLockedError). CreatorRequirement is
+// INFORMATIONAL only — nothing reads it into matching/ranking/outreach.
+
+// GET /campaigns/:id/brand-identity — the brand's identity/branding for the campaign.
+router.get("/:id/brand-identity", async (req: Request, res: Response) => {
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const brandIdentity = await getBrandIdentity(req.params["id"]!);
+    if (!brandIdentity) {
+      res.status(404).json({ error: "no BrandIdentity set for this campaign yet" });
+      return;
+    }
+    res.json({
+      ...brandIdentity,
+      extractedAt: brandIdentity.extractedAt?.toISOString() ?? null,
+      createdAt: brandIdentity.createdAt.toISOString(),
+      updatedAt: brandIdentity.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    console.error("[campaigns] get brand identity error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// PATCH /campaigns/:id/brand-identity — insert-or-update the one BrandIdentity row.
+router.patch("/:id/brand-identity", async (req: Request, res: Response) => {
+  const { logoRef, primaryColor, secondaryColor, typography } = req.body as {
+    logoRef?: string | null;
+    primaryColor?: string | null;
+    secondaryColor?: string | null;
+    typography?: string | null;
+  };
+
+  const patch: Parameters<typeof upsertBrandIdentity>[1] = {};
+  if (logoRef !== undefined) patch.logoRef = typeof logoRef === "string" ? logoRef.trim() || null : null;
+  if (primaryColor !== undefined) {
+    patch.primaryColor = typeof primaryColor === "string" ? primaryColor.trim() || null : null;
+  }
+  if (secondaryColor !== undefined) {
+    patch.secondaryColor = typeof secondaryColor === "string" ? secondaryColor.trim() || null : null;
+  }
+  if (typography !== undefined) {
+    patch.typography = typeof typography === "string" ? typography.trim() || null : null;
+  }
+
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const brandIdentity = await upsertBrandIdentity(req.params["id"]!, patch);
+    res.json({
+      ...brandIdentity,
+      extractedAt: brandIdentity.extractedAt?.toISOString() ?? null,
+      createdAt: brandIdentity.createdAt.toISOString(),
+      updatedAt: brandIdentity.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    if (err instanceof CampaignLockedError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    console.error("[campaigns] update brand identity error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// GET /campaigns/:id/creator-requirement — informational creator-fit criteria.
+router.get("/:id/creator-requirement", async (req: Request, res: Response) => {
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const creatorRequirement = await getCreatorRequirement(req.params["id"]!);
+    if (!creatorRequirement) {
+      res.status(404).json({ error: "no CreatorRequirement set for this campaign yet" });
+      return;
+    }
+    res.json({
+      ...creatorRequirement,
+      createdAt: creatorRequirement.createdAt.toISOString(),
+      updatedAt: creatorRequirement.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    console.error("[campaigns] get creator requirement error:", err);
+    res.status(500).json({ error: "internal server error" });
+  }
+});
+
+// PATCH /campaigns/:id/creator-requirement — insert-or-update the one
+// CreatorRequirement row. Lists (platforms/niches/geography/languages) are jsonb
+// string[]; validated as string arrays at the trust boundary.
+router.patch("/:id/creator-requirement", async (req: Request, res: Response) => {
+  const {
+    platforms,
+    niches,
+    geography,
+    languages,
+    minFollowers,
+    audienceNotes,
+    contentStyle,
+    brandSafety,
+  } = req.body as {
+    platforms?: unknown;
+    niches?: unknown;
+    geography?: unknown;
+    languages?: unknown;
+    minFollowers?: number | null;
+    audienceNotes?: string | null;
+    contentStyle?: string | null;
+    brandSafety?: string | null;
+  };
+
+  const isStringArray = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.every((x) => typeof x === "string");
+
+  const patch: Parameters<typeof upsertCreatorRequirement>[1] = {};
+  for (const [key, value] of [
+    ["platforms", platforms],
+    ["niches", niches],
+    ["geography", geography],
+    ["languages", languages],
+  ] as const) {
+    if (value === undefined) continue;
+    if (value !== null && !isStringArray(value)) {
+      res.status(400).json({ error: `${key} must be an array of strings` });
+      return;
+    }
+    patch[key] = (value as string[] | null) as JsonValue | null;
+  }
+  if (minFollowers !== undefined) {
+    // Upper bound = PostgreSQL int4 max: the minFollowers column is `integer`,
+    // so a larger value overflows (SQLSTATE 22003) and the catch-all would 500
+    // instead of rejecting bad input. No real follower count approaches 2.1B.
+    if (
+      minFollowers !== null &&
+      (typeof minFollowers !== "number" ||
+        !Number.isInteger(minFollowers) ||
+        minFollowers < 0 ||
+        minFollowers > 2147483647)
+    ) {
+      res.status(400).json({ error: "minFollowers must be an integer between 0 and 2147483647" });
+      return;
+    }
+    patch.minFollowers = minFollowers;
+  }
+  if (audienceNotes !== undefined) {
+    patch.audienceNotes = typeof audienceNotes === "string" ? audienceNotes.trim() || null : null;
+  }
+  if (contentStyle !== undefined) {
+    patch.contentStyle = typeof contentStyle === "string" ? contentStyle.trim() || null : null;
+  }
+  if (brandSafety !== undefined) {
+    patch.brandSafety = typeof brandSafety === "string" ? brandSafety.trim() || null : null;
+  }
+
+  try {
+    const campaign = await findCampaignById(req.params["id"]!);
+    if (!campaign) {
+      res.status(404).json({ error: "campaign not found" });
+      return;
+    }
+    const creatorRequirement = await upsertCreatorRequirement(req.params["id"]!, patch);
+    res.json({
+      ...creatorRequirement,
+      createdAt: creatorRequirement.createdAt.toISOString(),
+      updatedAt: creatorRequirement.updatedAt.toISOString(),
+    });
+  } catch (err) {
+    if (err instanceof CampaignLockedError) {
+      res.status(409).json({ error: err.message });
+      return;
+    }
+    console.error("[campaigns] update creator requirement error:", err);
     res.status(500).json({ error: "internal server error" });
   }
 });
