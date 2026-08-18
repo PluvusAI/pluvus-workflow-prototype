@@ -39,6 +39,7 @@ import { getLatestCampaignBriefForCampaign } from "./campaignBriefRender.js";
 import {
   resolveCurrentCampaignBriefForCampaign,
   resolveCurrentCampaignBriefForInstance,
+  CampaignBriefRegenerationUnavailableError,
 } from "./campaignBriefValidation.js";
 import { getCampaignBriefRenderQueue, closeQueues } from "../workers/queues.js";
 import { uploadsDir, resolveStoredFile } from "../storage/localFileStorage.js";
@@ -312,6 +313,78 @@ async function main(): Promise<void> {
       assert.equal(result.status, "BLOCKED");
       assert.equal(result.regenerationAllowed, false);
       assert.equal(result.nextAction, "operator_review_required");
+    },
+  );
+
+  // Review fix (#5): resolveCurrentCampaignBriefForCampaign's own try/catch
+  // around resolveCampaignLaunchContext used to ALSO wrap the delegated call
+  // to resolveAgainstExpectedSnapshot — so a CampaignBriefRegenerationUnavailableError
+  // thrown from THAT function's regeneration attempt (a transient Redis/DB
+  // failure, fix #4) was caught here too and silently reclassified as a
+  // permanent BLOCKED/NO_CAMPAIGN result, before it could ever reach a
+  // route's dedicated 503 handler — defeating fix #4 for every caller that
+  // goes through the campaign-scoped entry point (both routes). Proven here
+  // by wrapping the real pgdb so every call succeeds normally EXCEPT
+  // `.transaction()` — the one method only createOrGetCampaignBriefRenderRequest
+  // (called deep inside the regeneration attempt) uses — which throws a
+  // plain, non-domain Error simulating a transient failure.
+  await test(
+    "a transient failure during regeneration propagates as CampaignBriefRegenerationUnavailableError, not a swallowed BLOCKED result",
+    async () => {
+      const { campaignId } = await seedLaunchedCampaign(pgdb);
+      const brokenClient = Object.create(pgdb) as Db;
+      brokenClient.transaction = (async () => {
+        throw new Error("simulated transient Redis/DB failure");
+      }) as Db["transaction"];
+
+      await assert.rejects(
+        () => resolveCurrentCampaignBriefForCampaign(campaignId, brokenClient),
+        (err: unknown) => {
+          assert.ok(
+            err instanceof CampaignBriefRegenerationUnavailableError,
+            `expected CampaignBriefRegenerationUnavailableError, got ${err}`,
+          );
+          return true;
+        },
+      );
+    },
+  );
+
+  // Review fix (#6): fix #5 above only closed the try/catch gap around the
+  // DELEGATED call to resolveAgainstExpectedSnapshot — several plain reads
+  // (findCampaignById here, plus getCurrentReadyCampaignBrief/
+  // getLatestCampaignBriefForCampaign inside resolveAgainstExpectedSnapshot
+  // itself) had NO error handling at all, so a transient failure on any of
+  // them propagated as a raw driver error rather than
+  // CampaignBriefRegenerationUnavailableError — bypassing both routes'
+  // `instanceof` check and falling through to their generic 500 instead of
+  // the intended 503. Now every one of those reads goes through the same
+  // `wrapTransient()` helper `resolveAgainstExpectedSnapshot`'s own
+  // regeneration-attempt catch already used. Proven here for the
+  // campaign-lookup call specifically (the cleanest to isolate — the very
+  // first DB call in the chain); the other three share this exact same
+  // helper and code shape, so are covered by construction rather than each
+  // needing its own isolated mock (the same practical-testability boundary
+  // already noted for fix #4's negative-space branch, above).
+  await test(
+    "a transient failure during the campaign lookup itself propagates as CampaignBriefRegenerationUnavailableError, not a raw error",
+    async () => {
+      const { campaignId } = await seedLaunchedCampaign(pgdb);
+      const brokenClient = Object.create(pgdb) as Db;
+      brokenClient.select = (() => {
+        throw new Error("simulated transient DB failure");
+      }) as Db["select"];
+
+      await assert.rejects(
+        () => resolveCurrentCampaignBriefForCampaign(campaignId, brokenClient),
+        (err: unknown) => {
+          assert.ok(
+            err instanceof CampaignBriefRegenerationUnavailableError,
+            `expected CampaignBriefRegenerationUnavailableError, got ${err}`,
+          );
+          return true;
+        },
+      );
     },
   );
 

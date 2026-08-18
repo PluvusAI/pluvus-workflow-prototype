@@ -55,6 +55,26 @@ export class CampaignBriefRegenerationUnavailableError extends Error {
   }
 }
 
+/**
+ * Review fix: several plain reads in this file (the current/latest/settled
+ * CampaignBrief lookups, the campaign/instance lookups) had no error
+ * handling at all — a transient DB failure on any of them propagated as a
+ * raw driver error, bypassing `CampaignBriefRegenerationUnavailableError`
+ * entirely, so neither route's `instanceof` check for it could ever match
+ * and both fell through to their generic 500 instead of the intended 503.
+ * Wraps a single async DB call so any escaping error becomes this same
+ * retryable type (passed through unchanged if it already is one, so a call
+ * that wraps `resolveAgainstExpectedSnapshot` itself doesn't double-wrap).
+ */
+async function wrapTransient<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err instanceof CampaignBriefRegenerationUnavailableError) throw err;
+    throw new CampaignBriefRegenerationUnavailableError(err);
+  }
+}
+
 export type CampaignBriefMismatchCategory =
   | "NO_CAMPAIGN" // expected campaign no longer exists (or isn't resolvable — see below)
   | "NO_PINNED_SNAPSHOT" // instance path only: no campaignTermsSnapshotId pinned
@@ -135,7 +155,7 @@ async function resolveAgainstExpectedSnapshot(
 ): Promise<CampaignBriefValidationResult> {
   const expected = { campaignId, campaignTermsSnapshotId: expectedSnapshotId };
 
-  const candidate = await getCurrentReadyCampaignBrief(campaignId, client);
+  const candidate = await wrapTransient(() => getCurrentReadyCampaignBrief(campaignId, client));
   if (
     candidate &&
     candidate.campaignId === campaignId &&
@@ -182,7 +202,7 @@ async function resolveAgainstExpectedSnapshot(
     // ever rendered" from "something exists but isn't currently servable"
     // (FAILED, still GENERATING, or a stray READY row missing its asset
     // ref) so the diagnostic can say WHY, not just "nothing."
-    const latest = await getLatestCampaignBriefForCampaign(campaignId, client);
+    const latest = await wrapTransient(() => getLatestCampaignBriefForCampaign(campaignId, client));
     if (!latest) {
       category = "NO_CURRENT_BRIEF";
       stored = { campaignId: null, campaignTermsSnapshotId: null };
@@ -311,7 +331,7 @@ async function resolveAgainstExpectedSnapshot(
     // already finished this exact render between the `candidate` read above
     // and this point. Re-check fresh (including the file) rather than
     // assume — cheap, and correct.
-    const settled = await getCurrentReadyCampaignBrief(campaignId, client);
+    const settled = await wrapTransient(() => getCurrentReadyCampaignBrief(campaignId, client));
     if (
       settled &&
       settled.campaignTermsSnapshotId === expectedSnapshotId &&
@@ -388,7 +408,7 @@ export async function resolveCurrentCampaignBriefForCampaign(
   campaignId: string,
   client: Db | DbTx = db,
 ): Promise<CampaignBriefValidationResult> {
-  const campaign = await findCampaignById(campaignId, client);
+  const campaign = await wrapTransient(() => findCampaignById(campaignId, client));
   if (!campaign) {
     const result: CampaignBriefValidationResult = {
       status: "BLOCKED",
@@ -472,7 +492,7 @@ export async function resolveCurrentCampaignBriefForInstance(
   instanceId: string,
   client: Db | DbTx = db,
 ): Promise<CampaignBriefValidationResult> {
-  const instance = await findInstanceById(instanceId, client);
+  const instance = await wrapTransient(() => findInstanceById(instanceId, client));
   if (!instance) {
     // No campaign is resolvable at all. `expected.campaignId` has no real
     // campaign id to report — the instance id is carried there instead
@@ -498,12 +518,14 @@ export async function resolveCurrentCampaignBriefForInstance(
   if (!instance.campaignTermsSnapshotId) {
     // A real, structurally-possible BLOCKED case — instances enrolled before
     // this column existed have none pinned. Not a crash.
-    const [row] = await client
-      .select({ campaignId: workflows.campaignId })
-      .from(workflowVersions)
-      .innerJoin(workflows, eq(workflowVersions.workflowId, workflows.id))
-      .where(eq(workflowVersions.id, instance.workflowVersionId))
-      .limit(1);
+    const [row] = await wrapTransient(() =>
+      client
+        .select({ campaignId: workflows.campaignId })
+        .from(workflowVersions)
+        .innerJoin(workflows, eq(workflowVersions.workflowId, workflows.id))
+        .where(eq(workflowVersions.id, instance.workflowVersionId))
+        .limit(1),
+    );
     const campaignId = row?.campaignId ?? instanceId;
     const result: CampaignBriefValidationResult = {
       status: "BLOCKED",
@@ -519,12 +541,14 @@ export async function resolveCurrentCampaignBriefForInstance(
     return result;
   }
 
-  const [row] = await client
-    .select({ campaignId: workflows.campaignId })
-    .from(workflowVersions)
-    .innerJoin(workflows, eq(workflowVersions.workflowId, workflows.id))
-    .where(eq(workflowVersions.id, instance.workflowVersionId))
-    .limit(1);
+  const [row] = await wrapTransient(() =>
+    client
+      .select({ campaignId: workflows.campaignId })
+      .from(workflowVersions)
+      .innerJoin(workflows, eq(workflowVersions.workflowId, workflows.id))
+      .where(eq(workflowVersions.id, instance.workflowVersionId))
+      .limit(1),
+  );
 
   if (!row || !row.campaignId) {
     // Structurally shouldn't happen — every Workflow in this codebase is
