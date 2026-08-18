@@ -9,10 +9,10 @@ import {
 import {
   createOrGetCampaignBriefRenderRequest,
   getLatestCampaignBriefForCampaign,
-  getCurrentReadyCampaignBrief,
   listCampaignBriefsForCampaign,
   CampaignBriefRenderRequestConflictError,
 } from "../db/campaignBriefRender.js";
+import { resolveCurrentCampaignBriefForCampaign } from "../db/campaignBriefValidation.js";
 import { enqueueCampaignBriefRender } from "../workers/queues.js";
 import { readStoredFile } from "../storage/localFileStorage.js";
 import type { CampaignBrief } from "../db/schema.js";
@@ -157,31 +157,32 @@ router.get("/:id/brief/pdf", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    // The CURRENT ready asset, not the newest attempt — a re-render still
-    // GENERATING (or one that just FAILED) must not shadow a perfectly good,
-    // un-superseded prior PDF. See getCurrentReadyCampaignBrief()'s own doc
-    // comment for why this is a different query from the status route below.
-    const brief = await getCurrentReadyCampaignBrief(campaignId);
-    if (!brief || !brief.renderedAssetRef) {
-      // Distinguish "nothing has ever rendered" from "a render exists but
-      // none has ever completed" for a clearer error, without changing
-      // which row actually gets served above.
-      const latest = await getLatestCampaignBriefForCampaign(campaignId);
-      if (!latest) {
-        res.status(404).json({ error: "no brief has been rendered for this campaign yet" });
-        return;
-      }
-      res.status(409).json({
-        error: `no ready brief is available yet (latest attempt is ${latest.status.toLowerCase()})`,
-        status: latest.status,
-      });
+    // PLU-142: the one authoritative validation service — never a bare
+    // getCurrentReadyCampaignBrief() lookup. It re-checks the brief actually
+    // matches the campaign's current CampaignTermsSnapshot (not just "some
+    // READY row exists") and, on a mismatch, triggers regeneration itself
+    // rather than this route re-deriving that decision independently.
+    const result = await resolveCurrentCampaignBriefForCampaign(campaignId);
+
+    if (result.status === "CURRENT") {
+      // brief is guaranteed non-null with a renderedAssetRef by the CURRENT
+      // contract itself (campaignBriefValidation.ts's own invariant).
+      const bytes = await readStoredFile(result.brief!.renderedAssetRef!);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", "inline");
+      res.send(bytes);
       return;
     }
 
-    const bytes = await readStoredFile(brief.renderedAssetRef);
-    res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", "inline");
-    res.send(bytes);
+    if (result.status === "REGENERATING") {
+      // Was a bare 409 before; now carries the structured result so the
+      // caller knows this is transient (poll_for_ready), not a hard failure.
+      res.status(202).json(result);
+      return;
+    }
+
+    // BLOCKED — operator-facing route, safe to show the full diagnostic.
+    res.status(409).json(result);
   } catch (err) {
     console.error("[campaign-briefs] get pdf error:", err);
     res.status(500).json({ error: "internal server error" });

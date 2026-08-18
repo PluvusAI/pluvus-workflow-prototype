@@ -35,8 +35,11 @@ import {
   type WorkflowStatus,
 } from "./schema.js";
 
-export async function findCampaignById(id: string): Promise<Campaign | null> {
-  const rows = await db.select().from(campaigns).where(eq(campaigns.id, id)).limit(1);
+export async function findCampaignById(
+  id: string,
+  client: Db | DbTx = db,
+): Promise<Campaign | null> {
+  const rows = await client.select().from(campaigns).where(eq(campaigns.id, id)).limit(1);
   return rows[0] ?? null;
 }
 

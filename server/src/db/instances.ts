@@ -24,8 +24,11 @@ export type InstancePatch = Partial<
 // Read
 // ---------------------------------------------------------------------------
 
-export async function findInstanceById(id: string): Promise<ExecutionInstance | null> {
-  const rows = await db
+export async function findInstanceById(
+  id: string,
+  client: Db | DbTx = db,
+): Promise<ExecutionInstance | null> {
+  const rows = await client
     .select()
     .from(executionInstances)
     .where(eq(executionInstances.id, id))
