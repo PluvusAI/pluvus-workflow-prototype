@@ -12,6 +12,14 @@ WORKDIR /app
 # build time/image size on a browser build that would never run.
 ENV PUPPETEER_SKIP_DOWNLOAD=true
 
+# node:20-alpine ships npm 10.8.2, which has a real npm-itself bug ("Exit
+# handler never called!", npm/cli#7657-class issue): under `npm ci`, npm can
+# crash mid-install but still exit 0, so Docker sees the RUN step as
+# successful even though node_modules is incomplete (typescript/tsc silently
+# missing) — surfaces later as a confusing `sh: tsc: not found` on the build
+# step below, not here. Pinning past 10.8.2 avoids it.
+RUN npm install -g npm@11
+
 # Install workspace deps (root + server). The repo is an npm workspace, so the
 # root package.json + lockfile drive install; the server package is a workspace.
 COPY package.json package-lock.json tsconfig.base.json ./

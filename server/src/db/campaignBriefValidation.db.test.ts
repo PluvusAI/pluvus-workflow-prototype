@@ -28,6 +28,7 @@
  */
 
 import assert from "node:assert/strict";
+import { mkdir, writeFile } from "node:fs/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { and, eq } from "drizzle-orm";
@@ -40,6 +41,7 @@ import {
   resolveCurrentCampaignBriefForInstance,
 } from "./campaignBriefValidation.js";
 import { getCampaignBriefRenderQueue, closeQueues } from "../workers/queues.js";
+import { uploadsDir, resolveStoredFile } from "../storage/localFileStorage.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
@@ -79,14 +81,23 @@ async function seedLaunchedCampaign(
   return { campaignId: campaign!.id, campaignTermsSnapshotId: snapshot.id };
 }
 
-/** Hand-inserts a CampaignBrief row, bypassing the real render pipeline (Puppeteer). */
+/**
+ * Hand-inserts a CampaignBrief row, bypassing the real render pipeline
+ * (Puppeteer). For a READY row (the default), also writes real bytes to the
+ * resolved storage path — review fix (#3) makes storedFileExists() a real
+ * gate on CURRENT, so a READY row whose file was never actually written
+ * would (correctly) no longer read as CURRENT. Pass `withRealFile: false`
+ * to deliberately construct the missing-file case that fix exists for.
+ */
 async function insertBrief(
   pgdb: Db,
   campaignId: string,
   campaignTermsSnapshotId: string,
   overrides: Partial<schema.CampaignBriefInsert> = {},
+  opts: { withRealFile?: boolean } = {},
 ): Promise<schema.CampaignBrief> {
   sfx++;
+  const withRealFile = opts.withRealFile ?? true;
   const [row] = await pgdb
     .insert(schema.campaignBriefs)
     .values({
@@ -94,12 +105,16 @@ async function insertBrief(
       campaignTermsSnapshotId,
       renderRequestId: `req-${sfx}`,
       status: "READY",
-      renderedAssetRef: `fake/asset/${sfx}.pdf`,
+      renderedAssetRef: `test-asset-${sfx}.pdf`,
       brandIdentitySnapshot: {},
       templateVersion: "v1",
       ...overrides,
     })
     .returning();
+  if (withRealFile && row!.status === "READY" && row!.renderedAssetRef) {
+    await mkdir(uploadsDir(), { recursive: true });
+    await writeFile(resolveStoredFile(row!.renderedAssetRef), "fake pdf bytes");
+  }
   return row!;
 }
 
@@ -187,6 +202,22 @@ async function main(): Promise<void> {
     assert.equal(result.nextAction, "serve_current");
   });
 
+  // Review fix (#3): a DB row claiming READY + renderedAssetRef is not
+  // proof the bytes are still retrievable (e.g. an ephemeral filesystem
+  // wiped by a container restart, DB untouched). Must not be served as
+  // CURRENT — regeneration should trigger instead, same as any other
+  // unservable candidate.
+  await test("a READY brief whose file is missing on disk -> REGENERATING/ASSET_UNAVAILABLE, never CURRENT", async () => {
+    const { campaignId, campaignTermsSnapshotId } = await seedLaunchedCampaign(pgdb);
+    await insertBrief(pgdb, campaignId, campaignTermsSnapshotId, {}, { withRealFile: false });
+    const result = await resolveCurrentCampaignBriefForCampaign(campaignId, pgdb);
+    assert.notEqual(result.status, "CURRENT");
+    assert.equal(result.status, "REGENERATING");
+    assert.equal(result.mismatchCategory, "ASSET_UNAVAILABLE");
+    assert.equal(result.stored.campaignTermsSnapshotId, campaignTermsSnapshotId, "identity matched — only the file was missing");
+    await cleanupQueuedJob(pgdb, campaignId);
+  });
+
   await test("no brief ever rendered -> REGENERATING/NO_CURRENT_BRIEF, a new GENERATING row is created", async () => {
     const { campaignId } = await seedLaunchedCampaign(pgdb);
     const result = await resolveCurrentCampaignBriefForCampaign(campaignId, pgdb);
@@ -213,7 +244,7 @@ async function main(): Promise<void> {
   // where SNAPSHOT_MISMATCH genuinely IS reachable (an ExecutionInstance's
   // pin has no such composite constraint).
 
-  await test("only a FAILED brief exists -> REGENERATING/ASSET_UNAVAILABLE, never CURRENT", async () => {
+  await test("only an unrelated FAILED brief exists -> REGENERATING/ASSET_UNAVAILABLE (a fresh attempt), never CURRENT", async () => {
     const { campaignId, campaignTermsSnapshotId } = await seedLaunchedCampaign(pgdb);
     await insertBrief(pgdb, campaignId, campaignTermsSnapshotId, {
       status: "FAILED",
@@ -226,6 +257,63 @@ async function main(): Promise<void> {
     assert.equal(result.mismatchCategory, "ASSET_UNAVAILABLE");
     await cleanupQueuedJob(pgdb, campaignId);
   });
+
+  // Review fix (#1a): the deterministic auto-regen renderRequestId means a
+  // PRIOR failed attempt for this EXACT snapshot is a dead end — a fresh
+  // call can never mint a new attempt (renderRequestId is DB-unique), so
+  // reporting REGENERATING here (the old behavior) would tell a caller to
+  // keep polling a job that will never run, forever.
+  await test(
+    "a prior auto-regen attempt for the EXACT expected snapshot already failed -> BLOCKED, never a stuck REGENERATING",
+    async () => {
+      const { campaignId, campaignTermsSnapshotId } = await seedLaunchedCampaign(pgdb);
+      // The exact deterministic key resolveAgainstExpectedSnapshot itself
+      // would compute for this campaign/snapshot pair.
+      await insertBrief(
+        pgdb,
+        campaignId,
+        campaignTermsSnapshotId,
+        {
+          renderRequestId: `auto-regen|${campaignId}|${campaignTermsSnapshotId}`,
+          status: "FAILED",
+          renderedAssetRef: null,
+          errorCategory: "RENDER_FAILED",
+        },
+        { withRealFile: false },
+      );
+      const result = await resolveCurrentCampaignBriefForCampaign(campaignId, pgdb);
+      assert.equal(result.status, "BLOCKED", "must not claim REGENERATING for a dead auto-regen attempt");
+      assert.equal(result.regenerationAllowed, false);
+      assert.equal(result.nextAction, "operator_review_required");
+      assert.ok(result.diagnostic.includes("already failed"));
+      // No job was ever enqueued for this dead end — nothing to clean up.
+    },
+  );
+
+  // Review fix (#4, positive control): a genuine domain error mid-
+  // regeneration (a renderRequestId collision across campaigns) must still
+  // classify as BLOCKED — proving the instanceof allowlist itself works,
+  // not just that unknown errors are no longer folded into it.
+  await test(
+    "a renderRequestId collision with a different campaign's row -> BLOCKED (known domain error), not thrown as transient",
+    async () => {
+      const { campaignId, campaignTermsSnapshotId } = await seedLaunchedCampaign(pgdb);
+      const other = await seedLaunchedCampaign(pgdb);
+      // Plant a row under a DIFFERENT campaign using the EXACT renderRequestId
+      // this campaign's own auto-regen attempt would deterministically compute.
+      await insertBrief(
+        pgdb,
+        other.campaignId,
+        other.campaignTermsSnapshotId,
+        { renderRequestId: `auto-regen|${campaignId}|${campaignTermsSnapshotId}` },
+        { withRealFile: false },
+      );
+      const result = await resolveCurrentCampaignBriefForCampaign(campaignId, pgdb);
+      assert.equal(result.status, "BLOCKED");
+      assert.equal(result.regenerationAllowed, false);
+      assert.equal(result.nextAction, "operator_review_required");
+    },
+  );
 
   await test("concurrent calls on the same mismatch collapse into exactly one new row", async () => {
     const { campaignId } = await seedLaunchedCampaign(pgdb);
@@ -296,8 +384,15 @@ async function main(): Promise<void> {
     assert.equal(result.brief!.id, brief.id);
   });
 
+  // Review fix (#1b): regeneration ALWAYS renders the CAMPAIGN's own
+  // permanent snapshot (createOrGetCampaignBriefRenderRequest resolves it
+  // via resolveCampaignLaunchContext, never from expectedSnapshotId) — so
+  // when an instance is pinned to a DIFFERENT campaign's snapshot,
+  // "regenerating" campaign A can never produce a document matching B's
+  // snapshot. The old behavior reported REGENERATING here forever; this
+  // must now be BLOCKED — regeneration is provably incapable of fixing it.
   await test(
-    "an instance pinned to a DIFFERENT campaign's snapshot -> REGENERATING/SNAPSHOT_MISMATCH, expected reflects the instance's OWN pin",
+    "an instance pinned to a DIFFERENT campaign's snapshot -> BLOCKED (impossible for regeneration to satisfy), never a stuck REGENERATING",
     async () => {
       // Unlike CampaignBrief (composite FK, see the NOTE above),
       // ExecutionInstance.campaignTermsSnapshotId references
@@ -314,14 +409,20 @@ async function main(): Promise<void> {
         campaignTermsSnapshotId: b.campaignTermsSnapshotId,
       });
       const result = await resolveCurrentCampaignBriefForInstance(instance.id, pgdb);
-      assert.equal(result.status, "REGENERATING");
+      assert.equal(result.status, "BLOCKED");
       assert.equal(result.mismatchCategory, "SNAPSHOT_MISMATCH");
+      assert.equal(result.regenerationAllowed, false);
+      assert.equal(result.nextAction, "operator_review_required");
       assert.equal(
         result.expected.campaignTermsSnapshotId,
         b.campaignTermsSnapshotId,
         "instance-scoped resolution expects the INSTANCE's own pin, not the campaign's current snapshot",
       );
-      await cleanupQueuedJob(pgdb, a.campaignId);
+      assert.ok(result.diagnostic.includes("does not belong to campaign"));
+      // Regeneration was attempted (and detected as impossible) before we
+      // could know that — a GENERATING row for campaign A's OWN snapshot
+      // may exist, but no job was ever enqueued for it (the check runs
+      // before enqueueing), so there's nothing queued to clean up.
     },
   );
 

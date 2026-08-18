@@ -1,7 +1,10 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { resolveCampaignBriefByCreatorToken } from "../db/campaignBriefRender.js";
-import { resolveCurrentCampaignBriefForCampaign } from "../db/campaignBriefValidation.js";
+import {
+  resolveCurrentCampaignBriefForCampaign,
+  CampaignBriefRegenerationUnavailableError,
+} from "../db/campaignBriefValidation.js";
 import { readStoredFile } from "../storage/localFileStorage.js";
 
 // ---------------------------------------------------------------------------
@@ -33,17 +36,23 @@ router.get("/:token", async (req: Request, res: Response) => {
       return;
     }
 
-    // PLU-142: campaign-scoped (not instance-scoped — the token carries no
-    // instanceId, §0's own documented gap). Re-validates against the
-    // campaign's CURRENT brief rather than trusting the token's own row
-    // directly — a token minted for a since-superseded render now correctly
-    // resolves to whatever's current for the campaign (still the same
-    // permanent CampaignTermsSnapshot per §0, so this is "the latest good
-    // render," never a different campaign's or a stale one).
+    // PLU-142 (review fix): campaign-scoped (not instance-scoped — the
+    // token carries no instanceId, §0's own documented gap). Re-validates
+    // against the campaign's CURRENT brief, but requires it to be the EXACT
+    // row this token was minted for — not "whatever's current now." The
+    // original version treated any CURRENT result as good enough, reasoning
+    // that a campaign only ever has one permanent CampaignTermsSnapshot, so
+    // a later re-render is "the same terms, just refreshed." That's true of
+    // the TERMS, but not of the rendered PRESENTATION: PLU-141 already
+    // proves brandIdentitySnapshot is captured point-in-time, so a
+    // superseding render can legitimately show different colors/narrative
+    // text than what this token's own brief showed. Silently substituting
+    // that under a link a creator already has is a real integrity gap, not
+    // a convenience — a superseded token now 404s instead, the same
+    // "never leak whether it almost matched" posture as the unknown-token
+    // case above, rather than serving different content under it.
     const result = await resolveCurrentCampaignBriefForCampaign(brief.campaignId);
-    if (result.status !== "CURRENT") {
-      // Same posture as the unknown-token case above: REGENERATING/BLOCKED
-      // never leaks internal validation state to an unauthenticated caller.
+    if (result.status !== "CURRENT" || result.brief!.id !== brief.id) {
       res.status(404).json({ error: "not found" });
       return;
     }
@@ -53,6 +62,12 @@ router.get("/:token", async (req: Request, res: Response) => {
     res.setHeader("Content-Disposition", "inline");
     res.send(bytes);
   } catch (err) {
+    if (err instanceof CampaignBriefRegenerationUnavailableError) {
+      // Review fix: a transient infra failure (Redis/DB) mid-regeneration
+      // is not "not found" and not a permanent error — retryable, 503.
+      res.status(503).json({ error: "temporarily unavailable, retry" });
+      return;
+    }
     console.error("[campaign-brief-token] get error:", err);
     res.status(500).json({ error: "internal server error" });
   }

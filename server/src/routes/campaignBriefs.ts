@@ -12,7 +12,10 @@ import {
   listCampaignBriefsForCampaign,
   CampaignBriefRenderRequestConflictError,
 } from "../db/campaignBriefRender.js";
-import { resolveCurrentCampaignBriefForCampaign } from "../db/campaignBriefValidation.js";
+import {
+  resolveCurrentCampaignBriefForCampaign,
+  CampaignBriefRegenerationUnavailableError,
+} from "../db/campaignBriefValidation.js";
 import { enqueueCampaignBriefRender } from "../workers/queues.js";
 import { readStoredFile } from "../storage/localFileStorage.js";
 import type { CampaignBrief } from "../db/schema.js";
@@ -184,6 +187,13 @@ router.get("/:id/brief/pdf", async (req: Request, res: Response) => {
     // BLOCKED — operator-facing route, safe to show the full diagnostic.
     res.status(409).json(result);
   } catch (err) {
+    if (err instanceof CampaignBriefRegenerationUnavailableError) {
+      // Review fix: a Redis/DB hiccup mid-regeneration is not a campaign
+      // problem — retryable, 503, distinct from BLOCKED's 409 and from an
+      // actual unexpected-bug 500.
+      res.status(503).json({ error: err.message });
+      return;
+    }
     console.error("[campaign-briefs] get pdf error:", err);
     res.status(500).json({ error: "internal server error" });
   }

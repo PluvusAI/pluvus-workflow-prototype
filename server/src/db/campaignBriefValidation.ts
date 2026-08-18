@@ -15,16 +15,45 @@
 // reasoning this module implements.
 import { eq } from "drizzle-orm";
 import { db, type Db, type DbTx } from "./drizzle.js";
-import { findCampaignById, resolveCampaignLaunchContext } from "./campaigns.js";
+import {
+  findCampaignById,
+  resolveCampaignLaunchContext,
+  CampaignNotFoundError,
+  CampaignNotActiveError,
+  CampaignSnapshotMissingError,
+} from "./campaigns.js";
 import { findInstanceById } from "./instances.js";
 import {
   createOrGetCampaignBriefRenderRequest,
   getCurrentReadyCampaignBrief,
   getLatestCampaignBriefForCampaign,
+  CampaignBriefRenderRequestConflictError,
 } from "./campaignBriefRender.js";
 import { enqueueCampaignBriefRender } from "../workers/queues.js";
+import { storedFileExists } from "../storage/localFileStorage.js";
 import { logTrace } from "../observability/logger.js";
 import { workflowVersions, workflows, type CampaignBrief } from "./schema.js";
+
+/**
+ * Review fix: a Redis/DB hiccup while attempting regeneration is not a
+ * campaign data problem — it must not be reported as BLOCKED
+ * (`operator_review_required`), which tells an operator "this campaign
+ * needs a human to fix something about it" when nothing is actually wrong
+ * with the campaign. Thrown by resolveAgainstExpectedSnapshot for any
+ * failure that ISN'T one of the three known domain errors (campaign not
+ * launchable, or a renderRequestId collision); route layers catch this
+ * specifically and respond 503 (retry), distinct from their generic
+ * unexpected-error 500.
+ */
+export class CampaignBriefRegenerationUnavailableError extends Error {
+  constructor(cause: unknown) {
+    super(
+      `campaign brief regeneration temporarily unavailable: ${cause instanceof Error ? cause.message : String(cause)}`,
+    );
+    this.name = "CampaignBriefRegenerationUnavailableError";
+    this.cause = cause;
+  }
+}
 
 export type CampaignBriefMismatchCategory =
   | "NO_CAMPAIGN" // expected campaign no longer exists (or isn't resolvable — see below)
@@ -65,6 +94,23 @@ function emitValidationResult(
   });
 }
 
+function buildCurrentResult(
+  campaignId: string,
+  expectedSnapshotId: string,
+  brief: CampaignBrief,
+): CampaignBriefValidationResult {
+  return {
+    status: "CURRENT",
+    brief,
+    expected: { campaignId, campaignTermsSnapshotId: expectedSnapshotId },
+    stored: { campaignId: brief.campaignId, campaignTermsSnapshotId: brief.campaignTermsSnapshotId },
+    mismatchCategory: null,
+    regenerationAllowed: false,
+    nextAction: "serve_current",
+    diagnostic: "the current READY brief matches the expected snapshot",
+  };
+}
+
 /**
  * The shared comparison + regeneration-trigger core. Not exported —
  * campaign-scoped and instance-scoped callers both funnel through this so
@@ -75,10 +121,12 @@ function emitValidationResult(
  * `expectedSnapshotId` when the campaign-scoped current-READY row (1) has
  * the SAME campaignId (structurally guaranteed by the query below — checked
  * explicitly anyway, not assumed), (2) has the SAME campaignTermsSnapshotId,
- * and (3) has a renderedAssetRef. Anything else is "not current" — this
- * function categorizes WHY, then tries to fix it via regeneration (never by
- * falling back to a different snapshot/row/table), and returns one of the
- * three outcomes CURRENT/REGENERATING/BLOCKED this function alone owns.
+ * (3) has a renderedAssetRef, AND (4) that referenced asset is actually
+ * still retrievable (review fix: a DB row is not proof the file survived a
+ * restart). Anything else is "not current" — this function categorizes WHY,
+ * then tries to fix it via regeneration (never by falling back to a
+ * different snapshot/row/table), and returns one of the three outcomes
+ * CURRENT/REGENERATING/BLOCKED this function alone owns.
  */
 async function resolveAgainstExpectedSnapshot(
   campaignId: string,
@@ -92,21 +140,10 @@ async function resolveAgainstExpectedSnapshot(
     candidate &&
     candidate.campaignId === campaignId &&
     candidate.campaignTermsSnapshotId === expectedSnapshotId &&
-    candidate.renderedAssetRef
+    candidate.renderedAssetRef &&
+    (await storedFileExists(candidate.renderedAssetRef))
   ) {
-    const result: CampaignBriefValidationResult = {
-      status: "CURRENT",
-      brief: candidate,
-      expected,
-      stored: {
-        campaignId: candidate.campaignId,
-        campaignTermsSnapshotId: candidate.campaignTermsSnapshotId,
-      },
-      mismatchCategory: null,
-      regenerationAllowed: false,
-      nextAction: "serve_current",
-      diagnostic: "the current READY brief matches the expected snapshot",
-    };
+    const result = buildCurrentResult(campaignId, expectedSnapshotId, candidate);
     emitValidationResult(campaignId, expectedSnapshotId, candidate.id, result);
     return result;
   }
@@ -116,13 +153,24 @@ async function resolveAgainstExpectedSnapshot(
   let stored: { campaignId: string | null; campaignTermsSnapshotId: string | null };
   let candidateBriefId: string | null = null;
 
-  if (candidate) {
-    // A READY, un-superseded row exists for this campaign but failed the
-    // CURRENT check above — since getCurrentReadyCampaignBrief() itself
-    // filters WHERE campaignId = campaignId, candidate.campaignId !==
-    // campaignId is structurally impossible through this query; checked
-    // explicitly anyway (the ticket's own "do not assume" posture), so this
-    // branch is really always SNAPSHOT_MISMATCH in practice.
+  if (candidate && candidate.campaignId === campaignId && candidate.campaignTermsSnapshotId === expectedSnapshotId) {
+    // Matched on identity but still failed the CURRENT check above — the
+    // only thing left that could have failed is the file-existence check
+    // (review fix): the DB says READY with an asset ref, but the bytes are
+    // gone. Distinct from a real identity mismatch below — this campaign's
+    // document IS the right one, it's just not currently retrievable.
+    category = "ASSET_UNAVAILABLE";
+    stored = { campaignId: candidate.campaignId, campaignTermsSnapshotId: candidate.campaignTermsSnapshotId };
+    candidateBriefId = candidate.id;
+  } else if (candidate) {
+    // A READY, un-superseded row exists for this campaign but its identity
+    // didn't match — since getCurrentReadyCampaignBrief() itself filters
+    // WHERE campaignId = campaignId, candidate.campaignId !== campaignId is
+    // structurally impossible through this query; checked explicitly
+    // anyway (the ticket's own "do not assume" posture), so this branch is
+    // really always SNAPSHOT_MISMATCH in practice for the campaign-scoped
+    // caller — but IS reachable for the instance-scoped caller, whose
+    // expectedSnapshotId can legitimately differ from this campaign's own.
     category = candidate.campaignId !== campaignId ? "CROSS_CAMPAIGN" : "SNAPSHOT_MISMATCH";
     stored = {
       campaignId: candidate.campaignId,
@@ -151,52 +199,61 @@ async function resolveAgainstExpectedSnapshot(
   // createOrGetCampaignBriefRenderRequest's own idempotency — no new
   // locking needed.
   const renderRequestId = `auto-regen|${campaignId}|${expectedSnapshotId}`;
+  let campaignBrief: CampaignBrief;
   try {
-    const { campaignBrief } = await createOrGetCampaignBriefRenderRequest(
-      campaignId,
-      renderRequestId,
-      client,
-    );
-    // Same status-gated re-enqueue as the POST route (Calvin review #4):
-    // safe to call unconditionally for a row that already has a job running
-    // — enqueueCampaignBriefRender()'s jobId is deterministic
-    // (`brief-render|${campaignBriefId}`) and BullMQ dedupes on it.
-    if (campaignBrief.status === "GENERATING") {
-      await enqueueCampaignBriefRender({ campaignBriefId: campaignBrief.id });
-    }
-    const result: CampaignBriefValidationResult = {
-      status: "REGENERATING",
-      brief: null,
-      expected,
-      stored,
-      mismatchCategory: category,
-      regenerationAllowed: true,
-      nextAction: "poll_for_ready",
-      diagnostic: `no current brief matches the expected snapshot (${category}); regeneration ${
-        campaignBrief.status === "GENERATING" ? "enqueued" : `already ${campaignBrief.status.toLowerCase()}`
-      }`,
-    };
-    logTrace("campaign_brief_regeneration_requested", {
-      campaignId,
-      expectedSnapshotId,
-      campaignBriefId: campaignBrief.id,
-      mismatchCategory: category,
-    });
-    emitValidationResult(campaignId, expectedSnapshotId, candidateBriefId, result);
-    return result;
+    ({ campaignBrief } = await createOrGetCampaignBriefRenderRequest(campaignId, renderRequestId, client));
   } catch (err) {
-    // Only reachable if createOrGetCampaignBriefRenderRequest's OWN
-    // launch-context check fails (CampaignNotActiveError /
-    // CampaignSnapshotMissingError) or its renderRequestId collides across
-    // campaigns (CampaignBriefRenderRequestConflictError) — i.e. material
-    // data genuinely isn't launchable, not a transient issue. This is a
-    // synchronous check only; the DATA_INCOMPLETE category (a snapshot that
-    // IS launchable but missing a required field) is the render WORKER's
-    // own classification, discovered later inside the actual async render —
-    // never something this function can observe, so it is never fabricated
-    // here. `category` (the pre-regeneration mismatch reason) is preserved
-    // as-is; `diagnostic` carries the real thrown reason.
-    const diagnostic = err instanceof Error ? err.message : String(err);
+    // Review fix: only these three are genuine domain/data problems — the
+    // campaign isn't launchable, or a renderRequestId collided (itself only
+    // possible via a real bug). Anything else (a transient DB error inside
+    // the transaction) is NOT a campaign problem and must not be reported
+    // as one — rethrown as a distinct, retryable error type instead of
+    // being folded into the same BLOCKED bucket the old bare `catch` used.
+    if (
+      err instanceof CampaignNotActiveError ||
+      err instanceof CampaignSnapshotMissingError ||
+      err instanceof CampaignBriefRenderRequestConflictError
+    ) {
+      const diagnostic = err.message;
+      const result: CampaignBriefValidationResult = {
+        status: "BLOCKED",
+        brief: null,
+        expected,
+        stored,
+        mismatchCategory: category,
+        regenerationAllowed: false,
+        nextAction: "operator_review_required",
+        diagnostic,
+      };
+      logTrace("campaign_brief_regeneration_blocked", {
+        campaignId,
+        expectedSnapshotId,
+        mismatchCategory: category,
+        reason: diagnostic,
+      });
+      emitValidationResult(campaignId, expectedSnapshotId, candidateBriefId, result);
+      return result;
+    }
+    throw new CampaignBriefRegenerationUnavailableError(err);
+  }
+
+  // Review fix: createOrGetCampaignBriefRenderRequest() ALWAYS creates/
+  // resolves a row against the CAMPAIGN's own permanent snapshot (via
+  // resolveCampaignLaunchContext), never `expectedSnapshotId` directly. For
+  // the campaign-scoped entry point these are always the same value
+  // (resolveCurrentCampaignBriefForCampaign derives expectedSnapshotId the
+  // identical way, so this is a no-op check there). For the instance-scoped
+  // entry point, expectedSnapshotId is the INSTANCE's own pin, which can
+  // legitimately differ (an anomalous cross-campaign pin — see
+  // resolveCurrentCampaignBriefForInstance's doc comment). In that case
+  // regeneration would run forever and never produce a match, since it can
+  // only ever render THIS campaign's own snapshot — detected here, once,
+  // for both callers: BLOCKED, not an endless REGENERATING.
+  if (campaignBrief.campaignTermsSnapshotId !== expectedSnapshotId) {
+    const diagnostic =
+      `expected snapshot ${expectedSnapshotId} does not belong to campaign ${campaignId} ` +
+      `(its own current snapshot is ${campaignBrief.campaignTermsSnapshotId}) — regeneration ` +
+      "can never produce a matching document";
     const result: CampaignBriefValidationResult = {
       status: "BLOCKED",
       brief: null,
@@ -213,9 +270,106 @@ async function resolveAgainstExpectedSnapshot(
       mismatchCategory: category,
       reason: diagnostic,
     });
+    emitValidationResult(campaignId, expectedSnapshotId, campaignBrief.id, result);
+    return result;
+  }
+
+  if (campaignBrief.status === "GENERATING") {
+    // Same status-gated re-enqueue as the POST route (Calvin review #4):
+    // safe to call unconditionally for a row that already has a job running
+    // — enqueueCampaignBriefRender()'s jobId is deterministic
+    // (`brief-render|${campaignBriefId}`) and BullMQ dedupes on it. If THIS
+    // throws (e.g. Redis unavailable), it propagates out of the try/catch
+    // above having already returned — never reported as REGENERATING.
+    try {
+      await enqueueCampaignBriefRender({ campaignBriefId: campaignBrief.id });
+    } catch (err) {
+      throw new CampaignBriefRegenerationUnavailableError(err);
+    }
+    const result: CampaignBriefValidationResult = {
+      status: "REGENERATING",
+      brief: null,
+      expected,
+      stored,
+      mismatchCategory: category,
+      regenerationAllowed: true,
+      nextAction: "poll_for_ready",
+      diagnostic: `no current brief matches the expected snapshot (${category}); regeneration enqueued`,
+    };
+    logTrace("campaign_brief_regeneration_requested", {
+      campaignId,
+      expectedSnapshotId,
+      campaignBriefId: campaignBrief.id,
+      mismatchCategory: category,
+    });
     emitValidationResult(campaignId, expectedSnapshotId, candidateBriefId, result);
     return result;
   }
+
+  if (campaignBrief.status === "READY") {
+    // Race: something else (a concurrent validator, or a real client POST)
+    // already finished this exact render between the `candidate` read above
+    // and this point. Re-check fresh (including the file) rather than
+    // assume — cheap, and correct.
+    const settled = await getCurrentReadyCampaignBrief(campaignId, client);
+    if (
+      settled &&
+      settled.campaignTermsSnapshotId === expectedSnapshotId &&
+      settled.renderedAssetRef &&
+      (await storedFileExists(settled.renderedAssetRef))
+    ) {
+      const result = buildCurrentResult(campaignId, expectedSnapshotId, settled);
+      emitValidationResult(campaignId, expectedSnapshotId, campaignBrief.id, result);
+      return result;
+    }
+    // Defensive — should not happen (the row just resolved as READY with a
+    // matching snapshot); if it does, don't claim a status this can't back up.
+    const result: CampaignBriefValidationResult = {
+      status: "BLOCKED",
+      brief: null,
+      expected,
+      stored: { campaignId: campaignBrief.campaignId, campaignTermsSnapshotId: campaignBrief.campaignTermsSnapshotId },
+      mismatchCategory: category,
+      regenerationAllowed: false,
+      nextAction: "operator_review_required",
+      diagnostic: "regeneration completed but the result could not be confirmed current — retry",
+    };
+    emitValidationResult(campaignId, expectedSnapshotId, campaignBrief.id, result);
+    return result;
+  }
+
+  // FAILED — this exact deterministic renderRequestId already failed once.
+  // Because renderRequestId is unique, createOrGetCampaignBriefRenderRequest
+  // will keep returning this SAME dead row forever; auto-regen can never
+  // create a fresh attempt for this snapshot on its own. Review fix: the old
+  // code reported REGENERATING/poll_for_ready here, telling callers to keep
+  // polling a job that will never run. BLOCKED instead — an operator (or a
+  // real client) must trigger a fresh attempt via POST /campaigns/:id/brief
+  // with a NEW, client-supplied renderRequestId (the existing PLU-141 §6a
+  // retry mechanism); this auto-path deliberately does not mint one itself
+  // (unbounded, unattended retries on every poll would be its own failure
+  // mode).
+  const diagnostic =
+    `a prior regeneration attempt for this exact snapshot already failed ` +
+    `(errorCategory: ${campaignBrief.errorCategory ?? "unknown"}); a fresh render request is required`;
+  const result: CampaignBriefValidationResult = {
+    status: "BLOCKED",
+    brief: null,
+    expected,
+    stored,
+    mismatchCategory: category,
+    regenerationAllowed: false,
+    nextAction: "operator_review_required",
+    diagnostic,
+  };
+  logTrace("campaign_brief_regeneration_blocked", {
+    campaignId,
+    expectedSnapshotId,
+    mismatchCategory: category,
+    reason: diagnostic,
+  });
+  emitValidationResult(campaignId, expectedSnapshotId, campaignBrief.id, result);
+  return result;
 }
 
 /**
@@ -250,28 +404,51 @@ export async function resolveCurrentCampaignBriefForCampaign(
     return result;
   }
 
+  let campaignTermsSnapshotId: string;
   try {
-    const { campaignTermsSnapshotId } = await resolveCampaignLaunchContext(campaignId, client);
-    return await resolveAgainstExpectedSnapshot(campaignId, campaignTermsSnapshotId, client);
+    ({ campaignTermsSnapshotId } = await resolveCampaignLaunchContext(campaignId, client));
   } catch (err) {
-    // The campaign exists but isn't ACTIVE, or is ACTIVE with no resolvable
-    // snapshot (a data-integrity gap) — there is no snapshot to validate a
-    // brief against. Reuses the NO_CAMPAIGN category (closest fit: "nothing
-    // to validate") with the real reason carried in `diagnostic`.
-    const diagnostic = err instanceof Error ? err.message : String(err);
-    const result: CampaignBriefValidationResult = {
-      status: "BLOCKED",
-      brief: null,
-      expected: { campaignId, campaignTermsSnapshotId: null },
-      stored: { campaignId: null, campaignTermsSnapshotId: null },
-      mismatchCategory: "NO_CAMPAIGN",
-      regenerationAllowed: false,
-      nextAction: "operator_review_required",
-      diagnostic,
-    };
-    emitValidationResult(campaignId, null, null, result);
-    return result;
+    // Review fix: only these are genuine domain problems — the campaign
+    // truly isn't launchable, or (a narrow TOCTOU) it was deleted between
+    // the findCampaignById check above and this call. Reused as the
+    // NO_CAMPAIGN category (closest fit: "nothing to validate"). Anything
+    // else — a transient DB error on either of resolveCampaignLaunchContext's
+    // own two selects — is NOT a campaign problem and must not be reported
+    // as one; same reasoning, and same fix, as resolveAgainstExpectedSnapshot's
+    // own classification (review round 2, fix #4).
+    if (
+      err instanceof CampaignNotFoundError ||
+      err instanceof CampaignNotActiveError ||
+      err instanceof CampaignSnapshotMissingError
+    ) {
+      const diagnostic = err.message;
+      const result: CampaignBriefValidationResult = {
+        status: "BLOCKED",
+        brief: null,
+        expected: { campaignId, campaignTermsSnapshotId: null },
+        stored: { campaignId: null, campaignTermsSnapshotId: null },
+        mismatchCategory: "NO_CAMPAIGN",
+        regenerationAllowed: false,
+        nextAction: "operator_review_required",
+        diagnostic,
+      };
+      emitValidationResult(campaignId, null, null, result);
+      return result;
+    }
+    throw new CampaignBriefRegenerationUnavailableError(err);
   }
+
+  // Review fix: deliberately OUTSIDE the try above.
+  // resolveAgainstExpectedSnapshot() has its own complete error handling and
+  // throws CampaignBriefRegenerationUnavailableError for transient failures
+  // — that must propagate to the caller (routes map it to 503/retry), not
+  // be silently reclassified as this function's own "campaign isn't
+  // launchable" NO_CAMPAIGN case. The try above used to wrap this call too,
+  // so ANY throw from resolveAgainstExpectedSnapshot — including the very
+  // error type fix #4 introduced specifically to signal "retry me" — was
+  // caught here and converted into a permanent BLOCKED result before ever
+  // reaching a route's dedicated 503 handler, defeating that fix entirely.
+  return resolveAgainstExpectedSnapshot(campaignId, campaignTermsSnapshotId, client);
 }
 
 /**
