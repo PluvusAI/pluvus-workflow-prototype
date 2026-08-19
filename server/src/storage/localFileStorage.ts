@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -65,6 +65,25 @@ export function resolveStoredFile(reference: string): string {
 /** Read a stored file's bytes by reference. Throws if the file is missing. */
 export async function readStoredFile(reference: string): Promise<Buffer> {
   return readFile(resolveStoredFile(reference));
+}
+
+/**
+ * PLU-142 review fix: a DB row claiming `renderedAssetRef` is set is not
+ * proof the bytes are still retrievable — the uploads dir can be wiped by a
+ * container/host restart independently of the DB. Callers that are about to
+ * declare a stored reference "safe to serve" should check this first rather
+ * than discover the gap via a thrown error at read time. Any stat failure
+ * (missing file, permissions, etc.) is treated as "not available" — the
+ * caller's job is deciding what to do about that (e.g. regenerate), not
+ * distinguishing failure modes here.
+ */
+export async function storedFileExists(reference: string): Promise<boolean> {
+  try {
+    await access(resolveStoredFile(reference));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
