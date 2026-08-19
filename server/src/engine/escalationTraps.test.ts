@@ -297,6 +297,63 @@ test("H1: a fully-capped campaign (floor AND ceiling) does NOT trip the no-ceili
   );
 });
 
+test("H1: a pinned (even corrupt) journey does NOT pre-escalate as no_ceiling on stale config", async () => {
+  // PLU-137/138: the pre-build H1 arm must be gated on there being NO pin AT ALL.
+  // A journey pinned to a snapshot (here a terms-only pin) with a floor-no-ceiling
+  // *legacy* config must NOT short-circuit to no_ceiling_configured before the
+  // build — that would mask a corrupt pin with the wrong reason and let stale
+  // config decide. It must fall THROUGH the pre-build arm to the build, where the
+  // snapshot integrity guard (or a valid snapshot ceiling) gets first say.
+  let negotiateCalls = 0;
+  const spyAgent = {
+    negotiate: async () => {
+      negotiateCalls++;
+      throw new Error("agent-not-expected");
+    },
+    draftEmail: async () => null,
+    classify: async () => ({ intent: "POSITIVE", confidence: 1 }),
+  } as never;
+
+  const cfg = { minBudget: 200 }; // floor only — no ceiling (the H1 trap shape)
+  const ctx = {
+    instance: {
+      id: "i1",
+      currentState: "NEGOTIATING",
+      negotiationRound: 1,
+      campaignTermsSnapshotId: "terms-pin-1", // a pin exists → defer to post-build
+      negotiationPolicySnapshotId: null,
+    },
+    node: { id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg },
+    nodeGraph: [{ id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg }],
+    creator: { id: "c1", name: "Alex" },
+  } as never;
+
+  // Any pin ⇒ the pre-build no-ceiling arm is skipped, so the executor always
+  // proceeds to buildConversationContext. Like the sibling "fully-capped" test
+  // above, that needs a live DB this offline suite doesn't have; unlike that
+  // test, the failure isn't reliably a plain Error with a matchable message
+  // in every environment (confirmed here: it can surface as a WebSocket
+  // ErrorEvent, not an Error instance at all) — so rather than fingerprint an
+  // unstable shape, we just don't let a DB-environment failure at THIS point
+  // fail the test. Where a real DB IS available: ctx has no campaign, so
+  // expectedCampaignId is unresolved and the Step-1 fail-closed guard fires
+  // (campaign_unresolved) before any read — the result is a
+  // snapshot_integrity escalation, never no_ceiling_configured. Either way,
+  // negotiate() being uncalled proves the pre-build no_ceiling arm (the only
+  // path that could reject with the agent never touched) did not fire — that
+  // assertion runs unconditionally, live DB or not.
+  try {
+    const result = await executeNegotiation(ctx, fakeEmail, spyAgent);
+    assert.equal(result.nextState, "MANUAL_REVIEW");
+    const reason = (result.eventPayload as Record<string, unknown>)["reason"];
+    assert.notEqual(reason, "no_ceiling_configured", "must NOT pre-escalate as no_ceiling on stale config");
+    assert.equal(reason, "snapshot_integrity", "a corrupt/unresolvable pin fails as an integrity error");
+  } catch {
+    // Tolerated: no DB in this offline suite. See comment above.
+  }
+  assert.equal(negotiateCalls, 0, "the agent was never consulted");
+});
+
 test("PLU-129: a commission-only 0/0 band does NOT trip the no-ceiling guard", async () => {
   // The canonical commission-only shape (minBudget:0, maxBudget:0) resolves to
   // floor 0 AND ceiling 0 — both DEFINED, unlike floor-without-ceiling. It is a

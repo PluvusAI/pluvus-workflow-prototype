@@ -19,6 +19,7 @@ import * as schema from "./schema.js";
 import type { Db } from "./drizzle.js";
 import { launchCampaign, resolveCampaignLaunchContext } from "./campaigns.js";
 import { loadPinnedSnapshots } from "../engine/executors/negotiation.js";
+import { loadPinnedTermsSnapshotForExecutor } from "./campaignSnapshots.js";
 import { buildConversationContext, buildContextRecord } from "../engine/conversationContext.js";
 import type { ResolvedBrief } from "../engine/executors/briefKnowledge.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
@@ -250,6 +251,62 @@ async function main(): Promise<void> {
     assert.equal(cc.legacyFallbackUsed, false, "a broken pin is NOT a silent legacy fallback");
     // And the reason rides the sanitized observability record (§4a / E11).
     assert.equal(buildContextRecord(cc).integrityFailureReason, "terms_snapshot_cross_campaign");
+  });
+
+  // -------- loadPinnedTermsSnapshotForExecutor (PLU-137/138 §4, post-accept executors) --------
+
+  await test("loadPinnedTermsSnapshotForExecutor: a valid pin resolves the terms row", async () => {
+    const { campaignId, termsId } = await seedLaunchedCampaign(pgdb);
+    const instance = await enrollInstance(pgdb, campaignId, { campaignTermsSnapshotId: termsId });
+    const result = await loadPinnedTermsSnapshotForExecutor(instance, campaignId, pgdb);
+    assert.equal(result.terms?.id, termsId);
+    assert.equal(result.integrityFailure, undefined);
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: no pin → clean legacy pass (empty result, not a failure)", async () => {
+    const { campaignId } = await seedLaunchedCampaign(pgdb);
+    const instance = await enrollInstance(pgdb, campaignId, { campaignTermsSnapshotId: null });
+    const result = await loadPinnedTermsSnapshotForExecutor(instance, campaignId, pgdb);
+    assert.deepEqual(result, {});
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: a pin whose row is missing → terms_snapshot_missing", async () => {
+    const { campaignId } = await seedLaunchedCampaign(pgdb);
+    // loadPinnedTermsSnapshotForExecutor only needs the pin SHAPE, not a real
+    // persisted ExecutionInstance — a real row can't carry a non-existent
+    // campaignTermsSnapshotId (a live FK), so feed a plain object with a
+    // NON-EXISTENT id to model the missing-row case, same pattern as
+    // loadPinnedSnapshots's own "vanished-terms" test above.
+    const result = await loadPinnedTermsSnapshotForExecutor(
+      { campaignTermsSnapshotId: "vanished-terms" },
+      campaignId,
+      pgdb,
+    );
+    assert.equal(result.integrityFailure?.reason, "terms_snapshot_missing");
+    assert.equal(result.terms, undefined);
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: a cross-campaign pin → terms_snapshot_cross_campaign", async () => {
+    const a = await seedLaunchedCampaign(pgdb);
+    const b = await seedLaunchedCampaign(pgdb);
+    // Same reasoning as above: b.termsId is a REAL row (satisfies the FK), just
+    // not owned by campaign A — so the plain-object shape is only needed to
+    // avoid enrolling under the wrong campaign's workflow, not to dodge the FK.
+    const result = await loadPinnedTermsSnapshotForExecutor(
+      { campaignTermsSnapshotId: b.termsId },
+      a.campaignId,
+      pgdb,
+    );
+    assert.equal(result.integrityFailure?.reason, "terms_snapshot_cross_campaign");
+    assert.equal(result.terms, undefined);
+  });
+
+  await test("loadPinnedTermsSnapshotForExecutor: fails closed with campaign_unresolved when the campaign can't be resolved", async () => {
+    const { campaignId, termsId } = await seedLaunchedCampaign(pgdb);
+    const instance = await enrollInstance(pgdb, campaignId, { campaignTermsSnapshotId: termsId });
+    const result = await loadPinnedTermsSnapshotForExecutor(instance, null, pgdb);
+    assert.equal(result.integrityFailure?.reason, "campaign_unresolved");
+    assert.equal(result.terms, undefined);
   });
 
   console.log(`\n${n} passed\n`);

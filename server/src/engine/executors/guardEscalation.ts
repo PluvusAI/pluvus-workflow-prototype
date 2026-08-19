@@ -51,6 +51,26 @@ export function blockedByAttributionMint(node: string): NodeResult {
   };
 }
 
+// PLU-137/138: the same MANUAL_REVIEW shape the four post-accept executors
+// (contentBrief / rewardSetup / operatorHandoff / brandApproval) each need when
+// loadPinnedTermsSnapshotForExecutor reports an integrity failure (a missing or
+// cross-campaign pinned terms snapshot). Pulled out here — the exact same
+// precedent as blockedByMissingBrand/blockedByAttributionMint below — instead
+// of repeating the identical object literal at all 4 call sites.
+export function blockedBySnapshotIntegrity(node: string, reason: string): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "MANUAL_REVIEW_FLAGGED",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason,
+      node,
+    },
+  };
+}
+
 // L4: fail loud when a creator-facing email has no resolvable brand name (config
 // AND campaign both missing it). Rather than send "Thanks, your brand" to a real
 // creator, route the instance to MANUAL_REVIEW so a human fixes the config. This

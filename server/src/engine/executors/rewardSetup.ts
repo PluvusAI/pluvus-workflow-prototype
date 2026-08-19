@@ -9,9 +9,11 @@ import {
 } from "../knowledgePrecedence.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { sendOnce } from "./idempotentSend.js";
-import { blockedByGuard, blockedByMissingBrand } from "./guardEscalation.js";
+import { blockedByGuard, blockedByMissingBrand, blockedBySnapshotIntegrity } from "./guardEscalation.js";
 import { renderRewardConfirmationEmail } from "./rewardEmail.js";
 import { resolveBrandName } from "../campaignContext.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Reward Setup executor
@@ -40,7 +42,18 @@ export async function executeRewardSetup(
   agent: IAgentProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
-  const config = node.config;
+
+  // PLU-137/138: this email is contract-forming, so its PUBLIC terms must come
+  // from the pinned CampaignTermsSnapshot, not the stale nodeGraph config —
+  // same discipline as contentBrief.ts. No-snapshot (legacy) journey overlays
+  // nothing → the existing config chain runs unchanged.
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, ctx.campaign?.id);
+  if (pinnedTerms.integrityFailure) {
+    return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
+  }
+  const config = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
+    : node.config;
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
