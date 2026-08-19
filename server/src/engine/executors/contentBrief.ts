@@ -77,9 +77,14 @@ export async function executeContentBrief(
   if (pinnedTerms.integrityFailure) {
     return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
   }
-  const config = pinnedTerms.terms
-    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
-    : node.config;
+  const effectiveTerms = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config })
+    : undefined;
+  const config = effectiveTerms?.config ?? node.config;
+  // PLU-142 follow-up: fields the pinned snapshot explicitly cleared must not be
+  // resurrected from the stale NEGOTIATION node below (resolveKnowledgeField's
+  // explicitlyCleared flag).
+  const clearedFields = effectiveTerms?.clearedFields ?? new Set<string>();
 
   // The merged flow enters on ACCEPTED (Content Brief directly follows negotiation).
   // With the brand-approval gate ON, the SEND phase is deferred until the brand
@@ -183,18 +188,21 @@ export async function executeContentBrief(
     const commission = resolveKnowledgeField("commissionRate", {
       workflowConfig: config["commissionRate"],
       negotiationState: negotiationConfig["commissionRate"],
+      explicitlyCleared: clearedFields.has("commissionRate"),
     });
     commissionRate = commission.value as number | undefined;
     resolvedSources["commissionRate"] = commission.source;
     const deliverablesR = resolveKnowledgeField("deliverables", {
       workflowConfig: config["deliverables"],
       negotiationState: negotiationConfig["deliverables"],
+      explicitlyCleared: clearedFields.has("deliverables"),
     });
     deliverables = deliverablesR.value as string | undefined;
     resolvedSources["deliverables"] = deliverablesR.source;
     const timelineR = resolveKnowledgeField("timeline", {
       workflowConfig: config["timeline"],
       negotiationState: negotiationConfig["timeline"],
+      explicitlyCleared: clearedFields.has("timeline"),
     });
     timeline = timelineR.value as string | undefined;
     resolvedSources["timeline"] = timelineR.source;

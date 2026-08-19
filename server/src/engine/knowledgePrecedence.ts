@@ -72,6 +72,15 @@ export interface KnowledgeSources {
   campaignDefault?: unknown;
   // briefSection is deliberately NOT a slot — the brief is a CONFLICT CHALLENGER,
   // never a resolution fallback (invariant #2, §4.2). It never appears here.
+
+  /** PLU-142 follow-up: true when the pinned terms snapshot explicitly CLEARED
+   *  this field (EffectiveTerms.clearedFields) — the snapshot key was present but
+   *  blank/null, an authoritative "nothing here", not a legacy absence. When set,
+   *  the walk skips the negotiation_state tier so a stale NEGOTIATION node value
+   *  cannot resurrect a term the pinned snapshot deliberately cleared. It does NOT
+   *  suppress campaign_default — that source is independent of the negotiation
+   *  history the snapshot is guarding against. */
+  explicitlyCleared?: boolean;
 }
 
 export type SourceLabel =
@@ -196,6 +205,10 @@ export function resolveKnowledgeField(
 
   for (const label of order) {
     if (label === null) continue;
+    // The pinned snapshot explicitly cleared this field — do not let the stale
+    // NEGOTIATION node resurrect it. operator_override/workflow_config/
+    // campaign_default are unaffected (§ above).
+    if (label === "negotiation_state" && sources.explicitlyCleared) continue;
     const slot = SLOT_BY_LABEL[label];
     if (!slot) continue;
     const candidate = sources[slot];

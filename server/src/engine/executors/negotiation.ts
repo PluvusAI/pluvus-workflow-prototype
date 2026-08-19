@@ -888,12 +888,31 @@ export async function executeNegotiation(
     nodeGraph.some((n) => n.type === "REWARD_SETUP" || n.type === "CONTENT_BRIEF") ||
     instance.postAcceptanceMode === "operator_handoff";
 
-  // Pacing (maxRounds) is a WORKFLOW-owned behavior field (node config stays
-  // authoritative for it — PLU-137/138 only cut over material TERMS). The
-  // snapshot's own maxRounds, when present, is applied to the EFFECTIVE config
-  // below for the agent; this pre-build stop only guards the wasted-context-
-  // assembly case and is conservative on the raw config value.
-  const maxRounds = typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5;
+  // PLU-142 follow-up: maxRounds is WORKFLOW-owned pacing, but a pinned
+  // NegotiationPolicySnapshot's OWN maxRounds — when present — is authoritative
+  // over the raw node config, same as every other snapshot-sourced field
+  // (PLU-137/138: a valid snapshot always wins). Resolve that ONE value here,
+  // before the build, so the pre-build hard stop below, the post-agent counter
+  // guard, relationshipWarmth, and the agent request (via effectiveConfig,
+  // built from this SAME immutable snapshot row further down) all agree. A
+  // cheap direct-by-id read — nowhere near the cost of the full context build —
+  // so the pre-build guard keeps its job of skipping that build once the round
+  // ceiling is reached. A missing or cross-campaign pin is NOT trusted here; it
+  // falls back to the raw config value, and is caught for real by the post-build
+  // integrity gate (cc.integrityFailure) before the agent is ever invoked.
+  let pinnedMaxRounds: number | undefined;
+  if (instance.negotiationPolicySnapshotId && ctx.campaign?.id) {
+    const policySnapshot = await getNegotiationPolicySnapshotById(instance.negotiationPolicySnapshotId);
+    if (
+      policySnapshot &&
+      policySnapshot.campaignId === ctx.campaign.id &&
+      typeof policySnapshot.maxRounds === "number"
+    ) {
+      pinnedMaxRounds = policySnapshot.maxRounds;
+    }
+  }
+  const maxRounds =
+    pinnedMaxRounds ?? (typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5);
 
   // Hard stop — enforce maxRounds before calling the agent (and BEFORE the full
   // context build — §5.2). This prevents the agent from even being consulted past

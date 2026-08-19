@@ -63,6 +63,13 @@ export interface EffectiveTerms {
   bandLegacyFallback: boolean;
   /** The public terms came from config (no terms snapshot). */
   termsLegacyFallback: boolean;
+  /** The node-config KEYS (e.g. "deliverables", "rewardDescription") the pinned
+   *  terms snapshot explicitly CLEARED — the snapshot key was present but blank/
+   *  null, so overlaySnapshotField deleted any stale config value rather than
+   *  leaving it. Callers pass this to resolveKnowledgeField (explicitlyCleared)
+   *  so an intentional clear cannot be resurrected from a stale NEGOTIATION node
+   *  (the negotiation_state fallback tier) once the snapshot has spoken. */
+  clearedFields: ReadonlySet<string>;
 }
 
 function finiteNumber(v: unknown): number | undefined {
@@ -101,11 +108,19 @@ function overlaySnapshotField(
   snapshotKey: string,
   configKey: string,
   parse: (v: unknown) => unknown,
+  cleared: Set<string>,
 ): void {
   if (!(snapshotKey in details)) return;
   const parsed = parse(details[snapshotKey]);
-  if (parsed === undefined) delete overlay[configKey];
-  else overlay[configKey] = parsed;
+  if (parsed === undefined) {
+    delete overlay[configKey];
+    // The snapshot key was PRESENT but blank/null — an authoritative clear, not
+    // an absent legacy blob. Record it so callers can suppress the
+    // negotiation_state fallback for this field (see EffectiveTerms.clearedFields).
+    cleared.add(configKey);
+  } else {
+    overlay[configKey] = parsed;
+  }
 }
 
 /**
@@ -115,6 +130,7 @@ function overlaySnapshotField(
 export function resolveEffectiveNegotiationConfig(input: EffectiveTermsInput): EffectiveTerms {
   const { policyAuthority, termsSnapshot, config } = input;
   const overlay: Record<string, unknown> = { ...config };
+  const cleared = new Set<string>();
 
   // -- Band (private → policyAuthority; CENTS → DOLLARS) ---------------------
   const bandLegacyFallback = !policyAuthority;
@@ -168,9 +184,9 @@ export function resolveEffectiveNegotiationConfig(input: EffectiveTermsInput): E
   const termsLegacyFallback = !details;
   if (details) {
     // PUBLIC commission ONLY — never the private commission triad on policyAuthority.
-    overlaySnapshotField(overlay, details, "publicCommissionRate", "commissionRate", finiteNumber);
+    overlaySnapshotField(overlay, details, "publicCommissionRate", "commissionRate", finiteNumber, cleared);
     for (const [snapshotKey, configKey] of PUBLIC_STRING_FIELD_MAP) {
-      overlaySnapshotField(overlay, details, snapshotKey, configKey, nonEmptyString);
+      overlaySnapshotField(overlay, details, snapshotKey, configKey, nonEmptyString, cleared);
     }
   }
 
@@ -179,5 +195,6 @@ export function resolveEffectiveNegotiationConfig(input: EffectiveTermsInput): E
     source: bandLegacyFallback && termsLegacyFallback ? "legacy_nodegraph" : "snapshot",
     bandLegacyFallback,
     termsLegacyFallback,
+    clearedFields: cleared,
   };
 }

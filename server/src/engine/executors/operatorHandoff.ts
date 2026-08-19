@@ -65,9 +65,14 @@ export async function executeOperatorHandoff(
   if (pinnedTerms.integrityFailure) {
     return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
   }
-  const config = pinnedTerms.terms
-    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
-    : node.config;
+  const effectiveTerms = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config })
+    : undefined;
+  const config = effectiveTerms?.config ?? node.config;
+  // PLU-142 follow-up: fields the pinned snapshot explicitly cleared must not be
+  // resurrected from the stale NEGOTIATION node below (resolveKnowledgeField's
+  // explicitlyCleared flag).
+  const clearedFields = effectiveTerms?.clearedFields ?? new Set<string>();
   // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
   // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
   // loads CampaignDetails alongside Campaign into ExecutionContext specifically
@@ -114,6 +119,7 @@ export async function executeOperatorHandoff(
   const commission = resolveKnowledgeField("commissionRate", {
     workflowConfig: config["commissionRate"],
     negotiationState: negotiationConfig["commissionRate"],
+    explicitlyCleared: clearedFields.has("commissionRate"),
   });
   const commissionRate = commission.value as number | undefined;
   resolvedSources["commissionRate"] = commission.source;
@@ -121,6 +127,7 @@ export async function executeOperatorHandoff(
     workflowConfig: config["deliverables"],
     negotiationState: negotiationConfig["deliverables"],
     campaignDefault: campaignFields?.deliverables,
+    explicitlyCleared: clearedFields.has("deliverables"),
   });
   const deliverables = deliverablesR.value as string | undefined;
   resolvedSources["deliverables"] = deliverablesR.source;
@@ -128,6 +135,7 @@ export async function executeOperatorHandoff(
     workflowConfig: config["timeline"],
     negotiationState: negotiationConfig["timeline"],
     campaignDefault: campaignFields?.timeline,
+    explicitlyCleared: clearedFields.has("timeline"),
   });
   const timeline = timelineR.value as string | undefined;
   resolvedSources["timeline"] = timelineR.source;
@@ -154,6 +162,7 @@ export async function executeOperatorHandoff(
     workflowConfig: config["rewardDescription"],
     negotiationState: negotiationConfig["rewardDescription"],
     campaignDefault: campaignFields?.rewardDescription,
+    explicitlyCleared: clearedFields.has("rewardDescription"),
   });
   const rewardDescription = rewardDescriptionR.value as string | undefined;
   resolvedSources["rewardDescription"] = rewardDescriptionR.source;

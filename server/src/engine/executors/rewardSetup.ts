@@ -51,9 +51,14 @@ export async function executeRewardSetup(
   if (pinnedTerms.integrityFailure) {
     return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
   }
-  const config = pinnedTerms.terms
-    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
-    : node.config;
+  const effectiveTerms = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config })
+    : undefined;
+  const config = effectiveTerms?.config ?? node.config;
+  // PLU-142 follow-up: fields the pinned snapshot explicitly cleared must not be
+  // resurrected from the stale NEGOTIATION node below (resolveKnowledgeField's
+  // explicitlyCleared flag).
+  const clearedFields = effectiveTerms?.clearedFields ?? new Set<string>();
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
@@ -83,6 +88,7 @@ export async function executeRewardSetup(
   const commission = resolveKnowledgeField("commissionRate", {
     workflowConfig: config["commissionRate"],
     negotiationState: negotiationConfig["commissionRate"],
+    explicitlyCleared: clearedFields.has("commissionRate"),
   });
   const commissionRate = commission.value as number | undefined;
   resolvedSources["commissionRate"] = commission.source;
@@ -92,6 +98,7 @@ export async function executeRewardSetup(
   const deliverablesR = resolveKnowledgeField("deliverables", {
     workflowConfig: config["deliverables"],
     negotiationState: negotiationConfig["deliverables"],
+    explicitlyCleared: clearedFields.has("deliverables"),
   });
   const deliverables = deliverablesR.value as string | undefined;
   resolvedSources["deliverables"] = deliverablesR.source;
@@ -100,6 +107,7 @@ export async function executeRewardSetup(
   const timelineR = resolveKnowledgeField("timeline", {
     workflowConfig: config["timeline"],
     negotiationState: negotiationConfig["timeline"],
+    explicitlyCleared: clearedFields.has("timeline"),
   });
   const timeline = timelineR.value as string | undefined;
   resolvedSources["timeline"] = timelineR.source;
@@ -108,6 +116,7 @@ export async function executeRewardSetup(
   const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
     workflowConfig: config["rewardDescription"],
     negotiationState: negotiationConfig["rewardDescription"],
+    explicitlyCleared: clearedFields.has("rewardDescription"),
   });
   const rewardDescription = rewardDescriptionR.value as string | undefined;
   resolvedSources["rewardDescription"] = rewardDescriptionR.source;

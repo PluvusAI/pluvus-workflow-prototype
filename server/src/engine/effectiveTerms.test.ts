@@ -227,6 +227,9 @@ test("present-null publicCommissionRate clears stale config commissionRate (no 3
   });
   assert.equal(r.config["commissionRate"], undefined);
   assert.equal(r.termsLegacyFallback, false);
+  // PLU-142 follow-up: the clear is recorded so callers can suppress the
+  // negotiation_state fallback for this field.
+  assert.ok(r.clearedFields.has("commissionRate"));
 });
 
 // 14. present-blank string snapshot value clears stale config; present + valid
@@ -238,6 +241,10 @@ test("present-blank snapshot string clears stale config; valid still overrides",
   });
   assert.equal(r.config["deliverables"], undefined); // blank snapshot cleared it
   assert.equal(r.config["rewardDescription"], "New gift box");
+  // PLU-142 follow-up: deliverables cleared, rewardDescription overridden (not
+  // cleared) — only the truly-cleared field is recorded.
+  assert.ok(r.clearedFields.has("deliverables"));
+  assert.ok(!r.clearedFields.has("rewardDescription"));
 });
 
 // 15. ABSENT snapshot key (legacy blob predating the field) preserves the config
@@ -250,6 +257,16 @@ test("absent snapshot key preserves config value (fallback, not clear)", () => {
   });
   assert.equal(r.config["paymentTerms"], "Net 15 from config"); // preserved
   assert.equal(r.config["deliverables"], "3 reels");
+  // Absent key ≠ clear: paymentTerms was never mentioned by the snapshot, so it
+  // must not be recorded as explicitly cleared.
+  assert.ok(!r.clearedFields.has("paymentTerms"));
+  assert.ok(!r.clearedFields.has("deliverables"));
+});
+
+// 16. no terms snapshot at all → clearedFields is empty (nothing to clear).
+test("no terms snapshot → clearedFields is empty", () => {
+  const r = resolveEffectiveNegotiationConfig({ config: { deliverables: "3 reels" } });
+  assert.equal(r.clearedFields.size, 0);
 });
 
 console.log(`\n${n} passed\n`);

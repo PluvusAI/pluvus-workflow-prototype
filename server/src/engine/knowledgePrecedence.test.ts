@@ -217,6 +217,54 @@ test("an undefined operator_override is skipped exactly like an absent slot (byt
   assert.equal(withSeam.source, "workflow_config");
 });
 
+console.log("\nexplicitlyCleared — PLU-142 follow-up: pinned-snapshot clears must not resurrect negotiation_state\n");
+
+test("explicitlyCleared suppresses negotiation_state, still falls through to campaign_default", () => {
+  const r = resolveKnowledgeField("deliverables", {
+    negotiationState: "3 Reels (stale negotiation)",
+    campaignDefault: "1 Reel (campaign)",
+    explicitlyCleared: true,
+  });
+  assert.equal(r.value, "1 Reel (campaign)");
+  assert.equal(r.source, "campaign_default");
+});
+
+test("explicitlyCleared: nothing below negotiation_state → undefined value + null source", () => {
+  const r = resolveKnowledgeField("commissionRate", {
+    negotiationState: 15,
+    explicitlyCleared: true,
+  });
+  assert.equal(r.value, undefined);
+  assert.equal(r.source, null);
+});
+
+test("explicitlyCleared does NOT block operator_override or workflow_config", () => {
+  const withOverride = resolveKnowledgeField("deliverables", {
+    operatorOverride: "operator says 4 Reels",
+    negotiationState: "3 Reels",
+    explicitlyCleared: true,
+  });
+  assert.equal(withOverride.value, "operator says 4 Reels");
+  assert.equal(withOverride.source, "operator_override");
+
+  const withWorkflow = resolveKnowledgeField("deliverables", {
+    workflowConfig: "2 Reels",
+    negotiationState: "3 Reels",
+    explicitlyCleared: true,
+  });
+  assert.equal(withWorkflow.value, "2 Reels");
+  assert.equal(withWorkflow.source, "workflow_config");
+});
+
+test("explicitlyCleared unset (default) behaves exactly as before — negotiation_state still wins when present", () => {
+  const r = resolveKnowledgeField("deliverables", {
+    negotiationState: "3 Reels (negotiation)",
+    campaignDefault: "1 Reel (campaign)",
+  });
+  assert.equal(r.value, "3 Reels (negotiation)");
+  assert.equal(r.source, "negotiation_state");
+});
+
 console.log("\ngeneral-knowledge family — WC → CD, no NS, no brief slot (§4.2)\n");
 
 for (const cat of ["usageRights", "exclusivity", "attributionWindow"] as const) {
