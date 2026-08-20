@@ -12,6 +12,7 @@
 // no negotiation-logic change required.
 
 import { z } from "zod";
+import { createId } from "@paralleldrive/cuid2";
 import type { Deliverable, DeliverableFormat, DeliverablePlatform } from "./deliverables.js";
 
 export const DELIVERABLE_PLATFORMS: readonly DeliverablePlatform[] = [
@@ -95,4 +96,36 @@ export function validateDeliverables(value: unknown): DeliverablesValidationResu
     return { ok: true, deliverables: result.data as Deliverable[] };
   }
   return { ok: false, error: result.error.issues.map((i) => i.message).join("; ") };
+}
+
+// ---------------------------------------------------------------------------
+// Legacy id backfill — shared by every call site that must accept a
+// pre-id-requirement row without rejecting it.
+// ---------------------------------------------------------------------------
+// PLU-169 (1f): deliverableSchema requires `id: string().min(1)`, but a
+// campaign's `CampaignDetails.deliverableQuantities` can still hold rows
+// created before that requirement existed — the one-time backfill script
+// (deliverables:backfill-ids) fixes these in bulk, but nothing guarantees it
+// has run for every campaign at any given moment a call site here validates.
+// Review fix: an already-launched, IMMUTABLE CampaignTermsSnapshot can never
+// be reached by that script at all (see resolveFinalDeliverables' own doc
+// comment), and the campaigns.ts PATCH route was rejecting an otherwise
+// unrelated edit to a legacy, NOT-YET-BACKFILLED campaign with a 400 (the
+// intake resends the complete deliverableQuantities array on every group
+// PATCH, so a stale id-less row surfaces the error on any save). Mint a
+// fresh id for any item missing one, BEFORE validation runs, so a call site
+// can both (a) accept the row instead of 400ing on it, and (b) — if it
+// persists the RETURNED, now-normalized array back to storage, as
+// campaigns.ts's PATCH route does — incrementally self-heal a campaign's
+// legacy rows the first time anyone happens to save it, without waiting on
+// the separate backfill script. Non-object items pass through untouched so
+// the shared validator produces the real error for them.
+export function normalizeLegacyDeliverableIds(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((item) => {
+    if (typeof item !== "object" || item === null) return item;
+    const r = item as Record<string, unknown>;
+    if (typeof r["id"] === "string" && r["id"].length > 0) return r;
+    return { ...r, id: createId() };
+  });
 }

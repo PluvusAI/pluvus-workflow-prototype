@@ -191,7 +191,6 @@ export interface DeliverableQuantity {
  *  alone let every "other"/"other" custom deliverable collide on one shared
  *  key. */
 export type DeliverablePricing = Record<string, number>;
-export type DeliverablePricing = Record<string, number>;
 
 /** PLU-139 (2a): S3.11 per-platform follower ranges — keyed by platform. `max`
  *  null = no upper limit. */

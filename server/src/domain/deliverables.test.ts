@@ -11,6 +11,7 @@ import {
   deliverableSchema,
   deliverablesSchema,
   validateDeliverables,
+  normalizeLegacyDeliverableIds,
 } from "./deliverablesValidator.js";
 
 function d(overrides: Record<string, unknown> = {}) {
@@ -182,4 +183,69 @@ test("every platform has at least one valid format", () => {
 
 test("\"other\" platform allows only \"other\" format (decision #8)", () => {
   assert.deepEqual(PLATFORM_FORMAT_MATRIX.other, ["other"]);
+});
+
+console.log("\nnormalizeLegacyDeliverableIds — a campaign can still hold rows saved before id was required\n");
+
+test("an id-less legacy row is minted a fresh, non-empty id", () => {
+  const legacy = { platform: "instagram", format: "reel", quantity: 2 }; // no id
+  const [normalized] = normalizeLegacyDeliverableIds([legacy]) as Array<Record<string, unknown>>;
+  assert.equal(typeof normalized?.["id"], "string");
+  assert.ok((normalized?.["id"] as string).length > 0);
+  assert.equal(normalized?.["platform"], "instagram");
+});
+
+test("a row that already has an id keeps that EXACT id (not re-minted)", () => {
+  const [normalized] = normalizeLegacyDeliverableIds([d({ id: "del_stable" })]) as Array<
+    Record<string, unknown>
+  >;
+  assert.equal(normalized?.["id"], "del_stable");
+});
+
+test("two id-less rows in the same array each get their OWN distinct minted id", () => {
+  const a = { platform: "instagram", format: "reel", quantity: 1 };
+  const b = { platform: "instagram", format: "story", quantity: 1 };
+  const [na, nb] = normalizeLegacyDeliverableIds([a, b]) as Array<Record<string, unknown>>;
+  assert.notEqual(na?.["id"], nb?.["id"]);
+});
+
+test("non-array input passes through untouched, letting validateDeliverables produce the real error", () => {
+  const input = { not: "an array" };
+  assert.equal(normalizeLegacyDeliverableIds(input), input);
+});
+
+test("non-object array entries pass through untouched", () => {
+  const result = normalizeLegacyDeliverableIds([null, 42, "x"]);
+  assert.deepEqual(result, [null, 42, "x"]);
+});
+
+// The reported bug: an id-less legacy row, run through validateDeliverables
+// DIRECTLY, is rejected — this is what made an unrelated edit to a legacy,
+// not-yet-backfilled campaign 400 on every save.
+test("regression: an id-less legacy row FAILS validateDeliverables directly (proves the bug existed)", () => {
+  const legacy = { platform: "instagram", format: "reel", quantity: 2 };
+  const result = validateDeliverables([legacy]);
+  assert.equal(result.ok, false);
+});
+
+// The fix: normalize BEFORE validating, exactly as finalAgreements.ts's
+// resolveFinalDeliverables and routes/campaigns.ts's PATCH handler now do —
+// the same legacy row now passes.
+test("fix: normalizeLegacyDeliverableIds then validateDeliverables accepts the same legacy row", () => {
+  const legacy = { platform: "instagram", format: "reel", quantity: 2 };
+  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacy]));
+  assert.equal(result.ok, true);
+});
+
+test("a mix of legacy id-less rows and already-id'd rows all validate together, ids stay unique", () => {
+  const legacyA = { platform: "instagram", format: "reel", quantity: 1 };
+  const legacyB = { platform: "instagram", format: "story", quantity: 1 };
+  const modern = d({ id: "del_modern", platform: "tiktok", format: "video" });
+  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacyA, legacyB, modern]));
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.deliverables.length, 3);
+    const ids = result.deliverables.map((x) => x.id);
+    assert.equal(new Set(ids).size, 3, "every row — legacy and modern — has a unique id");
+  }
 });

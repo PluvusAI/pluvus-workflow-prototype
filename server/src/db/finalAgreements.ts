@@ -1,5 +1,4 @@
 import { eq } from "drizzle-orm";
-import { createId } from "@paralleldrive/cuid2";
 import { db, type Db, type DbTx } from "./drizzle.js";
 import {
   finalAgreements,
@@ -8,7 +7,7 @@ import {
   type FinalAgreementInsert,
 } from "./schema.js";
 import type { Deliverable } from "../domain/deliverables.js";
-import { validateDeliverables } from "../domain/deliverablesValidator.js";
+import { validateDeliverables, normalizeLegacyDeliverableIds } from "../domain/deliverablesValidator.js";
 
 // ---------------------------------------------------------------------------
 // FinalAgreement — the ONE canonical accepted-terms record (PLU-169, 1f).
@@ -230,38 +229,30 @@ export type ResolveFinalDeliverablesResult =
  * carries whatever scope was agreed, per PLU-169 decision #9); that is NOT
  * the same failure mode as "an array that contains a bad item."
  */
+// PLU-169 (1f) — Greptile review (PR #46) fix: a launched CampaignTermsSnapshot
+// is IMMUTABLE (written once by launchCampaign(), never updated after — see
+// its own doc comment in schema.ts), so the one-time id backfill script
+// (decision #4), which only writes to the MUTABLE CampaignDetails row, can
+// never reach an already-launched campaign's frozen snapshot.
+// normalizeLegacyDeliverableIds mints a fresh id here, BEFORE
+// validateDeliverables runs, so a launched snapshot predating the backfill
+// doesn't fail validation forever on every one of its items. This id is NOT
+// written back to the immutable snapshot and is only guaranteed stable for
+// the lifetime of this one FinalAgreement row — acceptable for Phase 1, since
+// nothing references a deliverable id yet (negotiation-delta support,
+// decision #5, is a separate future ticket that will need its own answer for
+// referencing an id inside an immutable snapshot before it can rely on
+// reproducibility here).
 export function resolveFinalDeliverables(args: {
   baseline: unknown; // termsSnapshot.detailsSnapshot["deliverableQuantities"]
 }): ResolveFinalDeliverablesResult {
   if (!Array.isArray(args.baseline) || args.baseline.length === 0) {
     return { ok: true, deliverables: [] };
   }
-  const normalized = args.baseline.map(normalizeLegacyId);
+  const normalized = normalizeLegacyDeliverableIds(args.baseline);
   const result = validateDeliverables(normalized);
   if (!result.ok) return { ok: false, error: result.error };
   return { ok: true, deliverables: result.deliverables };
-}
-
-// PLU-169 (1f) — Greptile review (PR #46) fix: a launched CampaignTermsSnapshot
-// is IMMUTABLE (written once by launchCampaign(), never updated after — see
-// its own doc comment in schema.ts), so the one-time id backfill script
-// (decision #4), which only writes to the MUTABLE CampaignDetails row, can
-// never reach an already-launched campaign's frozen snapshot. Mint a fresh id
-// here, BEFORE validateDeliverables runs (deliverablesSchema requires
-// `id: string().min(1)`, and a launched snapshot predating the backfill would
-// otherwise fail validation forever on every one of its items). This id is
-// NOT written back to the immutable snapshot and is only guaranteed stable
-// for the lifetime of this one FinalAgreement row — acceptable for Phase 1,
-// since nothing references a deliverable id yet (negotiation-delta support,
-// decision #5, is a separate future ticket that will need its own answer for
-// referencing an id inside an immutable snapshot before it can rely on
-// reproducibility here). Non-object items pass through untouched so the
-// shared validator — not this function — produces the real error for them.
-function normalizeLegacyId(v: unknown): unknown {
-  if (typeof v !== "object" || v === null) return v;
-  const r = v as Record<string, unknown>;
-  if (typeof r["id"] === "string" && r["id"].length > 0) return r;
-  return { ...r, id: createId() };
 }
 
 // ---------------------------------------------------------------------------

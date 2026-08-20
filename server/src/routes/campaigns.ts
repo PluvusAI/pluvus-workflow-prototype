@@ -23,7 +23,7 @@ import {
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
 import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
-import { validateDeliverables } from "../domain/deliverablesValidator.js";
+import { validateDeliverables, normalizeLegacyDeliverableIds } from "../domain/deliverablesValidator.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
   getCreatorRequirement,
@@ -856,15 +856,28 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // consumer (FinalAgreement.finalDeliverables). null clears the field;
     // an empty array is valid (a campaign can have zero deliverables
     // recorded yet).
+    //
+    // Review fix: a campaign can still hold deliverableQuantities rows
+    // created before `id` was required (the one-time backfill script fixes
+    // these in bulk, but nothing guarantees it has run for THIS campaign
+    // yet). The intake resends the complete array on every group-level PATCH
+    // — including an edit to a totally unrelated field — so validating the
+    // raw input rejected any legacy, not-yet-backfilled campaign with a 400
+    // until an operator ran the backfill. Normalize legacy rows (mint a
+    // missing id) BEFORE validating, and persist the NORMALIZED array (not
+    // the raw input) so those ids become stable from this save forward —
+    // this campaign incrementally self-heals the first time anyone happens
+    // to save it, without waiting on the separate backfill script.
+    let normalizedDeliverables: JsonValue | null = deliverableQuantities as JsonValue | null;
     if (deliverableQuantities !== null) {
-      const result = validateDeliverables(deliverableQuantities);
+      const result = validateDeliverables(normalizeLegacyDeliverableIds(deliverableQuantities));
       if (!result.ok) {
         res.status(400).json({ error: `deliverableQuantities: ${result.error}` });
         return;
       }
+      normalizedDeliverables = result.deliverables as unknown as JsonValue;
     }
-    (detailsPatch as Record<string, unknown>)["deliverableQuantities"] =
-      deliverableQuantities as JsonValue | null;
+    (detailsPatch as Record<string, unknown>)["deliverableQuantities"] = normalizedDeliverables;
   }
   // S7.P1 pricing map / S3.11 follower-ranges map — plain JSON objects keyed by
   // deliverable or platform. Accept an object or null; reject arrays/scalars at
