@@ -396,6 +396,10 @@ function fakeFinalAgreement(): FinalAgreement {
     acceptanceSource: "AI_NEGOTIATION",
     sourceMessageId: "m1",
     acceptedAt: new Date("2026-08-20T00:00:00Z"),
+    contentBriefGeneratedAt: null,
+    contentBriefCampaignBriefId: null,
+    contentBriefAssetRef: null,
+    contentBriefTemplateVersion: null,
     createdAt: new Date("2026-08-20T00:00:00Z"),
     updatedAt: new Date("2026-08-20T00:00:00Z"),
   };

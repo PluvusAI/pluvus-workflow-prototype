@@ -1,17 +1,12 @@
 import type { JsonObject } from "../../db/schema.js";
-import { listEventsByInstance, findPaymentInfoByInstance } from "../../db/index.js";
+import { findPaymentInfoByInstance } from "../../db/index.js";
 import type { ExecutionContext, NodeResult, EmailAttachment } from "../types.js";
 import type { IEmailProvider, IAgentProvider } from "../providers.js";
 import { resolvePartnership } from "./partnership.js";
 import { readStoredFile } from "../../storage/localFileStorage.js";
 import { sendOnce } from "./idempotentSend.js";
 import { renderContentBriefEmail } from "./contentBriefEmail.js";
-import { resolveAgreedFee } from "./agreedFee.js";
-import {
-  agreedFeeSource,
-  resolveKnowledgeField,
-  type SourceLabel,
-} from "../knowledgePrecedence.js";
+import { resolveKnowledgeField } from "../knowledgePrecedence.js";
 import { resolvePaymentToken } from "./paymentInfo.js";
 import { paymentFormLink } from "./paymentEmail.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
@@ -20,10 +15,23 @@ import {
   blockedByMissingBrand,
   blockedByAttributionMint,
   blockedBySnapshotIntegrity,
+  blockedByCampaignBriefMismatch,
+  blockedByMissingFinalAgreement,
+  blockedByIncompleteDeliverables,
 } from "./guardEscalation.js";
 import { resolveBrandName } from "../campaignContext.js";
 import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
 import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
+// PLU-143: the two canonical creator-specific/shared-obligation sources this
+// executor now reads from — see docs/plu-143-content-brief-final-agreement-plan.md.
+import { resolveCurrentCampaignBriefForInstance } from "../../db/campaignBriefValidation.js";
+import type { CampaignBriefMismatchCategory } from "../../db/campaignBriefValidation.js";
+import {
+  findFinalAgreementByInstance,
+  recordContentBriefGeneration,
+} from "../../db/finalAgreements.js";
+import { validateDeliverables } from "../../domain/deliverablesValidator.js";
+import { formatDeliverablesForCreator } from "../../domain/deliverablesFormat.js";
 
 // ---------------------------------------------------------------------------
 // Content Brief executor (merged post-negotiation node)
@@ -63,7 +71,7 @@ export async function executeContentBrief(
   email: IEmailProvider,
   _agent: IAgentProvider,
 ): Promise<NodeResult> {
-  const { instance, node, nodeGraph, creator } = ctx;
+  const { instance, node, creator } = ctx;
 
   // PLU-137/138: this email is contract-forming, so its PUBLIC terms
   // (deliverables / timeline / public commission / reward) must come from the
@@ -81,10 +89,6 @@ export async function executeContentBrief(
     ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config })
     : undefined;
   const config = effectiveTerms?.config ?? node.config;
-  // PLU-142 follow-up: fields the pinned snapshot explicitly cleared must not be
-  // resurrected from the stale NEGOTIATION node below (resolveKnowledgeField's
-  // explicitlyCleared flag).
-  const clearedFields = effectiveTerms?.clearedFields ?? new Set<string>();
 
   // The merged flow enters on ACCEPTED (Content Brief directly follows negotiation).
   // With the brand-approval gate ON, the SEND phase is deferred until the brand
@@ -103,38 +107,22 @@ export async function executeContentBrief(
     );
   }
 
-  // 1. Read the brand-supplied configuration.
-  const briefFileRef = str(config, "briefFileRef");
+  // 1. Read the brand-supplied WORKFLOW configuration (behavior fields, not
+  //    material terms — PLU-137/138 only cut over material terms; briefFileName/
+  //    creatorNotes stay config-sourced same as before).
   const briefFileName = str(config, "briefFileName") || "campaign-brief.pdf";
   const creatorNotes = str(config, "creatorNotes");
-  // Preserve this executor's legacy `str()` behavior (workflow config only,
-  // trimmed before rendering) while routing presence/provenance through the
-  // shared knowledge resolver like the other finalized terms.
-  const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
+  // Legacy default — overridden below for the merged flow once FinalAgreement
+  // is loaded (PLU-143: creator-specific compensation, including the gift/
+  // product blurb, is FinalAgreement's authority for an accepted journey,
+  // never resolveKnowledgeField/config).
+  const legacyRewardDescriptionR = resolveKnowledgeField("rewardDescription", {
     workflowConfig: config["rewardDescription"],
   });
-  const rewardDescription =
-    typeof rewardDescriptionR.value === "string" ? rewardDescriptionR.value.trim() : "";
+  let rewardDescription =
+    typeof legacyRewardDescriptionR.value === "string" ? legacyRewardDescriptionR.value.trim() : "";
 
-  // The Campaign Brief PDF is required (enforced at publish/launch validation);
-  // fail loudly if it's somehow missing at runtime rather than sending a brief
-  // email with no brief. A thrown error preserves the engine's retry/error
-  // handling — the same behavior every other executor relies on.
-  if (!briefFileRef) {
-    throw new Error(
-      `CONTENT_BRIEF for ${instance.id} has no campaign brief PDF configured (briefFileRef)`,
-    );
-  }
-
-  // 2. Load the uploaded PDF from local storage and build the attachment.
-  const content = await readStoredFile(briefFileRef);
-  const attachment: EmailAttachment = {
-    filename: briefFileName,
-    contentType: "application/pdf",
-    content,
-  };
-
-  // 3. Resolve the brand. L4 (#14): resolve from config → campaign; if neither
+  // 2. Resolve the brand. L4 (#14): resolve from config → campaign; if neither
   //    has it, route to MANUAL_REVIEW (clean one-way handoff) for a human to fix
   //    the config rather than email the creator "your brand". runtime emails the
   //    brand an FYI keyed on missing_brand_name.
@@ -143,72 +131,141 @@ export async function executeContentBrief(
     return blockedByMissingBrand(ctx.node.type);
   }
 
-  // 4. In the merged flow, assemble the finalized offer + mint the payout link so
-  //    the single email carries the terms and the form. In the legacy flow payout
-  //    is already collected, so we send the brief-only email (no offer/link).
+  // 3. In the merged flow, resolve the canonical FinalAgreement (PLU-169) for
+  //    creator-specific accepted compensation + deliverables, and the
+  //    campaign-brief attachment (PLU-143 — see the plan doc's "Architecture
+  //    decision" for why this branches on briefDeliveryMethod). The legacy
+  //    flow (isLegacy) is unaffected: it predates FinalAgreement entirely and
+  //    never resolves finalized terms (brief-only email, briefFileRef exactly
+  //    as before).
   let fixedFee: number | undefined;
   let commissionRate: number | undefined;
-  let deliverables: string | undefined;
+  let deliverableLines: string[] = [];
   let timeline: string | undefined;
   let formLink = "";
   let token: string | undefined;
-  // PLU-82 (§4.6): the winning-source label per finalized term, populated in the
-  // merged branch below (the legacy brief-only flow resolves no terms). Debug
-  // metadata for the event payload only — never a money/term input.
-  const resolvedSources: Record<string, SourceLabel> = {};
+  let attachment: EmailAttachment;
+  let contentBriefProvenance:
+    | { campaignBriefId: string | null; assetRef: string; templateVersion: string }
+    | undefined;
 
   if (isMerged) {
-    resolvedSources["rewardDescription"] = rewardDescriptionR.source;
-    // The negotiation commission is stamped onto THIS node's config at save/publish
-    // (stampRewardFromNegotiation). Read the NEGOTIATION node as a defensive
-    // fallback for versions published before the stamp (or direct-created instances).
-    const negotiationConfig =
-      nodeGraph.find((n) => n.type === "NEGOTIATION")?.config ?? {};
-    const events = await listEventsByInstance(instance.id, { type: "NEGOTIATION_TURN" });
-    fixedFee = resolveAgreedFee(events, negotiationConfig, config);
-    // CRITICAL-3: the merged Content Brief email is contract-forming — it states
-    // the fee + payout link the creator submits against. If no genuine agreed
-    // rate was recorded (resolveAgreedFee returns undefined; the old code fell
-    // back to the internal ceiling here), escalate to a human rather than email a
-    // fabricated figure. Deterministic code must never invent a fee (PRINCIPLES.md).
-    if (fixedFee === undefined) {
-      return {
-        nextState: "MANUAL_REVIEW",
-        nextNodeId: null,
-        completedAt: new Date(),
-        eventType: "MANUAL_REVIEW_FLAGGED",
-        eventPayload: { outcome: "ESCALATE", reason: "no_agreed_fee", node: node.type },
+    // Per the issue's own "do not fall back" list: a missing row is a hard
+    // block, never a resolveAgreedFee/nodeGraph replay. Reachable only for a
+    // legacy instance that reached ACCEPTED before PLU-169 shipped and is
+    // somehow re-driven through this node later (PLU-169 does not backfill
+    // historical acceptances).
+    const finalAgreement = await findFinalAgreementByInstance(instance.id);
+    if (!finalAgreement) {
+      return blockedByMissingFinalAgreement(node.type);
+    }
+
+    // Creator-specific accepted compensation — FinalAgreement is the SOLE
+    // authority (the issue's own "final agreement is the authority for
+    // creator-specific accepted deliverables" rule). finalFeeCents is
+    // cents; every other consumer of `fixedFee` in this file (the email
+    // template, the output-guard fee allowlist) expects dollars, matching
+    // how `proposedRate` is dollars everywhere upstream of PLU-169's own
+    // cents conversion at write time.
+    fixedFee = finalAgreement.finalFeeCents !== null ? finalAgreement.finalFeeCents / 100 : undefined;
+    commissionRate = finalAgreement.finalCommissionRate ?? undefined;
+    timeline = finalAgreement.finalTimeline ?? undefined;
+    rewardDescription = finalAgreement.finalGiftProductDescription ?? "";
+
+    // Deliverable projection contract: consume the COMPLETE finalDeliverables
+    // array, unmodified — no delta reapplication (nothing upstream stores one
+    // in this phase), no partial-package fallback. Missing/empty/invalid
+    // blocks safely rather than rendering "To be finalized".
+    const deliverablesResult = validateDeliverables(finalAgreement.finalDeliverables ?? []);
+    if (!deliverablesResult.ok || deliverablesResult.deliverables.length === 0) {
+      return blockedByIncompleteDeliverables(
+        node.type,
+        deliverablesResult.ok ? "finalDeliverables is empty" : deliverablesResult.error,
+      );
+    }
+    deliverableLines = formatDeliverablesForCreator(deliverablesResult.deliverables);
+
+    // The attached document — branch on the PINNED snapshot's own
+    // briefDeliveryMethod (frozen with the rest of CampaignDetails at
+    // launch; never live CampaignDetails). "own_doc" (or unset/legacy, since
+    // this field predates this ticket) keeps the brand's manually-uploaded
+    // PDF exactly as before; "pluvus_builder" attaches the PLU-142-resolved
+    // rendered CampaignBrief instead.
+    const detailsSnapshot = pinnedTerms.terms?.detailsSnapshot as Record<string, unknown> | undefined;
+    const briefDeliveryMethod = detailsSnapshot?.["briefDeliveryMethod"];
+
+    if (briefDeliveryMethod === "pluvus_builder") {
+      const briefResult = await resolveCurrentCampaignBriefForInstance(instance.id);
+      if (briefResult.status !== "CURRENT") {
+        const IDENTITY_MISMATCH_CATEGORIES = new Set<CampaignBriefMismatchCategory>([
+          "NO_CAMPAIGN",
+          "NO_PINNED_SNAPSHOT",
+          "SNAPSHOT_MISMATCH",
+          "CROSS_CAMPAIGN",
+        ]);
+        if (briefResult.mismatchCategory && IDENTITY_MISMATCH_CATEGORIES.has(briefResult.mismatchCategory)) {
+          // A real identity/integrity problem — no retry fixes this.
+          return blockedByCampaignBriefMismatch(node.type, briefResult);
+        }
+        // The asset just isn't ready yet (NO_CURRENT_BRIEF/ASSET_UNAVAILABLE/
+        // DATA_INCOMPLETE) — resolveCurrentCampaignBriefForInstance already
+        // triggered a regeneration. Throw so the engine's own retry re-attempts
+        // later, same pattern the missing-briefFileRef check below already
+        // uses, rather than escalating a transient state to a human.
+        throw new Error(
+          `CONTENT_BRIEF for ${instance.id}: campaign brief not yet ready ` +
+            `(status=${briefResult.status}, category=${briefResult.mismatchCategory ?? "none"})`,
+        );
+      }
+      const brief = briefResult.brief;
+      if (!brief || !brief.renderedAssetRef) {
+        // Defensive — getCurrentReadyCampaignBrief()'s own CURRENT contract
+        // guarantees both are set; should be unreachable.
+        throw new Error(
+          `CONTENT_BRIEF for ${instance.id}: CURRENT CampaignBrief result has no renderedAssetRef`,
+        );
+      }
+      const content = await readStoredFile(brief.renderedAssetRef);
+      attachment = { filename: "campaign-brief.pdf", contentType: "application/pdf", content };
+      contentBriefProvenance = {
+        campaignBriefId: brief.id,
+        assetRef: brief.renderedAssetRef,
+        templateVersion: brief.templateVersion,
+      };
+    } else {
+      const briefFileRef = str(config, "briefFileRef");
+      // The Campaign Brief PDF is required (enforced at publish/launch
+      // validation); fail loudly if it's somehow missing at runtime rather
+      // than sending a brief email with no brief. A thrown error preserves
+      // the engine's retry/error handling — the same behavior every other
+      // executor relies on.
+      if (!briefFileRef) {
+        throw new Error(
+          `CONTENT_BRIEF for ${instance.id} has no campaign brief PDF configured (briefFileRef)`,
+        );
+      }
+      const content = await readStoredFile(briefFileRef);
+      attachment = { filename: briefFileName, contentType: "application/pdf", content };
+      contentBriefProvenance = {
+        campaignBriefId: null,
+        assetRef: briefFileRef,
+        templateVersion: "brand_uploaded",
       };
     }
-    resolvedSources["fixedFee"] = agreedFeeSource(fixedFee);
-    // PLU-82 (§4.3): resolve through the documented precedence resolver instead of
-    // the inline chains — byte-identical (invariant #3), golden-test locked. 2-tier
-    // here (config → negotiationConfig, no campaign fallback), so campaignDefault
-    // is omitted (undefined = skipped).
-    const commission = resolveKnowledgeField("commissionRate", {
-      workflowConfig: config["commissionRate"],
-      negotiationState: negotiationConfig["commissionRate"],
-      explicitlyCleared: clearedFields.has("commissionRate"),
-    });
-    commissionRate = commission.value as number | undefined;
-    resolvedSources["commissionRate"] = commission.source;
-    const deliverablesR = resolveKnowledgeField("deliverables", {
-      workflowConfig: config["deliverables"],
-      negotiationState: negotiationConfig["deliverables"],
-      explicitlyCleared: clearedFields.has("deliverables"),
-    });
-    deliverables = deliverablesR.value as string | undefined;
-    resolvedSources["deliverables"] = deliverablesR.source;
-    const timelineR = resolveKnowledgeField("timeline", {
-      workflowConfig: config["timeline"],
-      negotiationState: negotiationConfig["timeline"],
-      explicitlyCleared: clearedFields.has("timeline"),
-    });
-    timeline = timelineR.value as string | undefined;
-    resolvedSources["timeline"] = timelineR.source;
 
     token = await resolvePaymentToken(instance.id);
     formLink = paymentFormLink(token);
+  } else {
+    // Legacy (PAYMENT_RECEIVED): brief-only email, unchanged — briefFileRef
+    // exactly as before, no FinalAgreement/CampaignBrief involvement.
+    const briefFileRef = str(config, "briefFileRef");
+    if (!briefFileRef) {
+      throw new Error(
+        `CONTENT_BRIEF for ${instance.id} has no campaign brief PDF configured (briefFileRef)`,
+      );
+    }
+    const content = await readStoredFile(briefFileRef);
+    attachment = { filename: briefFileName, contentType: "application/pdf", content };
   }
 
   // 5. Render the email. The renderer includes the offer block + payout link only
@@ -220,7 +277,7 @@ export async function executeContentBrief(
       formLink,
       fixedFee,
       commissionRate,
-      deliverables,
+      deliverableLines,
       timeline,
       creatorNotes,
       rewardDescription,
@@ -255,6 +312,14 @@ export async function executeContentBrief(
   // 8a. Merged flow: enter the PAYMENT_PENDING waiting state and stay on THIS node
   //     so the hosted-form submission resumes here. NOT terminal — no completedAt.
   if (isMerged) {
+    // PLU-143: record which document was actually attached, on the same
+    // FinalAgreement row recordFinalAgreementOnce inserted at accept time. A
+    // second write against an existing row (see recordContentBriefGeneration's
+    // own doc comment) — safe to repeat on a retried step.
+    const generatedAt = new Date();
+    if (contentBriefProvenance) {
+      await recordContentBriefGeneration(instance.id, { ...contentBriefProvenance, generatedAt });
+    }
     return {
       nextState: "PAYMENT_PENDING",
       nextNodeId: node.id,
@@ -263,8 +328,7 @@ export async function executeContentBrief(
         ...(token ? { token, formLink } : {}),
         ...(fixedFee !== undefined ? { fixedFee } : {}),
         ...(commissionRate !== undefined ? { commission: commissionRate } : {}),
-        // PLU-82 (§4.6): winning-source label per finalized term. Debug metadata only.
-        resolvedSources,
+        ...(contentBriefProvenance ? { contentBriefGeneration: contentBriefProvenance } : {}),
       } as JsonObject,
     };
   }

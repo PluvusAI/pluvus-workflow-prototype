@@ -871,6 +871,8 @@ model CampaignBrief {
 
   campaign      Campaign              @relation(fields: [campaignId], references: [id], onDelete: Restrict)
   termsSnapshot CampaignTermsSnapshot @relation(fields: [campaignTermsSnapshotId, campaignId], references: [id, campaignId], onDelete: Restrict)
+  /// PLU-143: back-relation for FinalAgreement.contentBriefCampaignBriefId.
+  contentBriefGenerations FinalAgreement[]
 
   @@index([campaignId])
   @@index([campaignTermsSnapshotId])
@@ -1617,6 +1619,19 @@ model FinalAgreement {
   sourceMessageId  String?
   acceptedAt       DateTime
 
+  /// PLU-143: Content Brief generation provenance. Nullable — populated by
+  /// recordContentBriefGeneration() AFTER this row's initial insert (a
+  /// second, later write against the same row, by instanceId), once
+  /// executeContentBrief actually generates the creator's Content Brief.
+  /// contentBriefCampaignBriefId is null on the "own_doc" briefDeliveryMethod
+  /// path (no CampaignBrief row is ever consulted there); contentBriefTemplateVersion
+  /// is the fixed marker "brand_uploaded" on that same path, so the column is
+  /// always meaningful, never silently null-because-not-applicable.
+  contentBriefGeneratedAt     DateTime?
+  contentBriefCampaignBriefId String?
+  contentBriefAssetRef        String?
+  contentBriefTemplateVersion String?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -1624,6 +1639,7 @@ model FinalAgreement {
   campaignTermsSnapshot     CampaignTermsSnapshot?     @relation(fields: [campaignTermsSnapshotId], references: [id], onDelete: Restrict)
   negotiationPolicySnapshot NegotiationPolicySnapshot? @relation(fields: [negotiationPolicySnapshotId], references: [id], onDelete: Restrict)
   sourceMessage             Message?                   @relation(fields: [sourceMessageId], references: [id])
+  contentBriefCampaignBrief CampaignBrief?             @relation(fields: [contentBriefCampaignBriefId], references: [id], onDelete: Restrict)
 }
 
 /// PLU-111: a durable record of an open conversation thread with its own

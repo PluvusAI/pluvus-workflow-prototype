@@ -7,9 +7,11 @@
  *   ACCEPTED → (auto) merged Content Brief email → PAYMENT_PENDING
  *            → (form submit) → CONTENT_LINKS_PENDING (await content links)
  *
- * Also verifies: the merged email carries the finalized offer (fee/commission/
- * deliverables) + the tokenized payout link + referral link + creator notes; the
- * configured PDF is loaded from local storage and attached; the send is
+ * Also verifies: the merged email carries the finalized offer — sourced from the
+ * FinalAgreement row a real accept turn writes (PLU-143), never config/negotiation
+ * history — (fee/commission/deliverables) + the tokenized payout link + creator
+ * notes; the configured PDF is loaded from local storage, attached, and its
+ * provenance recorded onto FinalAgreement.contentBriefGeneration*; the send is
  * idempotent (a re-run does not send a second email); a CONTENT_BRIEF_SENT event
  * is recorded and the instance parks (non-terminal) on CONTENT_LINKS_PENDING after
  * the form submission.
@@ -39,6 +41,7 @@ import {
   creators,
   events,
   executionInstances,
+  finalAgreements,
   messages,
   paymentInfo,
   workflows,
@@ -50,6 +53,10 @@ import {
   listEventsByInstance,
   listMessagesByInstance,
 } from "../db/index.js";
+// PLU-143: the merged flow now reads finalized terms from FinalAgreement, not
+// resolveAgreedFee/config — the harness must seed the row a real accept turn
+// would have written (recordFinalAgreementOnce), same as any other caller.
+import { recordFinalAgreementOnce, findFinalAgreementByInstance } from "../db/finalAgreements.js";
 import { WorkflowRuntime } from "./runtime.js";
 import { MockEmailProvider, MockAgentProvider } from "./providers.js";
 import type { NodeSnapshot } from "./types.js";
@@ -65,7 +72,13 @@ const PDF_BYTES = Buffer.from(
 const NOTES = "Please tag @acme in your first post.";
 const AGREED_RATE = 420;
 const COMMISSION = 12;
-const DELIVERABLES = "2 Reels + 1 Story";
+// PLU-143: the structured Deliverable[] FinalAgreement now carries, in place
+// of the old free-text "2 Reels + 1 Story" config string. Rendered by
+// formatDeliverablesForCreator as "2 Instagram Reels" / "1 Instagram Story".
+const FINAL_DELIVERABLES = [
+  { id: "fd-reel", platform: "instagram" as const, format: "reel" as const, quantity: 2 },
+  { id: "fd-story", platform: "instagram" as const, format: "story" as const, quantity: 1 },
+];
 
 // Shared pipeline prefix (import → outreach → follow-up → reply → negotiation).
 function pipelinePrefix(): NodeSnapshot[] {
@@ -88,14 +101,16 @@ function pipelinePrefix(): NodeSnapshot[] {
       id: "node-negotiation",
       type: "NEGOTIATION",
       order: 4,
-      config: { minBudget: 200, maxBudget: 500, maxRounds: 3, commissionRate: COMMISSION, deliverables: DELIVERABLES, brandName: "Acme", senderName: "Acme" },
+      config: { minBudget: 200, maxBudget: 500, maxRounds: 3, commissionRate: COMMISSION, deliverables: "2 Reels + 1 Story", brandName: "Acme", senderName: "Acme" },
     },
   ];
 }
 
-// MERGED graph: negotiation → Content Brief (the new default). Commission +
-// deliverables are stamped onto the brief node (mirrors stampRewardFromNegotiation
-// + restampBrand), so the executor can render the finalized offer.
+// MERGED graph: negotiation → Content Brief (the new default). PLU-143: the
+// finalized fee/commission/deliverables/timeline now come from the
+// FinalAgreement row (seedFinalAgreement below), not this node's config — the
+// config here only carries the brand/PDF/notes fields the executor still
+// reads directly.
 function mergedNodes(briefFileRef: string, briefFileName: string): NodeSnapshot[] {
   return [
     ...pipelinePrefix(),
@@ -106,8 +121,6 @@ function mergedNodes(briefFileRef: string, briefFileName: string): NodeSnapshot[
       config: {
         brandName: "Acme",
         senderName: "Acme",
-        commissionRate: COMMISSION,
-        deliverables: DELIVERABLES,
         briefFileRef,
         briefFileName,
         creatorNotes: NOTES,
@@ -144,8 +157,46 @@ async function state(instanceId: string): Promise<InstanceState> {
   return inst.currentState;
 }
 
-// Seed the ACCEPT NEGOTIATION_TURN event so resolveAgreedFee recovers the agreed
-// rate as the finalized offer (mirrors what the negotiation executor persists).
+// PLU-143: the canonical accepted-terms row a real accept turn writes
+// (recordFinalAgreementOnce) — the merged Content Brief flow now reads its
+// finalized fee/commission/deliverables/timeline from THIS, never from
+// config or NEGOTIATION_TURN history.
+async function seedFinalAgreement(
+  instanceId: string,
+  overrides: { finalDeliverables?: typeof FINAL_DELIVERABLES } = {},
+): Promise<void> {
+  await recordFinalAgreementOnce({
+    instanceId,
+    campaignTermsSnapshotId: null,
+    negotiationPolicySnapshotId: null,
+    finalFeeCents: AGREED_RATE * 100,
+    finalCommissionMode: "PERCENT",
+    finalCommissionRate: COMMISSION,
+    finalCommissionAmountCents: null,
+    finalCommissionDurationDays: null,
+    finalCommissionConditions: null,
+    finalGiftProductDescription: null,
+    finalGiftDisposition: null,
+    finalFulfillmentTerms: null,
+    finalDeliverables: overrides.finalDeliverables ?? FINAL_DELIVERABLES,
+    finalTimeline: null,
+    finalPostingDate: null,
+    finalUsageRights: null,
+    finalExclusivity: null,
+    finalAttributionWindow: null,
+    finalPaymentTerms: null,
+    finalScriptSubmissionRequired: false,
+    approvedDeviations: null,
+    acceptanceSource: "AI_NEGOTIATION",
+    sourceMessageId: null,
+    acceptedAt: new Date(),
+  });
+}
+
+// Seed the ACCEPT NEGOTIATION_TURN event too — a real accept turn writes both;
+// no current code path in this file still reads it back (resolveAgreedFee was
+// retired from the merged Content Brief flow), kept only for parity with what
+// negotiation.ts actually persists on accept.
 async function seedAcceptEvent(instanceId: string): Promise<void> {
   await appendEvent({
     instanceId,
@@ -194,12 +245,14 @@ async function main(): Promise<void> {
     currentNodeId: null,
   }).returning())[0]!;
   await seedAcceptEvent(instance.id);
+  await seedFinalAgreement(instance.id);
 
   const cleanup = async () => {
     await db.delete(events).where(eq(events.instanceId, instance.id));
     await db.delete(messages).where(eq(messages.instanceId, instance.id));
     await db.delete(brandNotifications).where(eq(brandNotifications.instanceId, instance.id));
     await db.delete(paymentInfo).where(eq(paymentInfo.instanceId, instance.id));
+    await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, instance.id));
     await db.delete(executionInstances).where(eq(executionInstances.id, instance.id));
     await db.delete(workflowVersions).where(eq(workflowVersions.id, version.id));
     await db.delete(workflows).where(eq(workflows.id, workflow.id));
@@ -230,14 +283,27 @@ async function main(): Promise<void> {
     assert.ok(briefEmail, "a 'Your Campaign Brief' email must be sent");
     assert.ok(briefEmail!.body.includes(`$${AGREED_RATE}`), "email must state the agreed fee");
     assert.ok(briefEmail!.body.includes(`${COMMISSION}%`), "email must state the commission");
-    assert.ok(briefEmail!.body.includes("2 Reels"), "email must list the deliverables");
+    assert.ok(briefEmail!.body.includes("2 Instagram Reels"), "email must list the FinalAgreement deliverables");
+    assert.ok(briefEmail!.body.includes("1 Instagram Story"), "email must list every FinalAgreement deliverable");
     assert.ok(/\/payment\//.test(briefEmail!.body), "email must include the tokenized payout link");
     assert.ok(briefEmail!.body.includes(NOTES), "email must include the creator notes");
     assert.ok(
       (briefEmail!.idempotencyKey ?? "").startsWith("content-brief:"),
       "the send must use the content-brief idempotency key",
     );
-    console.log("  ✓ email carries offer (fee/commission/deliverables) + payout link + referral + notes");
+    console.log("  ✓ email carries the FinalAgreement offer (fee/commission/deliverables) + payout link + notes");
+
+    // PLU-143: the FinalAgreement row is the one source of these terms now
+    // (no more resolveAgreedFee/config reads for the merged flow), and this
+    // step must have recorded which document was attached (own_doc path: no
+    // campaignBriefId, assetRef = the uploaded briefFileRef).
+    const finalAgreement = await findFinalAgreementByInstance(instance.id);
+    assert.ok(finalAgreement, "a FinalAgreement row must exist for the merged flow");
+    assert.equal(finalAgreement!.contentBriefCampaignBriefId, null, "own_doc path attaches no CampaignBrief");
+    assert.equal(finalAgreement!.contentBriefAssetRef, stored.reference, "provenance must record the attached PDF");
+    assert.equal(finalAgreement!.contentBriefTemplateVersion, "brand_uploaded");
+    assert.ok(finalAgreement!.contentBriefGeneratedAt instanceof Date, "generation timestamp must be stamped");
+    console.log("  ✓ FinalAgreement.contentBriefGeneration* provenance recorded (own_doc path)");
 
     // A PaymentInfo row/token was minted, and no completedAt yet (still waiting).
     const pi =
@@ -275,6 +341,56 @@ async function main(): Promise<void> {
     const parked = await findInstanceById(instance.id);
     assert.ok(!parked!.completedAt, "completedAt must NOT be stamped — CONTENT_LINKS_PENDING is non-terminal");
     console.log("  ✓ payout form submit → CONTENT_LINKS_PENDING (ledger minted, awaiting content links)");
+
+    // ── PLU-143 SUB-CASE: no FinalAgreement row → MANUAL_REVIEW, never a fee guess ─
+    const noFaInstance = (await db.insert(executionInstances).values({
+      workflowVersionId: version.id,
+      creatorId: creator.id,
+      currentState: "ACCEPTED",
+      currentNodeId: null,
+    }).returning())[0]!;
+    try {
+      await runtime.stepInstance(noFaInstance.id);
+      assert.equal(await state(noFaInstance.id), "MANUAL_REVIEW", "a missing FinalAgreement must escalate, never fabricate terms");
+      const escalations = await listEventsByInstance(noFaInstance.id, { type: "MANUAL_REVIEW_FLAGGED" });
+      assert.equal((escalations[0]?.payload as Record<string, unknown> | undefined)?.["reason"], "no_final_agreement");
+      const noFaMsgs = await listMessagesByInstance(noFaInstance.id);
+      assert.equal(
+        noFaMsgs.filter((m) => m.direction === "OUTBOUND").length,
+        0,
+        "no brief/offer email must be sent when there is no FinalAgreement to source it from",
+      );
+      console.log("  ✓ no FinalAgreement row → MANUAL_REVIEW (no_final_agreement), no email sent");
+    } finally {
+      await db.delete(events).where(eq(events.instanceId, noFaInstance.id));
+      await db.delete(messages).where(eq(messages.instanceId, noFaInstance.id));
+      await db.delete(executionInstances).where(eq(executionInstances.id, noFaInstance.id));
+    }
+
+    // ── PLU-143 SUB-CASE: FinalAgreement with empty deliverables → MANUAL_REVIEW ─
+    const emptyDeliverablesInstance = (await db.insert(executionInstances).values({
+      workflowVersionId: version.id,
+      creatorId: creator.id,
+      currentState: "ACCEPTED",
+      currentNodeId: null,
+    }).returning())[0]!;
+    try {
+      await seedFinalAgreement(emptyDeliverablesInstance.id, { finalDeliverables: [] });
+      await runtime.stepInstance(emptyDeliverablesInstance.id);
+      assert.equal(
+        await state(emptyDeliverablesInstance.id),
+        "MANUAL_REVIEW",
+        "empty finalDeliverables must escalate rather than render 'To be finalized'",
+      );
+      const escalations = await listEventsByInstance(emptyDeliverablesInstance.id, { type: "MANUAL_REVIEW_FLAGGED" });
+      assert.equal((escalations[0]?.payload as Record<string, unknown> | undefined)?.["reason"], "incomplete_final_deliverables");
+      console.log("  ✓ FinalAgreement with empty deliverables → MANUAL_REVIEW (incomplete_final_deliverables)");
+    } finally {
+      await db.delete(events).where(eq(events.instanceId, emptyDeliverablesInstance.id));
+      await db.delete(messages).where(eq(messages.instanceId, emptyDeliverablesInstance.id));
+      await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, emptyDeliverablesInstance.id));
+      await db.delete(executionInstances).where(eq(executionInstances.id, emptyDeliverablesInstance.id));
+    }
 
     // ── LEGACY SUB-CASE: reward → payment → content-brief still reaches terminal ─
     const legacyVersion = (await db.insert(workflowVersions).values({

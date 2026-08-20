@@ -1,5 +1,4 @@
 import type { EmailDraft } from "../types.js";
-import { splitDeliverables } from "./rewardEmail.js";
 
 // ---------------------------------------------------------------------------
 // Content Brief — "Your Campaign Brief" email copy (merged post-negotiation email)
@@ -28,8 +27,9 @@ export interface ContentBriefInput {
   fixedFee?: number | undefined;
   /** Commission %. Rendered as "<n>%", or "None" when absent/zero. */
   commissionRate?: number | undefined;
-  /** Free-text deliverables scope; split into bullets. */
-  deliverables?: string | undefined;
+  /** Pre-formatted, creator-readable deliverable lines (PLU-143:
+   *  formatDeliverablesForCreator), rendered as bullets verbatim. */
+  deliverableLines?: string[] | undefined;
   /** Optional go-live timeline; stated only when present. */
   timeline?: string | undefined;
   /** Optional brand-authored notes, shown in the body. Empty string when none. */
@@ -49,7 +49,7 @@ export function renderContentBriefEmail(input: ContentBriefInput): EmailDraft {
   const feeLine = input.fixedFee !== undefined ? `$${input.fixedFee}` : `the agreed fee`;
   const commissionLine =
     input.commissionRate && input.commissionRate > 0 ? `${input.commissionRate}%` : `None`;
-  const items = splitDeliverables(input.deliverables);
+  const items = input.deliverableLines ?? [];
   const deliverablesBlock =
     items.length > 0 ? items.map((d) => `    - ${d}`).join("\n") : `    - To be finalized`;
   const timeline =

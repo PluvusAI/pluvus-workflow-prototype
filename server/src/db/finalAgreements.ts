@@ -70,6 +70,42 @@ export async function findFinalAgreementByInstance(
 }
 
 // ---------------------------------------------------------------------------
+// Content Brief generation provenance (PLU-143).
+// ---------------------------------------------------------------------------
+// A second, LATER write against the same row `recordFinalAgreementOnce`
+// already inserted (at accept time) — never a new row. Safe to call more
+// than once for the same instance: it's a plain overwrite of these four
+// columns, not an insert, so a retried CONTENT_BRIEF step (the email send
+// itself is separately deduped by sendOnce) just rewrites the same
+// provenance with the same or refreshed values — never a conflict, never a
+// duplicate row.
+
+export interface ContentBriefGenerationInput {
+  campaignBriefId: string | null; // null on the "own_doc" briefDeliveryMethod path
+  assetRef: string;
+  templateVersion: string; // the CampaignBrief's templateVersion, or the fixed marker "brand_uploaded"
+  generatedAt: Date;
+}
+
+export async function recordContentBriefGeneration(
+  instanceId: string,
+  data: ContentBriefGenerationInput,
+  client: Db | DbTx = db,
+): Promise<FinalAgreement | null> {
+  const rows = await client
+    .update(finalAgreements)
+    .set({
+      contentBriefGeneratedAt: data.generatedAt,
+      contentBriefCampaignBriefId: data.campaignBriefId,
+      contentBriefAssetRef: data.assetRef,
+      contentBriefTemplateVersion: data.templateVersion,
+    })
+    .where(eq(finalAgreements.instanceId, instanceId))
+    .returning();
+  return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
 // The BUILDER — pure, no I/O, testable without a DB.
 // ---------------------------------------------------------------------------
 
