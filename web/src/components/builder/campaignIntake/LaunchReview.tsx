@@ -413,9 +413,11 @@ export function LaunchReview({
 }
 
 // PLU-182 (2f.1, Change 4) — the approval-persistence status line next to the
-// CTA: the shell's save state (saving / failed-Retry) plus the disabled reason,
-// so a failed or pending approval PATCH is visible ON Page 9 and the brand knows
-// whether their approval is actually persisted-current.
+// CTA: whether the approval is persisted-current (from the refetched campaign
+// row), plus the shell's shared save state (saving / failed-Retry) and the
+// disabled reason, so the brand knows the real approval state ON Page 9. Approved-
+// current is shown even when an unrelated group's save failed the same cycle (the
+// failure is surfaced as a secondary retryable note, never masking the approval).
 function ApprovalStatus({
   canApprove,
   bothApproved,
@@ -433,44 +435,62 @@ function ApprovalStatus({
   saveError: string | null;
   onRetry: () => void;
 }) {
-  // Failure first — it's the most important state to surface + retry (AC6).
   // NB: saveError/saving are the shell's SHARED state across ALL save groups, not
-  // approval-scoped (Issue 2). So the copy stays group-agnostic ("your changes",
-  // matching the header's generic SaveStatus) rather than claiming "your
-  // approval" — Retry re-runs doSave, which re-sends whatever actually failed
-  // (which, on Page 9, is the approval when that's what was in flight).
+  // approval-scoped. Two consequences handled below:
+  //  • The copy stays group-agnostic ("your changes", matching the header's
+  //    generic SaveStatus) — it never claims "your approval" for an unrelated
+  //    group's failure. Retry re-runs doSave, re-sending whatever failed.
+  //  • Approved-current takes PRECEDENCE over a bare saveError. The campaign
+  //    (approval) PATCH runs FIRST in doSave and, on success, refetches the
+  //    campaign query — so `confirmedCurrent` (read from that fresh row) means the
+  //    approval genuinely IS persisted, even if a LATER independent group failed
+  //    in the same cycle. Letting saveError render first would hide a true
+  //    Approved-current behind an unrelated failure. We show the confirmation and
+  //    surface the failure as a secondary Retry note.
+  const retryButton = (
+    <button
+      onClick={onRetry}
+      className="ds-focusable"
+      style={{
+        background: "none",
+        border: "none",
+        padding: 0,
+        color: colors.accent,
+        cursor: "pointer",
+        fontSize: font.size.sm,
+        textDecoration: "underline",
+      }}
+    >
+      Retry {/* COPY:PLU-159 */}
+    </button>
+  );
+
+  if (confirmedCurrent) {
+    // Approved-current — plus, if some OTHER group's save failed this cycle, a
+    // secondary note so the failure isn't swallowed (still retryable).
+    return (
+      <span style={{ ...text.caption, color: colors.success, display: "flex", alignItems: "center", gap: 6 }}>
+        <Check size={14} strokeWidth={2.5} aria-hidden /> Approved — current.{/* COPY:PLU-159 */}
+        {saveError && (
+          <span style={{ color: colors.danger, display: "inline-flex", alignItems: "center", gap: 6 }}>
+            · Some other changes didn't save. {/* COPY:PLU-159 */}
+            {retryButton}
+          </span>
+        )}
+      </span>
+    );
+  }
+  // Not confirmed-current: a failure here may BE the approval, so surface it first.
   if (saveError) {
     return (
       <span style={{ ...text.caption, color: colors.danger, display: "flex", alignItems: "center", gap: 6 }}>
-        {/* COPY:PLU-159 */}
-        Couldn't save your changes.
-        <button
-          onClick={onRetry}
-          className="ds-focusable"
-          style={{
-            background: "none",
-            border: "none",
-            padding: 0,
-            color: colors.accent,
-            cursor: "pointer",
-            fontSize: font.size.sm,
-            textDecoration: "underline",
-          }}
-        >
-          Retry {/* COPY:PLU-159 */}
-        </button>
+        Couldn't save your changes.{/* COPY:PLU-159 */}
+        {retryButton}
       </span>
     );
   }
   if (saving) {
     return <span style={{ ...text.caption }}>Saving…{/* COPY:PLU-159 */}</span>;
-  }
-  if (confirmedCurrent) {
-    return (
-      <span style={{ ...text.caption, color: colors.success, display: "flex", alignItems: "center", gap: 6 }}>
-        <Check size={14} strokeWidth={2.5} aria-hidden /> Approved — current.{/* COPY:PLU-159 */}
-      </span>
-    );
   }
   if (!canApprove) {
     return (
