@@ -978,10 +978,14 @@ test("buildPublicReviewRows: an INACTIVE conditional value is ABSENT (gift on a 
   assert.ok(gift.has("Gift / product"), "gift row shown for gift-only");
 });
 
-test("buildPublicReviewRows: flat commission formats as dollars", () => {
-  const c = campaignDetail({ campaignType: "AFFILIATE", publicCommissionRate: 2500, commissionMode: "flat" });
-  const rows = rowsByLabel(buildPublicReviewRows(c, shape("AFFILIATE")));
-  assert.equal(rows.get("Public commission")!.value, "$25", "flat commission → dollars");
+test("buildPublicReviewRows: flat commission renders the dollar amount as entered (Issue 1)", () => {
+  // publicCommissionRate is persisted in the unit the brand typed — for "flat"
+  // that's whole DOLLARS (no cents conversion on the persist path), so $25 stored
+  // as 25 must render "$25", not "$0.25". A $2,500 flat renders "$2,500".
+  const small = campaignDetail({ campaignType: "AFFILIATE", publicCommissionRate: 25, commissionMode: "flat" });
+  assert.equal(rowsByLabel(buildPublicReviewRows(small, shape("AFFILIATE"))).get("Public commission")!.value, "$25");
+  const big = campaignDetail({ campaignType: "AFFILIATE", publicCommissionRate: 2500, commissionMode: "flat" });
+  assert.equal(rowsByLabel(buildPublicReviewRows(big, shape("AFFILIATE"))).get("Public commission")!.value, "$2,500");
 });
 
 test("buildPublicReviewRows: blank public fields don't produce empty rows", () => {

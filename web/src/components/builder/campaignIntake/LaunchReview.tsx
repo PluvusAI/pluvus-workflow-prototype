@@ -45,6 +45,7 @@ import {
   blockerSection,
   fixableBlockers,
   buildPublicReviewRows,
+  commissionDisplay,
   type CompensationShape,
   type SectionKey,
 } from "./sections";
@@ -63,10 +64,12 @@ interface Props {
    *  through some other path). */
   onDuplicate: () => void;
   duplicating: boolean;
-  // PLU-182 (2f.1): the shell's campaign-group save state, surfaced next to the
-  // Approve CTA so a failed/pending approval PATCH is visible ON Page 9 (not just
-  // in the far-off header). `onRetry` re-runs the same save (re-sends the
-  // approved status), the natural retry surface for AC6.
+  // PLU-182 (2f.1): the shell's SHARED save state (across all groups, not
+  // approval-scoped — Issue 2), surfaced next to the Approve CTA so a failed or
+  // pending save is visible ON Page 9 (not just in the far-off header). The
+  // status copy stays group-agnostic to avoid misattributing an unrelated
+  // group's failure to the approval. `onRetry` re-runs doSave, re-sending
+  // whatever failed — the natural retry surface for AC6.
   saving: boolean;
   saveError: string | null;
   onRetry: () => void;
@@ -180,7 +183,9 @@ export function LaunchReview({
       campaign.publicCommissionRate != null &&
       (p.commissionFloorRate != null || p.commissionCeilingRate != null)
     ) {
-      const unit = campaign.commissionMode === "flat" ? dollars(campaign.publicCommissionRate) : `${campaign.publicCommissionRate}%`;
+      // Flat commission is persisted in dollars (not cents), so reuse the shared
+      // formatter — dollars() would wrongly divide by 100 here (Issue 1).
+      const unit = commissionDisplay(campaign.publicCommissionRate, campaign.commissionMode);
       pairs.push({ label: "Public commission (creators see)", value: unit });
     }
     return pairs;
@@ -429,11 +434,16 @@ function ApprovalStatus({
   onRetry: () => void;
 }) {
   // Failure first — it's the most important state to surface + retry (AC6).
+  // NB: saveError/saving are the shell's SHARED state across ALL save groups, not
+  // approval-scoped (Issue 2). So the copy stays group-agnostic ("your changes",
+  // matching the header's generic SaveStatus) rather than claiming "your
+  // approval" — Retry re-runs doSave, which re-sends whatever actually failed
+  // (which, on Page 9, is the approval when that's what was in flight).
   if (saveError) {
     return (
       <span style={{ ...text.caption, color: colors.danger, display: "flex", alignItems: "center", gap: 6 }}>
         {/* COPY:PLU-159 */}
-        Couldn't save your approval.
+        Couldn't save your changes.
         <button
           onClick={onRetry}
           className="ds-focusable"
@@ -453,7 +463,7 @@ function ApprovalStatus({
     );
   }
   if (saving) {
-    return <span style={{ ...text.caption }}>Saving approval…{/* COPY:PLU-159 */}</span>;
+    return <span style={{ ...text.caption }}>Saving…{/* COPY:PLU-159 */}</span>;
   }
   if (confirmedCurrent) {
     return (

@@ -1594,10 +1594,15 @@ export function summarizeDeliverables(rows: DeliverableQuantity[] | null | undef
     .join(", ");
 }
 
-// Format a public commission value in its own unit — percent or a flat dollar
-// amount (S7.A1 commissionMode). Cents-as-dollars for flat, "%" for percent.
-function commissionDisplay(rate: number, mode: string | null | undefined): string {
-  return mode === "flat" ? `$${(rate / 100).toLocaleString()}` : `${rate}%`;
+/** Format a public commission value in its own unit — percent or a flat dollar
+ *  amount (S7.A1 commissionMode). publicCommissionRate is persisted in the SAME
+ *  unit the brand typed: whole percent for "percent", whole DOLLARS for "flat"
+ *  (the S7.A1 CommissionAmount input stores the raw number, no cents conversion —
+ *  see CampaignIntake buildCampaignPayload). So flat renders as-is with a $, NOT
+ *  divided by 100. Exported so every review surface uses ONE formatter and can't
+ *  drift into the cents/dollars mismatch. */
+export function commissionDisplay(rate: number, mode: string | null | undefined): string {
+  return mode === "flat" ? `$${rate.toLocaleString()}` : `${rate}%`;
 }
 
 /**
