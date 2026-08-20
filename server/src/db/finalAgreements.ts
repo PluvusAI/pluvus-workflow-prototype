@@ -1,4 +1,5 @@
 import { eq } from "drizzle-orm";
+import { createId } from "@paralleldrive/cuid2";
 import { db, type Db, type DbTx } from "./drizzle.js";
 import { isUniqueViolation } from "./errors.js";
 import {
@@ -152,25 +153,50 @@ export function resolveFinalDeliverables(args: {
   baseline: unknown; // termsSnapshot.detailsSnapshot["deliverableQuantities"]
 }): Deliverable[] {
   if (!Array.isArray(args.baseline)) return [];
-  return args.baseline.filter(isPlausibleDeliverable);
+  return args.baseline.filter(isPlausibleDeliverableShape).map(normalizeDeliverable);
 }
 
 // A defensive, non-throwing shape check — NOT a replacement for
 // deliverablesSchema (routes/campaigns.ts already validated this array at
-// write time). Only filters out rows from before PLU-169 (no `id`) so a
-// legacy campaign's un-backfilled items don't leak an id-less Deliverable
-// into a FinalAgreement row; the one-time backfill (decision #4) is expected
-// to make this filter a no-op in practice.
-function isPlausibleDeliverable(v: unknown): v is Deliverable {
+// write time). Checks only the fields that carry the deal's actual content
+// (platform/format/quantity); `id` is intentionally NOT required here — see
+// normalizeDeliverable below for why.
+function isPlausibleDeliverableShape(v: unknown): v is Record<string, unknown> {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Record<string, unknown>;
   return (
-    typeof r["id"] === "string" &&
-    r["id"].length > 0 &&
     typeof r["platform"] === "string" &&
     typeof r["format"] === "string" &&
     typeof r["quantity"] === "number"
   );
+}
+
+// PLU-169 (1f) — Greptile review (PR #46) fix: a launched CampaignTermsSnapshot
+// is IMMUTABLE (written once by launchCampaign(), never updated after — see
+// its own doc comment in schema.ts), so the one-time id backfill script
+// (decision #4), which only writes to the MUTABLE CampaignDetails row, can
+// never reach an already-launched campaign's frozen snapshot. Dropping
+// id-less items here (the original approach) would therefore silently lose
+// EVERY deliverable on EVERY campaign that launched before this ticket
+// shipped. Mint a fresh id at resolve time instead, so the deal's actual
+// content (platform/format/quantity/etc.) is always preserved. This id is
+// NOT written back to the immutable snapshot and is only guaranteed stable
+// for the lifetime of this one FinalAgreement row — acceptable for Phase 1,
+// since nothing references a deliverable id yet (negotiation-delta support,
+// decision #5, is a separate future ticket that will need its own answer for
+// referencing an id inside an immutable snapshot before it can rely on
+// reproducibility here).
+function normalizeDeliverable(r: Record<string, unknown>): Deliverable {
+  const out: Record<string, unknown> = {
+    id: typeof r["id"] === "string" && r["id"].length > 0 ? r["id"] : createId(),
+    platform: r["platform"],
+    format: r["format"],
+    quantity: r["quantity"],
+  };
+  if (r["requirements"] !== undefined) out["requirements"] = r["requirements"];
+  if (r["customLabel"] !== undefined) out["customLabel"] = r["customLabel"];
+  if (r["notes"] !== undefined) out["notes"] = r["notes"];
+  return out as unknown as Deliverable;
 }
 
 // ---------------------------------------------------------------------------

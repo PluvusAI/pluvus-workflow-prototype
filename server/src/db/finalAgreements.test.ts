@@ -181,10 +181,44 @@ test("a non-array baseline (null/undefined/legacy shape) resolves to an empty ar
   assert.deepEqual(resolveFinalDeliverables({ baseline: "not an array" }), []);
 });
 
-test("legacy id-less items (pre-PLU-169, before the id backfill) are filtered out defensively", () => {
+test("PLU-169 Greptile fix (PR #46): legacy id-less items (a launched, IMMUTABLE snapshot the id backfill can never reach) are PRESERVED with a freshly minted id, never dropped", () => {
   const legacyItem = { platform: "instagram", format: "reel", quantity: 2 }; // no id
   const result = resolveFinalDeliverables({ baseline: [legacyItem, reelDeliverable] });
-  assert.deepEqual(result, [reelDeliverable]);
+  assert.equal(result.length, 2, "the legacy item's data must survive, not be silently lost");
+  const normalizedLegacy = result.find((d) => d.id !== reelDeliverable.id);
+  assert.ok(normalizedLegacy, "the legacy item is present");
+  assert.equal(typeof normalizedLegacy!.id, "string");
+  assert.ok(normalizedLegacy!.id.length > 0, "a fresh id was minted");
+  assert.equal(normalizedLegacy!.platform, "instagram");
+  assert.equal(normalizedLegacy!.format, "reel");
+  assert.equal(normalizedLegacy!.quantity, 2);
+});
+
+test("an item that already has an id keeps that EXACT id (not re-minted)", () => {
+  const result = resolveFinalDeliverables({ baseline: [reelDeliverable] });
+  assert.equal(result[0]?.id, reelDeliverable.id);
+});
+
+test("two legacy id-less items in the same array each get their OWN distinct minted id", () => {
+  const a = { platform: "instagram", format: "reel", quantity: 1 };
+  const b = { platform: "instagram", format: "story", quantity: 3 };
+  const result = resolveFinalDeliverables({ baseline: [a, b] });
+  assert.equal(result.length, 2);
+  assert.notEqual(result[0]?.id, result[1]?.id);
+});
+
+test("optional fields (requirements/customLabel/notes) survive normalization when present", () => {
+  const item = {
+    platform: "instagram",
+    format: "reel",
+    quantity: 1,
+    requirements: { durationSeconds: { min: 30, max: 60 } },
+    customLabel: null,
+    notes: "brand-requested angle",
+  };
+  const result = resolveFinalDeliverables({ baseline: [item] });
+  assert.deepEqual(result[0]?.requirements, { durationSeconds: { min: 30, max: 60 } });
+  assert.equal(result[0]?.notes, "brand-requested angle");
 });
 
 test("malformed array entries (wrong types) are filtered out, never thrown on", () => {
