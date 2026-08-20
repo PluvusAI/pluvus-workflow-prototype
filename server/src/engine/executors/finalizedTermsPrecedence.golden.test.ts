@@ -227,6 +227,35 @@ for (const raw of ["  creator receives shoes  ", "", S.ws, undefined, S.num]) {
   });
 }
 
+console.log("\nPLU-142 follow-up — a pinned-snapshot clear must not resurrect a stale NEGOTIATION value\n");
+
+// Reproduces the reported bug directly against the real call sites' wiring: the
+// pinned terms snapshot explicitly cleared this field (workflowConfig is absent
+// because effectiveTerms deleted it), but the stale NEGOTIATION node still has a
+// leftover value from before the clear. Without explicitlyCleared, the old
+// resolveKnowledgeField would fall through and resurrect it into the
+// contract-forming confirmation.
+for (const category of ["commissionRate", "deliverables", "timeline", "rewardDescription"] as const) {
+  test(`${category}: explicitlyCleared blocks the stale negotiation_state value from reappearing`, () => {
+    const staleNegotiationValue = category === "commissionRate" ? 37 : "STALE from NEGOTIATION node";
+    const cleared = resolveKnowledgeField(category, {
+      // workflowConfig absent — effectiveTerms.ts deleted the stale config value.
+      negotiationState: staleNegotiationValue,
+      explicitlyCleared: true,
+    });
+    assert.equal(cleared.value, undefined, `${category} must not resurrect the stale negotiation value`);
+    assert.equal(cleared.source, null);
+
+    // Sanity: WITHOUT the fix (explicitlyCleared unset), the stale value DOES win —
+    // proving this is a real regression guard, not a vacuously-true assertion.
+    const unpatched = resolveKnowledgeField(category, {
+      negotiationState: staleNegotiationValue,
+    });
+    assert.equal(unpatched.value, staleNegotiationValue);
+    assert.equal(unpatched.source, "negotiation_state");
+  });
+}
+
 // ---------------------------------------------------------------------------
 // review §2 (Calvin): PIN the exact field-by-field precedence policy as a literal
 // table, so approving PLU-82 means intentionally approving THIS order — not

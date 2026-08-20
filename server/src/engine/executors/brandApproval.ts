@@ -18,8 +18,10 @@ import {
 import { resolveAgreedFee, firstNumber, firstString } from "./agreedFee.js";
 import { resolveBand } from "../band.js";
 import { resolveBrandName, toCampaignBrandFields } from "../campaignContext.js";
-import { blockedByMissingBrand } from "./guardEscalation.js";
+import { blockedByMissingBrand, blockedBySnapshotIntegrity } from "./guardEscalation.js";
 import { resolveBrandRecipient } from "../../notifications/escalation.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Brand-approval executor (brand-approval gate)
@@ -53,7 +55,19 @@ export async function executeBrandApproval(
   email: IEmailProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator, campaign, campaignDetails } = ctx;
-  const config = node.config;
+
+  // PLU-137/138: this email is contract-forming, so its PUBLIC terms must come
+  // from the pinned CampaignTermsSnapshot, not the stale nodeGraph config —
+  // same discipline as contentBrief.ts. The negotiation BAND here stays
+  // nodeGraph (private-band swap on brandApproval is a tracked follow-up, not
+  // this cutover's scope). No-snapshot (legacy) journey overlays nothing.
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, campaign?.id);
+  if (pinnedTerms.integrityFailure) {
+    return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
+  }
+  const config = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config }).config
+    : node.config;
   // PLU-135 (1a) code-review fix (Ayush): deliverables/timeline/paymentTerms/
   // rewardDescription moved off Campaign onto CampaignDetails. runtime.ts now
   // loads CampaignDetails alongside Campaign into ExecutionContext specifically

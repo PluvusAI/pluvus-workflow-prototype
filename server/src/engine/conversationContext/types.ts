@@ -264,6 +264,16 @@ export interface ContextRecord {
   termsSnapshotId?: string; // pinned CampaignTermsSnapshot id (undefined = legacy)
   policySnapshotId?: string; // pinned NegotiationPolicySnapshot id — authorized-decision purposes ONLY
   legacyFallbackUsed: boolean; // a material term came from nodeGraph (no snapshot)
+  // PLU-137/138 §obs — the private BAND fell back to nodeGraph because no policy
+  // snapshot was pinned. DISTINCT from legacyFallbackUsed (which tracks the PUBLIC
+  // terms snapshot): a gift/affiliate journey can have a terms snapshot but no
+  // fee band pinned.
+  bandLegacyFallback: boolean;
+  // PLU-137/138 §obs — the effective source of the material terms used this turn:
+  // 'snapshot' when either snapshot supplied a value, 'legacy_nodegraph' when both
+  // the band and the public terms fell back to config. Lets an operator trace
+  // which authority a runtime decision used.
+  termsSource: "snapshot" | "legacy_nodegraph";
   integrityFailureReason?: string; // §3d — set when a pinned snapshot was missing/mismatched
 }
 

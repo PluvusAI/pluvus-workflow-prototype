@@ -42,6 +42,15 @@ export function buildContextRecord(ctx: AssembledContext): ContextRecord {
       ? { policySnapshotId: ctx.policySnapshot.id }
       : {}),
     legacyFallbackUsed: ctx.legacyFallbackUsed,
+    // PLU-137/138 §obs — band-fallback + effective source, derived from snapshot
+    // PRESENCE alone (never values). bandLegacyFallback mirrors the effectiveTerms
+    // resolver's own rule (!policySnapshot ⇒ band from config); termsSource is
+    // 'legacy_nodegraph' only when BOTH snapshots are absent, matching
+    // resolveEffectiveNegotiationConfig — kept as a pure derivation of `ctx` here
+    // rather than threaded through from the resolver's own output, so this record
+    // never depends on which call site happened to compute the overlay.
+    bandLegacyFallback: ctx.policySnapshot == null,
+    termsSource: ctx.policySnapshot == null && ctx.termsSnapshot == null ? "legacy_nodegraph" : "snapshot",
     ...(ctx.integrityFailure ? { integrityFailureReason: ctx.integrityFailure.reason } : {}),
   };
 }

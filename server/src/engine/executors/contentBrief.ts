@@ -15,8 +15,15 @@ import {
 import { resolvePaymentToken } from "./paymentInfo.js";
 import { paymentFormLink } from "./paymentEmail.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
-import { blockedByGuard, blockedByMissingBrand, blockedByAttributionMint } from "./guardEscalation.js";
+import {
+  blockedByGuard,
+  blockedByMissingBrand,
+  blockedByAttributionMint,
+  blockedBySnapshotIntegrity,
+} from "./guardEscalation.js";
 import { resolveBrandName } from "../campaignContext.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Content Brief executor (merged post-negotiation node)
@@ -57,7 +64,27 @@ export async function executeContentBrief(
   _agent: IAgentProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
-  const config = node.config;
+
+  // PLU-137/138: this email is contract-forming, so its PUBLIC terms
+  // (deliverables / timeline / public commission / reward) must come from the
+  // pinned CampaignTermsSnapshot, not the stale nodeGraph config. Load the pinned
+  // snapshot with integrity discipline (missing / cross-campaign → MANUAL_REVIEW,
+  // never a silent config read) and overlay its public fields onto the config the
+  // knowledge resolver reads. A no-snapshot (legacy) journey overlays nothing → the
+  // existing config→negotiationConfig chain runs unchanged. The FEE stays
+  // creator-history-sourced (resolveAgreedFee) — final-deal state, not a snapshot.
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, ctx.campaign?.id);
+  if (pinnedTerms.integrityFailure) {
+    return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
+  }
+  const effectiveTerms = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config })
+    : undefined;
+  const config = effectiveTerms?.config ?? node.config;
+  // PLU-142 follow-up: fields the pinned snapshot explicitly cleared must not be
+  // resurrected from the stale NEGOTIATION node below (resolveKnowledgeField's
+  // explicitlyCleared flag).
+  const clearedFields = effectiveTerms?.clearedFields ?? new Set<string>();
 
   // The merged flow enters on ACCEPTED (Content Brief directly follows negotiation).
   // With the brand-approval gate ON, the SEND phase is deferred until the brand
@@ -161,18 +188,21 @@ export async function executeContentBrief(
     const commission = resolveKnowledgeField("commissionRate", {
       workflowConfig: config["commissionRate"],
       negotiationState: negotiationConfig["commissionRate"],
+      explicitlyCleared: clearedFields.has("commissionRate"),
     });
     commissionRate = commission.value as number | undefined;
     resolvedSources["commissionRate"] = commission.source;
     const deliverablesR = resolveKnowledgeField("deliverables", {
       workflowConfig: config["deliverables"],
       negotiationState: negotiationConfig["deliverables"],
+      explicitlyCleared: clearedFields.has("deliverables"),
     });
     deliverables = deliverablesR.value as string | undefined;
     resolvedSources["deliverables"] = deliverablesR.source;
     const timelineR = resolveKnowledgeField("timeline", {
       workflowConfig: config["timeline"],
       negotiationState: negotiationConfig["timeline"],
+      explicitlyCleared: clearedFields.has("timeline"),
     });
     timeline = timelineR.value as string | undefined;
     resolvedSources["timeline"] = timelineR.source;

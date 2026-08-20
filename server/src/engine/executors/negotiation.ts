@@ -69,6 +69,11 @@ import { describeDeal } from "../dealDescription.js";
 import { extractReplyText } from "./replyText.js";
 import { mergeCampaignFallback } from "../campaignContext.js";
 import { resolveBand } from "../band.js";
+// PLU-137/138: the read-side snapshot cutover. The pinned launch snapshots
+// (loaded by buildConversationContext) overlay the merged node config so the
+// agent decision, the output guard, and the offer/counter copy read the
+// authoritative band + public terms instead of stale nodeGraph values.
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 // HARD-A2: the output-guard-blocked MANUAL_REVIEW result is the SAME shape used
 // by other executors, so it lives in one place (guardEscalation.ts) rather than
 // being duplicated inline here. Previously negotiation.ts and guardEscalation.ts
@@ -480,6 +485,32 @@ export function escalateNoCeiling(args: { round: number }): NodeResult {
   };
 }
 
+// PLU-137/138 — the terminal MANUAL_REVIEW NodeResult for a missing/mismatched/
+// cross-campaign/unresolved pinned snapshot. Pure (mirrors escalateNoCeiling
+// above) and built from the integrity reason ALONE, so it can run immediately
+// after the context build — before the agent, summary refresh, or memory plan:
+// a broken pin must never invoke the model or persist agent-derived facts.
+// Exported for the ordering test.
+export function escalateSnapshotIntegrity(args: { round: number; reason: string }): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "NEGOTIATION_TURN",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "snapshot_integrity",
+      integrityReason: args.reason,
+      round: args.round,
+      message:
+        "Negotiation cannot run: the launch snapshot this journey is pinned to is " +
+        "missing or does not match this campaign. A human must review the pinning.",
+    },
+    // No obligationWrites/memoryWrites: this is a pre-decision terminal
+    // escalation — nothing was comprehended from the creator this turn.
+  };
+}
+
 // PLU-137 (1c) §2b — the ContextDeps.loadSnapshots implementation: load the two
 // pinned launch snapshots BY the ids stamped on the instance at enrollment, gate the
 // PRIVATE policy load on the authorized-decision purpose, and detect an integrity
@@ -497,6 +528,19 @@ export async function loadPinnedSnapshots(
   expectedCampaignId: string | null | undefined,
 ): Promise<SnapshotLoadResult> {
   const result: SnapshotLoadResult = {};
+
+  // Fail CLOSED: a pin exists but the instance's campaign could not be
+  // resolved (ctx.campaign is null for a deleted campaign or a DB error).
+  // Without this, the cross-campaign guards below silently no-op (their
+  // `expectedCampaignId &&` short-circuits), so a pinned journey would
+  // negotiate with NO campaign verification at all. Every other integrity
+  // check here fails closed; this one must too.
+  if (
+    (instance.campaignTermsSnapshotId || instance.negotiationPolicySnapshotId) &&
+    !expectedCampaignId
+  ) {
+    return { integrityFailure: { reason: "campaign_unresolved" } };
+  }
 
   if (instance.campaignTermsSnapshotId) {
     const terms = await getCampaignTermsSnapshotById(instance.campaignTermsSnapshotId, client);
@@ -808,22 +852,23 @@ export async function executeNegotiation(
   // ACCEPT guard downstream is a no-op (nothing exceeds +inf) — the model's prompt
   // would be the ONLY cap between the creator and an unbounded agree. Escalate to a
   // human here, as a pure-config PRECONDITION (before any DB load or agent call),
-  // rather than risk it. (No floor + no ceiling = an unconfigured band; the
-  // accept/counter logic is already inert there and there's no money exposure to
-  // guard, so that case falls through unchanged.) This is the runtime backstop for
-  // the invariant the parent enforces at campaign-publish time.
+  // rather than risk it — but ONLY when there is NO pinned snapshot of either kind
+  // (PLU-137/138). A snapshot may supply the ceiling this stale config lacks, AND a
+  // corrupt pin must fail as an INTEGRITY error (Step 1's guard, post-build), not a
+  // no-ceiling one — escalating here on stale config would let a legacy copy
+  // override a valid snapshot (1d forbids this) and would mask a corrupt pin with
+  // the wrong reason. A truly unpinned legacy journey keeps this cheap pre-build
+  // escalation (no DB load, no agent call); any pin defers to the EFFECTIVE band,
+  // checked again right after the context build below.
   // PLU-129: a commission-only campaign is the canonical 0/0 shape — resolveBand
   // returns floor === 0 AND ceiling === 0 (both DEFINED, not undefined), so it
-  // does NOT trip this backstop. That is intentional: 0/0 is a VALID configured
-  // state (no fee band to negotiate), unlike a floor WITHOUT a ceiling. It
-  // proceeds to the agent, which — with the explicit-zero-ceiling fix in
-  // negotiate.py (PLU-129) — treats ceiling 0 as a real cap and ESCALATES any
-  // upfront-fee ask rather than negotiating an unbounded fee. We deliberately do
-  // NOT unconditionally escalate at 0/0 here: a creator who just asks "what's the
-  // commission?" must proceed, not be paged.
-  const { floor, ceiling } = resolveBand(config);
-  if (floor !== undefined && ceiling === undefined) {
-    return escalateNoCeiling({ round: instance.negotiationRound });
+  // does NOT trip this backstop either way. That is intentional: 0/0 is a VALID
+  // configured state (no fee band to negotiate), unlike a floor WITHOUT a ceiling.
+  if (!instance.negotiationPolicySnapshotId && !instance.campaignTermsSnapshotId) {
+    const { floor, ceiling } = resolveBand(config);
+    if (floor !== undefined && ceiling === undefined) {
+      return escalateNoCeiling({ round: instance.negotiationRound });
+    }
   }
 
   // When a downstream node owns the post-acceptance email, the negotiation ACCEPT
@@ -843,13 +888,31 @@ export async function executeNegotiation(
     nodeGraph.some((n) => n.type === "REWARD_SETUP" || n.type === "CONTENT_BRIEF") ||
     instance.postAcceptanceMode === "operator_handoff";
 
-  const maxRounds = typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5;
-
-  // Describe the deal structure (fixed fee / commission / both) from THIS
-  // (NEGOTIATION) node's config, exactly as outreach/follow-up do. Threading it
-  // into the offer/counter copy lets the email explain WHAT KIND of deal this is
-  // (e.g. "hybrid — fixed fee plus commission") instead of only quoting a fee.
-  const dealDescription = describeDeal(config);
+  // PLU-142 follow-up: maxRounds is WORKFLOW-owned pacing, but a pinned
+  // NegotiationPolicySnapshot's OWN maxRounds — when present — is authoritative
+  // over the raw node config, same as every other snapshot-sourced field
+  // (PLU-137/138: a valid snapshot always wins). Resolve that ONE value here,
+  // before the build, so the pre-build hard stop below, the post-agent counter
+  // guard, relationshipWarmth, and the agent request (via effectiveConfig,
+  // built from this SAME immutable snapshot row further down) all agree. A
+  // cheap direct-by-id read — nowhere near the cost of the full context build —
+  // so the pre-build guard keeps its job of skipping that build once the round
+  // ceiling is reached. A missing or cross-campaign pin is NOT trusted here; it
+  // falls back to the raw config value, and is caught for real by the post-build
+  // integrity gate (cc.integrityFailure) before the agent is ever invoked.
+  let pinnedMaxRounds: number | undefined;
+  if (instance.negotiationPolicySnapshotId && ctx.campaign?.id) {
+    const policySnapshot = await getNegotiationPolicySnapshotById(instance.negotiationPolicySnapshotId);
+    if (
+      policySnapshot &&
+      policySnapshot.campaignId === ctx.campaign.id &&
+      typeof policySnapshot.maxRounds === "number"
+    ) {
+      pinnedMaxRounds = policySnapshot.maxRounds;
+    }
+  }
+  const maxRounds =
+    pinnedMaxRounds ?? (typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5);
 
   // Hard stop — enforce maxRounds before calling the agent (and BEFORE the full
   // context build — §5.2). This prevents the agent from even being consulted past
@@ -947,6 +1010,69 @@ export async function executeNegotiation(
     },
   );
 
+  // PLU-137/138 (Greptile review) — a missing/mismatched/cross-campaign/
+  // unresolved pinned snapshot is an explicit integrity failure: RETURN a
+  // terminal MANUAL_REVIEW HERE, immediately after the build and BEFORE the
+  // summary refresh, the agent call, and the memory-write plan below. A T-Rex
+  // run caught the OLD (later) placement invoking the agent and persisting an
+  // agent-derived memory write alongside MANUAL_REVIEW for a cross-campaign
+  // pin — derived facts from an invalid pin, and a saved summary a retry
+  // could treat as valid. The two observability records ARE safe to fold
+  // here (buildKnowledgeRecord/buildContextRecord are pure functions of `cc`,
+  // no agent involved) — memoryWrites is NOT, by construction, so it is never
+  // attached to this result. NEGOTIATING → MANUAL_REVIEW is a legal
+  // transition (stateMachine.ts). We never throw across the executor
+  // boundary — the build call site has no try/catch, so a throw would
+  // dead-letter the job and record no ContextRecord.
+  if (cc.integrityFailure) {
+    const integrityResult = escalateSnapshotIntegrity({
+      round: instance.negotiationRound,
+      reason: cc.integrityFailure.reason,
+    });
+    return foldObservabilityRecords(
+      integrityResult,
+      buildKnowledgeRecord(cc.briefAvailability, cc.brief.conflicts ?? []),
+      { context: buildContextRecord(cc) },
+    );
+  }
+
+  // PLU-137/138 — THE READ-SIDE CUTOVER. PLU-137 loaded the pinned snapshots into
+  // `cc` but the decision still read the band + public terms from the (legacy) node
+  // config. Overlay the snapshots onto the config so a VALID SNAPSHOT ALWAYS WINS:
+  // the agent request, the output guard, the H1 no-ceiling backstop, and the
+  // offer/counter email copy all read `effectiveConfig` from here on. A no-snapshot
+  // journey ⇒ zero overlay ⇒ effectiveConfig is shape-identical to `config`
+  // (byte-identical prompts — the golden matrix is the enforcement gate).
+  // `toDecisionContext(cc)` is hoisted into one `decision` binding, reused below for
+  // `decisionHistory` too, so the projection only runs once per turn.
+  const decision = toDecisionContext(cc);
+  // Only `config` is consumed here — the fallback/source labels are re-derived
+  // independently (from snapshot presence on `cc`, not this call's output) by
+  // buildContextRecord below, so a caller never has to thread them through.
+  const { config: effectiveConfig } = resolveEffectiveNegotiationConfig({
+    policyAuthority: decision.policyAuthority,
+    termsSnapshot: cc.termsSnapshot,
+    config,
+  });
+
+  // Relocated H1 no-ceiling backstop: runs here (in addition to the pre-build arm
+  // above) whenever EITHER snapshot is pinned, reading the EFFECTIVE band instead
+  // of raw config. A legacy floor-no-ceiling config pinned to a policy snapshot
+  // WITH a valid ceiling is correctly NOT escalated here — a stale copy can't
+  // override a valid snapshot. A corrupt pin never reaches this line at all (Step
+  // 1's integrity guard above already returned MANUAL_REVIEW for it).
+  if (instance.negotiationPolicySnapshotId || instance.campaignTermsSnapshotId) {
+    const { floor: effFloor, ceiling: effCeiling } = resolveBand(effectiveConfig);
+    if (effFloor !== undefined && effCeiling === undefined) {
+      return escalateNoCeiling({ round: instance.negotiationRound });
+    }
+  }
+
+  // Describe the deal structure (fixed fee / commission / both) from the EFFECTIVE
+  // config so the offer/counter email copy matches the snapshot-sourced decision,
+  // not a stale nodeGraph value.
+  const dealDescription = describeDeal(effectiveConfig);
+
   // Names the branches below already use, sourced from the builder (§6). The
   // builder derived `latestInbound`/`creatorReply` with the SAME logic (§5.4), so
   // the present-offer idempotency key + obligation sourceMessageId are unchanged.
@@ -983,7 +1109,7 @@ export async function executeNegotiation(
   // by the projection ONLY when non-empty (§5.7 emptiness contract). The band is NOT
   // on this object; buildNegotiationRequest resolves it from `config` at request-build
   // time (§5.3 / §5.7). This is byte-identical to the old inline assembly (§10).
-  const negotiationContext: PriorNegotiationContext = toDecisionContext(cc).decisionHistory;
+  const negotiationContext: PriorNegotiationContext = decision.decisionHistory;
 
   // creatorQuestions / pushedFixedTerms: the comprehension /negotiate already did
   // (the creator's questions + which fixed terms they pushed), threaded across
@@ -998,7 +1124,7 @@ export async function executeNegotiation(
   // APPROVE records as the deal rate). The regex remains a fallback for copy
   // acknowledgment and guard allowlisting only.
   const { outcome, message, proposedRate, creatorQuestions, pushedFixedTerms, creatorRequestedRate, escalationReason, isFinalRound, negotiatorAnswers, creatorFacts } =
-    await agent.negotiate(instance.negotiationRound, config, creatorReply, negotiationContext);
+    await agent.negotiate(instance.negotiationRound, effectiveConfig, creatorReply, negotiationContext);
 
   // For acknowledgment copy + the output-guard allowlist (NOT the money path):
   // prefer the agent's validated comprehension, fall back to the regex read.
@@ -1121,34 +1247,6 @@ export async function executeNegotiation(
     const folded = foldObservabilityRecords(result, knowledgeRecord, contextRecord);
     return memoryWrites ? { ...folded, memoryWrites } : folded;
   };
-
-  // PLU-137 §3d (Defect 1) — a missing/mismatched/cross-campaign pinned snapshot is an
-  // explicit integrity failure: RETURN a terminal MANUAL_REVIEW NodeResult (the same
-  // shape as escalateOverCeiling/escalateNoCeiling) so a human takes over, and NEVER
-  // throw across the executor boundary — the buildConversationContext call site has no
-  // try/catch, so a throw would dead-letter the job and record no ContextRecord. The
-  // integrityFailureReason rides the folded context record (§4a). NEGOTIATING →
-  // MANUAL_REVIEW is a legal transition (stateMachine.ts). Placed before the agent is
-  // consulted: a broken pin must never reach the model or invent a permissive default.
-  if (cc.integrityFailure) {
-    return withContextRecord({
-      nextState: "MANUAL_REVIEW",
-      nextNodeId: null,
-      completedAt: new Date(),
-      eventType: "NEGOTIATION_TURN",
-      eventPayload: {
-        outcome: "ESCALATE",
-        reason: "snapshot_integrity",
-        integrityReason: cc.integrityFailure.reason,
-        round: instance.negotiationRound,
-        message:
-          "Negotiation cannot run: the launch snapshot this journey is pinned to is " +
-          "missing or does not match this campaign. A human must review the pinning.",
-      },
-      // No obligationWrites: this is a pre-decision terminal escalation (like
-      // maxRoundsReject) — nothing new was comprehended from the creator this turn.
-    });
-  }
 
   // PLU-111: the durable obligation ledger (loaded by the builder) supersedes the
   // event-diff as the source of "what creator questions are still open". This is a
@@ -1346,7 +1444,7 @@ export async function executeNegotiation(
       // not a leak even if it coincides with a bound).
       const guard = scanOutboundDraft(
         draft,
-        guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
+        guardConstraintsFromConfig(effectiveConfig, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
         return withContextRecord({ ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
@@ -1472,7 +1570,7 @@ export async function executeNegotiation(
       // (their number == a bound) must be able to state that number.
       const guard = scanOutboundDraft(
         draft,
-        guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
+        guardConstraintsFromConfig(effectiveConfig, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
         return withContextRecord({ ...blockedByGuard(instance.negotiationRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });
@@ -1627,7 +1725,7 @@ export async function executeNegotiation(
       // a leak, so a legitimate at-bound negotiation isn't forced to MANUAL_REVIEW.
       const guard = scanOutboundDraft(
         draft,
-        guardConstraintsFromConfig(config, proposedRate, ackRequestedRate),
+        guardConstraintsFromConfig(effectiveConfig, proposedRate, ackRequestedRate),
       );
       if (!guard.ok) {
         return withContextRecord({ ...blockedByGuard(newRound, guard.hits), obligationWrites: buildObligationWrites(undefined) });

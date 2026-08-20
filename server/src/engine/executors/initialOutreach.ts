@@ -10,6 +10,8 @@ import {
 } from "../guards/outputGuard.js";
 import { mergeCampaignFallback } from "../campaignContext.js";
 import { missingRequiredValues } from "../outreachVariables.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // Manual Initial Outreach: the operator can write the first email by hand in the
 // builder ("manual" mode) instead of having the AI draft it ("ai" mode). The
@@ -92,7 +94,23 @@ export async function executeInitialOutreach(
   }
 
   // H5: fill missing brand context from the parent campaign (node config wins).
-  const config = mergeCampaignFallback(node.config, ctx.campaign);
+  const mergedConfig = mergeCampaignFallback(node.config, ctx.campaign);
+
+  // PLU-137/138: outreach isn't contract-forming (it quotes no money — rates are
+  // negotiated on reply), but the deliverables/timeline/reward it describes should
+  // still come from the pinned CampaignTermsSnapshot when one exists, so the
+  // creator's expectations match the authoritative terms. Overlay the public
+  // snapshot fields (snapshot-wins). A no-snapshot (legacy) journey overlays nothing.
+  // On a bad pin we do NOT escalate here — outreach is the wrong surface to gate;
+  // the negotiation path applies the integrity → MANUAL_REVIEW rule when the creator
+  // replies. So an integrity failure just falls through to the merged legacy config
+  // — `pinnedTerms.terms` alone is enough to check (the loader never returns both
+  // `terms` and `integrityFailure` at once, so a separate `!integrityFailure` check
+  // would be redundant).
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, ctx.campaign?.id);
+  const config = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: mergedConfig }).config
+    : mergedConfig;
 
   // Describe the deal structure (fixed fee / commission / both) from the
   // NEGOTIATION node so the outreach email explains the real offer instead of

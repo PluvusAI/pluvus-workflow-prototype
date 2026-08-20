@@ -18,6 +18,7 @@ import { resolveAgreedFee, firstNumber } from "./agreedFee.js";
 import { resolveBrandName } from "../campaignContext.js";
 import { paymentBaseUrl } from "./paymentEmail.js";
 import { isSafeRedirectUrl } from "../../validation/targetUrl.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
 
 // ---------------------------------------------------------------------------
 // Partnership minting (Phase 1)
@@ -140,11 +141,23 @@ export async function resolvePartnership(
     fixedFee = resolveAgreedFee(events, negotiationConfig, {});
   }
   if (commissionRate === undefined) {
+    // PLU-137/138: the primary path above is already snapshot-sourced (the
+    // persisted PAYMENT_INFO_SENT event, stamped by executeContentBrief, which
+    // itself now overlays the pinned CampaignTermsSnapshot). This is only the
+    // re-derive fallback for a missing event — prefer the pinned snapshot's
+    // publicCommissionRate here too, so stopping the nodeGraph commission
+    // stamp (Step 5) can't null the ledger for that fallback path.
     const negotiationConfig =
       nodeGraph.find((n) => n.type === "NEGOTIATION")?.config ?? {};
     const cbConfig =
       nodeGraph.find((n) => n.type === "CONTENT_BRIEF")?.config ?? {};
+    const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, campaign?.id);
+    const snapshotCommission =
+      pinnedTerms.terms && typeof pinnedTerms.terms.detailsSnapshot === "object" && pinnedTerms.terms.detailsSnapshot !== null
+        ? (pinnedTerms.terms.detailsSnapshot as Record<string, unknown>)["publicCommissionRate"]
+        : undefined;
     commissionRate = firstNumber(
+      snapshotCommission,
       cbConfig["commissionRate"],
       negotiationConfig["commissionRate"],
     );

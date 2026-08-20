@@ -237,6 +237,40 @@ test("draftConfig (the provider payload) carries NONE of POLICY_SNAPSHOT_KEYS", 
   assert.ok(!serialized.includes("SECRET-GUIDANCE-55555"), "negotiationGuidance must not reach the draft");
 });
 
+test("PLU-137/138: draftConfig PUBLIC terms come from the terms snapshot, not stale nodeGraph", () => {
+  // Stale nodeGraph public terms + a poisoned band; the pinned snapshot supplies the
+  // real public terms. The DRAFT copy must quote the SNAPSHOT values, and STILL carry
+  // no private band (money-safety unchanged).
+  const staleConfig = {
+    commissionRate: 10, // stale nodeGraph commission
+    rewardDescription: "old widget", // stale nodeGraph reward
+    termFloor: { rate: 999 }, // poisoned band — must never reach draft anyway
+    termCeiling: { rate: 9999 },
+    minBudget: 999,
+    maxBudget: 9999,
+  };
+  const snap = termsSnapshot({
+    detailsSnapshot: {
+      publicCommissionRate: 8, // the AUTHORITATIVE public commission
+      productOrOffer: "new gift box", // maps to rewardDescription
+      deliverables: "1 Reel + 2 Stories",
+    },
+  });
+  const ctx = assembleContext(baseInputs({ purpose: "EMAIL_DRAFT", termsSnapshot: snap, mergedConfig: staleConfig }));
+  const draft = toDraftContext(ctx);
+
+  // Public terms are the SNAPSHOT's, not the stale nodeGraph copies.
+  assert.equal(draft.draftConfig["commissionRate"], 8, "commission must come from the snapshot (8), not stale nodeGraph (10)");
+  assert.equal(draft.draftConfig["rewardDescription"], "new gift box", "reward must come from the snapshot, not 'old widget'");
+  assert.equal(draft.draftConfig["deliverables"], "1 Reel + 2 Stories", "deliverables must come from the snapshot");
+
+  // Band still structurally absent — the public overlay never re-introduces it.
+  for (const k of ["minBudget", "maxBudget", "termFloor", "termCeiling"] as const) {
+    assert.ok(!(k in draft.draftConfig), `draftConfig must NOT carry band key ${k}`);
+  }
+  assert.ok(!JSON.stringify(draft).includes("9999"), "poisoned ceiling value must not reach the draft");
+});
+
 // ---------------------------------------------------------------------------
 // Observability: the PRIVATE policy id is gated on an authorized purpose (Defect 4).
 // Value-leak prevention (E11) is asserted on the real record in the DB e2e test.

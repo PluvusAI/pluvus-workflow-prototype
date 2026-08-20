@@ -9,9 +9,11 @@ import {
 } from "../knowledgePrecedence.js";
 import { scanOutboundDraft, guardConstraintsFromConfig } from "../guards/outputGuard.js";
 import { sendOnce } from "./idempotentSend.js";
-import { blockedByGuard, blockedByMissingBrand } from "./guardEscalation.js";
+import { blockedByGuard, blockedByMissingBrand, blockedBySnapshotIntegrity } from "./guardEscalation.js";
 import { renderRewardConfirmationEmail } from "./rewardEmail.js";
 import { resolveBrandName } from "../campaignContext.js";
+import { loadPinnedTermsSnapshotForExecutor } from "../../db/campaignSnapshots.js";
+import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 
 // ---------------------------------------------------------------------------
 // Reward Setup executor
@@ -40,7 +42,23 @@ export async function executeRewardSetup(
   agent: IAgentProvider,
 ): Promise<NodeResult> {
   const { instance, node, nodeGraph, creator } = ctx;
-  const config = node.config;
+
+  // PLU-137/138: this email is contract-forming, so its PUBLIC terms must come
+  // from the pinned CampaignTermsSnapshot, not the stale nodeGraph config —
+  // same discipline as contentBrief.ts. No-snapshot (legacy) journey overlays
+  // nothing → the existing config chain runs unchanged.
+  const pinnedTerms = await loadPinnedTermsSnapshotForExecutor(instance, ctx.campaign?.id);
+  if (pinnedTerms.integrityFailure) {
+    return blockedBySnapshotIntegrity(node.type, pinnedTerms.integrityFailure.reason);
+  }
+  const effectiveTerms = pinnedTerms.terms
+    ? resolveEffectiveNegotiationConfig({ termsSnapshot: pinnedTerms.terms, config: node.config })
+    : undefined;
+  const config = effectiveTerms?.config ?? node.config;
+  // PLU-142 follow-up: fields the pinned snapshot explicitly cleared must not be
+  // resurrected from the stale NEGOTIATION node below (resolveKnowledgeField's
+  // explicitlyCleared flag).
+  const clearedFields = effectiveTerms?.clearedFields ?? new Set<string>();
 
   if (instance.currentState !== "ACCEPTED") {
     throw new Error(
@@ -70,6 +88,7 @@ export async function executeRewardSetup(
   const commission = resolveKnowledgeField("commissionRate", {
     workflowConfig: config["commissionRate"],
     negotiationState: negotiationConfig["commissionRate"],
+    explicitlyCleared: clearedFields.has("commissionRate"),
   });
   const commissionRate = commission.value as number | undefined;
   resolvedSources["commissionRate"] = commission.source;
@@ -79,6 +98,7 @@ export async function executeRewardSetup(
   const deliverablesR = resolveKnowledgeField("deliverables", {
     workflowConfig: config["deliverables"],
     negotiationState: negotiationConfig["deliverables"],
+    explicitlyCleared: clearedFields.has("deliverables"),
   });
   const deliverables = deliverablesR.value as string | undefined;
   resolvedSources["deliverables"] = deliverablesR.source;
@@ -87,6 +107,7 @@ export async function executeRewardSetup(
   const timelineR = resolveKnowledgeField("timeline", {
     workflowConfig: config["timeline"],
     negotiationState: negotiationConfig["timeline"],
+    explicitlyCleared: clearedFields.has("timeline"),
   });
   const timeline = timelineR.value as string | undefined;
   resolvedSources["timeline"] = timelineR.source;
@@ -95,6 +116,7 @@ export async function executeRewardSetup(
   const rewardDescriptionR = resolveKnowledgeField("rewardDescription", {
     workflowConfig: config["rewardDescription"],
     negotiationState: negotiationConfig["rewardDescription"],
+    explicitlyCleared: clearedFields.has("rewardDescription"),
   });
   const rewardDescription = rewardDescriptionR.value as string | undefined;
   resolvedSources["rewardDescription"] = rewardDescriptionR.source;

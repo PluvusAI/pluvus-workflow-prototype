@@ -492,6 +492,10 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
 
     // Stamp brandName/senderName into every node's config so {{brandName}}
     // resolves correctly when draft() is called at send time.
+    // PLU-137/138: deliverables/timeline/rewardDescription (productOrOffer) are
+    // material campaign terms — REMOVED from this stamp. CampaignTermsSnapshot
+    // is authoritative for them on read (effectiveTerms.ts); stamping them here
+    // would only recreate the stale competing copy the cutover removes.
     const nodes = (JSON.parse(JSON.stringify(template.nodes)) as typeof template.nodes).map(
       (node) => ({
         ...node,
@@ -499,9 +503,6 @@ router.post("/:id/workflows", async (req: Request, res: Response) => {
           brandName: campaign.brand,
           senderName: campaign.brand,
           ...(details?.brandDescription ? { brandDescription: details.brandDescription } : {}),
-          ...(details?.deliverables ? { deliverables: details.deliverables } : {}),
-          ...(details?.timeline ? { timeline: details.timeline } : {}),
-          ...(details?.productOrOffer ? { rewardDescription: details.productOrOffer } : {}),
           ...(details?.shipsPhysicalProduct ? { shipsPhysicalProduct: true } : {}),
           ...node.config,
         },
