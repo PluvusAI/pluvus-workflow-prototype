@@ -12,6 +12,7 @@ import {
   deliverablesSchema,
   validateDeliverables,
   normalizeLegacyDeliverableIds,
+  remapLegacyDeliverablePricingKeys,
 } from "./deliverablesValidator.js";
 
 function d(overrides: Record<string, unknown> = {}) {
@@ -189,34 +190,38 @@ console.log("\nnormalizeLegacyDeliverableIds — a campaign can still hold rows 
 
 test("an id-less legacy row is minted a fresh, non-empty id", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 }; // no id
-  const [normalized] = normalizeLegacyDeliverableIds([legacy]) as Array<Record<string, unknown>>;
+  const { items } = normalizeLegacyDeliverableIds([legacy]);
+  const [normalized] = items as Array<Record<string, unknown>>;
   assert.equal(typeof normalized?.["id"], "string");
   assert.ok((normalized?.["id"] as string).length > 0);
   assert.equal(normalized?.["platform"], "instagram");
 });
 
 test("a row that already has an id keeps that EXACT id (not re-minted)", () => {
-  const [normalized] = normalizeLegacyDeliverableIds([d({ id: "del_stable" })]) as Array<
-    Record<string, unknown>
-  >;
+  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds([d({ id: "del_stable" })]);
+  const [normalized] = items as Array<Record<string, unknown>>;
   assert.equal(normalized?.["id"], "del_stable");
+  assert.equal(legacyKeyToId.size, 0, "an already-id'd row mints nothing");
 });
 
 test("two id-less rows in the same array each get their OWN distinct minted id", () => {
   const a = { platform: "instagram", format: "reel", quantity: 1 };
   const b = { platform: "instagram", format: "story", quantity: 1 };
-  const [na, nb] = normalizeLegacyDeliverableIds([a, b]) as Array<Record<string, unknown>>;
+  const { items } = normalizeLegacyDeliverableIds([a, b]);
+  const [na, nb] = items as Array<Record<string, unknown>>;
   assert.notEqual(na?.["id"], nb?.["id"]);
 });
 
 test("non-array input passes through untouched, letting validateDeliverables produce the real error", () => {
   const input = { not: "an array" };
-  assert.equal(normalizeLegacyDeliverableIds(input), input);
+  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds(input);
+  assert.equal(items, input);
+  assert.equal(legacyKeyToId.size, 0);
 });
 
 test("non-object array entries pass through untouched", () => {
-  const result = normalizeLegacyDeliverableIds([null, 42, "x"]);
-  assert.deepEqual(result, [null, 42, "x"]);
+  const { items } = normalizeLegacyDeliverableIds([null, 42, "x"]);
+  assert.deepEqual(items, [null, 42, "x"]);
 });
 
 // The reported bug: an id-less legacy row, run through validateDeliverables
@@ -233,7 +238,7 @@ test("regression: an id-less legacy row FAILS validateDeliverables directly (pro
 // the same legacy row now passes.
 test("fix: normalizeLegacyDeliverableIds then validateDeliverables accepts the same legacy row", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 };
-  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacy]));
+  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacy]).items);
   assert.equal(result.ok, true);
 });
 
@@ -241,11 +246,91 @@ test("a mix of legacy id-less rows and already-id'd rows all validate together, 
   const legacyA = { platform: "instagram", format: "reel", quantity: 1 };
   const legacyB = { platform: "instagram", format: "story", quantity: 1 };
   const modern = d({ id: "del_modern", platform: "tiktok", format: "video" });
-  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacyA, legacyB, modern]));
+  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacyA, legacyB, modern]).items);
   assert.equal(result.ok, true);
   if (result.ok) {
     assert.equal(result.deliverables.length, 3);
     const ids = result.deliverables.map((x) => x.id);
     assert.equal(new Set(ids).size, 3, "every row — legacy and modern — has a unique id");
+  }
+});
+
+console.log("\nnormalizeLegacyDeliverableIds — legacyKeyToId (feeds the deliverablePricing remap)\n");
+
+test("a minted legacy id is recorded under its \"<platform>:<format>\" composite key", () => {
+  const legacy = { platform: "instagram", format: "reel", quantity: 2 };
+  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds([legacy]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(legacyKeyToId.size, 1);
+  assert.equal(legacyKeyToId.get("instagram:reel"), normalized?.["id"]);
+});
+
+test("an already-id'd row contributes NOTHING to legacyKeyToId", () => {
+  const { legacyKeyToId } = normalizeLegacyDeliverableIds([d({ id: "del_stable" })]);
+  assert.equal(legacyKeyToId.size, 0);
+});
+
+test("two legacy rows sharing the same platform+format only map the FIRST (an already-ambiguous case under the old composite-keyed scheme)", () => {
+  const a = { platform: "other", format: "other", quantity: 1, customLabel: "Raw Footage" };
+  const b = { platform: "other", format: "other", quantity: 1, customLabel: "Loose Post" };
+  const { legacyKeyToId } = normalizeLegacyDeliverableIds([a, b]);
+  assert.equal(legacyKeyToId.size, 1, "only one entry — the composite key can't disambiguate the two");
+});
+
+console.log("\nremapLegacyDeliverablePricingKeys — review fix: keep deliverablePricing from orphaning\n");
+
+test("a pricing entry keyed by the OLD composite is folded onto the newly minted id", () => {
+  const legacy = { platform: "instagram", format: "reel", quantity: 2 };
+  const { legacyKeyToId } = normalizeLegacyDeliverableIds([legacy]);
+  const newId = legacyKeyToId.get("instagram:reel")!;
+  const remapped = remapLegacyDeliverablePricingKeys({ "instagram:reel": 50000 }, legacyKeyToId) as Record<
+    string,
+    unknown
+  >;
+  assert.equal(remapped["instagram:reel"], undefined, "the stale composite key must not survive");
+  assert.equal(remapped[newId], 50000, "the price now lives under the row's current id");
+});
+
+test("a pricing entry NOT covered by legacyKeyToId (e.g. already id-keyed) passes through unchanged", () => {
+  const remapped = remapLegacyDeliverablePricingKeys(
+    { del_modern: 30000 },
+    new Map([["instagram:reel", "del_new"]]),
+  ) as Record<string, unknown>;
+  assert.equal(remapped["del_modern"], 30000);
+});
+
+test("a price already saved under the NEW id wins over the stale composite-keyed value", () => {
+  const legacyKeyToId = new Map([["instagram:reel", "del_new"]]);
+  const remapped = remapLegacyDeliverablePricingKeys(
+    { "instagram:reel": 50000, del_new: 99000 },
+    legacyKeyToId,
+  ) as Record<string, unknown>;
+  assert.equal(remapped["del_new"], 99000, "the already-migrated value must not be clobbered by the stale one");
+});
+
+test("an empty legacyKeyToId returns the pricing object unchanged (the common, non-legacy case)", () => {
+  const pricing = { del_a: 100, del_b: 200 };
+  assert.deepEqual(remapLegacyDeliverablePricingKeys(pricing, new Map()), pricing);
+});
+
+test("non-object pricing (null, array, scalar) passes through untouched for the caller's own validation", () => {
+  const map = new Map([["instagram:reel", "del_new"]]);
+  assert.equal(remapLegacyDeliverablePricingKeys(null, map), null);
+  assert.deepEqual(remapLegacyDeliverablePricingKeys([1, 2], map), [1, 2]);
+  assert.equal(remapLegacyDeliverablePricingKeys("not an object", map), "not an object");
+});
+
+test("end-to-end: normalize a legacy deliverable, then remap its pricing entry, exactly as the PATCH route does", () => {
+  const legacy = { platform: "instagram", format: "reel", quantity: 2 };
+  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds([legacy]);
+  const validated = validateDeliverables(items);
+  assert.equal(validated.ok, true);
+  const remappedPricing = remapLegacyDeliverablePricingKeys(
+    { "instagram:reel": 75000 },
+    legacyKeyToId,
+  ) as Record<string, unknown>;
+  if (validated.ok) {
+    const newId = validated.deliverables[0]!.id;
+    assert.equal(remappedPricing[newId], 75000, "PricingGrid's keyOf(row) now finds the price under row.id");
   }
 });

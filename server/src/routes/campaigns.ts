@@ -23,7 +23,11 @@ import {
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
 import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
-import { validateDeliverables, normalizeLegacyDeliverableIds } from "../domain/deliverablesValidator.js";
+import {
+  validateDeliverables,
+  normalizeLegacyDeliverableIds,
+  remapLegacyDeliverablePricingKeys,
+} from "../domain/deliverablesValidator.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
   getCreatorRequirement,
@@ -849,6 +853,10 @@ router.patch("/:id", async (req: Request, res: Response) => {
       (detailsPatch as Record<string, unknown>)[key] = boolOrNull(value);
     }
   }
+  // Review fix: populated below when deliverableQuantities normalization
+  // actually mints a new id for a legacy row — used to keep deliverablePricing
+  // (S7.P1, keyed by the SAME legacy composite key) from orphaning.
+  let legacyDeliverableKeyToId = new Map<string, string>();
   if (deliverableQuantities !== undefined) {
     // PLU-169 (1f): full structural + platform/format-combination validation
     // at the trust boundary (deliverablesValidator.ts) — replaces the old
@@ -870,7 +878,9 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // to save it, without waiting on the separate backfill script.
     let normalizedDeliverables: JsonValue | null = deliverableQuantities as JsonValue | null;
     if (deliverableQuantities !== null) {
-      const result = validateDeliverables(normalizeLegacyDeliverableIds(deliverableQuantities));
+      const { items: normalizedItems, legacyKeyToId } = normalizeLegacyDeliverableIds(deliverableQuantities);
+      legacyDeliverableKeyToId = legacyKeyToId;
+      const result = validateDeliverables(normalizedItems);
       if (!result.ok) {
         res.status(400).json({ error: `deliverableQuantities: ${result.error}` });
         return;
@@ -879,10 +889,45 @@ router.patch("/:id", async (req: Request, res: Response) => {
     }
     (detailsPatch as Record<string, unknown>)["deliverableQuantities"] = normalizedDeliverables;
   }
-  // S7.P1 pricing map / S3.11 follower-ranges map — plain JSON objects keyed by
-  // deliverable or platform. Accept an object or null; reject arrays/scalars at
-  // the trust boundary (mirrors the deliverableQuantities array guard).
-  const jsonObjectFields139 = { deliverablePricing, followerRanges, fieldProvenance } as const;
+
+  // S7.P1 pricing map — keyed by deliverable id (or, for a legacy row not yet
+  // normalized, the "<platform>:<format>" composite — see PricingGrid's own
+  // `keyOf` fallback). Review fix: if THIS save just minted new ids for
+  // legacy deliverableQuantities rows above, remap any pricing entry still
+  // keyed by the OLD composite onto the new id before persisting — otherwise
+  // that row's price displays blank (PricingGrid looks it up by the row's
+  // current id) and a subsequent edit writes a fresh entry under the new id
+  // while the old one sits orphaned forever.
+  if (deliverablePricing !== undefined) {
+    if (
+      deliverablePricing !== null &&
+      (typeof deliverablePricing !== "object" || Array.isArray(deliverablePricing))
+    ) {
+      res.status(400).json({ error: "deliverablePricing must be an object or null" });
+      return;
+    }
+    (detailsPatch as Record<string, unknown>)["deliverablePricing"] =
+      deliverablePricing === null
+        ? null
+        : (remapLegacyDeliverablePricingKeys(deliverablePricing, legacyDeliverableKeyToId) as JsonValue);
+  } else if (legacyDeliverableKeyToId.size > 0) {
+    // deliverablePricing wasn't part of THIS patch, but ids were just minted
+    // for legacy deliverableQuantities rows — the EXISTING stored pricing map
+    // (if any) would otherwise go stale the moment this save commits, with no
+    // further save guaranteed to ever touch it again. Load and remap it too.
+    const existingDetails = await getCampaignDetails(req.params["id"]!);
+    if (existingDetails?.deliverablePricing) {
+      (detailsPatch as Record<string, unknown>)["deliverablePricing"] = remapLegacyDeliverablePricingKeys(
+        existingDetails.deliverablePricing,
+        legacyDeliverableKeyToId,
+      ) as JsonValue;
+    }
+  }
+
+  // S3.11 follower-ranges map / field provenance — plain JSON objects, no
+  // deliverable-id concerns. Accept an object or null; reject arrays/scalars
+  // at the trust boundary.
+  const jsonObjectFields139 = { followerRanges, fieldProvenance } as const;
   for (const [key, value] of Object.entries(jsonObjectFields139)) {
     if (value === undefined) continue;
     if (value !== null && (typeof value !== "object" || Array.isArray(value))) {

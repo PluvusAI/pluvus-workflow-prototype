@@ -249,7 +249,7 @@ export function resolveFinalDeliverables(args: {
   if (!Array.isArray(args.baseline) || args.baseline.length === 0) {
     return { ok: true, deliverables: [] };
   }
-  const normalized = normalizeLegacyDeliverableIds(args.baseline);
+  const { items: normalized } = normalizeLegacyDeliverableIds(args.baseline);
   const result = validateDeliverables(normalized);
   if (!result.ok) return { ok: false, error: result.error };
   return { ok: true, deliverables: result.deliverables };

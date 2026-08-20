@@ -120,12 +120,68 @@ export function validateDeliverables(value: unknown): DeliverablesValidationResu
 // legacy rows the first time anyone happens to save it, without waiting on
 // the separate backfill script. Non-object items pass through untouched so
 // the shared validator produces the real error for them.
-export function normalizeLegacyDeliverableIds(value: unknown): unknown {
-  if (!Array.isArray(value)) return value;
-  return value.map((item) => {
+//
+// Review fix: `legacyKeyToId` is also returned so a caller that has a
+// companion structure keyed by the SAME legacy "<platform>:<format>"
+// composite (campaigns.ts's `deliverablePricing`, S7.P1 — see
+// PricingGrid's own `keyOf` fallback) can remap it onto the freshly minted
+// id in the SAME save. Without that, minting a new id here while leaving the
+// companion structure keyed by the old composite orphans its value: the UI
+// looks the row's price up by its (now current) id, finds nothing, shows
+// blank, and a subsequent edit writes a fresh entry under the new id while
+// the old one sits unreachable forever.
+export interface NormalizeLegacyDeliverableIdsResult {
+  items: unknown;
+  /** Old "<platform>:<format>" composite key -> newly minted id, one entry
+   *  per item that was missing an id. Empty when nothing was legacy (the
+   *  common case for anything created after this ticket shipped). When two
+   *  legacy items happen to share the same platform+format (already an
+   *  ambiguous state under the old composite-keyed pricing scheme — its one
+   *  price could only ever have described one of them), only the FIRST is
+   *  mapped; this doesn't regress anything, since that ambiguity predates
+   *  this function. */
+  legacyKeyToId: Map<string, string>;
+}
+
+export function normalizeLegacyDeliverableIds(value: unknown): NormalizeLegacyDeliverableIdsResult {
+  if (!Array.isArray(value)) return { items: value, legacyKeyToId: new Map() };
+  const legacyKeyToId = new Map<string, string>();
+  const items = value.map((item) => {
     if (typeof item !== "object" || item === null) return item;
     const r = item as Record<string, unknown>;
     if (typeof r["id"] === "string" && r["id"].length > 0) return r;
-    return { ...r, id: createId() };
+    const newId = createId();
+    if (typeof r["platform"] === "string" && typeof r["format"] === "string") {
+      const key = `${r["platform"]}:${r["format"]}`;
+      if (!legacyKeyToId.has(key)) legacyKeyToId.set(key, newId);
+    }
+    return { ...r, id: newId };
   });
+  return { items, legacyKeyToId };
+}
+
+// Review fix: fold every `deliverablePricing` entry still keyed by a legacy
+// "<platform>:<format>" composite onto the id `normalizeLegacyDeliverableIds`
+// just minted for that same row, so the price survives the id migration
+// instead of being orphaned. A value already present under the NEW id wins
+// over the stale composite-keyed one (the user may have already re-priced
+// that row after an id was minted on a prior save). Non-object input passes
+// through untouched — the caller's own object/null validation handles that.
+export function remapLegacyDeliverablePricingKeys(
+  pricing: unknown,
+  legacyKeyToId: Map<string, string>,
+): unknown {
+  if (typeof pricing !== "object" || pricing === null || Array.isArray(pricing)) return pricing;
+  if (legacyKeyToId.size === 0) return pricing;
+  const input = pricing as Record<string, unknown>;
+  const remapped: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (!legacyKeyToId.has(key)) remapped[key] = value;
+  }
+  for (const [oldKey, newId] of legacyKeyToId) {
+    if (Object.prototype.hasOwnProperty.call(input, oldKey) && !(newId in remapped)) {
+      remapped[newId] = input[oldKey];
+    }
+  }
+  return remapped;
 }
