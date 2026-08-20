@@ -314,6 +314,60 @@ function countTrailingPresentOffers(history: NegotiationHistoryEntryLite[]): num
 // failure must NOT block the transition, so the run still reaches REJECTED. It's
 // idempotent (keyed on the round via reserveOutbound) so a BullMQ retry of this
 // step can't double-email the creator.
+export interface MaxRoundsResolution {
+  maxRounds: number;
+  /** True when a NegotiationPolicySnapshot IS pinned (negotiationPolicySnapshotId
+   *  set) but could not be verified — the expected campaign was unresolved, the
+   *  row is missing, or it belongs to a different campaign. `maxRounds` is still
+   *  populated (the conservative raw-config/default fallback) so a caller that
+   *  doesn't care about pin corruption keeps working, but a caller about to take
+   *  a TERMINAL action on `maxRounds` alone (auto-reject) MUST check this flag
+   *  first and defer to the real snapshot-integrity gate instead — see the
+   *  PLU-142 follow-up note at the executeNegotiation pre-build hard stop. */
+  policyPinUnresolved: boolean;
+}
+
+// PLU-142 follow-up: the ONE authoritative maxRounds precedence, pure so it is
+// unit-tested without a DB. A pinned NegotiationPolicySnapshot's own maxRounds —
+// present AND verified same-campaign — wins over the raw workflow config, same
+// "a valid snapshot always wins" discipline as every other snapshot field
+// (PLU-137/138). A pin that exists but does NOT verify (campaign unresolved / row
+// missing / cross-campaign) is NOT trusted for the returned number — it falls
+// back to the raw config value, then the documented default (5) — AND is flagged
+// via `policyPinUnresolved` so a terminal-decision caller can refuse to act on it
+// (PLU-142 follow-up 2: a corrupted pin must escalate as snapshot_integrity, not
+// silently auto-reject on a conservative guess). The caller (executeNegotiation)
+// supplies the already-fetched snapshot row (or undefined when nothing is pinned,
+// or the row wasn't found) — this function does no I/O.
+export function resolveMaxRounds(args: {
+  config: Record<string, unknown>;
+  negotiationPolicySnapshotId: string | null | undefined;
+  expectedCampaignId: string | null | undefined;
+  pinnedPolicySnapshot?: { campaignId: string; maxRounds: number | null } | undefined;
+}): MaxRoundsResolution {
+  const { config, negotiationPolicySnapshotId, expectedCampaignId, pinnedPolicySnapshot } = args;
+  const fallback = typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5;
+
+  if (!negotiationPolicySnapshotId) {
+    // No pin at all — the legacy/no-snapshot journey. Nothing to verify.
+    return { maxRounds: fallback, policyPinUnresolved: false };
+  }
+
+  const verified =
+    expectedCampaignId != null &&
+    pinnedPolicySnapshot !== undefined &&
+    pinnedPolicySnapshot.campaignId === expectedCampaignId;
+
+  if (!verified) {
+    return { maxRounds: fallback, policyPinUnresolved: true };
+  }
+
+  return {
+    maxRounds: typeof pinnedPolicySnapshot.maxRounds === "number" ? pinnedPolicySnapshot.maxRounds : fallback,
+    policyPinUnresolved: false,
+  };
+}
+
 // Exported for the T1 escalation-trap tests (routing assertions). Visibility
 // only — behavior unchanged. See readme_docs/testing/.
 export async function maxRoundsReject(
@@ -894,25 +948,26 @@ export async function executeNegotiation(
   // (PLU-137/138: a valid snapshot always wins). Resolve that ONE value here,
   // before the build, so the pre-build hard stop below, the post-agent counter
   // guard, relationshipWarmth, and the agent request (via effectiveConfig,
-  // built from this SAME immutable snapshot row further down) all agree. A
-  // cheap direct-by-id read — nowhere near the cost of the full context build —
-  // so the pre-build guard keeps its job of skipping that build once the round
-  // ceiling is reached. A missing or cross-campaign pin is NOT trusted here; it
-  // falls back to the raw config value, and is caught for real by the post-build
-  // integrity gate (cc.integrityFailure) before the agent is ever invoked.
-  let pinnedMaxRounds: number | undefined;
-  if (instance.negotiationPolicySnapshotId && ctx.campaign?.id) {
-    const policySnapshot = await getNegotiationPolicySnapshotById(instance.negotiationPolicySnapshotId);
-    if (
-      policySnapshot &&
-      policySnapshot.campaignId === ctx.campaign.id &&
-      typeof policySnapshot.maxRounds === "number"
-    ) {
-      pinnedMaxRounds = policySnapshot.maxRounds;
-    }
-  }
-  const maxRounds =
-    pinnedMaxRounds ?? (typeof config["maxRounds"] === "number" ? config["maxRounds"] : 5);
+  // built from this SAME immutable snapshot row further down) all agree — see
+  // resolveMaxRounds for the precedence itself. A cheap direct-by-id read —
+  // nowhere near the cost of the full context build — so the pre-build guard
+  // keeps its job of skipping that build once the round ceiling is reached.
+  // `policyPinUnresolved` (missing row / cross-campaign / unresolved campaign)
+  // makes `maxRounds` itself a conservative guess only — the hard stop below
+  // MUST check that flag before treating it as grounds to reject (follow-up 2).
+  // Fail CLOSED before any read (same discipline as loadPinnedSnapshots's
+  // campaign_unresolved guard below): with no expected campaign to verify
+  // against, the fetch can never come back trusted, so skip it entirely.
+  const pinnedPolicySnapshot =
+    instance.negotiationPolicySnapshotId && ctx.campaign?.id
+      ? await getNegotiationPolicySnapshotById(instance.negotiationPolicySnapshotId)
+      : undefined;
+  const { maxRounds, policyPinUnresolved } = resolveMaxRounds({
+    config,
+    negotiationPolicySnapshotId: instance.negotiationPolicySnapshotId,
+    expectedCampaignId: ctx.campaign?.id,
+    pinnedPolicySnapshot,
+  });
 
   // Hard stop — enforce maxRounds before calling the agent (and BEFORE the full
   // context build — §5.2). This prevents the agent from even being consulted past
@@ -934,7 +989,18 @@ export async function executeNegotiation(
   // the builder would do) rather than the full assembly. This runs ONLY when the
   // round ceiling is reached; the normal path skips it and goes straight to the
   // single build below.
-  if (maxRounds > 0 && instance.negotiationRound >= maxRounds) {
+  //
+  // PLU-142 follow-up (2): `!policyPinUnresolved` gates this terminal auto-reject
+  // the SAME way the H1 no-ceiling arm gates on "no pin at all" above — a pinned
+  // policy snapshot that could NOT be verified (campaign unresolved / row missing
+  // / cross-campaign) must never inform a terminal decision here. Without this
+  // gate, a round-exhausted instance with a corrupted pin would reserve a
+  // creator-facing close email and return REJECTED/max_rounds_no_agreement
+  // instead of falling through to the build, where the real snapshot-integrity
+  // gate (cc.integrityFailure → escalateSnapshotIntegrity) correctly routes it to
+  // MANUAL_REVIEW/snapshot_integrity. `maxRounds` itself stays the conservative
+  // fallback in that case (resolveMaxRounds), but it is not trusted to REJECT.
+  if (!policyPinUnresolved && maxRounds > 0 && instance.negotiationRound >= maxRounds) {
     const { latest } = await loadCreatorInbounds(instance.id);
     const creatorReplyForStop = latest?.body ? extractReplyText(latest.body) : "";
     return maxRoundsReject(ctx, email, config, {

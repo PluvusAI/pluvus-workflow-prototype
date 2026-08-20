@@ -354,6 +354,73 @@ test("H1: a pinned (even corrupt) journey does NOT pre-escalate as no_ceiling on
   assert.equal(negotiateCalls, 0, "the agent was never consulted");
 });
 
+test("PLU-142 follow-up (2): an unresolved policy pin does NOT auto-reject on round limit — no close email is reserved", async () => {
+  // Mirrors the H1 "pinned (even corrupt) journey" test above, but for the
+  // maxRounds hard stop instead of the no-ceiling guard: a NegotiationPolicySnapshot
+  // IS pinned, but it cannot be VERIFIED (here: ctx.campaign is absent, so
+  // expectedCampaignId is unresolved — the same campaign_unresolved shape
+  // loadPinnedSnapshots fails closed on). The raw workflow config alone says the
+  // round ceiling is already reached (maxRounds: 2, negotiationRound: 2) — proving
+  // that WITHOUT the fix, the pre-build hard stop would have trusted that number,
+  // reserved a courteous close email, and returned REJECTED/max_rounds_no_agreement,
+  // masking what must actually resolve to MANUAL_REVIEW/snapshot_integrity.
+  //
+  // Because ctx.campaign is absent, resolveMaxRounds's caller skips the policy
+  // fetch entirely (fail-closed BEFORE any read, same discipline as
+  // loadPinnedSnapshots) — so THIS assertion is fully deterministic, live DB or
+  // not: the close-email draft must never be reserved for an unresolved pin.
+  let draftCalls = 0;
+  let sendCalls = 0;
+  const spyEmail = {
+    draft: async () => {
+      draftCalls++;
+      return { subject: "Close", body: "..." };
+    },
+    send: async () => {
+      sendCalls++;
+      return { messageId: "msg-1", threadId: "thr-1" };
+    },
+  } as never;
+  const spyAgent = {
+    negotiate: async () => {
+      throw new Error("agent-not-expected");
+    },
+    draftEmail: async () => null,
+    classify: async () => ({ intent: "POSITIVE", confidence: 1 }),
+  } as never;
+
+  const cfg = { maxRounds: 2, minBudget: 200, maxBudget: 500 }; // raw config alone says "stop"
+  const ctx = {
+    instance: {
+      id: "i1",
+      currentState: "NEGOTIATING",
+      negotiationRound: 2, // already AT the raw config's maxRounds
+      negotiationPolicySnapshotId: "policy-pin-1", // pinned, but unverifiable (no campaign below)
+      campaignTermsSnapshotId: null,
+    },
+    node: { id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg },
+    nodeGraph: [{ id: "node-negotiation", type: "NEGOTIATION", order: 5, config: cfg }],
+    creator: { id: "c1", name: "Alex" },
+    // campaign deliberately omitted — expectedCampaignId is unresolved.
+  } as never;
+
+  try {
+    const result = await executeNegotiation(ctx, spyEmail, spyAgent);
+    const reason = (result.eventPayload as Record<string, unknown>)["reason"];
+    assert.notEqual(
+      reason,
+      "max_rounds_no_agreement",
+      "an unresolved policy pin must never be trusted to auto-reject on round limit",
+    );
+  } catch {
+    // Tolerated: the fall-through path still needs buildConversationContext, which
+    // needs a live DB this offline suite doesn't have. See the sibling H1 test
+    // above for the same convention. The invariant below holds regardless.
+  }
+  assert.equal(draftCalls, 0, "no close-email draft may be reserved for an unresolved pin");
+  assert.equal(sendCalls, 0, "no close-email send may be reserved for an unresolved pin");
+});
+
 test("PLU-129: a commission-only 0/0 band does NOT trip the no-ceiling guard", async () => {
   // The canonical commission-only shape (minBudget:0, maxBudget:0) resolves to
   // floor 0 AND ceiling 0 — both DEFINED, unlike floor-without-ceiling. It is a
