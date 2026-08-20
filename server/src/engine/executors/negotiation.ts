@@ -74,11 +74,17 @@ import { resolveBand } from "../band.js";
 // agent decision, the output guard, and the offer/counter copy read the
 // authoritative band + public terms instead of stale nodeGraph values.
 import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
+// PLU-169 (1f) — Greptile review (PR #46) fix: the executor only BUILDS the
+// final-agreement insert (pure, no I/O) and attaches it to a real ACCEPTED
+// NodeResult as finalAgreementWrite; the runtime (runtime.ts) is what calls
+// recordFinalAgreementOnce, inside the same OCC transaction as the state
+// commit — see the finalAgreementWrite doc comment on NodeResult (types.ts).
+import { buildFinalAgreementInput, resolveFinalDeliverables } from "../../db/finalAgreements.js";
 // HARD-A2: the output-guard-blocked MANUAL_REVIEW result is the SAME shape used
 // by other executors, so it lives in one place (guardEscalation.ts) rather than
 // being duplicated inline here. Previously negotiation.ts and guardEscalation.ts
 // each carried a byte-identical copy — a drift hazard on a safety path.
-import { blockedByGuard } from "./guardEscalation.js";
+import { blockedByGuard, blockedByInvalidFinalDeliverables } from "./guardEscalation.js";
 
 // PLU-81: the /negotiate brief-into-prompt gating (BRIEF_INTO_NEGOTIATE /
 // KNOWLEDGE_RETRIEVAL_ENABLED) + the flat-knowledge / brief-section projections that
@@ -1497,6 +1503,55 @@ export async function executeNegotiation(
     }
 
     case "accept": {
+      // PLU-169 (1f) — Greptile review (PR #46) fix: this used to WRITE the
+      // FinalAgreement eagerly, right here, before the draft/guard/send logic
+      // below and before the actual OCC-guarded ACCEPTED transition commits.
+      // That let a row persist for a turn that then failed the output guard,
+      // failed draft generation, or lost the OCC race — an agreement recorded
+      // for an instance that was never really ACCEPTED. Fixed by only BUILDING
+      // the insert here (pure, no I/O) and attaching it as `finalAgreementWrite`
+      // on the two returns below that actually carry nextState: "ACCEPTED" — the
+      // runtime applies it inside the SAME transaction as the state write
+      // (mirrors obligationWrites exactly, types.ts). No new DB round-trip for
+      // snapshot data (cc.termsSnapshot/cc.policySnapshot are already loaded by
+      // the builder above) and no new resolution logic (effectiveConfig is
+      // already computed).
+      //
+      // resolveFinalDeliverables is Phase 1: a pure pass-through of the pinned
+      // snapshot's deliverableQuantities. Negotiation-delta application is a
+      // separate future ticket (PLU-169 decision #5) — deliverables stay
+      // atomic/non-negotiable here, exactly as they behave today.
+      //
+      // Review fix (PR #48): resolveFinalDeliverables now validates the
+      // COMPLETE package against the shared deliverablesSchema and fails
+      // rather than silently dropping invalid items. Check that BEFORE
+      // building finalAgreementWrite (and before any email is drafted/sent
+      // below) — an invalid pinned package must escalate, never produce a
+      // FinalAgreement with a silently-incomplete deliverables array.
+      const finalDeliverablesResult = resolveFinalDeliverables({
+        baseline: (cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined)?.[
+          "deliverableQuantities"
+        ],
+      });
+      if (!finalDeliverablesResult.ok) {
+        return withContextRecord({
+          ...blockedByInvalidFinalDeliverables(instance.negotiationRound, finalDeliverablesResult.error),
+          obligationWrites: buildObligationWrites(undefined),
+        });
+      }
+      const finalAgreementWrite = buildFinalAgreementInput({
+        instanceId: instance.id,
+        campaignTermsSnapshotId: cc.termsSnapshot?.id ?? null,
+        negotiationPolicySnapshotId: cc.policySnapshot?.id ?? null,
+        effectiveConfig,
+        detailsSnapshot: cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined,
+        finalDeliverables: finalDeliverablesResult.deliverables,
+        agreedFeeCents: proposedRate !== undefined ? Math.round(proposedRate * 100) : undefined,
+        acceptanceSource: "AI_NEGOTIATION",
+        sourceMessageId: latestInbound?.id,
+        acceptedAt: new Date(),
+      });
+
       // A post-acceptance email node (Content Brief in the merged flow, or legacy
       // Reward Setup) owns the post-acceptance email. Skip the negotiation's own
       // onboarding/acceptance send entirely and just transition to ACCEPTED; the
@@ -1517,6 +1572,9 @@ export async function executeNegotiation(
           // answers them (or the downstream node's send does, once it too is
           // wired). Conservative: never resolve without a real send.
           obligationWrites: buildObligationWrites(undefined),
+          // PLU-169 (1f): a real ACCEPTED transition — the runtime writes this
+          // inside the same OCC transaction as the state commit above.
+          finalAgreementWrite,
           eventPayload: {
             outcome,
             round: instance.negotiationRound,
@@ -1595,6 +1653,9 @@ export async function executeNegotiation(
         // PLU-111: the onboarding/acceptance email answers this turn's questions —
         // link it so they resolve on send (§4.5).
         obligationWrites: buildObligationWrites(accept.deferredSend?.messageId),
+        // PLU-169 (1f): a real ACCEPTED transition — the runtime writes this
+        // inside the same OCC transaction as the state commit above.
+        finalAgreementWrite,
         // Persist the agreed rate (FIX-2) so it is recoverable for audit and
         // for threading as currentOffer on any subsequent turn.
         eventPayload: {

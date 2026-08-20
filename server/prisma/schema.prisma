@@ -603,6 +603,8 @@ model CampaignTermsSnapshot {
   briefExtraction CampaignBriefExtraction? @relation(fields: [briefExtractionId], references: [id], onDelete: Restrict)
   executionInstances ExecutionInstance[]
   briefs             CampaignBrief[]
+  /// PLU-169 (1f): back-relation for FinalAgreement.campaignTermsSnapshotId.
+  finalAgreements    FinalAgreement[]
 
   @@index([briefExtractionId])
   /// Enables the composite FK from CampaignBrief(campaignTermsSnapshotId,
@@ -735,6 +737,8 @@ model NegotiationPolicySnapshot {
 
   campaign           Campaign            @relation(fields: [campaignId], references: [id], onDelete: Restrict)
   executionInstances ExecutionInstance[]
+  /// PLU-169 (1f): back-relation for FinalAgreement.negotiationPolicySnapshotId.
+  finalAgreements    FinalAgreement[]
 }
 
 /// PLU-135 (1a): brand logo/colors/typography for anything rendered on the
@@ -1193,6 +1197,7 @@ model ExecutionInstance {
   brandNotifications BrandNotification[]
   paymentInfo        PaymentInfo?
   dealHandoff        DealHandoff?
+  finalAgreement     FinalAgreement?
   outboxJobs         OutboxJob[]
   conversationObligations ConversationObligation[]
 
@@ -1278,6 +1283,8 @@ model Message {
   /// (inbound) or the one that resolved them (a sent outbound answer).
   raisedObligations   ConversationObligation[] @relation("ConversationObligationSource")
   resolvedObligations ConversationObligation[] @relation("ConversationObligationResolution")
+  /// PLU-169 (1f): back-relation for FinalAgreement.sourceMessageId.
+  finalAgreements     FinalAgreement[]
 
   @@index([threadId])
   @@index([instanceId])
@@ -1529,6 +1536,94 @@ model DealHandoff {
   instance ExecutionInstance @relation(fields: [instanceId], references: [id])
 
   @@index([status])
+}
+
+/// PLU-169 (1f): which flow produced a FinalAgreement. AI_NEGOTIATION is the
+/// only source any code path writes today — executeNegotiation's
+/// case "accept:" is the ONE transition into ACCEPTED (confirmed, no route
+/// transitions an instance to ACCEPTED directly). OPERATOR_MANUAL/
+/// BRAND_APPROVAL are reserved, unused values (decision #2 in the plan doc) —
+/// same "positioned, unused seam" precedent as the operator_override slot in
+/// knowledgePrecedence.ts.
+enum FinalAgreementSource {
+  AI_NEGOTIATION
+  OPERATOR_MANUAL
+  BRAND_APPROVAL
+}
+
+/// PLU-169 (1f): PERCENT (finalCommissionRate) vs FLAT (finalCommissionAmountCents).
+enum FinalAgreementCommissionMode {
+  PERCENT
+  FLAT
+}
+
+/// PLU-169 (1f): the ONE canonical accepted-terms record for a creator
+/// journey. Written exactly once per ExecutionInstance (UNIQUE instanceId —
+/// the same idempotency guard DealHandoff already proved out: a retried write
+/// re-inserts, hits the constraint, and the writer returns the existing row
+/// instead of erroring). Unlike DealHandoff, this is written for EVERY
+/// accepted journey regardless of postAcceptanceMode — not an
+/// operator-handoff-specific display snapshot. Every field is an ACCEPTED,
+/// creator-facing outcome; private floors/ceilings/strategy/rejected
+/// positions are never copied in (mirrors the structural-exclusion
+/// discipline PLU-137 established for DraftContext).
+model FinalAgreement {
+  id         String @id @default(cuid())
+  instanceId String @unique
+
+  /// Governing references — nullable: a legacy no-snapshot journey has none.
+  campaignTermsSnapshotId     String?
+  negotiationPolicySnapshotId String?
+
+  /// Money — integer cents throughout (matches NegotiationPolicySnapshot).
+  finalFeeCents               Int?
+  finalCommissionMode         FinalAgreementCommissionMode?
+  finalCommissionRate         Float? // PERCENT mode
+  finalCommissionAmountCents  Int?   // FLAT mode
+  finalCommissionDurationDays Int?
+  finalCommissionConditions   String?
+
+  /// Gift / product (GIFT_ONLY, or includesGifting on any other type).
+  finalGiftProductDescription String?
+  finalGiftDisposition        GiftDisposition?
+  /// No current source column — PLU-169 decision #3 (inert until a real
+  /// upstream source exists; never populated with invented values).
+  finalFulfillmentTerms       String?
+
+  /// The shared Deliverable[] shape (server/src/domain/deliverables.ts) — the
+  /// same structure CampaignDetails.deliverableQuantities uses. JSON, not a
+  /// generalized contract-line-item system.
+  finalDeliverables Json?
+  finalTimeline     String?
+  /// No current source column — PLU-169 decision #3.
+  finalPostingDate  DateTime?
+
+  /// Rights.
+  finalUsageRights       String?
+  finalExclusivity       String?
+  finalAttributionWindow String?
+  finalPaymentTerms      String?
+
+  /// No current source column — PLU-169 decision #3.
+  finalScriptSubmissionRequired Boolean @default(false)
+
+  /// Approved deviations from the campaign's published policy (e.g. a
+  /// manually-approved above-ceiling exception). Small typed shape, JSON —
+  /// not a version/amendment system.
+  approvedDeviations Json?
+
+  /// Acceptance evidence.
+  acceptanceSource FinalAgreementSource
+  sourceMessageId  String?
+  acceptedAt       DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  instance               ExecutionInstance          @relation(fields: [instanceId], references: [id])
+  campaignTermsSnapshot     CampaignTermsSnapshot?     @relation(fields: [campaignTermsSnapshotId], references: [id], onDelete: Restrict)
+  negotiationPolicySnapshot NegotiationPolicySnapshot? @relation(fields: [negotiationPolicySnapshotId], references: [id], onDelete: Restrict)
+  sourceMessage             Message?                   @relation(fields: [sourceMessageId], references: [id])
 }
 
 /// PLU-111: a durable record of an open conversation thread with its own

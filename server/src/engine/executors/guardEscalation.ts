@@ -71,6 +71,28 @@ export function blockedBySnapshotIntegrity(node: string, reason: string): NodeRe
   };
 }
 
+// PLU-169 (1f) — Review fix (PR #48): resolveFinalDeliverables now fails the
+// WHOLE resolution (instead of silently dropping only the invalid items) when
+// the pinned snapshot's deliverableQuantities don't pass the shared
+// deliverablesSchema (an invalid platform/format combination, or a genuinely
+// malformed item). Escalate BEFORE the accept email is drafted/sent — same
+// NEGOTIATION_TURN/round shape as blockedByGuard above, since this fires from
+// negotiation.ts's own "accept" case, not a separate post-accept node.
+export function blockedByInvalidFinalDeliverables(round: number, reason: string): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "NEGOTIATION_TURN",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "invalid_final_deliverables",
+      detail: reason,
+      round,
+    },
+  };
+}
+
 // L4: fail loud when a creator-facing email has no resolvable brand name (config
 // AND campaign both missing it). Rather than send "Thanks, your brand" to a real
 // creator, route the instance to MANUAL_REVIEW so a human fixes the config. This
