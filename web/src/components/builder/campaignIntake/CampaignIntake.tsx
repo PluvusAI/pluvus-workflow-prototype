@@ -1886,27 +1886,14 @@ function QuantityRows({
   );
 }
 
-// PLU-169 (1f): stable per-item id, generated client-side. crypto.randomUUID()
-// rather than adding a cuid2 dependency to web/ just for this — the format
-// doesn't need to match the server's cuid2 ids, only be unique and stable
-// once written (negotiation deltas, a future ticket, reference it by value).
-function newDeliverableId(): string {
-  return `del_${crypto.randomUUID()}`;
-}
-
 // ---------------------------------------------------------------------------
-// DeliverableCards — the 8 worksheet platform/format checkbox cards (S3.2–S3.9)
-// plus a PLU-169 custom-deliverable escape hatch ("other").
+// DeliverableCards — the 8 worksheet platform/format checkbox cards (S3.2–S3.9).
 // ---------------------------------------------------------------------------
-// Each card toggles a { id, platform, format, quantity } row in the SAME
+// Each card toggles a { platform, format, quantity } row in the SAME
 // deliverableQuantities jsonb the generic QuantityRows wrote — so the storage
 // contract is unchanged; only the UI is worksheet-exact now. A card is selected
-// iff a row with its platform+format exists; selecting adds a row (qty 1, a
-// freshly minted id), deselecting removes it, and the quantity input edits it
-// in place. Custom (platform "other") rows are NOT part of the fixed 8-card
-// catalog — they render in their own list below, since they need a free-text
-// label instead of a checkbox toggle (PLU-169 decision #8: "other" is a
-// platform-less custom slot, matching PLATFORM_FORMAT_MATRIX server-side).
+// iff a row with its platform+format exists; selecting adds a row (qty 1),
+// deselecting removes it, and the quantity input edits it in place.
 function DeliverableCards({
   value,
   onChange,
@@ -1917,12 +1904,12 @@ function DeliverableCards({
   disabled: boolean;
 }) {
   const indexOf = (platform: string, format: string) =>
-    value.findIndex((r) => r.platform === platform && r.format === format && r.platform !== "other");
+    value.findIndex((r) => r.platform === platform && r.format === format);
 
   function toggle(platform: string, format: string) {
     const i = indexOf(platform, format);
     if (i >= 0) onChange(value.filter((_, idx) => idx !== i));
-    else onChange([...value, { id: newDeliverableId(), platform, format, quantity: 1 }]);
+    else onChange([...value, { platform, format, quantity: 1 }]);
   }
   function setQty(platform: string, format: string, quantity: number) {
     const i = indexOf(platform, format);
@@ -1930,25 +1917,7 @@ function DeliverableCards({
     onChange(value.map((r, idx) => (idx === i ? { ...r, quantity } : r)));
   }
 
-  const customRows = value
-    .map((row, idx) => ({ row, idx }))
-    .filter(({ row }) => row.platform === "other");
-
-  function addCustom() {
-    onChange([
-      ...value,
-      { id: newDeliverableId(), platform: "other", format: "other", quantity: 1, customLabel: "" },
-    ]);
-  }
-  function updateCustom(idx: number, patch: Partial<DeliverableQuantity>) {
-    onChange(value.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
-  }
-  function removeCustom(idx: number) {
-    onChange(value.filter((_, i) => i !== idx));
-  }
-
   return (
-    <>
     <div
       style={{
         display: "grid",
@@ -2016,50 +1985,7 @@ function DeliverableCards({
           </div>
         );
       })}
-      </div>
-      {/* PLU-169 (1f) decision #8: a fully custom, platform-less deliverable
-          slot — not one of the fixed 8 cards above. */}
-      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
-        {customRows.map(({ row, idx }) => (
-          <div key={row.id ?? idx} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <Input
-              aria-label="Custom deliverable label"
-              placeholder="Custom deliverable (e.g. Raw Footage Package)" // COPY:PLU-159
-              value={row.customLabel ?? ""}
-              disabled={disabled}
-              onChange={(e) => updateCustom(idx, { customLabel: e.target.value })}
-              style={{ flex: 2 }}
-            />
-            <Input
-              aria-label="Custom deliverable quantity"
-              type="number"
-              min={1}
-              value={String(row.quantity ?? "")}
-              disabled={disabled}
-              onChange={(e) => updateCustom(idx, { quantity: Number(e.target.value) || 0 })}
-              style={{ width: 64, flexShrink: 0 }}
-            />
-            {!disabled && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => removeCustom(idx)}
-                leftIcon={<X size={13} strokeWidth={2.25} />}
-              >
-                {""}
-              </Button>
-            )}
-          </div>
-        ))}
-        {!disabled && (
-          <div>
-            <Button variant="secondary" size="sm" onClick={addCustom}>
-              Add custom deliverable {/* COPY:PLU-159 */}
-            </Button>
-          </div>
-        )}
-      </div>
-    </>
+    </div>
   );
 }
 

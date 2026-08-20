@@ -23,10 +23,6 @@ import {
   applyMemoryWritePlan,
   recordFailedMemoryWrite,
 } from "../db/index.js";
-// PLU-169 (1f) — Greptile review (PR #46) fix: recordFinalAgreementOnce is
-// called HERE, inside the OCC transaction, never eagerly by the executor —
-// see the finalAgreementWrite doc comment on NodeResult (types.ts).
-import { recordFinalAgreementOnce } from "../db/finalAgreements.js";
 import type { Db, DbTx } from "../db/drizzle.js";
 import { findCampaignById } from "../db/campaigns.js";
 import { getCampaignDetails } from "../db/campaignDetails.js";
@@ -360,17 +356,6 @@ export class WorkflowRuntime {
       // on the resolving Message's sentAt (resolveObligationsByResolutionMessage).
       if (result.obligationWrites) {
         await applyObligationWrites(instanceId, result.obligationWrites, tx);
-      }
-
-      // PLU-169 (1f) — Greptile review (PR #46) fix: the canonical FinalAgreement
-      // write, applied INSIDE this same OCC transaction. If updateInstanceStateConditional
-      // above already returned null (stale/lost OCC race), we never reach this line at
-      // all — this whole callback returns early. If it succeeds but something LATER
-      // in this transaction throws, the transaction rolls back and this insert rolls
-      // back with it. Either way, a FinalAgreement row can only ever exist for an
-      // instance whose ACCEPTED transition genuinely committed.
-      if (result.finalAgreementWrite) {
-        await recordFinalAgreementOnce(result.finalAgreementWrite, tx);
       }
 
       // Persist the authoritative due time in the same transaction as the

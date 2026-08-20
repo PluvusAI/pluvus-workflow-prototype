@@ -6,7 +6,6 @@ import type {
   InstanceState,
   EventType,
   ReplyIntent,
-  FinalAgreementInsert,
 } from "../db/schema.js";
 // F-H1: the full both-sides transcript entry, reused from the draft seam so the
 // negotiator receives the same conversation shape the copywriter already gets.
@@ -108,21 +107,6 @@ export interface NodeResult {
      *  applying questionPlan (so newly-minted rows are included). */
     escalateAfterWrite?: boolean | undefined;
   };
-  /**
-   * PLU-169 (1f) — Greptile review (PR #46): the canonical FinalAgreement
-   * write-plan, applied by the runtime INSIDE stepInstance's db.transaction —
-   * alongside the NEGOTIATION_TURN event + OCC state write — mirroring
-   * `obligationWrites` exactly and for the SAME reason: writing the agreement
-   * eagerly inside the executor (before the OCC-guarded state transition
-   * actually commits) let it persist for a turn that later failed a guard
-   * check, a draft-generation failure, or lost the OCC race — leaving a
-   * FinalAgreement row for an instance that was never actually ACCEPTED. The
-   * executor keeps this pure (build-only, via buildFinalAgreementInput); the
-   * runtime owns the tx-scoped insert via recordFinalAgreementOnce. Only ever
-   * set on a NodeResult whose nextState is actually "ACCEPTED" — never on a
-   * guard-blocked / draft-unavailable / escalated return from the same case.
-   */
-  finalAgreementWrite?: FinalAgreementInsert;
   /**
    * PLU-113: the campaign-scoped creator-memory write-plan for this turn — the
    * verified durable facts extracted from the creator's reply (already evidence-

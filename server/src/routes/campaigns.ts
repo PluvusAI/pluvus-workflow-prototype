@@ -23,7 +23,6 @@ import {
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
 import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
-import { validateDeliverables } from "../domain/deliverablesValidator.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
   getCreatorRequirement,
@@ -850,18 +849,11 @@ router.patch("/:id", async (req: Request, res: Response) => {
     }
   }
   if (deliverableQuantities !== undefined) {
-    // PLU-169 (1f): full structural + platform/format-combination validation
-    // at the trust boundary (deliverablesValidator.ts) — replaces the old
-    // bare "is an array" check now that this field has a real downstream
-    // consumer (FinalAgreement.finalDeliverables). null clears the field;
-    // an empty array is valid (a campaign can have zero deliverables
-    // recorded yet).
-    if (deliverableQuantities !== null) {
-      const result = validateDeliverables(deliverableQuantities);
-      if (!result.ok) {
-        res.status(400).json({ error: `deliverableQuantities: ${result.error}` });
-        return;
-      }
+    // Structured list [{ platform, format, quantity }] — accept an array or
+    // null; reject anything else at the trust boundary.
+    if (deliverableQuantities !== null && !Array.isArray(deliverableQuantities)) {
+      res.status(400).json({ error: "deliverableQuantities must be an array or null" });
+      return;
     }
     (detailsPatch as Record<string, unknown>)["deliverableQuantities"] =
       deliverableQuantities as JsonValue | null;
