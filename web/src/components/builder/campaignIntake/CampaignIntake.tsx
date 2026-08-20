@@ -615,6 +615,18 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
         // retry still carries it. By the time a follow-up PATCH runs, the draft
         // has committed CONFIRMED, so the ref is no longer needed.
         pendingReviewStatusRef.current = null;
+        // PLU-182 (Bug C/R2): refetch readiness + the campaign row IMMEDIATELY
+        // after the campaign PATCH succeeds — NOT after the whole group loop.
+        // A later group (brand/creator/policy) can still throw below and jump to
+        // catch; deferring these past that point would leave the mounted
+        // <LaunchReview> on the stale NEEDS_REVIEW campaign result even though the
+        // approval already persisted (so Page 9 would report a save failure
+        // instead of "Approved — current."). react-query refetches in place; the
+        // component stays mounted, its useReadiness re-runs. Safe vs a reseed
+        // wipe: the campaign seed effect's guard (seededCampaignRef) is already
+        // tripped, so the refetch won't re-run the seed and clobber drafts.
+        void qc.invalidateQueries({ queryKey: ["campaign", campaignId, "readiness"] });
+        void qc.invalidateQueries({ queryKey: ["campaign", campaignId] });
       }
       if (groups.includes("brandIdentity"))
         await updateBrandIdentity(campaignId, buildBrandPayload());
@@ -630,16 +642,6 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       }
       succeeded = true;
       setSavedTick((t) => t + 1);
-      // PLU-182 (Bug C/R2): after a successful campaign PATCH, refetch readiness
-      // and the campaign row so Page-9's readiness/CTA and the persisted
-      // compensationReviewStatus re-read WITHOUT a remount (react-query refetches
-      // in place; <LaunchReview> stays mounted, its useReadiness re-runs). Safe
-      // vs a reseed wipe: the campaign seed effect's guard (seededCampaignRef) is
-      // already tripped, so the refetch won't re-run the seed and clobber drafts.
-      if (groups.includes("campaign")) {
-        void qc.invalidateQueries({ queryKey: ["campaign", campaignId, "readiness"] });
-        void qc.invalidateQueries({ queryKey: ["campaign", campaignId] });
-      }
     } catch (err) {
       // Keep the local draft AND the dirty set intact so nothing is lost and a
       // retry re-sends exactly what failed.
