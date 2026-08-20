@@ -160,6 +160,27 @@ export function blockedByMissingFinalAgreement(node: string): NodeResult {
   };
 }
 
+// Review fix: a campaign whose campaignType requires a fixed fee (PAID /
+// HYBRID) accepted with no finite finalFeeCents — most likely an ACCEPT turn
+// that carried no numeric proposedTerms.rate (the accept still went through,
+// e.g. on a pure-commission/gift acknowledgement, but this campaign's type
+// says a fee is owed). Content Brief must never mint a payout-form link and
+// present "Fixed Fee: the agreed fee" for a genuinely amountless agreement —
+// that sends a real creator to a real payout form with no fee attached.
+export function blockedByMissingFixedFee(node: string): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "MANUAL_REVIEW_FLAGGED",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "missing_fixed_fee",
+      node,
+    },
+  };
+}
+
 // PLU-143: FinalAgreement.finalDeliverables is missing, empty, or fails
 // deliverablesSchema (an invalid platform/format combination, a missing
 // applicable quantity, or — per the issue's deliverable-projection contract —

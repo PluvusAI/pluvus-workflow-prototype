@@ -38,6 +38,8 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/drizzle.js";
 import {
   brandNotifications,
+  campaignDetails,
+  campaigns,
   creators,
   events,
   executionInstances,
@@ -163,13 +165,13 @@ async function state(instanceId: string): Promise<InstanceState> {
 // config or NEGOTIATION_TURN history.
 async function seedFinalAgreement(
   instanceId: string,
-  overrides: { finalDeliverables?: typeof FINAL_DELIVERABLES } = {},
+  overrides: { finalDeliverables?: typeof FINAL_DELIVERABLES; finalFeeCents?: number | null } = {},
 ): Promise<void> {
   await recordFinalAgreementOnce({
     instanceId,
     campaignTermsSnapshotId: null,
     negotiationPolicySnapshotId: null,
-    finalFeeCents: AGREED_RATE * 100,
+    finalFeeCents: overrides.finalFeeCents !== undefined ? overrides.finalFeeCents : AGREED_RATE * 100,
     finalCommissionMode: "PERCENT",
     finalCommissionRate: COMMISSION,
     finalCommissionAmountCents: null,
@@ -225,6 +227,19 @@ async function main(): Promise<void> {
     name: `Content Brief Harness ${stamp}`,
     status: "PUBLISHED",
   }).returning())[0]!;
+  // Review fix: a PAID campaignType (via ctx.campaignDetails.campaignType) is
+  // what blockedByMissingFixedFee's guard branches on — needs a real
+  // campaign/campaignDetails row linked through the workflow for
+  // runtime.loadContext to actually populate ctx.campaignDetails.
+  const campaign = (await db.insert(campaigns).values({
+    name: `Content Brief Harness Campaign ${stamp}`,
+    brand: "Acme",
+  }).returning())[0]!;
+  await db.insert(campaignDetails).values({
+    campaignId: campaign.id,
+    campaignType: "PAID",
+  });
+  await db.update(workflows).set({ campaignId: campaign.id }).where(eq(workflows.id, workflow.id));
   const version = (await db.insert(workflowVersions).values({
     workflowId: workflow.id,
     version: 1,
@@ -256,6 +271,8 @@ async function main(): Promise<void> {
     await db.delete(executionInstances).where(eq(executionInstances.id, instance.id));
     await db.delete(workflowVersions).where(eq(workflowVersions.id, version.id));
     await db.delete(workflows).where(eq(workflows.id, workflow.id));
+    await db.delete(campaignDetails).where(eq(campaignDetails.campaignId, campaign.id));
+    await db.delete(campaigns).where(eq(campaigns.id, campaign.id));
     await db.delete(creators).where(eq(creators.id, creator.id));
     await rm(uploadDir, { recursive: true, force: true });
     if (prevUploads === undefined) delete process.env["UPLOADS_DIR"];
@@ -390,6 +407,43 @@ async function main(): Promise<void> {
       await db.delete(messages).where(eq(messages.instanceId, emptyDeliverablesInstance.id));
       await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, emptyDeliverablesInstance.id));
       await db.delete(executionInstances).where(eq(executionInstances.id, emptyDeliverablesInstance.id));
+    }
+
+    // ── Review fix SUB-CASE: FinalAgreement with no fee on a PAID campaign →
+    //    MANUAL_REVIEW, never a payout link with no fee attached ────────────
+    const noFeeInstance = (await db.insert(executionInstances).values({
+      workflowVersionId: version.id,
+      creatorId: creator.id,
+      currentState: "ACCEPTED",
+      currentNodeId: null,
+    }).returning())[0]!;
+    try {
+      // Simulates an ACCEPT turn with no numeric proposedTerms.rate — the
+      // exact scenario the review comment described.
+      await seedFinalAgreement(noFeeInstance.id, { finalFeeCents: null });
+      await runtime.stepInstance(noFeeInstance.id);
+      assert.equal(
+        await state(noFeeInstance.id),
+        "MANUAL_REVIEW",
+        "a PAID campaign's accepted agreement with no fee must escalate, never proceed to payout",
+      );
+      const escalations = await listEventsByInstance(noFeeInstance.id, { type: "MANUAL_REVIEW_FLAGGED" });
+      assert.equal(
+        (escalations[0]?.payload as Record<string, unknown> | undefined)?.["reason"],
+        "missing_fixed_fee",
+      );
+      const noFeeMsgs = await listMessagesByInstance(noFeeInstance.id);
+      assert.equal(
+        noFeeMsgs.filter((m) => m.direction === "OUTBOUND").length,
+        0,
+        "no payout-link email may be sent for a fee-less agreement on a campaign that requires a fee",
+      );
+      console.log("  ✓ PAID campaign, no fee on FinalAgreement → MANUAL_REVIEW (missing_fixed_fee), no email sent");
+    } finally {
+      await db.delete(events).where(eq(events.instanceId, noFeeInstance.id));
+      await db.delete(messages).where(eq(messages.instanceId, noFeeInstance.id));
+      await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, noFeeInstance.id));
+      await db.delete(executionInstances).where(eq(executionInstances.id, noFeeInstance.id));
     }
 
     // ── LEGACY SUB-CASE: reward → payment → content-brief still reaches terminal ─

@@ -25,7 +25,7 @@ import {
 import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
 import {
   validateDeliverables,
-  normalizeLegacyDeliverableIds,
+  normalizeLegacyDeliverables,
   remapLegacyDeliverablePricingKeys,
 } from "../domain/deliverablesValidator.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
@@ -871,14 +871,22 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // yet). The intake resends the complete array on every group-level PATCH
     // — including an edit to a totally unrelated field — so validating the
     // raw input rejected any legacy, not-yet-backfilled campaign with a 400
-    // until an operator ran the backfill. Normalize legacy rows (mint a
-    // missing id) BEFORE validating, and persist the NORMALIZED array (not
-    // the raw input) so those ids become stable from this save forward —
-    // this campaign incrementally self-heals the first time anyone happens
-    // to save it, without waiting on the separate backfill script.
+    // until an operator ran the backfill. Normalize legacy rows BEFORE
+    // validating, and persist the NORMALIZED array (not the raw input) so
+    // the fix becomes stable from this save forward — this campaign
+    // incrementally self-heals the first time anyone happens to save it,
+    // without waiting on the separate backfill script.
+    //
+    // Review fix (round 2): the id mint alone wasn't enough — a legacy row
+    // predating the CLOSED platform/format catalog (a free-form platform
+    // string, an unsupported platform/format pairing) or carrying a zero/
+    // missing quantity still failed `deliverablesSchema` after the id fix,
+    // 400ing the exact same "unrelated edit to an old campaign" case for a
+    // different reason. normalizeLegacyDeliverables now migrates those too
+    // (see its own doc comment for exactly what "migrate" means for each).
     let normalizedDeliverables: JsonValue | null = deliverableQuantities as JsonValue | null;
     if (deliverableQuantities !== null) {
-      const { items: normalizedItems, legacyKeyToId } = normalizeLegacyDeliverableIds(deliverableQuantities);
+      const { items: normalizedItems, legacyKeyToId } = normalizeLegacyDeliverables(deliverableQuantities);
       legacyDeliverableKeyToId = legacyKeyToId;
       const result = validateDeliverables(normalizedItems);
       if (!result.ok) {

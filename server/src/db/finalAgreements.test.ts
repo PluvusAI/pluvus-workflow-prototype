@@ -333,7 +333,10 @@ test("optional fields (requirements/customLabel/notes) survive normalization whe
 // Review fix (PR #48): the old version silently FILTERED OUT malformed items
 // instead of failing — so an invalid platform/format combination could
 // survive into FinalAgreement, and a genuinely malformed item just vanished
-// from the package with no record. Now the WHOLE resolution fails.
+// from the package with no record. Now the WHOLE resolution fails for a
+// non-object entry (an empty object `{}` is itself a recognizable — if
+// completely blank — legacy shape and gets migrated, not rejected; it's the
+// non-object entries here that still sink the whole array).
 test("malformed array entries (wrong types) fail the WHOLE resolution, never silently dropped", () => {
   const result = resolveFinalDeliverables({
     baseline: [null, 42, "string", {}, reelDeliverable],
@@ -341,16 +344,36 @@ test("malformed array entries (wrong types) fail the WHOLE resolution, never sil
   assert.equal(result.ok, false);
 });
 
-test("an invalid platform/format combination (not in PLATFORM_FORMAT_MATRIX) fails, never survives into FinalAgreement", () => {
+// Review fix (round 2): an invalid platform/format combination (not in
+// PLATFORM_FORMAT_MATRIX) is a common LEGACY shape, not necessarily a
+// genuinely malformed one — a real historical row predating today's closed
+// catalog. normalizeLegacyDeliverables now migrates it into the flexible
+// platform:"other"/format:"other" slot (with a synthesized customLabel)
+// rather than failing the whole resolution, so it survives into
+// FinalAgreement instead of blocking an otherwise-unrelated accept turn.
+test("an invalid platform/format combination (not in PLATFORM_FORMAT_MATRIX) is migrated into other/other, not failed", () => {
   const invalid = { id: "del_bad", platform: "tiktok", format: "reel", quantity: 1 }; // tiktok only pairs with "video"
   const result = resolveFinalDeliverables({ baseline: [invalid] });
-  assert.equal(result.ok, false);
+  assertOk(result);
+  assert.equal(result.deliverables[0]?.platform, "other");
+  assert.equal(result.deliverables[0]?.format, "other");
+  assert.equal(result.deliverables[0]?.customLabel, "tiktok reel");
 });
 
-test("one invalid item fails the ENTIRE package, not just that item — the valid sibling is not silently kept either", () => {
+test("a migrated invalid-combo item survives ALONGSIDE an already-valid sibling — neither is dropped", () => {
   const invalid = { id: "del_bad", platform: "tiktok", format: "reel", quantity: 1 };
   const result = resolveFinalDeliverables({ baseline: [reelDeliverable, invalid] });
-  assert.equal(result.ok, false, "a partially-valid package must escalate, not silently ship only the good half");
+  assertOk(result);
+  assert.equal(result.deliverables.length, 2, "both the valid and the migrated-legacy item are present");
+});
+
+// A genuinely malformed item — not a recognizable legacy shape at all (no
+// platform/format strings for the migration to even work with) — still
+// fails, since normalizeLegacyDeliverables only migrates OBJECTS; non-object
+// entries pass through untouched and validateDeliverables rejects them.
+test("a non-object entry alongside a valid sibling still fails the WHOLE resolution", () => {
+  const result = resolveFinalDeliverables({ baseline: [reelDeliverable, "not a deliverable"] });
+  assert.equal(result.ok, false, "a genuinely malformed (non-object) entry is never silently dropped or migrated");
 });
 
 test("platform \"other\" without a customLabel fails (deliverablesSchema's own rule)", () => {

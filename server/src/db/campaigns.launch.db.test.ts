@@ -66,6 +66,9 @@ async function seedLaunchableCampaign(pgdb: Db, suffix: string): Promise<string>
     // avoids also needing publicStartingFeeCents.
     priceStrategy: "REQUEST_RATE_CARD",
     compensationReviewStatus: "CONFIRMED",
+    // Review fix: launch now also requires a non-empty structured
+    // deliverables list, regardless of campaignType.
+    deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
   });
   await pgdb.insert(schema.negotiationPolicies).values({
     campaignId: campaign!.id,
@@ -222,6 +225,7 @@ async function main(): Promise<void> {
         productOrOffer: "A pair of running shoes",
         giftDisposition: "KEEP",
         compensationReviewStatus: "CONFIRMED",
+        deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
       });
 
       await assert.rejects(

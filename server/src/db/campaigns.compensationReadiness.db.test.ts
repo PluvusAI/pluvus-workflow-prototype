@@ -34,6 +34,13 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
   console.log(`  ✓ ${name}`);
 }
 
+// Review fix: launch now requires a non-empty, structurally valid
+// deliverableQuantities array for every campaignType (this file's own tests
+// are all about COMPENSATION completeness, not deliverables, so every
+// otherwise-complete fixture needs one to keep launching — see the dedicated
+// "deliverables gate" tests below for what happens when it's missing/empty).
+const DEFAULT_DELIVERABLES = [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }];
+
 /**
  * Seeds a Campaign + CampaignDetails (defaulting compensationReviewStatus to
  * CONFIRMED, since most of this file is about field-completeness, not the
@@ -53,6 +60,7 @@ async function seedCampaign(
   await pgdb.insert(schema.campaignDetails).values({
     campaignId: campaign!.id,
     compensationReviewStatus: "CONFIRMED",
+    deliverableQuantities: DEFAULT_DELIVERABLES,
     ...details,
   });
   if (policy !== null) {
@@ -473,6 +481,7 @@ async function main(): Promise<void> {
         campaignId: campaign!.id,
         campaignType: "PAID",
         priceStrategy: "REQUEST_RATE_CARD",
+        deliverableQuantities: DEFAULT_DELIVERABLES,
       });
       await pgdb.insert(schema.negotiationPolicies).values({
         campaignId: campaign!.id,
@@ -508,6 +517,7 @@ async function main(): Promise<void> {
         priceStrategy: "PROPOSE_STARTING_FEE",
         publicStartingFeeCents: 50000,
         compensationReviewStatus: "CONFIRMED",
+        deliverableQuantities: DEFAULT_DELIVERABLES,
       });
 
       // No floorCents/ceilingCents at all — only the marker. Written through
@@ -531,6 +541,97 @@ async function main(): Promise<void> {
       );
     },
   );
+
+  console.log("\ndeliverables gate — review fix: launch requires a non-empty, valid deliverables list\n");
+
+  await test("a campaign with NO deliverableQuantities at all cannot launch", async () => {
+    const id = await seedCampaign(
+      pgdb,
+      "no-deliverables",
+      { campaignType: "PAID", priceStrategy: "REQUEST_RATE_CARD", deliverableQuantities: null },
+      { floorCents: 10000, ceilingCents: 30000 },
+    );
+    await assert.rejects(
+      () => launchCampaign(id, pgdb),
+      (err: unknown) =>
+        err instanceof CompensationIncompleteError &&
+        err.missing.some((m) => m.includes("deliverableQuantities")),
+      "otherwise-complete compensation fields must not be enough — deliverables are required too",
+    );
+  });
+
+  await test("a campaign with an EMPTY deliverableQuantities array cannot launch", async () => {
+    const id = await seedCampaign(
+      pgdb,
+      "empty-deliverables",
+      { campaignType: "AFFILIATE", publicCommissionRate: 15, deliverableQuantities: [] },
+      { commissionFloorRate: 10, commissionCeilingRate: 20 },
+    );
+    await assert.rejects(
+      () => launchCampaign(id, pgdb),
+      (err: unknown) =>
+        err instanceof CompensationIncompleteError &&
+        err.missing.some((m) => m.includes("non-empty")),
+    );
+  });
+
+  // Review fix (round 2): an invalid platform/format combination (not in
+  // PLATFORM_FORMAT_MATRIX) is a recognized LEGACY shape, not necessarily a
+  // genuinely malformed one — normalizeLegacyDeliverables migrates it into
+  // the flexible platform:"other"/format:"other" slot (with a synthesized
+  // customLabel) rather than blocking launch, so an old campaign with this
+  // kind of historical data isn't stuck unable to ever launch.
+  await test("an invalid platform/format combination in deliverableQuantities is migrated and DOES launch", async () => {
+    const id = await seedCampaign(
+      pgdb,
+      "invalid-deliverables",
+      {
+        campaignType: "GIFT_ONLY",
+        productOrOffer: "Running shoes",
+        giftDisposition: "KEEP",
+        // tiktok only pairs with "video" (PLATFORM_FORMAT_MATRIX).
+        deliverableQuantities: [{ id: "del_bad", platform: "tiktok", format: "reel", quantity: 1 }],
+      },
+      { giftSubstitutionAllowed: true },
+    );
+    const snapshot = await launchCampaign(id, pgdb);
+    assert.equal(snapshot.campaignId, id);
+  });
+
+  await test("a legacy deliverable row missing `id` is normalized and does NOT block launch", async () => {
+    const id = await seedCampaign(
+      pgdb,
+      "legacy-deliverables",
+      {
+        campaignType: "PAID",
+        priceStrategy: "REQUEST_RATE_CARD",
+        // No id — simulates a draft campaign created before the id
+        // requirement shipped. Must not be rejected purely for that.
+        deliverableQuantities: [{ platform: "instagram", format: "reel", quantity: 2 }],
+      },
+      { floorCents: 10000, ceilingCents: 30000 },
+    );
+    const snapshot = await launchCampaign(id, pgdb);
+    assert.equal(snapshot.campaignId, id);
+  });
+
+  await test("a fully valid deliverableQuantities array launches cleanly (baseline for the gate above)", async () => {
+    const id = await seedCampaign(
+      pgdb,
+      "valid-deliverables",
+      {
+        campaignType: "PAID",
+        priceStrategy: "REQUEST_RATE_CARD",
+        deliverableQuantities: [
+          { id: "del_a", platform: "instagram", format: "reel", quantity: 2 },
+          { id: "del_b", platform: "instagram", format: "story", quantity: 1 },
+        ],
+      },
+      { floorCents: 10000, ceilingCents: 30000 },
+    );
+    const snapshot = await launchCampaign(id, pgdb);
+    assert.equal(snapshot.campaignId, id);
+  });
 
   console.log(`\n${n} passed\n`);
   process.exit(0);

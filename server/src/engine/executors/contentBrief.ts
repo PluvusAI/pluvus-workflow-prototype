@@ -17,6 +17,7 @@ import {
   blockedBySnapshotIntegrity,
   blockedByCampaignBriefMismatch,
   blockedByMissingFinalAgreement,
+  blockedByMissingFixedFee,
   blockedByIncompleteDeliverables,
 } from "./guardEscalation.js";
 import { resolveBrandName } from "../campaignContext.js";
@@ -172,6 +173,29 @@ export async function executeContentBrief(
     timeline = finalAgreement.finalTimeline ?? undefined;
     rewardDescription = finalAgreement.finalGiftProductDescription ?? "";
 
+    // Frozen CampaignDetails copy from the pinned snapshot — used below for
+    // the brief-attachment branch (deliberately NEVER falls back to live
+    // CampaignDetails — see that block's own comment).
+    const detailsSnapshot = pinnedTerms.terms?.detailsSnapshot as Record<string, unknown> | undefined;
+
+    // Review fix: an ACCEPT turn with no numeric proposedTerms.rate persists
+    // finalFeeCents as null — legitimate for a pure-AFFILIATE/GIFT_ONLY deal,
+    // but a genuine bug for a campaign whose type says a fixed fee is owed
+    // (PAID/HYBRID, mirroring validateCompensationReadiness's own `needsFee`
+    // rule in db/campaigns.ts). Never mint a payout-form link and state
+    // "Fixed Fee: the agreed fee" for an amountless agreement — escalate
+    // instead, before any email drafts or the payout token is minted.
+    // Unlike briefDeliveryMethod below, this DOES fall back to live
+    // campaignDetails for a legacy no-snapshot journey — campaignType isn't a
+    // material negotiated term the snapshot exists to freeze, just a
+    // classification, and skipping this guard entirely for every no-snapshot
+    // legacy instance would defeat its purpose.
+    const campaignType = detailsSnapshot?.["campaignType"] ?? ctx.campaignDetails?.campaignType;
+    const needsFixedFee = campaignType === "PAID" || campaignType === "HYBRID";
+    if (needsFixedFee && fixedFee === undefined) {
+      return blockedByMissingFixedFee(node.type);
+    }
+
     // Deliverable projection contract: consume the COMPLETE finalDeliverables
     // array, unmodified — no delta reapplication (nothing upstream stores one
     // in this phase), no partial-package fallback. Missing/empty/invalid
@@ -191,7 +215,6 @@ export async function executeContentBrief(
     // this field predates this ticket) keeps the brand's manually-uploaded
     // PDF exactly as before; "pluvus_builder" attaches the PLU-142-resolved
     // rendered CampaignBrief instead.
-    const detailsSnapshot = pinnedTerms.terms?.detailsSnapshot as Record<string, unknown> | undefined;
     const briefDeliveryMethod = detailsSnapshot?.["briefDeliveryMethod"];
 
     if (briefDeliveryMethod === "pluvus_builder") {
