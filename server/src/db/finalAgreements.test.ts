@@ -80,6 +80,33 @@ test("AFFILIATE: flat commission mode maps to FLAT", () => {
   assert.equal(input.finalCommissionMode, "FLAT");
 });
 
+// Review fix (PR #48): CampaignDetails' commissionAmount control stores ONE
+// number whose unit is decided by commissionMode — dollars when "flat". The
+// old code always wrote it into finalCommissionRate, leaving
+// finalCommissionAmountCents permanently null for every flat deal.
+test("FLAT mode routes the value to finalCommissionAmountCents (dollars->cents), never finalCommissionRate", () => {
+  const input = buildFinalAgreementInput(
+    baseInput({
+      effectiveConfig: { commissionRate: 20 }, // $20 flat, per the "flat" mode
+      detailsSnapshot: { commissionMode: "flat" },
+    }),
+  );
+  assert.equal(input.finalCommissionMode, "FLAT");
+  assert.equal(input.finalCommissionAmountCents, 2000);
+  assert.equal(input.finalCommissionRate, null, "PERCENT-mode column must stay null for a flat deal");
+});
+
+test("PERCENT mode routes the value to finalCommissionRate, never finalCommissionAmountCents", () => {
+  const input = buildFinalAgreementInput(
+    baseInput({
+      effectiveConfig: { commissionRate: 15 },
+      detailsSnapshot: { commissionMode: "percent" },
+    }),
+  );
+  assert.equal(input.finalCommissionRate, 15);
+  assert.equal(input.finalCommissionAmountCents, null);
+});
+
 test("an unrecognized commissionMode string maps to null, never guessed", () => {
   const input = buildFinalAgreementInput(
     baseInput({ detailsSnapshot: { commissionMode: "something-else" } }),
@@ -125,11 +152,80 @@ test("an unrecognized giftDisposition string maps to null, never guessed", () =>
 
 console.log("\nfields with no current source (PLU-169 decision #3) — always inert, never invented\n");
 
-test("finalFulfillmentTerms / finalPostingDate / finalScriptSubmissionRequired are always the documented inert default", () => {
+test("finalPostingDate has no current source column and is always null", () => {
+  const input = buildFinalAgreementInput(baseInput());
+  assert.equal(input.finalPostingDate, null);
+});
+
+console.log("\nfinalScriptSubmissionRequired — review fix (PR #48): reads detailsSnapshot.scriptSubmission\n");
+
+test('scriptSubmission "require" maps to true', () => {
+  const input = buildFinalAgreementInput(baseInput({ detailsSnapshot: { scriptSubmission: "require" } }));
+  assert.equal(input.finalScriptSubmissionRequired, true);
+});
+
+test('scriptSubmission "skip" maps to false', () => {
+  const input = buildFinalAgreementInput(baseInput({ detailsSnapshot: { scriptSubmission: "skip" } }));
+  assert.equal(input.finalScriptSubmissionRequired, false);
+});
+
+test("scriptSubmission absent/unset defaults to false, never guessed true", () => {
+  const input = buildFinalAgreementInput(baseInput());
+  assert.equal(input.finalScriptSubmissionRequired, false);
+});
+
+console.log("\nfinalFulfillmentTerms — review fix (PR #48): folds gift delivery method + promo code/contact + shipping\n");
+
+test("finalFulfillmentTerms is null with no detailsSnapshot and no gift delivery info", () => {
   const input = buildFinalAgreementInput(baseInput());
   assert.equal(input.finalFulfillmentTerms, null);
-  assert.equal(input.finalPostingDate, null);
-  assert.equal(input.finalScriptSubmissionRequired, false);
+});
+
+test("promo_code delivery includes the actual promo code", () => {
+  const input = buildFinalAgreementInput(
+    baseInput({ detailsSnapshot: { giftDeliveryMethod: "promo_code", promoCode: "CREATOR20" } }),
+  );
+  assert.equal(input.finalFulfillmentTerms, "Promo code: CREATOR20");
+});
+
+test("manual_contact delivery includes the contact email", () => {
+  const input = buildFinalAgreementInput(
+    baseInput({
+      detailsSnapshot: { giftDeliveryMethod: "manual_contact", giftContactEmail: "gifts@brand.com" },
+    }),
+  );
+  assert.equal(input.finalFulfillmentTerms, "Manual fulfillment — contact gifts@brand.com");
+});
+
+test("requiresShippingInfo appends a shipping line alongside the delivery method", () => {
+  const input = buildFinalAgreementInput(
+    baseInput({
+      detailsSnapshot: {
+        giftDeliveryMethod: "promo_code",
+        promoCode: "CREATOR20",
+        requiresShippingInfo: true,
+      },
+    }),
+  );
+  assert.equal(input.finalFulfillmentTerms, "Promo code: CREATOR20; Shipping information required");
+});
+
+test("the worked example from the review comment: script approval + flat $20 commission + promo-code gift, all preserved together", () => {
+  const input = buildFinalAgreementInput(
+    baseInput({
+      effectiveConfig: { commissionRate: 20 },
+      detailsSnapshot: {
+        scriptSubmission: "require",
+        commissionMode: "flat",
+        giftDeliveryMethod: "promo_code",
+        promoCode: "CREATOR20",
+      },
+    }),
+  );
+  assert.equal(input.finalScriptSubmissionRequired, true);
+  assert.equal(input.finalCommissionMode, "FLAT");
+  assert.equal(input.finalCommissionAmountCents, 2000);
+  assert.equal(input.finalFulfillmentTerms, "Promo code: CREATOR20");
 });
 
 console.log("\nno private-policy field name ever appears in the builder output\n");
@@ -170,22 +266,32 @@ test("JSON.stringify(input) never contains a private-policy key name", () => {
 
 console.log("\nresolveFinalDeliverables — Phase 1 pass-through\n");
 
+function assertOk(
+  result: ReturnType<typeof resolveFinalDeliverables>,
+): asserts result is { ok: true; deliverables: import("../domain/deliverables.js").Deliverable[] } {
+  assert.equal(result.ok, true, result.ok ? "" : `expected ok:true, got error: ${result.error}`);
+}
+
 test("a valid baseline array passes through unchanged", () => {
   const result = resolveFinalDeliverables({ baseline: [reelDeliverable] });
-  assert.deepEqual(result, [reelDeliverable]);
+  assertOk(result);
+  assert.deepEqual(result.deliverables, [reelDeliverable]);
 });
 
-test("a non-array baseline (null/undefined/legacy shape) resolves to an empty array, never throws", () => {
-  assert.deepEqual(resolveFinalDeliverables({ baseline: null }), []);
-  assert.deepEqual(resolveFinalDeliverables({ baseline: undefined }), []);
-  assert.deepEqual(resolveFinalDeliverables({ baseline: "not an array" }), []);
+test("a non-array baseline (null/undefined/legacy shape) resolves to ok:true with an empty array, never fails", () => {
+  for (const baseline of [null, undefined, "not an array", []]) {
+    const result = resolveFinalDeliverables({ baseline });
+    assertOk(result);
+    assert.deepEqual(result.deliverables, []);
+  }
 });
 
 test("PLU-169 Greptile fix (PR #46): legacy id-less items (a launched, IMMUTABLE snapshot the id backfill can never reach) are PRESERVED with a freshly minted id, never dropped", () => {
   const legacyItem = { platform: "instagram", format: "reel", quantity: 2 }; // no id
   const result = resolveFinalDeliverables({ baseline: [legacyItem, reelDeliverable] });
-  assert.equal(result.length, 2, "the legacy item's data must survive, not be silently lost");
-  const normalizedLegacy = result.find((d) => d.id !== reelDeliverable.id);
+  assertOk(result);
+  assert.equal(result.deliverables.length, 2, "the legacy item's data must survive, not be silently lost");
+  const normalizedLegacy = result.deliverables.find((d) => d.id !== reelDeliverable.id);
   assert.ok(normalizedLegacy, "the legacy item is present");
   assert.equal(typeof normalizedLegacy!.id, "string");
   assert.ok(normalizedLegacy!.id.length > 0, "a fresh id was minted");
@@ -196,15 +302,17 @@ test("PLU-169 Greptile fix (PR #46): legacy id-less items (a launched, IMMUTABLE
 
 test("an item that already has an id keeps that EXACT id (not re-minted)", () => {
   const result = resolveFinalDeliverables({ baseline: [reelDeliverable] });
-  assert.equal(result[0]?.id, reelDeliverable.id);
+  assertOk(result);
+  assert.equal(result.deliverables[0]?.id, reelDeliverable.id);
 });
 
 test("two legacy id-less items in the same array each get their OWN distinct minted id", () => {
   const a = { platform: "instagram", format: "reel", quantity: 1 };
   const b = { platform: "instagram", format: "story", quantity: 3 };
   const result = resolveFinalDeliverables({ baseline: [a, b] });
-  assert.equal(result.length, 2);
-  assert.notEqual(result[0]?.id, result[1]?.id);
+  assertOk(result);
+  assert.equal(result.deliverables.length, 2);
+  assert.notEqual(result.deliverables[0]?.id, result.deliverables[1]?.id);
 });
 
 test("optional fields (requirements/customLabel/notes) survive normalization when present", () => {
@@ -217,15 +325,46 @@ test("optional fields (requirements/customLabel/notes) survive normalization whe
     notes: "brand-requested angle",
   };
   const result = resolveFinalDeliverables({ baseline: [item] });
-  assert.deepEqual(result[0]?.requirements, { durationSeconds: { min: 30, max: 60 } });
-  assert.equal(result[0]?.notes, "brand-requested angle");
+  assertOk(result);
+  assert.deepEqual(result.deliverables[0]?.requirements, { durationSeconds: { min: 30, max: 60 } });
+  assert.equal(result.deliverables[0]?.notes, "brand-requested angle");
 });
 
-test("malformed array entries (wrong types) are filtered out, never thrown on", () => {
+// Review fix (PR #48): the old version silently FILTERED OUT malformed items
+// instead of failing — so an invalid platform/format combination could
+// survive into FinalAgreement, and a genuinely malformed item just vanished
+// from the package with no record. Now the WHOLE resolution fails.
+test("malformed array entries (wrong types) fail the WHOLE resolution, never silently dropped", () => {
   const result = resolveFinalDeliverables({
     baseline: [null, 42, "string", {}, reelDeliverable],
   });
-  assert.deepEqual(result, [reelDeliverable]);
+  assert.equal(result.ok, false);
+});
+
+test("an invalid platform/format combination (not in PLATFORM_FORMAT_MATRIX) fails, never survives into FinalAgreement", () => {
+  const invalid = { id: "del_bad", platform: "tiktok", format: "reel", quantity: 1 }; // tiktok only pairs with "video"
+  const result = resolveFinalDeliverables({ baseline: [invalid] });
+  assert.equal(result.ok, false);
+});
+
+test("one invalid item fails the ENTIRE package, not just that item — the valid sibling is not silently kept either", () => {
+  const invalid = { id: "del_bad", platform: "tiktok", format: "reel", quantity: 1 };
+  const result = resolveFinalDeliverables({ baseline: [reelDeliverable, invalid] });
+  assert.equal(result.ok, false, "a partially-valid package must escalate, not silently ship only the good half");
+});
+
+test("platform \"other\" without a customLabel fails (deliverablesSchema's own rule)", () => {
+  const result = resolveFinalDeliverables({
+    baseline: [{ id: "del_custom", platform: "other", format: "other", quantity: 1 }],
+  });
+  assert.equal(result.ok, false);
+});
+
+test("duplicate ids within the package fail (deliverablesSchema's own rule)", () => {
+  const result = resolveFinalDeliverables({
+    baseline: [reelDeliverable, { ...reelDeliverable }],
+  });
+  assert.equal(result.ok, false);
 });
 
 console.log("\ntoCreatorFinalAgreementView — strips exactly the four internal fields\n");

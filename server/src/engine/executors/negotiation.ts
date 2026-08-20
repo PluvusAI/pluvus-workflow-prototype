@@ -84,7 +84,7 @@ import { buildFinalAgreementInput, resolveFinalDeliverables } from "../../db/fin
 // by other executors, so it lives in one place (guardEscalation.ts) rather than
 // being duplicated inline here. Previously negotiation.ts and guardEscalation.ts
 // each carried a byte-identical copy — a drift hazard on a safety path.
-import { blockedByGuard } from "./guardEscalation.js";
+import { blockedByGuard, blockedByInvalidFinalDeliverables } from "./guardEscalation.js";
 
 // PLU-81: the /negotiate brief-into-prompt gating (BRIEF_INTO_NEGOTIATE /
 // KNOWLEDGE_RETRIEVAL_ENABLED) + the flat-knowledge / brief-section projections that
@@ -1521,17 +1521,31 @@ export async function executeNegotiation(
       // snapshot's deliverableQuantities. Negotiation-delta application is a
       // separate future ticket (PLU-169 decision #5) — deliverables stay
       // atomic/non-negotiable here, exactly as they behave today.
+      //
+      // Review fix (PR #48): resolveFinalDeliverables now validates the
+      // COMPLETE package against the shared deliverablesSchema and fails
+      // rather than silently dropping invalid items. Check that BEFORE
+      // building finalAgreementWrite (and before any email is drafted/sent
+      // below) — an invalid pinned package must escalate, never produce a
+      // FinalAgreement with a silently-incomplete deliverables array.
+      const finalDeliverablesResult = resolveFinalDeliverables({
+        baseline: (cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined)?.[
+          "deliverableQuantities"
+        ],
+      });
+      if (!finalDeliverablesResult.ok) {
+        return withContextRecord({
+          ...blockedByInvalidFinalDeliverables(instance.negotiationRound, finalDeliverablesResult.error),
+          obligationWrites: buildObligationWrites(undefined),
+        });
+      }
       const finalAgreementWrite = buildFinalAgreementInput({
         instanceId: instance.id,
         campaignTermsSnapshotId: cc.termsSnapshot?.id ?? null,
         negotiationPolicySnapshotId: cc.policySnapshot?.id ?? null,
         effectiveConfig,
         detailsSnapshot: cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined,
-        finalDeliverables: resolveFinalDeliverables({
-          baseline: (cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined)?.[
-            "deliverableQuantities"
-          ],
-        }),
+        finalDeliverables: finalDeliverablesResult.deliverables,
         agreedFeeCents: proposedRate !== undefined ? Math.round(proposedRate * 100) : undefined,
         acceptanceSource: "AI_NEGOTIATION",
         sourceMessageId: latestInbound?.id,

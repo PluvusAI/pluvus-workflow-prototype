@@ -144,6 +144,36 @@ async function main(): Promise<void> {
     assert.equal(found!.instanceId, instanceId);
   });
 
+  // Review fix (PR #48): runtime.ts calls recordFinalAgreementOnce WITH the
+  // accept turn's own OCC transaction, not the bare `db` singleton every test
+  // above uses. Postgres aborts an ENTIRE transaction after any statement
+  // inside it fails — the old "catch the unique-violation, then SELECT on the
+  // SAME client" pattern would have the SELECT itself throw
+  // `current transaction is aborted` instead of returning the existing row.
+  // This reproduces that exact call shape against PGlite (a real Postgres, so
+  // it enforces the same abort-on-error transaction semantics) — it fails
+  // under the pre-fix implementation and passes under onConflictDoNothing.
+  await test("a duplicate write INSIDE an explicit transaction (mirrors runtime.ts's tx-scoped call) does not abort the transaction", async () => {
+    const instanceId = await seedInstance(pgdb);
+    const first = await recordFinalAgreementOnce(agreement(instanceId), pgdb);
+
+    const dup = await pgdb.transaction(async (tx) => {
+      const inner = await recordFinalAgreementOnce(agreement(instanceId), tx);
+      // Prove tx is STILL usable after the conflicting write — this is
+      // exactly what broke under the old catch-then-select-on-same-client
+      // pattern: a failed statement poisons the rest of the transaction, so
+      // this probe query would itself throw if the fix regressed.
+      const probe = await tx
+        .select()
+        .from(schema.finalAgreements)
+        .where(eq(schema.finalAgreements.instanceId, instanceId));
+      assert.equal(probe.length, 1, "the transaction must still be able to run further queries");
+      return inner;
+    });
+
+    assert.equal(dup.id, first.id, "the existing row is returned, not a new one");
+  });
+
   console.log(`\n${n} passed\n`);
   await pg.close();
 }

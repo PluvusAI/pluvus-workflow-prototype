@@ -184,7 +184,13 @@ export interface DeliverableQuantity {
   notes?: string | null;
 }
 
-/** PLU-139 (2a): S7.P1 per-deliverable pricing — cents keyed by "<platform>:<format>". */
+/** PLU-139 (2a): S7.P1 per-deliverable pricing — cents keyed by the
+ *  deliverable's own stable `id` (falling back to "<platform>:<format>" only
+ *  for a legacy row saved before the PLU-169 id backfill, whose already-saved
+ *  pricing map used that composite key). Review fix: keying by the composite
+ *  alone let every "other"/"other" custom deliverable collide on one shared
+ *  key. */
+export type DeliverablePricing = Record<string, number>;
 export type DeliverablePricing = Record<string, number>;
 
 /** PLU-139 (2a): S3.11 per-platform follower ranges — keyed by platform. `max`

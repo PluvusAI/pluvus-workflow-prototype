@@ -2504,9 +2504,16 @@ function RepeatableLinks({
 
 // ---------------------------------------------------------------------------
 // PricingGrid (S7.P1) — one currency row per selected deliverable format. Each
-// row's price persists to the deliverablePricing map (cents, keyed
-// "<platform>:<format>"); the FIRST row's price also mirrors to
-// publicStartingFeeCents (the public starting fee). Values shown in dollars.
+// row's price persists to the deliverablePricing map, keyed by the row's own
+// stable `id` (falling back to the old "<platform>:<format>" composite key
+// only for a legacy row saved before the PLU-169 id backfill). Review fix:
+// every "other"/"other" (custom) deliverable shared the SAME "other:other"
+// key, so a second custom deliverable silently overwrote the first one's
+// price — id-keying fixes this since every row minted by newDeliverableId()
+// already has a unique id; only pre-backfill legacy rows fall back to the
+// composite key, matching whatever key their already-saved pricing map used.
+// The FIRST row's price also mirrors to publicStartingFeeCents (the public
+// starting fee). Values shown in dollars.
 // ---------------------------------------------------------------------------
 function PricingGrid({
   firstFeeDollars,
@@ -2532,7 +2539,7 @@ function PricingGrid({
       </span>
     );
   }
-  const keyOf = (d: DeliverableQuantity) => `${d.platform}:${d.format}`;
+  const keyOf = (d: DeliverableQuantity) => d.id ?? `${d.platform}:${d.format}`;
   // Dollars shown per row: the first row reflects publicStartingFeeCents (dollars
   // string) so the two stay in sync; the rest read from the cents map.
   const dollarsFor = (d: DeliverableQuantity, first: boolean): string => {
