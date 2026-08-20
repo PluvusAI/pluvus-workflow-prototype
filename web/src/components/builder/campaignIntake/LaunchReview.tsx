@@ -43,6 +43,8 @@ import {
   getSection,
   visibleFields,
   blockerSection,
+  fixableBlockers,
+  buildPublicReviewRows,
   type CompensationShape,
   type SectionKey,
 } from "./sections";
@@ -61,6 +63,13 @@ interface Props {
    *  through some other path). */
   onDuplicate: () => void;
   duplicating: boolean;
+  // PLU-182 (2f.1): the shell's campaign-group save state, surfaced next to the
+  // Approve CTA so a failed/pending approval PATCH is visible ON Page 9 (not just
+  // in the far-off header). `onRetry` re-runs the same save (re-sends the
+  // approved status), the natural retry surface for AC6.
+  saving: boolean;
+  saveError: string | null;
+  onRetry: () => void;
 }
 
 const SECTION_LABEL: Record<SectionKey, string> = {
@@ -73,15 +82,6 @@ const SECTION_LABEL: Record<SectionKey, string> = {
   negotiationSettings: "Private negotiation settings",
   reviewActivate: "Review & approve",
 }; // COPY:PLU-159
-
-// The public creator-facing fields shown in the S9.1 preview, grouped by their
-// origin section (drives the per-section Edit link). ONLY CampaignDetails public
-// columns — never a policy field. `fmt` renders the raw value for display.
-interface PublicRow {
-  label: string; // COPY:PLU-159
-  value: string;
-  section: SectionKey;
-}
 
 function dollars(cents: number | null | undefined): string {
   return typeof cents === "number" ? `$${(cents / 100).toLocaleString()}` : "—";
@@ -100,6 +100,9 @@ export function LaunchReview({
   onConfirmReview,
   onDuplicate,
   duplicating,
+  saving,
+  saveError,
+  onRetry,
 }: Props) {
   const toast = useToast();
   const readinessQ = useReadiness(campaignId);
@@ -129,25 +132,11 @@ export function LaunchReview({
     [campaign],
   );
 
-  // Public preview rows — a curated projection of CampaignDetails public fields.
-  const publicRows: PublicRow[] = useMemo(() => {
-    const rows: PublicRow[] = [
-      { label: "Objective", value: show(campaign.objective), section: "campaignProduct" },
-      { label: "Product / offer", value: show(campaign.productName || campaign.rewardDescription), section: "campaignProduct" },
-      { label: "Deliverables", value: show(campaign.deliverables), section: "platformsDeliverables" },
-      { label: "Timeline", value: show(campaign.timeline), section: "timelineRights" },
-      { label: "Usage rights", value: show(campaign.usageRights), section: "timelineRights" },
-      { label: "Exclusivity", value: show(campaign.exclusivity), section: "timelineRights" },
-      { label: "Compensation structure", value: show(campaign.campaignType), section: "rewardStructure" },
-    ];
-    if (campaign.publicStartingFeeCents != null) {
-      rows.push({ label: "Public starting fee", value: dollars(campaign.publicStartingFeeCents), section: "rewardStructure" });
-    }
-    if (campaign.publicCommissionRate != null) {
-      rows.push({ label: "Public commission", value: `${campaign.publicCommissionRate}%`, section: "rewardStructure" });
-    }
-    return rows;
-  }, [campaign]);
+  // Public preview rows — the pure, complete projection of CampaignDetails
+  // public fields (PLU-182). Structural-gated on `comp` so inactive conditional
+  // values never surface; each row keeps its section for the Edit link. Never a
+  // policy/private field (buildPublicReviewRows enforces that).
+  const publicRows = useMemo(() => buildPublicReviewRows(campaign, comp), [campaign, comp]);
 
   // Private policy rows — visible policy fields for this structure, read from the
   // policy row. Lock-labeled; never creator-facing.
@@ -173,12 +162,42 @@ export function LaunchReview({
       });
   }, [comp, policy]);
 
+  // PLU-182 (Change 6): the public term shown beside its private boundary — only
+  // when BOTH the public value and the matching private band are present, so it
+  // reads as a comparison, not a stray public value in the private panel.
+  const publicBesidePrivate = useMemo(() => {
+    const p = policy as Record<string, unknown>;
+    const pairs: { label: string; value: string }[] = [];
+    // Public starting fee ↔ fee floor/ceiling band.
+    if (
+      campaign.publicStartingFeeCents != null &&
+      (p.floorCents != null || p.ceilingCents != null)
+    ) {
+      pairs.push({ label: "Public starting fee (creators see)", value: dollars(campaign.publicStartingFeeCents) });
+    }
+    // Public commission ↔ commission floor/ceiling band.
+    if (
+      campaign.publicCommissionRate != null &&
+      (p.commissionFloorRate != null || p.commissionCeilingRate != null)
+    ) {
+      const unit = campaign.commissionMode === "flat" ? dollars(campaign.publicCommissionRate) : `${campaign.publicCommissionRate}%`;
+      pairs.push({ label: "Public commission (creators see)", value: unit });
+    }
+    return pairs;
+  }, [campaign, policy]);
+
   const bothApproved = approvePublic && approvePrivate;
-  // "ready" reuses computeReadiness — the same compensation-completeness check
-  // launchCampaign() enforces. Reused here as a Stage-1 sanity gate (you
-  // shouldn't be able to approve compensation terms that are internally
-  // inconsistent/incomplete), not because approving triggers that launch.
-  const ready = readinessQ.data?.ready === true;
+  // PLU-182 (Bug D): gate on readiness MINUS the review-confirmed blocker, never
+  // on `ready`. Server `ready` counts "Compensation review is not confirmed" as
+  // a blocker — but that only clears BY approving, so gating the approve CTA on
+  // `ready` is a deadlock. `fixable` = the blockers a brand must actually fix in
+  // an editing section first; the CTA is enabled when those are clear + both
+  // boxes checked. The same `fixable` list is what we render below, so we never
+  // show "review not confirmed" as a red thing-to-fix on the page whose job is
+  // to confirm it.
+  const blockers = readinessQ.data?.blockers ?? [];
+  const fixable = fixableBlockers(blockers);
+  const canApprove = fixable.length === 0 && bothApproved;
 
   // Keep the persisted flag in step with the checkboxes: CONFIRMED only when both
   // are checked, else NEEDS_REVIEW. Called on each toggle — approving is just
@@ -191,12 +210,13 @@ export function LaunchReview({
   };
 
   const handleApprove = () => {
-    // The checkboxes above already persisted CONFIRMED the moment both were
-    // checked (syncReview) — this is a deliberate, visible confirmation of
-    // that state for the brand, not a separate write. No POST /launch: Stage 1
-    // approval and campaign activation are different actions on different
-    // timelines (activation happens once the campaign is actually ready to
-    // run, after Workflow Building).
+    // PLU-182 (reviewer B1): a REAL, idempotent commit — NOT a toast-only. If the
+    // last checkbox toggle's PATCH failed, both boxes still look checked
+    // (`canApprove` true) but the server flag is still NEEDS_REVIEW; a toast-only
+    // CTA would claim success with nothing persisted. Re-issuing onConfirmReview(true)
+    // makes this the authoritative write AND the natural retry surface (AC6). It
+    // is idempotent (CONFIRMED→CONFIRMED) and never launches: no POST /launch —
+    // Stage-1 approval and activation are different actions on different timelines.
     onConfirmReview(true);
     toast.success("Stage 1 approved. You can keep editing — a material change will re-open this checkpoint."); // COPY:PLU-159
   };
@@ -234,6 +254,28 @@ export function LaunchReview({
                 {null}
               </ReviewRow>
             ))}
+            {/* PLU-182 (Change 6, R7): show the PUBLIC term beside its private
+                boundary "where useful" — so the brand can sanity-check the band
+                against what creators see (e.g. a floor below the public fee).
+                Read-only caption; no data change. */}
+            {publicBesidePrivate.length > 0 && (
+              <div
+                style={{
+                  marginTop: 4,
+                  paddingTop: 10,
+                  borderTop: `1px dashed ${colors.border}`,
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                }}
+              >
+                {publicBesidePrivate.map((c) => (
+                  <div key={c.label} style={{ ...text.caption, color: colors.textMuted }}>
+                    {c.label}: <span style={{ color: colors.text }}>{c.value}</span> {/* COPY:PLU-159 */}
+                  </div>
+                ))}
+              </div>
+            )}
             <div style={{ marginTop: 8 }}>
               <EditLink label="Edit private negotiation settings" onClick={() => onEditSection("negotiationSettings")} />
             </div>
@@ -258,10 +300,13 @@ export function LaunchReview({
             ready to launch and run.
           </div>
 
-          {/* Readiness blockers — S9 missing-field warnings, each linking to its section. */}
+          {/* Readiness blockers — S9 missing-field warnings, each linking to its
+              section. PLU-182 (Bug D): render `fixable`, not the raw blockers —
+              "Compensation review is not confirmed" clears BY approving here, so
+              showing it as a red thing-to-fix on the approval page is nonsensical. */}
           {readinessQ.isLoading ? (
             <p style={{ ...text.caption }}>Checking readiness…{/* COPY:PLU-159 */}</p>
-          ) : readinessQ.data && readinessQ.data.blockers.length > 0 ? (
+          ) : fixable.length > 0 ? (
             <div
               role="alert"
               style={{
@@ -272,12 +317,12 @@ export function LaunchReview({
               }}
             >
               <div style={{ ...text.label, color: colors.danger, marginBottom: 8 }}>
-                {readinessQ.data.blockers.length === 1
+                {fixable.length === 1
                   ? "1 thing to fix before you can approve" // COPY:PLU-159
-                  : `${readinessQ.data.blockers.length} things to fix before you can approve`}
+                  : `${fixable.length} things to fix before you can approve`}
               </div>
               <ul style={{ margin: 0, paddingLeft: 18, display: "flex", flexDirection: "column", gap: 6 }}>
-                {readinessQ.data.blockers.map((b) => {
+                {fixable.map((b) => {
                   const sec = blockerSection(b);
                   return (
                     <li key={b} style={{ fontSize: font.size.sm, color: colors.text }}>
@@ -331,31 +376,105 @@ export function LaunchReview({
           </Card>
 
           {/* Approve Stage 1 — persists compensationReviewStatus only (no
-              POST /launch). Disabled until ready AND both approved; an
-              accessible reason names what's missing. Re-clickable any time
-              (e.g. after a material edit re-opened this checkpoint). */}
+              POST /launch). Disabled until fixable blockers are clear AND both
+              approved; an accessible reason names what's missing. Re-clickable
+              any time (e.g. after a material edit re-opened this checkpoint).
+              It's also the retry surface for a failed approval PATCH (B1/AC6). */}
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <Button
               variant="primary"
               onClick={handleApprove}
-              disabled={!ready || !bothApproved}
-              aria-disabled={!ready || !bothApproved}
+              disabled={!canApprove}
+              aria-disabled={!canApprove}
             >
               Approve Stage 1 {/* COPY:PLU-159 */}
             </Button>
-            {(!ready || !bothApproved) && (
-              <span style={{ ...text.caption }}>
-                {/* COPY:PLU-159 — accessible reason for the disabled action. */}
-                {!ready
-                  ? "Resolve the items above first."
-                  : "Check both approvals to continue."}
-              </span>
-            )}
+            <ApprovalStatus
+              canApprove={canApprove}
+              bothApproved={bothApproved}
+              fixableCount={fixable.length}
+              confirmedCurrent={
+                campaign.compensationReviewStatus === "CONFIRMED" && bothApproved
+              }
+              saving={saving}
+              saveError={saveError}
+              onRetry={onRetry}
+            />
           </div>
         </>
       )}
     </div>
   );
+}
+
+// PLU-182 (2f.1, Change 4) — the approval-persistence status line next to the
+// CTA: the shell's save state (saving / failed-Retry) plus the disabled reason,
+// so a failed or pending approval PATCH is visible ON Page 9 and the brand knows
+// whether their approval is actually persisted-current.
+function ApprovalStatus({
+  canApprove,
+  bothApproved,
+  fixableCount,
+  confirmedCurrent,
+  saving,
+  saveError,
+  onRetry,
+}: {
+  canApprove: boolean;
+  bothApproved: boolean;
+  fixableCount: number;
+  confirmedCurrent: boolean;
+  saving: boolean;
+  saveError: string | null;
+  onRetry: () => void;
+}) {
+  // Failure first — it's the most important state to surface + retry (AC6).
+  if (saveError) {
+    return (
+      <span style={{ ...text.caption, color: colors.danger, display: "flex", alignItems: "center", gap: 6 }}>
+        {/* COPY:PLU-159 */}
+        Couldn't save your approval.
+        <button
+          onClick={onRetry}
+          className="ds-focusable"
+          style={{
+            background: "none",
+            border: "none",
+            padding: 0,
+            color: colors.accent,
+            cursor: "pointer",
+            fontSize: font.size.sm,
+            textDecoration: "underline",
+          }}
+        >
+          Retry {/* COPY:PLU-159 */}
+        </button>
+      </span>
+    );
+  }
+  if (saving) {
+    return <span style={{ ...text.caption }}>Saving approval…{/* COPY:PLU-159 */}</span>;
+  }
+  if (confirmedCurrent) {
+    return (
+      <span style={{ ...text.caption, color: colors.success, display: "flex", alignItems: "center", gap: 6 }}>
+        <Check size={14} strokeWidth={2.5} aria-hidden /> Approved — current.{/* COPY:PLU-159 */}
+      </span>
+    );
+  }
+  if (!canApprove) {
+    return (
+      <span style={{ ...text.caption }}>
+        {/* COPY:PLU-159 — accessible reason for the disabled action. */}
+        {fixableCount > 0
+          ? "Resolve the items above first."
+          : !bothApproved
+            ? "Check both approvals to continue."
+            : ""}
+      </span>
+    );
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------

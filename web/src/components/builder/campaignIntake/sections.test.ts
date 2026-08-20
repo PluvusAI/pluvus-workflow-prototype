@@ -27,14 +27,19 @@ import {
   showsGiftDispositionPicker,
   showsStartingFee,
   showsAdditiveGiftToggle,
+  fixableBlockers,
+  REVIEW_CONFIRMED_BLOCKER,
+  buildPublicReviewRows,
+  summarizeDeliverables,
   CAMPAIGN_TYPE_OPTIONS,
   DELIVERABLE_CARDS,
   POLICY_CLEAR_VALUES,
   type CompensationShape,
   type FieldSpec,
   type SectionSpec,
+  type SectionKey,
 } from "./sections";
-import type { CampaignType } from "../../../api/builderTypes";
+import type { CampaignType, CampaignDetail } from "../../../api/builderTypes";
 
 let passed = 0;
 function test(name: string, fn: () => void): void {
@@ -749,6 +754,242 @@ test("blockerSection routes policy blockers to negotiationSettings, else rewardS
   assert.equal(blockerSection("NegotiationPolicy is missing"), "negotiationSettings");
   assert.equal(blockerSection("CampaignDetails.publicCommissionRate"), "rewardStructure");
   assert.equal(blockerSection("Compensation review is not confirmed"), "rewardStructure");
+});
+
+// ===========================================================================
+// PLU-182 (2f.1) — Page-9 review completeness + approval persistence helpers
+// ===========================================================================
+
+// -- fixableBlockers (Bug D gating) + B2 server-string pin --------------------
+
+test("fixableBlockers drops ONLY the review-confirmed blocker, keeps real ones", () => {
+  const real = "NegotiationPolicy fee bounds (floorCents/ceilingCents) or an explicit non-negotiable fee marker";
+  const fixed = fixableBlockers([real, REVIEW_CONFIRMED_BLOCKER]);
+  assert.deepEqual(fixed, [real], "review-confirmed removed; real blocker kept");
+  // An all-clear-but-unconfirmed campaign → nothing to fix → CTA can enable.
+  assert.deepEqual(fixableBlockers([REVIEW_CONFIRMED_BLOCKER]), []);
+  // No blockers at all → empty in, empty out.
+  assert.deepEqual(fixableBlockers([]), []);
+});
+
+test("B2: REVIEW_CONFIRMED_BLOCKER byte-matches the server blocker literal", () => {
+  // COPIED VERBATIM from server/src/db/campaigns.ts:349
+  //   if (!reviewConfirmed) blockers.push("Compensation review is not confirmed");
+  // The two files can't import each other, so pin the constant to this fixture —
+  // if anyone rewords the server blocker, this fails loudly instead of the
+  // fixableBlockers filter silently no-op-ing and re-introducing the deadlock.
+  const SERVER_LITERAL = "Compensation review is not confirmed";
+  assert.equal(REVIEW_CONFIRMED_BLOCKER, SERVER_LITERAL);
+});
+
+// -- summarizeDeliverables ---------------------------------------------------
+
+test("summarizeDeliverables renders quantities with card labels; empty → ''", () => {
+  assert.equal(summarizeDeliverables(null), "", "null → empty (free-text fallback)");
+  assert.equal(summarizeDeliverables([]), "", "empty array → empty");
+  const out = summarizeDeliverables([
+    { platform: "instagram", format: "reel", quantity: 3 },
+    { platform: "tiktok", format: "video", quantity: 2 },
+  ]);
+  assert.equal(out, "3× Instagram Reel, 2× TikTok video");
+  // Unknown pair falls back to "platform format"; non-positive quantity → 1.
+  const odd = summarizeDeliverables([{ platform: "snap", format: "story", quantity: 0 }]);
+  assert.equal(odd, "1× snap story");
+});
+
+// -- buildPublicReviewRows (public preview completeness + exclusions) ---------
+
+// Minimal CampaignDetail factory — only the fields the builder reads matter; the
+// rest are filled with nulls so the object satisfies the type at runtime (the
+// test file isn't typechecked as strictly as the app, but keep it honest).
+function campaignDetail(over: Partial<CampaignDetail>): CampaignDetail {
+  const base = {
+    id: "c1",
+    name: "Summer Launch",
+    brand: "Acme",
+    status: "DRAFT",
+    fieldProvenance: null,
+    objective: null,
+    notes: null,
+    notifyEmail: null,
+    brandDescription: null,
+    deliverables: null,
+    timeline: null,
+    rewardDescription: null,
+    shipsPhysicalProduct: false,
+    postAcceptanceMode: "operator_handoff",
+    dailyInitialOutreachLimit: null,
+    outreachPacingMinMinutes: null,
+    outreachPacingMaxMinutes: null,
+    negotiationReplyPacingMinMinutes: null,
+    negotiationReplyPacingMaxMinutes: null,
+    emailAccountId: null,
+    campaignType: "PAID",
+    includesGifting: false,
+    giftDisposition: null,
+    priceStrategy: "REQUEST_RATE_CARD",
+    publicStartingFeeCents: null,
+    publicCommissionRate: null,
+    commissionDurationDays: null,
+    commissionConditions: null,
+    compensationReviewStatus: null,
+    usageRights: null,
+    exclusivity: null,
+    paymentTerms: null,
+    attributionWindow: null,
+    keyMessages: null,
+    contentRequirements: null,
+    targetUrl: null,
+    hiddenParamKey: null,
+    duplicatedFromCampaignId: null,
+    createdAt: "",
+    updatedAt: "",
+    workflows: [],
+    // WorksheetStage1Fields
+    productName: null,
+    productType: null,
+    creatorAccessNeeded: null,
+    uniqueSellingPoints: null,
+    whyTrust: null,
+    howToUse: null,
+    brandAssets: null,
+    brandMaterialsRef: null,
+    deliverableQuantities: null,
+    deliverablePricing: null,
+    followerRanges: null,
+    briefDeliveryMethod: null,
+    briefHighlight: null,
+    creativeConcept: null,
+    referenceVideos: null,
+    scriptSubmission: null,
+    adAuthorization: null,
+    linkInBioDuration: null,
+    postRetention: null,
+    instagramCollab: null,
+    requireApproval: null,
+    commissionMode: null,
+    variableCommission: null,
+    giftDeliveryMethod: null,
+    promoCode: null,
+    giftContactEmail: null,
+    requiresShippingInfo: null,
+    affiliateTrackingUrl: null,
+    trackingLinkMode: null,
+    trackingDestinationUrl: null,
+    trackingParameter: null,
+  };
+  return { ...base, ...over } as CampaignDetail;
+}
+
+// Valid public sections a review row may link to — NEVER negotiationSettings.
+const PUBLIC_SECTION_KEYS: SectionKey[] = [
+  "startSources",
+  "campaignProduct",
+  "platformsDeliverables",
+  "contentGuidelines",
+  "timelineRights",
+  "rewardStructure",
+];
+
+function rowsByLabel(rows: { label: string; value: string; section: SectionKey }[]): Map<string, { value: string; section: SectionKey }> {
+  return new Map(rows.map((r) => [r.label, { value: r.value, section: r.section }]));
+}
+
+test("buildPublicReviewRows: campaign name present + section is a valid PUBLIC key", () => {
+  const rows = buildPublicReviewRows(campaignDetail({ name: "Summer Launch" }), shape("PAID"));
+  const byLabel = rowsByLabel(rows);
+  assert.ok(byLabel.has("Campaign name"), "name row present");
+  assert.equal(byLabel.get("Campaign name")!.value, "Summer Launch");
+  // Every row's section must be a valid public section — NEVER negotiationSettings.
+  for (const r of rows) {
+    assert.ok(PUBLIC_SECTION_KEYS.includes(r.section), `${r.label} → ${r.section} is a public section`);
+    assert.notEqual(r.section, "negotiationSettings", `${r.label} must never link to the private page`);
+  }
+});
+
+test("buildPublicReviewRows NEVER emits a private/policy or provenance field", () => {
+  // Populate a fully-loaded HYBRID campaign; scan every emitted label/value for
+  // anything that looks like a private policy field or provenance leak.
+  const rows = buildPublicReviewRows(
+    campaignDetail({
+      campaignType: "HYBRID",
+      priceStrategy: "PROPOSE_STARTING_FEE",
+      publicStartingFeeCents: 50000,
+      publicCommissionRate: 15,
+      commissionMode: "percent",
+      commissionConditions: "customer_lifetime",
+      attributionWindow: "30",
+      affiliateTrackingUrl: "https://x.com/shop",
+      trackingParameter: "_from",
+    }),
+    shape("HYBRID"),
+  );
+  const blob = rows.map((r) => `${r.label} ${r.value}`).join(" ").toLowerCase();
+  for (const banned of ["floor", "ceiling", "preferred", "guidance", "non-negotiable", "provenance", "confidence", "maxrounds", "tolerance"]) {
+    assert.ok(!blob.includes(banned), `public rows must not leak "${banned}"`);
+  }
+});
+
+test("buildPublicReviewRows: tracking + commission rows ONLY for commission shapes", () => {
+  const withTracking = campaignDetail({
+    affiliateTrackingUrl: "https://x.com/shop",
+    trackingParameter: "_from",
+    trackingLinkMode: "pluvus",
+    publicCommissionRate: 15,
+    commissionMode: "percent",
+  });
+  // PAID (no commission) → tracking/commission rows structurally excluded even
+  // though the columns hold values (they'd be cleared server-side; the STRUCTURAL
+  // gate is what excludes them — AC4).
+  const paid = rowsByLabel(buildPublicReviewRows(withTracking, shape("PAID")));
+  assert.ok(!paid.has("Affiliate tracking URL"), "no tracking row on PAID");
+  assert.ok(!paid.has("Public commission"), "no commission row on PAID");
+  // AFFILIATE → tracking + commission rows appear.
+  const aff = rowsByLabel(buildPublicReviewRows(withTracking, shape("AFFILIATE")));
+  assert.ok(aff.has("Affiliate tracking URL"), "tracking row on AFFILIATE");
+  assert.ok(aff.has("Public commission"), "commission row on AFFILIATE");
+  assert.equal(aff.get("Public commission")!.value, "15%", "percent commission formatted");
+});
+
+test("buildPublicReviewRows: starting-fee row gates on showsStartingFee, not needsFee (N2)", () => {
+  // A PAID campaign in REQUEST_RATE_CARD mode has needsFee=true but
+  // showsStartingFee=false — the fee is not proposed, so no (blank) fee row should
+  // surface. shape() hardcodes PROPOSE_STARTING_FEE, so build the comp directly.
+  const rateCardComp: CompensationShape = { campaignType: "PAID", includesGifting: false, priceStrategy: "REQUEST_RATE_CARD", giftDeliveryMethod: "", selectedPlatforms: [], shipsPhysicalProduct: false };
+  const rateCard = campaignDetail({ campaignType: "PAID", priceStrategy: "REQUEST_RATE_CARD", publicStartingFeeCents: 50000 });
+  const rc = rowsByLabel(buildPublicReviewRows(rateCard, rateCardComp));
+  assert.ok(!rc.has("Public starting fee"), "no fee row in rate-card mode");
+  // PROPOSE_STARTING_FEE → the fee row appears (shape() defaults to this).
+  const propose = campaignDetail({ campaignType: "PAID", priceStrategy: "PROPOSE_STARTING_FEE", publicStartingFeeCents: 50000 });
+  const pr = rowsByLabel(buildPublicReviewRows(propose, shape("PAID")));
+  assert.ok(pr.has("Public starting fee"), "fee row shown in propose mode");
+  assert.equal(pr.get("Public starting fee")!.value, "$500", "cents→dollars");
+});
+
+test("buildPublicReviewRows: an INACTIVE conditional value is ABSENT (gift on a non-gift PAID)", () => {
+  // rewardDescription holds a value but the structure has no gift → the gift row
+  // must be absent (structural gate, not value != null).
+  const c = campaignDetail({ campaignType: "PAID", rewardDescription: "A free box" });
+  const paid = rowsByLabel(buildPublicReviewRows(c, shape("PAID", false)));
+  assert.ok(!paid.has("Gift / product"), "no gift row when the structure has no gift");
+  // GIFT_ONLY → the gift row appears.
+  const g = campaignDetail({ campaignType: "GIFT_ONLY", rewardDescription: "A free box" });
+  const gift = rowsByLabel(buildPublicReviewRows(g, shape("GIFT_ONLY")));
+  assert.ok(gift.has("Gift / product"), "gift row shown for gift-only");
+});
+
+test("buildPublicReviewRows: flat commission formats as dollars", () => {
+  const c = campaignDetail({ campaignType: "AFFILIATE", publicCommissionRate: 2500, commissionMode: "flat" });
+  const rows = rowsByLabel(buildPublicReviewRows(c, shape("AFFILIATE")));
+  assert.equal(rows.get("Public commission")!.value, "$25", "flat commission → dollars");
+});
+
+test("buildPublicReviewRows: blank public fields don't produce empty rows", () => {
+  // A near-empty draft → only the always-present name + structure rows, no blanks.
+  const rows = buildPublicReviewRows(campaignDetail({ objective: "  " }), shape("PAID"));
+  const labels = rows.map((r) => r.label);
+  assert.ok(labels.includes("Campaign name"), "name always present");
+  assert.ok(!labels.includes("Objective"), "whitespace-only objective is dropped");
 });
 
 console.log(`\n${passed} passed\n`);

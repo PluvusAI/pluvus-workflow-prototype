@@ -630,6 +630,16 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       }
       succeeded = true;
       setSavedTick((t) => t + 1);
+      // PLU-182 (Bug C/R2): after a successful campaign PATCH, refetch readiness
+      // and the campaign row so Page-9's readiness/CTA and the persisted
+      // compensationReviewStatus re-read WITHOUT a remount (react-query refetches
+      // in place; <LaunchReview> stays mounted, its useReadiness re-runs). Safe
+      // vs a reseed wipe: the campaign seed effect's guard (seededCampaignRef) is
+      // already tripped, so the refetch won't re-run the seed and clobber drafts.
+      if (groups.includes("campaign")) {
+        void qc.invalidateQueries({ queryKey: ["campaign", campaignId, "readiness"] });
+        void qc.invalidateQueries({ queryKey: ["campaign", campaignId] });
+      }
     } catch (err) {
       // Keep the local draft AND the dirty set intact so nothing is lost and a
       // retry re-sends exactly what failed.
@@ -652,6 +662,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     }
   }, [
     campaignId,
+    qc,
     buildCampaignPayload,
     buildBrandPayload,
     buildCreatorPayload,
@@ -975,16 +986,28 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
                   // Approving here only ever writes compensationReviewStatus —
                   // it never launches the campaign (LaunchReview.tsx no longer
                   // calls POST /launch), so there's no ACTIVE flip to re-read
-                  // for.
-                  setField(
-                    "campaign",
-                    "compensationReviewStatus",
-                    confirmed ? "CONFIRMED" : "NEEDS_REVIEW",
-                  );
+                  // for. PLU-182 Bug C: doSave invalidates readiness + campaign
+                  // on success, so the CTA/readiness/flag re-read without a remount.
+                  const next = confirmed ? "CONFIRMED" : "NEEDS_REVIEW";
+                  // PLU-182 (Bug A): flushSave runs buildCampaignPayload
+                  // SYNCHRONOUSLY, before React commits the setField below — so
+                  // the build would read the stale draft status and OMIT the new
+                  // value (see buildCampaignPayload's pendingReviewStatusRef
+                  // note). Carry the intended status through the one-shot ref the
+                  // build already prefers, so the very first toggle/click persists
+                  // reliably (doSave clears the ref after the PATCH).
+                  pendingReviewStatusRef.current = next;
+                  setField("campaign", "compensationReviewStatus", next);
                   flushSave();
                 }}
                 onDuplicate={() => void handleDuplicate()}
                 duplicating={duplicating}
+                // PLU-182 (Change 4): surface the campaign-group save state on
+                // Page 9 so a failed/pending approval PATCH is visible + retryable
+                // next to the CTA (not only in the far-off header).
+                saving={saving}
+                saveError={saveError}
+                onRetry={() => void doSave()}
               />
             ) : (
               <>
