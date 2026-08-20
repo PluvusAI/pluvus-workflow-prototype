@@ -167,11 +167,21 @@ export type CompensationReviewStatus = "NEEDS_REVIEW" | "CONFIRMED";
  *  CampaignDetails/BrandIdentity/CreatorRequirement writes are rejected (409). */
 export type CampaignStatus = "DRAFT" | "ACTIVE";
 
-/** PLU-139 (2a): one row of the per-platform deliverable quantity list (S3.2–S3.9). */
+/** PLU-169 (1f): one row of the per-platform deliverable quantity list
+ *  (S3.2–S3.9) — the shared Deliverable shape (server/src/domain/deliverables.ts).
+ *  `id`/`requirements`/`customLabel`/`notes` are optional here (not enforced
+ *  required, unlike the server-side validator) so a legacy row saved before
+ *  the PLU-169 id backfill still type-checks; every NEW row the intake UI
+ *  writes always sets `id`. `customLabel` is required (by the server
+ *  validator, not this type) when platform is `"other"`. */
 export interface DeliverableQuantity {
+  id?: string;
   platform: string;
   format: string;
   quantity: number;
+  requirements?: { durationSeconds?: { min?: number; max?: number } } | null;
+  customLabel?: string | null;
+  notes?: string | null;
 }
 
 /** PLU-139 (2a): S7.P1 per-deliverable pricing — cents keyed by "<platform>:<format>". */

@@ -19,6 +19,8 @@
     "db:clean:harness:apply": "tsx scripts/cleanHarnessData.ts --apply --drain-queues",
     "labels:backfill": "tsx scripts/backfill-gmail-labels.ts",
     "labels:backfill:apply": "tsx scripts/backfill-gmail-labels.ts --apply",
+    "deliverables:backfill-ids": "tsx scripts/backfill-deliverable-ids.ts",
+    "deliverables:backfill-ids:apply": "tsx scripts/backfill-deliverable-ids.ts --apply",
     "harness": "cross-env NODE_ENV=production tsx --no-warnings src/engine/harness.ts",
     "harness:phase4": "cross-env NODE_ENV=production tsx --no-warnings src/workers/harness.ts",
     "harness:phase5": "cross-env NODE_ENV=production tsx --no-warnings src/scheduler/harness.ts",

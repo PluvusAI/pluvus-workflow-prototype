@@ -43,6 +43,7 @@ import { sql } from "drizzle-orm";
 import { createId } from "@paralleldrive/cuid2";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
+import type { Deliverable } from "../domain/deliverables.js";
 
 // ---------------------------------------------------------------------------
 // JSON value types (replacing Prisma.JsonValue / Prisma.InputJsonValue)
@@ -1485,6 +1486,112 @@ export const dealHandoffs = pgTable(
     index("DealHandoff_status_idx").on(table.status),
   ],
 );
+
+// PLU-169 (1f): one row per FinalDeliverable — see server/src/domain/deliverables.ts
+// for the actual Deliverable[] shape stored in finalDeliverables below. Kept
+// separate from that shared type because it's specific to the deviation-tracking
+// use case, not part of the deliverables domain.
+export interface ApprovedDeviation {
+  field: string; // which term deviated from the published policy
+  reason: string;
+  approvedBy?: string; // operator identifier, when acceptanceSource is OPERATOR_MANUAL
+}
+
+// PLU-169 (1f): which flow produced this FinalAgreement. AI_NEGOTIATION is the
+// only source any code path writes today (executeNegotiation's case "accept:"
+// is the ONE transition into ACCEPTED — confirmed, no route transitions an
+// instance to ACCEPTED directly). OPERATOR_MANUAL/BRAND_APPROVAL are reserved,
+// unused enum values (PLU-169 decision #2) — same "positioned, unused seam"
+// precedent as PolicyAuthority's operator_override slot in knowledgePrecedence.ts.
+export const finalAgreementSourceEnum = pgEnum("FinalAgreementSource", [
+  "AI_NEGOTIATION",
+  "OPERATOR_MANUAL",
+  "BRAND_APPROVAL",
+]);
+
+export const finalAgreementCommissionModeEnum = pgEnum("FinalAgreementCommissionMode", [
+  "PERCENT",
+  "FLAT",
+]);
+
+// PLU-169 (1f): the ONE canonical accepted-terms record for a creator journey.
+// Written exactly once per ExecutionInstance (UNIQUE instanceId — the same
+// idempotency guard DealHandoff already proved out: a retried write re-inserts,
+// hits the constraint, and returns the existing row instead of erroring).
+// Unlike DealHandoff, this is written for EVERY accepted journey regardless of
+// postAcceptanceMode — it is not an operator-handoff-specific display snapshot.
+// Every field here is an ACCEPTED, creator-facing outcome; private floors,
+// ceilings, strategy, and rejected positions are never copied in (mirrors the
+// same structural-exclusion discipline PLU-137 established for DraftContext).
+export const finalAgreements = pgTable(
+  "FinalAgreement",
+  {
+    id: cuidId("id"),
+    instanceId: text("instanceId")
+      .notNull()
+      .references(() => executionInstances.id),
+
+    // -- Governing references (nullable: a legacy no-snapshot journey has none) --
+    campaignTermsSnapshotId: text("campaignTermsSnapshotId").references(
+      () => campaignTermsSnapshots.id,
+      { onDelete: "restrict" },
+    ),
+    negotiationPolicySnapshotId: text("negotiationPolicySnapshotId").references(
+      () => negotiationPolicySnapshots.id,
+      { onDelete: "restrict" },
+    ),
+
+    // -- Money (integer cents throughout — matches NegotiationPolicySnapshot) --
+    finalFeeCents: integer("finalFeeCents"),
+    finalCommissionMode: finalAgreementCommissionModeEnum("finalCommissionMode"),
+    finalCommissionRate: doublePrecision("finalCommissionRate"), // PERCENT mode
+    finalCommissionAmountCents: integer("finalCommissionAmountCents"), // FLAT mode
+    finalCommissionDurationDays: integer("finalCommissionDurationDays"),
+    finalCommissionConditions: text("finalCommissionConditions"),
+
+    // -- Gift / product (GIFT_ONLY, or includesGifting on any other type) --
+    finalGiftProductDescription: text("finalGiftProductDescription"),
+    finalGiftDisposition: giftDispositionEnum("finalGiftDisposition"),
+    finalFulfillmentTerms: text("finalFulfillmentTerms"), // no current source — PLU-169 decision #3
+
+    // -- Deliverables: the SHARED Deliverable[] type (server/src/domain/deliverables.ts) —
+    //    the same shape Campaign Brief intake (CampaignDetails.deliverableQuantities)
+    //    uses. NOT a generalized contract-line-item system; still a small, closed shape. --
+    finalDeliverables: jsonb("finalDeliverables").$type<Deliverable[]>(),
+    finalTimeline: text("finalTimeline"),
+    finalPostingDate: ts("finalPostingDate"), // no current source — PLU-169 decision #3
+
+    // -- Rights --
+    finalUsageRights: text("finalUsageRights"),
+    finalExclusivity: text("finalExclusivity"),
+    finalAttributionWindow: text("finalAttributionWindow"),
+    finalPaymentTerms: text("finalPaymentTerms"),
+
+    // -- Content requirements --
+    finalScriptSubmissionRequired: boolean("finalScriptSubmissionRequired")
+      .notNull()
+      .default(false), // no current source — PLU-169 decision #3
+
+    // -- Approved deviations from the campaign's published policy (e.g. a
+    //    manually-approved above-ceiling exception). Small typed shape —
+    //    not a version/amendment system. --
+    approvedDeviations: jsonb("approvedDeviations").$type<ApprovedDeviation[]>(),
+
+    // -- Acceptance evidence --
+    acceptanceSource: finalAgreementSourceEnum("acceptanceSource").notNull(),
+    sourceMessageId: text("sourceMessageId").references(() => messages.id),
+    acceptedAt: ts("acceptedAt").notNull(),
+
+    createdAt: tsNow("createdAt"),
+    updatedAt: tsUpdatedAt("updatedAt"),
+  },
+  (table) => [
+    uniqueIndex("FinalAgreement_instanceId_key").on(table.instanceId),
+  ],
+);
+
+export type FinalAgreement = typeof finalAgreements.$inferSelect;
+export type FinalAgreementInsert = typeof finalAgreements.$inferInsert;
 
 // Brand-approval gate: the snapshot the BRAND sees when asked to approve a
 // creator the AI closed, plus the magic-link token + their decision. Modeled on

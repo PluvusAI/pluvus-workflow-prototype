@@ -74,6 +74,12 @@ import { resolveBand } from "../band.js";
 // agent decision, the output guard, and the offer/counter copy read the
 // authoritative band + public terms instead of stale nodeGraph values.
 import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
+// PLU-169 (1f): the ONE creator-specific final-agreement write, made inside
+// case "accept:" below (before the hasPostAcceptEmailNode split, so both
+// branches get it for free). buildFinalAgreementInput is pure; recordFinalAgreementOnce
+// is the idempotent insert-or-fetch (UNIQUE instanceId), same proven pattern
+// as createDealHandoffOnce.
+import { recordFinalAgreementOnce, buildFinalAgreementInput, resolveFinalDeliverables } from "../../db/finalAgreements.js";
 // HARD-A2: the output-guard-blocked MANUAL_REVIEW result is the SAME shape used
 // by other executors, so it lives in one place (guardEscalation.ts) rather than
 // being duplicated inline here. Previously negotiation.ts and guardEscalation.ts
@@ -1497,6 +1503,38 @@ export async function executeNegotiation(
     }
 
     case "accept": {
+      // PLU-169 (1f): the ONE creator-specific final-agreement write, before
+      // either post-accept branch below — so BOTH inherit it for free.
+      // Idempotent (UNIQUE instanceId) — a retry of this exact turn re-inserts
+      // and returns the existing row. No new DB round-trip for snapshot data
+      // (cc.termsSnapshot/cc.policySnapshot are already loaded by the builder
+      // above) and no new resolution logic (effectiveConfig is already
+      // computed) — this is a single INSERT sitting on top of values already
+      // in scope.
+      //
+      // resolveFinalDeliverables is Phase 1: a pure pass-through of the pinned
+      // snapshot's deliverableQuantities. Negotiation-delta application is a
+      // separate future ticket (PLU-169 decision #5) — deliverables stay
+      // atomic/non-negotiable here, exactly as they behave today.
+      await recordFinalAgreementOnce(
+        buildFinalAgreementInput({
+          instanceId: instance.id,
+          campaignTermsSnapshotId: cc.termsSnapshot?.id ?? null,
+          negotiationPolicySnapshotId: cc.policySnapshot?.id ?? null,
+          effectiveConfig,
+          detailsSnapshot: cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined,
+          finalDeliverables: resolveFinalDeliverables({
+            baseline: (cc.termsSnapshot?.detailsSnapshot as Record<string, unknown> | undefined)?.[
+              "deliverableQuantities"
+            ],
+          }),
+          agreedFeeCents: proposedRate !== undefined ? Math.round(proposedRate * 100) : undefined,
+          acceptanceSource: "AI_NEGOTIATION",
+          sourceMessageId: latestInbound?.id,
+          acceptedAt: new Date(),
+        }),
+      );
+
       // A post-acceptance email node (Content Brief in the merged flow, or legacy
       // Reward Setup) owns the post-acceptance email. Skip the negotiation's own
       // onboarding/acceptance send entirely and just transition to ACCEPTED; the
