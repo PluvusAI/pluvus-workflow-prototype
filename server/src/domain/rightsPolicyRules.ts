@@ -50,9 +50,20 @@ export const rightsPolicyRuleSchema = z
     minimumUnit: z.enum(DURATION_UNITS as unknown as [DurationUnitValue, ...DurationUnitValue[]]).optional(),
   })
   .strict()
+  // Review fix: a minimumValue with no minimumUnit is semantically
+  // incomplete — 30 WHAT? days, a lifetime, a count? The original refine
+  // only required minimumValue, so { mode: "ALLOW_TO_MINIMUM",
+  // minimumValue: 30 } validated and could reach an immutable launch
+  // snapshot with no way to interpret the number. Both fields are now
+  // required together, with distinct error messages/paths so a caller
+  // knows exactly which one is missing.
   .refine((r) => r.mode !== "ALLOW_TO_MINIMUM" || r.minimumValue !== undefined, {
     message: "minimumValue is required when mode is ALLOW_TO_MINIMUM",
     path: ["minimumValue"],
+  })
+  .refine((r) => r.mode !== "ALLOW_TO_MINIMUM" || r.minimumUnit !== undefined, {
+    message: "minimumUnit is required when mode is ALLOW_TO_MINIMUM",
+    path: ["minimumUnit"],
   });
 
 export const rightsPolicyRulesSchema = z

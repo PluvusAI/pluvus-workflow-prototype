@@ -39,6 +39,16 @@ test("ALLOW_TO_MINIMUM without minimumValue is rejected", () => {
   assert.equal(r.success, false);
 });
 
+test("BUG (fixed): ALLOW_TO_MINIMUM with minimumValue but NO minimumUnit is rejected — 30 what?", () => {
+  const r = rightsPolicyRuleSchema.safeParse({ term: "exclusivity", mode: "ALLOW_TO_MINIMUM", minimumValue: 30 });
+  assert.equal(r.success, false, "a bare number with no unit is semantically incomplete and must not validate");
+});
+
+test("ALLOW_TO_MINIMUM with minimumUnit but NO minimumValue is also rejected", () => {
+  const r = rightsPolicyRuleSchema.safeParse({ term: "exclusivity", mode: "ALLOW_TO_MINIMUM", minimumUnit: "DAYS" });
+  assert.equal(r.success, false);
+});
+
 test("ALLOW_TO_MINIMUM with minimumValue + minimumUnit is valid", () => {
   const r = rightsPolicyRuleSchema.safeParse({
     term: "exclusivity",

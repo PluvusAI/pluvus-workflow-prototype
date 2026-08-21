@@ -19,6 +19,11 @@ function ctx(overrides: Partial<NegotiationPolicyValidationContext> = {}): Negot
     publicStartingFeeCents: null,
     publicCommissionMode: null,
     publicCommissionRate: null,
+    existingFeeMode: null,
+    existingCeilingCents: null,
+    existingCommissionNegotiationMode: null,
+    existingCommissionCeilingRate: null,
+    existingCommissionCeilingAmountCents: null,
     existingCommissionDurationMode: null,
     existingPostingNegotiationMode: null,
     existingGiftSubstitutionMode: null,
@@ -238,4 +243,93 @@ test("giftCashReplacementLimitCents with mode omitted falls back to the EXISTING
     ctx({ existingGiftCashReplacementMode: "REJECT" }),
   );
   assert.equal(unauthorized.ok, false);
+});
+
+console.log("\nreview fix: partial updates must not bypass the below-public-offer checks\n");
+
+test("BUG (fixed): a limit-only patch against an ALREADY-ALLOW_WITHIN_LIMIT stored feeMode is still validated against the public offer", () => {
+  // feeMode is NOT part of this patch — it's already ALLOW_WITHIN_LIMIT in
+  // storage. Before the fix, `patch.feeMode === "ALLOW_WITHIN_LIMIT"` was
+  // literally false (patch.feeMode is undefined), so this slipped through.
+  const r = validateNegotiationPolicyPatch(
+    { ceilingCents: 100 }, // far below the public starting fee
+    ctx({
+      existingFeeMode: "ALLOW_WITHIN_LIMIT",
+      publicPriceStrategy: "PROPOSE_STARTING_FEE",
+      publicStartingFeeCents: 50000,
+    }),
+  );
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "FEE_LIMIT_BELOW_PUBLIC_OFFER");
+});
+
+test("BUG (fixed): a mode-only patch that newly authorizes ALLOW_WITHIN_LIMIT is validated against a STALE stored ceilingCents", () => {
+  // The symmetric direction: ceilingCents isn't part of THIS patch either —
+  // it's a stale value already sitting in storage (e.g. left over from
+  // before this ticket's checks existed) — but feeMode is now becoming
+  // ALLOW_WITHIN_LIMIT for the first time, which makes that stale value
+  // suddenly load-bearing.
+  const r = validateNegotiationPolicyPatch(
+    { feeMode: "ALLOW_WITHIN_LIMIT" },
+    ctx({
+      existingCeilingCents: 100,
+      publicPriceStrategy: "PROPOSE_STARTING_FEE",
+      publicStartingFeeCents: 50000,
+    }),
+  );
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "FEE_LIMIT_BELOW_PUBLIC_OFFER");
+});
+
+test("a patch touching NEITHER feeMode NOR ceilingCents never re-validates stale fee data, even if it's already invalid", () => {
+  // An unrelated field edit (posting) must not be blocked by pre-existing
+  // fee data this patch has nothing to do with.
+  const r = validateNegotiationPolicyPatch(
+    { postingNegotiationMode: "ALLOW_DELAY_DAYS", postingMaxDelayDays: 3 },
+    ctx({
+      existingFeeMode: "ALLOW_WITHIN_LIMIT",
+      existingCeilingCents: 1, // already invalid, but untouched by this patch
+      publicPriceStrategy: "PROPOSE_STARTING_FEE",
+      publicStartingFeeCents: 50000,
+    }),
+  );
+  assert.equal(r.ok, true);
+});
+
+test("BUG (fixed): a limit-only commission patch against an ALREADY-ALLOW_WITHIN_LIMIT stored mode is still validated (percent)", () => {
+  const r = validateNegotiationPolicyPatch(
+    { commissionCeilingRate: 1 },
+    ctx({
+      existingCommissionNegotiationMode: "ALLOW_WITHIN_LIMIT",
+      publicCommissionMode: "percent",
+      publicCommissionRate: 10,
+    }),
+  );
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION");
+});
+
+test("BUG (fixed): a limit-only commission patch against an ALREADY-ALLOW_WITHIN_LIMIT stored mode is still validated (flat)", () => {
+  const r = validateNegotiationPolicyPatch(
+    { commissionCeilingAmountCents: 100 },
+    ctx({
+      existingCommissionNegotiationMode: "ALLOW_WITHIN_LIMIT",
+      publicCommissionMode: "flat",
+      publicCommissionRate: 1000,
+    }),
+  );
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.code, "COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION");
+});
+
+test("a commission limit-only patch against an already-compliant stored mode+limit still passes", () => {
+  const r = validateNegotiationPolicyPatch(
+    { commissionCeilingRate: 20 }, // still >= public 10
+    ctx({
+      existingCommissionNegotiationMode: "ALLOW_WITHIN_LIMIT",
+      publicCommissionMode: "percent",
+      publicCommissionRate: 10,
+    }),
+  );
+  assert.equal(r.ok, true);
 });

@@ -51,6 +51,16 @@ export interface NegotiationPolicyValidationContext {
   /** "percent" | "flat" | null (campaignDetails.commissionMode). */
   publicCommissionMode: string | null;
   publicCommissionRate: number | null;
+  // Review fix: the fee/commission "cannot be below the public offer"
+  // checks need the CURRENTLY-STORED mode and limit too, not just the
+  // patch's — a patch that edits only the limit (mode already stored as
+  // ALLOW_WITHIN_LIMIT) or only the mode (limit already stored, stale)
+  // must still be validated against the real effective state.
+  existingFeeMode: string | null;
+  existingCeilingCents: number | null;
+  existingCommissionNegotiationMode: string | null;
+  existingCommissionCeilingRate: number | null;
+  existingCommissionCeilingAmountCents: number | null;
   existingCommissionDurationMode: string | null;
   existingPostingNegotiationMode: string | null;
   existingGiftSubstitutionMode: string | null;
@@ -67,55 +77,87 @@ export function validateNegotiationPolicyPatch(
   ctx: NegotiationPolicyValidationContext,
 ): NegotiationPolicyValidationResult {
   // S8.P1: "when a public starting fee exists, the maximum cannot be below
-  // it." Only checked when ceilingCents is PART OF THIS PATCH — an
-  // unrelated edit to an already-compliant policy must not re-run this
-  // check against a value that isn't changing.
-  if (patch.feeMode === "ALLOW_WITHIN_LIMIT" && patch.ceilingCents != null) {
-    if (
-      ctx.publicPriceStrategy === "PROPOSE_STARTING_FEE" &&
-      ctx.publicStartingFeeCents != null &&
-      patch.ceilingCents < ctx.publicStartingFeeCents
-    ) {
-      return {
-        ok: false,
-        code: "FEE_LIMIT_BELOW_PUBLIC_OFFER",
-        error: "ceilingCents cannot be below the public starting fee",
-      };
+  // it."
+  //
+  // Review fix: the original check gated on `patch.feeMode ===
+  // "ALLOW_WITHIN_LIMIT"` literally — so once a policy already had
+  // feeMode=ALLOW_WITHIN_LIMIT stored, a LATER patch that lowered
+  // ceilingCents WITHOUT resubmitting feeMode skipped this check entirely
+  // (patch.feeMode was undefined, not "ALLOW_WITHIN_LIMIT"), letting an
+  // invalid limit through to persistence and, eventually, the immutable
+  // launch snapshot. Fixed by resolving BOTH the effective mode and the
+  // effective limit from the patch, falling back to the currently-stored
+  // value for whichever one this patch doesn't touch — the same
+  // patch-or-existing pattern already used below for the
+  // "limit without an authorizing mode" checks. Gated on whether THIS patch
+  // touches feeMode or ceilingCents at all, so an unrelated field edit
+  // (e.g. postingMaxDelayDays) never re-validates fee data it didn't touch.
+  if (patch.feeMode !== undefined || patch.ceilingCents !== undefined) {
+    const effectiveFeeMode = patch.feeMode ?? ctx.existingFeeMode;
+    const effectiveCeilingCents = patch.ceilingCents === undefined ? ctx.existingCeilingCents : patch.ceilingCents;
+    if (effectiveFeeMode === "ALLOW_WITHIN_LIMIT" && effectiveCeilingCents != null) {
+      if (
+        ctx.publicPriceStrategy === "PROPOSE_STARTING_FEE" &&
+        ctx.publicStartingFeeCents != null &&
+        effectiveCeilingCents < ctx.publicStartingFeeCents
+      ) {
+        return {
+          ok: false,
+          code: "FEE_LIMIT_BELOW_PUBLIC_OFFER",
+          error: "ceilingCents cannot be below the public starting fee",
+        };
+      }
+      // REQUEST_RATE_CARD has no public numeric fee to compare against —
+      // nothing to reject here; the RUNTIME rule that a submitted rate must
+      // still not auto-approve without an explicit limit is frozen in
+      // domain/policyDecision.ts (REQUEST_RATE_CARD_REQUIRES_EXPLICIT_LIMIT)
+      // for PLU-175's evaluator to enforce, not this route's job.
     }
-    // REQUEST_RATE_CARD has no public numeric fee to compare against —
-    // nothing to reject here; the RUNTIME rule that a submitted rate must
-    // still not auto-approve without an explicit limit is frozen in
-    // domain/policyDecision.ts (REQUEST_RATE_CARD_REQUIRES_EXPLICIT_LIMIT)
-    // for PLU-175's evaluator to enforce, not this route's job.
   }
 
   // S8.A1: same "cannot be below the public amount" rule, branched on the
   // PUBLIC unit (campaignDetails.commissionMode: "percent" | "flat") so a
   // rate is never compared against a flat-dollar figure or vice versa.
-  if (patch.commissionNegotiationMode === "ALLOW_WITHIN_LIMIT") {
-    const publicIsFlat = ctx.publicCommissionMode === "flat";
-    if (publicIsFlat) {
-      if (
-        patch.commissionCeilingAmountCents != null &&
-        ctx.publicCommissionRate != null &&
-        patch.commissionCeilingAmountCents < ctx.publicCommissionRate
-      ) {
-        return {
-          ok: false,
-          code: "COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION",
-          error: "commissionCeilingAmountCents cannot be below the public flat commission amount",
-        };
+  //
+  // Review fix: same effective-mode/effective-limit resolution as the fee
+  // check above — a patch that edits only commissionCeilingRate/
+  // commissionCeilingAmountCents against an ALREADY-ALLOW_WITHIN_LIMIT
+  // policy (mode not resubmitted) must still be validated.
+  if (
+    patch.commissionNegotiationMode !== undefined ||
+    patch.commissionCeilingRate !== undefined ||
+    patch.commissionCeilingAmountCents !== undefined
+  ) {
+    const effectiveCommissionMode = patch.commissionNegotiationMode ?? ctx.existingCommissionNegotiationMode;
+    if (effectiveCommissionMode === "ALLOW_WITHIN_LIMIT") {
+      const publicIsFlat = ctx.publicCommissionMode === "flat";
+      if (publicIsFlat) {
+        const effectiveAmountCents =
+          patch.commissionCeilingAmountCents === undefined
+            ? ctx.existingCommissionCeilingAmountCents
+            : patch.commissionCeilingAmountCents;
+        if (
+          effectiveAmountCents != null &&
+          ctx.publicCommissionRate != null &&
+          effectiveAmountCents < ctx.publicCommissionRate
+        ) {
+          return {
+            ok: false,
+            code: "COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION",
+            error: "commissionCeilingAmountCents cannot be below the public flat commission amount",
+          };
+        }
+      } else {
+        const effectiveRate =
+          patch.commissionCeilingRate === undefined ? ctx.existingCommissionCeilingRate : patch.commissionCeilingRate;
+        if (effectiveRate != null && ctx.publicCommissionRate != null && effectiveRate < ctx.publicCommissionRate) {
+          return {
+            ok: false,
+            code: "COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION",
+            error: "commissionCeilingRate cannot be below the public commission",
+          };
+        }
       }
-    } else if (
-      patch.commissionCeilingRate != null &&
-      ctx.publicCommissionRate != null &&
-      patch.commissionCeilingRate < ctx.publicCommissionRate
-    ) {
-      return {
-        ok: false,
-        code: "COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION",
-        error: "commissionCeilingRate cannot be below the public commission",
-      };
     }
   }
 
