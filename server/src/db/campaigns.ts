@@ -31,10 +31,18 @@ import {
   type CampaignDetails,
   type CampaignInsert,
   type CampaignTermsSnapshot,
+  type JsonValue,
   type NegotiationPolicy,
   type WorkflowStatus,
 } from "./schema.js";
 import { validateDeliverables, normalizeLegacyDeliverables } from "../domain/deliverablesValidator.js";
+import {
+  needsFee as _needsFee,
+  needsCommission as _needsCommission,
+  projectActivePublicFields,
+  projectActivePrivatePolicyFields,
+  buildRightsPublicValues,
+} from "../domain/compensationShape.js";
 
 export async function findCampaignById(
   id: string,
@@ -274,9 +282,12 @@ export function validateCompensationReadiness(
 ): string[] {
   const missing: string[] = [];
 
-  const needsFee = details.campaignType === "PAID" || details.campaignType === "HYBRID";
-  const needsCommission =
-    details.campaignType === "AFFILIATE" || details.campaignType === "HYBRID";
+  // PLU-172: shared with the activation-time projection (compensationShape.ts)
+  // and the negotiation-policy PATCH route, so "does this campaignType need
+  // a fee/commission" can't drift between call sites the way it could when
+  // each one re-derived the answer inline.
+  const needsFee = _needsFee(details.campaignType);
+  const needsCommission = _needsCommission(details.campaignType);
   const needsGift = details.campaignType === "GIFT_ONLY" || details.includesGifting;
 
   // Legacy rows predating the id requirement are normalized (never rejected
@@ -512,8 +523,20 @@ export async function launchCampaign(
       confirmedAt: _detailsConfirmedAt,
       createdAt: _dc,
       updatedAt: _du,
-      ...detailsSnapshot
+      ...rawDetailsSnapshot
     } = details;
+
+    // PLU-172: exclude inactive conditional fields before freezing — a
+    // campaign that changed campaignType/includesGifting since an earlier
+    // edit must not carry stale leftovers (e.g. a HYBRID->GIFT_ONLY
+    // campaign's old publicCommissionRate) into the IMMUTABLE snapshot. See
+    // domain/compensationShape.ts's own doc comment for the full rule.
+    const detailsSnapshot = projectActivePublicFields(rawDetailsSnapshot);
+    const rightsPublicValues = buildRightsPublicValues(rawDetailsSnapshot);
+    const privatePolicySnapshot = projectActivePrivatePolicyFields(
+      { ...policy },
+      { campaignType: details.campaignType, includesGifting: details.includesGifting, rightsPublicValues },
+    );
 
     // Second layer behind the FOR UPDATE lock above (belt and suspenders,
     // same posture as payouts.ts): run the writes in a nested transaction
@@ -527,27 +550,52 @@ export async function launchCampaign(
           .insert(campaignTermsSnapshots)
           .values({
             campaignId: id,
-            detailsSnapshot,
+            detailsSnapshot: detailsSnapshot as JsonValue,
             briefExtractionId: confirmedFromExtractionId,
           })
           .returning();
 
         await tx2.insert(negotiationPolicySnapshots).values({
           campaignId: id,
-          floorCents: policy.floorCents,
-          ceilingCents: policy.ceilingCents,
-          preferredFeeCents: policy.preferredFeeCents,
-          commissionFloorRate: policy.commissionFloorRate,
-          commissionCeilingRate: policy.commissionCeilingRate,
-          preferredCommissionRate: policy.preferredCommissionRate,
+          floorCents: privatePolicySnapshot["floorCents"] as number | null,
+          ceilingCents: privatePolicySnapshot["ceilingCents"] as number | null,
+          preferredFeeCents: privatePolicySnapshot["preferredFeeCents"] as number | null,
+          commissionFloorRate: privatePolicySnapshot["commissionFloorRate"] as number | null,
+          commissionCeilingRate: privatePolicySnapshot["commissionCeilingRate"] as number | null,
+          preferredCommissionRate: privatePolicySnapshot["preferredCommissionRate"] as number | null,
           maxRounds: policy.maxRounds,
           openingOfferPosition: policy.openingOfferPosition,
           overCeilingTolerance: policy.overCeilingTolerance,
           negotiationGuidance: policy.negotiationGuidance,
-          giftSubstitutionAllowed: policy.giftSubstitutionAllowed,
-          giftValueFlexibilityCents: policy.giftValueFlexibilityCents,
+          giftSubstitutionAllowed: privatePolicySnapshot["giftSubstitutionAllowed"] as boolean | null,
+          giftValueFlexibilityCents: privatePolicySnapshot["giftValueFlexibilityCents"] as number | null,
           negotiableTerms: policy.negotiableTerms,
           nonNegotiableTerms: policy.nonNegotiableTerms,
+
+          // PLU-172: the Page-8 authority fields, run through the SAME
+          // exclusion projection as the fields above (mode-conditional for
+          // these — see compensationShape.ts's own doc comment on why the
+          // three fields above are exempt from that and these are not).
+          feeMode: policy.feeMode,
+          commissionNegotiationMode: policy.commissionNegotiationMode,
+          commissionCeilingAmountCents: privatePolicySnapshot["commissionCeilingAmountCents"] as number | null,
+          commissionDurationMode: policy.commissionDurationMode,
+          commissionDurationLimitValue: privatePolicySnapshot["commissionDurationLimitValue"] as number | null,
+          commissionDurationLimitUnit: privatePolicySnapshot["commissionDurationLimitUnit"] as NegotiationPolicy["commissionDurationLimitUnit"],
+          giftSubstitutionMode: policy.giftSubstitutionMode,
+          giftApprovedSubstitutes: privatePolicySnapshot["giftApprovedSubstitutes"] as JsonValue | null,
+          giftCashReplacementMode: policy.giftCashReplacementMode,
+          giftCashReplacementLimitCents: privatePolicySnapshot["giftCashReplacementLimitCents"] as number | null,
+          deliverableNegotiationMode: policy.deliverableNegotiationMode,
+          deliverablePolicyRules: privatePolicySnapshot["deliverablePolicyRules"] as JsonValue | null,
+          postingNegotiationMode: policy.postingNegotiationMode,
+          postingMaxDelayDays: privatePolicySnapshot["postingMaxDelayDays"] as number | null,
+          rightsPolicyRules: privatePolicySnapshot["rightsPolicyRules"] as JsonValue | null,
+          // Calvin review (item 9): scriptWaiverMode is never mode-gated by
+          // this projection (it has no associated limit field) — copied
+          // straight through, same as feeMode/giftCashReplacementMode above.
+          scriptWaiverMode: policy.scriptWaiverMode,
+          outOfPolicyAction: policy.outOfPolicyAction,
         });
 
         await tx2.update(campaigns).set({ status: "ACTIVE" }).where(eq(campaigns.id, id));

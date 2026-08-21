@@ -12,6 +12,7 @@ import queuesRouter from "./routes/queues.js";
 import webhooksRouter from "./routes/webhooks.js";
 import observabilityRouter from "./routes/observability.js";
 import campaignsRouter from "./routes/campaigns.js";
+import policyCapabilitiesRouter from "./routes/policyCapabilities.js";
 import campaignBriefsRouter from "./routes/campaignBriefs.js";
 import campaignBriefTokenRouter from "./routes/campaignBriefToken.js";
 import workflowsRouter from "./routes/workflows.js";
@@ -132,6 +133,10 @@ export function createApp(): Express {
   app.use("/observability", requireOperatorKey, observabilityRouter);
   // Phase 10 — Workflow Builder APIs (create + cascade-DELETE a campaign).
   app.use("/campaigns", requireOperatorKey, campaignsRouter);
+  // PLU-172 — the backend capability map PLU-173's Page-8 UI consumes
+  // instead of duplicating support rules client-side. Campaign-agnostic
+  // (not under /campaigns/:id) — see routes/policyCapabilities.ts.
+  app.use("/policy-capabilities", requireOperatorKey, policyCapabilitiesRouter);
   // PLU-139 §7 — CampaignBrief render/metadata/pdf/history routes, mounted
   // at the same /campaigns prefix as a second router (Express tries routers
   // in mount order; campaignsRouter's own routes don't overlap with /:id/brief*).
@@ -200,6 +205,7 @@ export function createApp(): Express {
     apiRouter.use("/observability", requireOperatorKey, observabilityRouter);
     apiRouter.use("/campaigns", requireOperatorKey, campaignsRouter);
     apiRouter.use("/campaigns", requireOperatorKey, campaignBriefsRouter);
+    apiRouter.use("/policy-capabilities", requireOperatorKey, policyCapabilitiesRouter);
     apiRouter.use("/workflows", requireOperatorKey, workflowsRouter);
     apiRouter.use("/email-accounts", requireOperatorKey, emailAccountsRouter);
     apiRouter.use("/manual-queue", requireOperatorKey, manualQueueRouter);

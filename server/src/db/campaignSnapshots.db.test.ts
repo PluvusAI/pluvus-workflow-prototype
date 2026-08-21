@@ -156,8 +156,14 @@ async function main(): Promise<void> {
       preferredFeeCents: null,
       // Private gift authority — what satisfies GIFT_ONLY launch readiness.
       giftSubstitutionAllowed: true,
-      // A non-fee value the loader assertion below verifies still loads.
-      commissionCeilingRate: 0.2,
+      // PLU-172: commissionCeilingRate is NOT used as the "non-fee value
+      // still loads" probe below anymore — GIFT_ONLY structurally needs no
+      // commission, so launchCampaign()'s activation projection now
+      // correctly excludes it from the snapshot (compensationShape.ts's
+      // projectActivePrivatePolicyFields), same as it always excluded the
+      // fee fields for this campaignType. maxRounds is the probe instead:
+      // a policy field genuinely unrelated to ANY compensation category,
+      // so it's never excluded regardless of campaignType.
       maxRounds: 1,
     });
     const terms = await launchCampaign(campaign!.id, pgdb);
@@ -172,7 +178,8 @@ async function main(): Promise<void> {
     const res = await loadPinnedSnapshots(instance, "NEGOTIATION_DECISION", pgdb, campaign!.id);
     assert.ok(res.policy, "GIFT policy loads despite null fee fields");
     assert.equal(res.policy?.floorCents, null);
-    assert.equal(res.policy?.commissionCeilingRate, 0.2);
+    assert.equal(res.policy?.commissionCeilingRate, null, "GIFT_ONLY needs no commission — correctly excluded from the snapshot (PLU-172)");
+    assert.equal(res.policy?.maxRounds, 1, "a genuinely category-agnostic field still loads — proves the LOADER isn't fee-gating access, independent of the exclusion projection");
   });
 
   await test("a MISSING terms snapshot (id set, row deleted) RETURNS an integrityFailure, does not throw", async () => {

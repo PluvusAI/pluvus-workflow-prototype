@@ -29,6 +29,18 @@ import {
   remapLegacyDeliverablePricingKeys,
   resolveDeliverableSave,
 } from "../domain/deliverablesValidator.js";
+import { validateDeliverablePolicyRules } from "../domain/deliverablePolicyRules.js";
+import {
+  validateRightsPolicyRules,
+  SCRIPT_WAIVER_MODES,
+  isScriptWaiverMode,
+} from "../domain/rightsPolicyRules.js";
+import {
+  validateNegotiationPolicyPatch,
+  needsNegotiationPolicyCrossFieldCheck,
+  type NegotiationPolicyPatchInput,
+  type NegotiationPolicyValidationCode as CrossFieldValidationCode,
+} from "../domain/negotiationPolicyValidation.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
   getCreatorRequirement,
@@ -204,6 +216,64 @@ const PRICE_STRATEGIES = ["REQUEST_RATE_CARD", "PROPOSE_STARTING_FEE"] as const;
 type PriceStrategyValue = (typeof PRICE_STRATEGIES)[number];
 function isPriceStrategy(v: unknown): v is PriceStrategyValue {
   return typeof v === "string" && (PRICE_STRATEGIES as readonly string[]).includes(v);
+}
+
+// PLU-172: one guard factory instead of 9 hand-written copies of the same
+// "typeof v === string && values.includes(v)" check — the Page-8 mode
+// enums all follow the identical shape isCampaignType/isPriceStrategy
+// above already established.
+function makeEnumGuard<T extends string>(values: readonly T[]): (v: unknown) => v is T {
+  return (v: unknown): v is T => typeof v === "string" && (values as readonly string[]).includes(v);
+}
+
+const FEE_NEGOTIATION_MODES = ["KEEP_PUBLIC_OFFER", "ALLOW_WITHIN_LIMIT", "ASK_FOR_APPROVAL"] as const;
+const isFeeNegotiationMode = makeEnumGuard(FEE_NEGOTIATION_MODES);
+
+const COMMISSION_NEGOTIATION_MODES = ["KEEP_PUBLIC_COMMISSION", "ALLOW_WITHIN_LIMIT", "ASK_FOR_APPROVAL"] as const;
+const isCommissionNegotiationMode = makeEnumGuard(COMMISSION_NEGOTIATION_MODES);
+
+const COMMISSION_DURATION_MODES = ["KEEP_PUBLIC_DURATION", "ALLOW_WITHIN_LIMIT", "ASK_FOR_APPROVAL"] as const;
+const isCommissionDurationMode = makeEnumGuard(COMMISSION_DURATION_MODES);
+
+const DURATION_UNITS = ["DAYS", "LIFETIME", "COUNT"] as const;
+const isDurationUnit = makeEnumGuard(DURATION_UNITS);
+
+const GIFT_SUBSTITUTION_MODES = ["KEEP_OFFERED_BENEFIT", "ALLOW_EQUIVALENT_APPROVED_OPTION", "ASK_FOR_APPROVAL"] as const;
+const isGiftSubstitutionMode = makeEnumGuard(GIFT_SUBSTITUTION_MODES);
+
+const GIFT_CASH_REPLACEMENT_MODES = ["REJECT", "ASK_FOR_APPROVAL", "ALLOW_UP_TO_AMOUNT"] as const;
+const isGiftCashReplacementMode = makeEnumGuard(GIFT_CASH_REPLACEMENT_MODES);
+
+const DELIVERABLE_NEGOTIATION_MODES = ["KEEP_REQUESTED", "ASK_FOR_APPROVAL", "ALLOW_SELECTED_CHANGES"] as const;
+const isDeliverableNegotiationMode = makeEnumGuard(DELIVERABLE_NEGOTIATION_MODES);
+
+const POSTING_NEGOTIATION_MODES = ["KEEP_DEADLINE", "ALLOW_DELAY_DAYS", "ASK_FOR_APPROVAL"] as const;
+const isPostingNegotiationMode = makeEnumGuard(POSTING_NEGOTIATION_MODES);
+
+const OUT_OF_POLICY_ACTIONS = ["ASK_FOR_APPROVAL", "REJECT_REQUEST"] as const;
+const isOutOfPolicyAction = makeEnumGuard(OUT_OF_POLICY_ACTIONS);
+
+function isStringArrayOrNull(v: unknown): v is string[] | null {
+  return v === null || (Array.isArray(v) && v.every((x) => typeof x === "string"));
+}
+
+// PLU-172 (review item 4 — "Stable API errors"): every new validation branch
+// this ticket adds returns a machine-readable `code` alongside the human
+// `error` message, so a client can branch on the FAILURE REASON rather than
+// parsing prose. A plain string union (not a thrown Error class, unlike
+// CampaignLockedError/CompensationIncompleteError) — this is a single
+// route's field-validation branch, not a reusable domain error a caller
+// catches by type. Extends the pure cross-field validator's own 3 codes
+// (domain/negotiationPolicyValidation.ts — the single source of truth for
+// those) with one more this route adds locally for its enum/shape guards.
+type NegotiationPolicyValidationCode = CrossFieldValidationCode | "INVALID_FIELD_VALUE";
+
+function negotiationPolicyValidationError(
+  res: Response,
+  code: NegotiationPolicyValidationCode,
+  error: string,
+): void {
+  res.status(400).json({ error, code });
 }
 
 // Accepted on create/patch so a future explicit-selection UI can set
@@ -1092,6 +1162,24 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     giftValueFlexibilityCents,
     negotiableTerms,
     nonNegotiableTerms,
+    // PLU-172 — Page-8 negotiation-authority fields.
+    feeMode,
+    commissionNegotiationMode,
+    commissionCeilingAmountCents,
+    commissionDurationMode,
+    commissionDurationLimitValue,
+    commissionDurationLimitUnit,
+    giftSubstitutionMode,
+    giftApprovedSubstitutes,
+    giftCashReplacementMode,
+    giftCashReplacementLimitCents,
+    deliverableNegotiationMode,
+    deliverablePolicyRules,
+    postingNegotiationMode,
+    postingMaxDelayDays,
+    rightsPolicyRules,
+    scriptWaiverMode,
+    outOfPolicyAction,
   } = req.body as {
     floorCents?: number | null;
     ceilingCents?: number | null;
@@ -1107,6 +1195,23 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     giftValueFlexibilityCents?: number | null;
     negotiableTerms?: unknown;
     nonNegotiableTerms?: unknown;
+    feeMode?: string;
+    commissionNegotiationMode?: string;
+    commissionCeilingAmountCents?: number | null;
+    commissionDurationMode?: string;
+    commissionDurationLimitValue?: number | null;
+    commissionDurationLimitUnit?: string | null;
+    giftSubstitutionMode?: string;
+    giftApprovedSubstitutes?: unknown;
+    giftCashReplacementMode?: string;
+    giftCashReplacementLimitCents?: number | null;
+    deliverableNegotiationMode?: string;
+    deliverablePolicyRules?: unknown;
+    postingNegotiationMode?: string;
+    postingMaxDelayDays?: number | null;
+    rightsPolicyRules?: unknown;
+    scriptWaiverMode?: string;
+    outOfPolicyAction?: string;
   };
 
   // negotiableTerms/nonNegotiableTerms follow the category-list convention
@@ -1133,6 +1238,98 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
       error: `nonNegotiableTerms must be an array of: ${NON_NEGOTIABLE_CATEGORIES.join(", ")}`,
     });
     return;
+  }
+
+  // PLU-172 — mode enums: reject-unrecognized-value-loudly, same posture as
+  // campaignType/priceStrategy above.
+  if (feeMode !== undefined && !isFeeNegotiationMode(feeMode)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `feeMode must be one of: ${FEE_NEGOTIATION_MODES.join(", ")}`);
+    return;
+  }
+  if (commissionNegotiationMode !== undefined && !isCommissionNegotiationMode(commissionNegotiationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `commissionNegotiationMode must be one of: ${COMMISSION_NEGOTIATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (commissionDurationMode !== undefined && !isCommissionDurationMode(commissionDurationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `commissionDurationMode must be one of: ${COMMISSION_DURATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (
+    commissionDurationLimitUnit !== undefined &&
+    commissionDurationLimitUnit !== null &&
+    !isDurationUnit(commissionDurationLimitUnit)
+  ) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `commissionDurationLimitUnit must be one of: ${DURATION_UNITS.join(", ")}`);
+    return;
+  }
+  if (giftSubstitutionMode !== undefined && !isGiftSubstitutionMode(giftSubstitutionMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `giftSubstitutionMode must be one of: ${GIFT_SUBSTITUTION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (giftCashReplacementMode !== undefined && !isGiftCashReplacementMode(giftCashReplacementMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `giftCashReplacementMode must be one of: ${GIFT_CASH_REPLACEMENT_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (deliverableNegotiationMode !== undefined && !isDeliverableNegotiationMode(deliverableNegotiationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `deliverableNegotiationMode must be one of: ${DELIVERABLE_NEGOTIATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (postingNegotiationMode !== undefined && !isPostingNegotiationMode(postingNegotiationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `postingNegotiationMode must be one of: ${POSTING_NEGOTIATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (outOfPolicyAction !== undefined && !isOutOfPolicyAction(outOfPolicyAction)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `outOfPolicyAction must be one of: ${OUT_OF_POLICY_ACTIONS.join(", ")}`);
+    return;
+  }
+  // Calvin review (item 9): its own dedicated mode — NOT rightsNegotiationModeEnum.
+  if (scriptWaiverMode !== undefined && !isScriptWaiverMode(scriptWaiverMode)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `scriptWaiverMode must be one of: ${SCRIPT_WAIVER_MODES.join(", ")}`);
+    return;
+  }
+
+  // PLU-172 — the two validated rule arrays + the free-text substitute list.
+  if (giftApprovedSubstitutes !== undefined && !isStringArrayOrNull(giftApprovedSubstitutes)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", "giftApprovedSubstitutes must be an array of strings or null");
+    return;
+  }
+  if (deliverablePolicyRules !== undefined && deliverablePolicyRules !== null) {
+    const result = validateDeliverablePolicyRules(deliverablePolicyRules);
+    if (!result.ok) {
+      negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `deliverablePolicyRules: ${result.error}`);
+      return;
+    }
+  }
+  if (rightsPolicyRules !== undefined && rightsPolicyRules !== null) {
+    const result = validateRightsPolicyRules(rightsPolicyRules);
+    if (!result.ok) {
+      negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `rightsPolicyRules: ${result.error}`);
+      return;
+    }
   }
 
   // floorCents/ceilingCents/preferredFeeCents/maxRounds/giftValueFlexibilityCents
@@ -1168,6 +1365,87 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
   ) {
     return;
   }
+  if (
+    commissionCeilingAmountCents !== undefined &&
+    commissionCeilingAmountCents !== null &&
+    !validateInt4(commissionCeilingAmountCents, "commissionCeilingAmountCents", res)
+  ) {
+    return;
+  }
+  if (
+    commissionDurationLimitValue !== undefined &&
+    commissionDurationLimitValue !== null &&
+    !validateInt4(commissionDurationLimitValue, "commissionDurationLimitValue", res)
+  ) {
+    return;
+  }
+  if (
+    postingMaxDelayDays !== undefined &&
+    postingMaxDelayDays !== null &&
+    !validateInt4(postingMaxDelayDays, "postingMaxDelayDays", res)
+  ) {
+    return;
+  }
+  if (
+    giftCashReplacementLimitCents !== undefined &&
+    giftCashReplacementLimitCents !== null &&
+    !validateInt4(giftCashReplacementLimitCents, "giftCashReplacementLimitCents", res)
+  ) {
+    return;
+  }
+
+  // PLU-172 — cross-field validation against the public offer, and
+  // write-time rejection of a limit whose mode doesn't authorize it (item
+  // 9's "ideally reject the combination at write time too"). The actual
+  // rules live in domain/negotiationPolicyValidation.ts (pure, unit-tested
+  // there) — this route's only job is fetching the live rows the pure
+  // function needs and translating its result into an HTTP response.
+  // ceilingCents/giftValueFlexibilityCents are DELIBERATELY EXEMPT from the
+  // "limit without authorizing mode" check — see compensationShape.ts's own
+  // doc comment (§3.6): they pre-date this ticket and the live negotiation
+  // agent already depends on them unconditionally.
+  const patchForValidation: NegotiationPolicyPatchInput = {
+    feeMode,
+    ceilingCents,
+    commissionNegotiationMode,
+    commissionCeilingRate,
+    commissionCeilingAmountCents,
+    commissionDurationMode,
+    commissionDurationLimitValue,
+    commissionDurationLimitUnit,
+    postingNegotiationMode,
+    postingMaxDelayDays,
+    giftSubstitutionMode,
+    giftApprovedSubstitutes,
+    giftCashReplacementMode,
+    giftCashReplacementLimitCents,
+    deliverableNegotiationMode,
+    deliverablePolicyRules,
+  };
+  if (needsNegotiationPolicyCrossFieldCheck(patchForValidation)) {
+    // Fetched (at most) once each, reused by every rule inside the pure
+    // validator — not re-fetched per field, which would otherwise be an
+    // N+1 query for a patch touching several mode/limit pairs at once.
+    const [details, existingPolicy] = await Promise.all([
+      getCampaignDetails(req.params["id"]!),
+      getNegotiationPolicy(req.params["id"]!),
+    ]);
+    const validation = validateNegotiationPolicyPatch(patchForValidation, {
+      publicPriceStrategy: details?.priceStrategy ?? null,
+      publicStartingFeeCents: details?.publicStartingFeeCents ?? null,
+      publicCommissionMode: details?.commissionMode ?? null,
+      publicCommissionRate: details?.publicCommissionRate ?? null,
+      existingCommissionDurationMode: existingPolicy?.commissionDurationMode ?? null,
+      existingPostingNegotiationMode: existingPolicy?.postingNegotiationMode ?? null,
+      existingGiftSubstitutionMode: existingPolicy?.giftSubstitutionMode ?? null,
+      existingGiftCashReplacementMode: existingPolicy?.giftCashReplacementMode ?? null,
+      existingDeliverableNegotiationMode: existingPolicy?.deliverableNegotiationMode ?? null,
+    });
+    if (!validation.ok) {
+      negotiationPolicyValidationError(res, validation.code, validation.error);
+      return;
+    }
+  }
 
   const patch: Parameters<typeof upsertNegotiationPolicy>[1] = {};
   if (floorCents !== undefined) patch.floorCents = floorCents;
@@ -1190,6 +1468,47 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
   if (negotiableTerms !== undefined) patch.negotiableTerms = negotiableTerms as JsonValue | null;
   if (nonNegotiableTerms !== undefined) {
     patch.nonNegotiableTerms = nonNegotiableTerms as JsonValue | null;
+  }
+
+  // PLU-172 — already validated (enum guards + schema.safeParse + cross-field
+  // checks) above; a straight assignment here, same convention as every
+  // field above it.
+  if (feeMode !== undefined) patch.feeMode = feeMode as (typeof FEE_NEGOTIATION_MODES)[number];
+  if (commissionNegotiationMode !== undefined) {
+    patch.commissionNegotiationMode = commissionNegotiationMode as (typeof COMMISSION_NEGOTIATION_MODES)[number];
+  }
+  if (commissionCeilingAmountCents !== undefined) patch.commissionCeilingAmountCents = commissionCeilingAmountCents;
+  if (commissionDurationMode !== undefined) {
+    patch.commissionDurationMode = commissionDurationMode as (typeof COMMISSION_DURATION_MODES)[number];
+  }
+  if (commissionDurationLimitValue !== undefined) patch.commissionDurationLimitValue = commissionDurationLimitValue;
+  if (commissionDurationLimitUnit !== undefined) {
+    patch.commissionDurationLimitUnit = commissionDurationLimitUnit as (typeof DURATION_UNITS)[number] | null;
+  }
+  if (giftSubstitutionMode !== undefined) {
+    patch.giftSubstitutionMode = giftSubstitutionMode as (typeof GIFT_SUBSTITUTION_MODES)[number];
+  }
+  if (giftApprovedSubstitutes !== undefined) patch.giftApprovedSubstitutes = giftApprovedSubstitutes as JsonValue | null;
+  if (giftCashReplacementMode !== undefined) {
+    patch.giftCashReplacementMode = giftCashReplacementMode as (typeof GIFT_CASH_REPLACEMENT_MODES)[number];
+  }
+  if (giftCashReplacementLimitCents !== undefined) {
+    patch.giftCashReplacementLimitCents = giftCashReplacementLimitCents;
+  }
+  if (deliverableNegotiationMode !== undefined) {
+    patch.deliverableNegotiationMode = deliverableNegotiationMode as (typeof DELIVERABLE_NEGOTIATION_MODES)[number];
+  }
+  if (deliverablePolicyRules !== undefined) patch.deliverablePolicyRules = deliverablePolicyRules as JsonValue | null;
+  if (postingNegotiationMode !== undefined) {
+    patch.postingNegotiationMode = postingNegotiationMode as (typeof POSTING_NEGOTIATION_MODES)[number];
+  }
+  if (postingMaxDelayDays !== undefined) patch.postingMaxDelayDays = postingMaxDelayDays;
+  if (rightsPolicyRules !== undefined) patch.rightsPolicyRules = rightsPolicyRules as JsonValue | null;
+  if (scriptWaiverMode !== undefined) {
+    patch.scriptWaiverMode = scriptWaiverMode as (typeof SCRIPT_WAIVER_MODES)[number];
+  }
+  if (outOfPolicyAction !== undefined) {
+    patch.outOfPolicyAction = outOfPolicyAction as (typeof OUT_OF_POLICY_ACTIONS)[number];
   }
 
   try {
