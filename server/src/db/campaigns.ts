@@ -29,12 +29,14 @@ import {
   workflowVersions,
   type Campaign,
   type CampaignDetails,
+  type CampaignDetailsInsert,
   type CampaignInsert,
   type CampaignTermsSnapshot,
   type JsonValue,
   type NegotiationPolicy,
   type WorkflowStatus,
 } from "./schema.js";
+import { getCampaignDetails, upsertCampaignDetailsValidated } from "./campaignDetails.js";
 import { validateDeliverables, normalizeLegacyDeliverables } from "../domain/deliverablesValidator.js";
 import {
   needsFee as _needsFee,
@@ -78,8 +80,9 @@ export async function createCampaign(data: CampaignInsert): Promise<Campaign> {
 export async function updateCampaign(
   id: string,
   data: Partial<CampaignInsert>,
+  client: Db | DbTx = db,
 ): Promise<Campaign> {
-  const rows = await db
+  const rows = await client
     .update(campaigns)
     .set(data)
     .where(eq(campaigns.id, id))
@@ -90,6 +93,48 @@ export async function updateCampaign(
     throw new Error(`Campaign ${id} not found`);
   }
   return updated;
+}
+
+// PLU-172 (review fix — "a request that changes campaign fields and public
+// terms can return a validation error after updateCampaign() has already
+// committed the campaign patch"). The `PATCH /campaigns/:id` route used to
+// call updateCampaign() and upsertCampaignDetailsValidated() as two
+// separate statements: a name change plus a public-fee raise above the
+// stored private ceiling committed the name change, THEN rejected the fee
+// change — leaving the campaign in a state neither the pre- nor post-request
+// shape, with no way for the client to tell from the 400 response that part
+// of its request had already taken effect.
+//
+// Fixed by moving both writes inside ONE transaction. upsertCampaignDetailsValidated
+// (db/campaignDetails.ts) already composes correctly inside a caller's
+// transaction — its own withDraftLock opens a Postgres SAVEPOINT when handed
+// an existing tx (see that function's doc comment) — so when its validation
+// throws CampaignDetailsValidationError, the exception propagates up through
+// this function's own `client.transaction()` callback and the WHOLE
+// transaction rolls back, undoing updateCampaign()'s write too, not just the
+// savepoint. `existingCampaign` is the ALREADY-fetched campaign row the route
+// resolved for its own 404 check — reused here (not re-queried) so the
+// "campaignPatch is empty" branch behaves identically to the pre-fix code,
+// which returned that same object without opening any transaction at all.
+export async function updateCampaignWithDetails(
+  id: string,
+  campaignPatch: Partial<CampaignInsert>,
+  detailsPatch: Omit<Partial<CampaignDetailsInsert>, "id" | "campaignId">,
+  existingCampaign: Campaign,
+  client: Db | DbTx = db,
+): Promise<{ campaign: Campaign; details: CampaignDetails | null }> {
+  const hasCampaignPatch = Object.keys(campaignPatch).length > 0;
+  const hasDetailsPatch = Object.keys(detailsPatch).length > 0;
+  if (!hasCampaignPatch && !hasDetailsPatch) {
+    return { campaign: existingCampaign, details: await getCampaignDetails(id, client) };
+  }
+  return client.transaction(async (tx) => {
+    const campaign = hasCampaignPatch ? await updateCampaign(id, campaignPatch, tx) : existingCampaign;
+    const details = hasDetailsPatch
+      ? await upsertCampaignDetailsValidated(id, detailsPatch, tx)
+      : await getCampaignDetails(id, tx);
+    return { campaign, details };
+  });
 }
 
 /**

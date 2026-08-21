@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 import {
   listCampaigns,
   createCampaign,
-  updateCampaign,
+  updateCampaignWithDetails,
   getCampaignWithWorkflows,
   findCampaignById,
   deleteCampaign,
@@ -22,7 +22,6 @@ import {
   getCampaignDetails,
   getCampaignDetailsByCampaignIds,
   upsertCampaignDetails,
-  upsertCampaignDetailsValidated,
 } from "../db/campaignDetails.js";
 import {
   getNegotiationPolicy,
@@ -736,7 +735,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     trackingParameter?: string | null;
   };
 
-  const patch: Parameters<typeof updateCampaign>[1] = {};
+  const patch: Parameters<typeof updateCampaignWithDetails>[1] = {};
   // PLU-135 (1a): the creator-facing fields below now live in CampaignDetails,
   // patched separately from the Campaign row itself.
   const detailsPatch: Parameters<typeof upsertCampaignDetails>[1] = {};
@@ -1076,14 +1075,18 @@ router.patch("/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const campaign =
-      Object.keys(patch).length > 0
-        ? await updateCampaign(req.params["id"]!, patch)
-        : existing;
-    const details =
-      Object.keys(detailsPatch).length > 0
-        ? await upsertCampaignDetailsValidated(req.params["id"]!, detailsPatch)
-        : await getCampaignDetails(req.params["id"]!);
+    // Review fix — "a request that changes campaign fields and public terms
+    // can return a validation error after updateCampaign() has already
+    // committed the campaign patch": both writes now happen inside ONE
+    // transaction (db/campaigns.ts's updateCampaignWithDetails) so a
+    // rejected details validation rolls back the campaign patch too,
+    // leaving no partial update.
+    const { campaign, details } = await updateCampaignWithDetails(
+      req.params["id"]!,
+      patch,
+      detailsPatch,
+      existing,
+    );
     res.json({
       ...flattenCampaign(campaign, details),
       updatedAt: campaign.updatedAt.toISOString(),
