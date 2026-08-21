@@ -22,7 +22,12 @@ import {
   getCampaignDetailsByCampaignIds,
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
-import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
+import {
+  getNegotiationPolicy,
+  upsertNegotiationPolicy,
+  upsertNegotiationPolicyValidated,
+  NegotiationPolicyValidationError,
+} from "../db/negotiationPolicy.js";
 import {
   validateDeliverables,
   normalizeLegacyDeliverables,
@@ -35,12 +40,7 @@ import {
   SCRIPT_WAIVER_MODES,
   isScriptWaiverMode,
 } from "../domain/rightsPolicyRules.js";
-import {
-  validateNegotiationPolicyPatch,
-  needsNegotiationPolicyCrossFieldCheck,
-  type NegotiationPolicyPatchInput,
-  type NegotiationPolicyValidationCode as CrossFieldValidationCode,
-} from "../domain/negotiationPolicyValidation.js";
+import type { NegotiationPolicyValidationCode as CrossFieldValidationCode } from "../domain/negotiationPolicyValidation.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
   getCreatorRequirement,
@@ -1398,60 +1398,21 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
   // write-time rejection of a limit whose mode doesn't authorize it (item
   // 9's "ideally reject the combination at write time too"). The actual
   // rules live in domain/negotiationPolicyValidation.ts (pure, unit-tested
-  // there) — this route's only job is fetching the live rows the pure
-  // function needs and translating its result into an HTTP response.
-  // ceilingCents/giftValueFlexibilityCents are DELIBERATELY EXEMPT from the
-  // "limit without authorizing mode" check — see compensationShape.ts's own
-  // doc comment (§3.6): they pre-date this ticket and the live negotiation
-  // agent already depends on them unconditionally.
-  const patchForValidation: NegotiationPolicyPatchInput = {
-    feeMode,
-    ceilingCents,
-    commissionNegotiationMode,
-    commissionCeilingRate,
-    commissionCeilingAmountCents,
-    commissionDurationMode,
-    commissionDurationLimitValue,
-    commissionDurationLimitUnit,
-    postingNegotiationMode,
-    postingMaxDelayDays,
-    giftSubstitutionMode,
-    giftApprovedSubstitutes,
-    giftCashReplacementMode,
-    giftCashReplacementLimitCents,
-    deliverableNegotiationMode,
-    deliverablePolicyRules,
-  };
-  if (needsNegotiationPolicyCrossFieldCheck(patchForValidation)) {
-    // Fetched (at most) once each, reused by every rule inside the pure
-    // validator — not re-fetched per field, which would otherwise be an
-    // N+1 query for a patch touching several mode/limit pairs at once.
-    const [details, existingPolicy] = await Promise.all([
-      getCampaignDetails(req.params["id"]!),
-      getNegotiationPolicy(req.params["id"]!),
-    ]);
-    const validation = validateNegotiationPolicyPatch(patchForValidation, {
-      publicPriceStrategy: details?.priceStrategy ?? null,
-      publicStartingFeeCents: details?.publicStartingFeeCents ?? null,
-      publicCommissionMode: details?.commissionMode ?? null,
-      publicCommissionRate: details?.publicCommissionRate ?? null,
-      existingFeeMode: existingPolicy?.feeMode ?? null,
-      existingCeilingCents: existingPolicy?.ceilingCents ?? null,
-      existingCommissionNegotiationMode: existingPolicy?.commissionNegotiationMode ?? null,
-      existingCommissionCeilingRate: existingPolicy?.commissionCeilingRate ?? null,
-      existingCommissionCeilingAmountCents: existingPolicy?.commissionCeilingAmountCents ?? null,
-      existingCommissionDurationMode: existingPolicy?.commissionDurationMode ?? null,
-      existingPostingNegotiationMode: existingPolicy?.postingNegotiationMode ?? null,
-      existingGiftSubstitutionMode: existingPolicy?.giftSubstitutionMode ?? null,
-      existingGiftCashReplacementMode: existingPolicy?.giftCashReplacementMode ?? null,
-      existingDeliverableNegotiationMode: existingPolicy?.deliverableNegotiationMode ?? null,
-    });
-    if (!validation.ok) {
-      negotiationPolicyValidationError(res, validation.code, validation.error);
-      return;
-    }
-  }
-
+  // there).
+  //
+  // Review fix ("policy validation is not atomic with its write"): this
+  // used to read CampaignDetails/NegotiationPolicy and validate HERE, then
+  // separately call upsertNegotiationPolicy — two steps with no lock held
+  // across them, so two concurrent PATCHes could each validate against a
+  // stale view of the OTHER's not-yet-committed change (e.g. one sets
+  // feeMode=ALLOW_WITHIN_LIMIT, the other concurrently sets a ceilingCents
+  // below the public fee — each looks valid in isolation against what it
+  // read, both commit, the combination is invalid). The read + validate now
+  // happens INSIDE db/negotiationPolicy.ts's upsertNegotiationPolicyValidated,
+  // in the SAME transaction and behind the SAME Campaign-row lock as the
+  // write itself — see that function's own doc comment for the full
+  // reasoning. This route no longer validates before calling it; it just
+  // builds the patch and lets the atomic function validate+write+throw.
   const patch: Parameters<typeof upsertNegotiationPolicy>[1] = {};
   if (floorCents !== undefined) patch.floorCents = floorCents;
   if (ceilingCents !== undefined) patch.ceilingCents = ceilingCents;
@@ -1522,7 +1483,7 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const policy = await upsertNegotiationPolicy(req.params["id"]!, patch);
+    const policy = await upsertNegotiationPolicyValidated(req.params["id"]!, patch);
     res.json({
       ...policy,
       createdAt: policy.createdAt.toISOString(),
@@ -1531,6 +1492,10 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
   } catch (err) {
     if (err instanceof CampaignLockedError) {
       res.status(409).json({ error: err.message });
+      return;
+    }
+    if (err instanceof NegotiationPolicyValidationError) {
+      negotiationPolicyValidationError(res, err.code, err.message);
       return;
     }
     console.error("[campaigns] update negotiation policy error:", err);
