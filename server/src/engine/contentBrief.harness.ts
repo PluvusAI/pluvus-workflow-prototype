@@ -38,13 +38,17 @@ import { eq } from "drizzle-orm";
 import { db } from "../db/drizzle.js";
 import {
   brandNotifications,
+  campaignBriefs,
   campaignDetails,
+  campaignTermsSnapshots,
   campaigns,
   creators,
   events,
   executionInstances,
   finalAgreements,
   messages,
+  negotiationPolicies,
+  negotiationPolicySnapshots,
   paymentInfo,
   workflows,
   workflowVersions,
@@ -59,6 +63,11 @@ import {
 // resolveAgreedFee/config — the harness must seed the row a real accept turn
 // would have written (recordFinalAgreementOnce), same as any other caller.
 import { recordFinalAgreementOnce, findFinalAgreementByInstance } from "../db/finalAgreements.js";
+// Review fix sub-case: a real launched campaign is required to exercise the
+// pluvus_builder BLOCKED branch — resolveCurrentCampaignBriefForInstance's
+// "dead auto-regen attempt" result only exists once a CampaignTermsSnapshot
+// is real and pinned.
+import { launchCampaign } from "../db/campaigns.js";
 import { WorkflowRuntime } from "./runtime.js";
 import { MockEmailProvider, MockAgentProvider } from "./providers.js";
 import type { NodeSnapshot } from "./types.js";
@@ -444,6 +453,208 @@ async function main(): Promise<void> {
       await db.delete(messages).where(eq(messages.instanceId, noFeeInstance.id));
       await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, noFeeInstance.id));
       await db.delete(executionInstances).where(eq(executionInstances.id, noFeeInstance.id));
+    }
+
+    // ── Review fix SUB-CASE (round 4): campaignType cannot be resolved at
+    //    all — no pinned snapshot AND no live campaignDetails (an orphaned
+    //    workflow with no campaignId). A fee-less agreement must still
+    //    escalate: the old `needsFixedFee` check read an unresolvable type
+    //    as neither PAID nor HYBRID and let it through as if no fee were
+    //    ever required — this must now fail CLOSED instead. ─────────────
+    const orphanWorkflow = (await db.insert(workflows).values({
+      name: `Content Brief Harness Orphan Workflow ${stamp}`,
+      status: "PUBLISHED",
+    }).returning())[0]!;
+    const orphanVersion = (await db.insert(workflowVersions).values({
+      workflowId: orphanWorkflow.id,
+      version: 1,
+      nodeGraph: MERGED as unknown as InputJsonValue,
+    }).returning())[0]!;
+    const orphanInstance = (await db.insert(executionInstances).values({
+      workflowVersionId: orphanVersion.id,
+      creatorId: creator.id,
+      currentState: "ACCEPTED",
+      currentNodeId: null,
+    }).returning())[0]!;
+    try {
+      await seedFinalAgreement(orphanInstance.id, { finalFeeCents: null });
+      await runtime.stepInstance(orphanInstance.id);
+      assert.equal(
+        await state(orphanInstance.id),
+        "MANUAL_REVIEW",
+        "an unresolvable campaignType must fail closed, never assume no fee is needed",
+      );
+      const escalations = await listEventsByInstance(orphanInstance.id, { type: "MANUAL_REVIEW_FLAGGED" });
+      assert.equal(
+        (escalations[0]?.payload as Record<string, unknown> | undefined)?.["reason"],
+        "missing_fixed_fee",
+      );
+      const orphanMsgs = await listMessagesByInstance(orphanInstance.id);
+      assert.equal(
+        orphanMsgs.filter((m) => m.direction === "OUTBOUND").length,
+        0,
+        "no payout-link email may be sent when campaignType cannot be resolved and no fee is present",
+      );
+      console.log("  ✓ unresolvable campaignType + no fee → MANUAL_REVIEW (missing_fixed_fee), fails closed");
+    } finally {
+      await db.delete(events).where(eq(events.instanceId, orphanInstance.id));
+      await db.delete(messages).where(eq(messages.instanceId, orphanInstance.id));
+      await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, orphanInstance.id));
+      await db.delete(executionInstances).where(eq(executionInstances.id, orphanInstance.id));
+      await db.delete(workflowVersions).where(eq(workflowVersions.id, orphanVersion.id));
+      await db.delete(workflows).where(eq(workflows.id, orphanWorkflow.id));
+    }
+
+    // ── Review fix SUB-CASE (round 4, positive control): an EXPLICITLY
+    //    amountless classification (AFFILIATE) with no fee must still
+    //    proceed normally — proves the fail-closed fix above didn't turn
+    //    into "always require a fee." ──────────────────────────────────
+    const affiliateCampaign = (await db.insert(campaigns).values({
+      name: `Content Brief Harness Affiliate Campaign ${stamp}`,
+      brand: "Acme",
+    }).returning())[0]!;
+    await db.insert(campaignDetails).values({
+      campaignId: affiliateCampaign.id,
+      campaignType: "AFFILIATE",
+    });
+    const affiliateWorkflow = (await db.insert(workflows).values({
+      name: `Content Brief Harness Affiliate Workflow ${stamp}`,
+      status: "PUBLISHED",
+      campaignId: affiliateCampaign.id,
+    }).returning())[0]!;
+    const affiliateVersion = (await db.insert(workflowVersions).values({
+      workflowId: affiliateWorkflow.id,
+      version: 1,
+      nodeGraph: MERGED as unknown as InputJsonValue,
+    }).returning())[0]!;
+    const affiliateInstance = (await db.insert(executionInstances).values({
+      workflowVersionId: affiliateVersion.id,
+      creatorId: creator.id,
+      currentState: "ACCEPTED",
+      currentNodeId: null,
+    }).returning())[0]!;
+    try {
+      await seedFinalAgreement(affiliateInstance.id, { finalFeeCents: null });
+      await runtime.stepInstance(affiliateInstance.id);
+      assert.equal(
+        await state(affiliateInstance.id),
+        "PAYMENT_PENDING",
+        "an explicitly AFFILIATE (amountless) agreement with no fee must proceed normally, not escalate",
+      );
+      console.log("  ✓ explicit AFFILIATE campaignType + no fee → PAYMENT_PENDING (no false-positive escalation)");
+    } finally {
+      await db.delete(events).where(eq(events.instanceId, affiliateInstance.id));
+      await db.delete(messages).where(eq(messages.instanceId, affiliateInstance.id));
+      await db.delete(paymentInfo).where(eq(paymentInfo.instanceId, affiliateInstance.id));
+      await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, affiliateInstance.id));
+      await db.delete(executionInstances).where(eq(executionInstances.id, affiliateInstance.id));
+      await db.delete(workflowVersions).where(eq(workflowVersions.id, affiliateVersion.id));
+      await db.delete(workflows).where(eq(workflows.id, affiliateWorkflow.id));
+      await db.delete(campaignDetails).where(eq(campaignDetails.campaignId, affiliateCampaign.id));
+      await db.delete(campaigns).where(eq(campaigns.id, affiliateCampaign.id));
+    }
+
+    // ── Review fix SUB-CASE: a BLOCKED pluvus_builder CampaignBrief (a dead
+    //    auto-regen attempt — the exact "transient-looking category, BLOCKED
+    //    status" case) must escalate to MANUAL_REVIEW, never throw for a
+    //    retry that can only replay the same failed render forever, and must
+    //    NOT notify the brand (a platform-side rendering problem, never
+    //    something the brand caused or can act on) ─────────────────────────
+    const blockedCampaign = (await db.insert(campaigns).values({
+      name: `Content Brief Harness BLOCKED Campaign ${stamp}`,
+      brand: "Acme",
+    }).returning())[0]!;
+    await db.insert(campaignDetails).values({
+      campaignId: blockedCampaign.id,
+      objective: "Drive signups",
+      usageRights: "90-day paid social",
+      campaignType: "PAID",
+      priceStrategy: "REQUEST_RATE_CARD",
+      compensationReviewStatus: "CONFIRMED",
+      deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
+      briefDeliveryMethod: "pluvus_builder",
+    });
+    await db.insert(negotiationPolicies).values({
+      campaignId: blockedCampaign.id,
+      floorCents: 20_000,
+      ceilingCents: 50_000,
+    });
+    const blockedSnapshot = await launchCampaign(blockedCampaign.id);
+    // The exact deterministic key resolveAgainstExpectedSnapshot itself would
+    // compute for this campaign/snapshot pair — a prior auto-regen attempt
+    // that already failed, so a fresh call can never mint a new one.
+    await db.insert(campaignBriefs).values({
+      campaignId: blockedCampaign.id,
+      campaignTermsSnapshotId: blockedSnapshot.id,
+      renderRequestId: `auto-regen|${blockedCampaign.id}|${blockedSnapshot.id}`,
+      status: "FAILED",
+      renderedAssetRef: null,
+      errorCategory: "RENDER_FAILED",
+      brandIdentitySnapshot: {},
+      templateVersion: "v1",
+    });
+    const blockedWorkflow = (await db.insert(workflows).values({
+      name: `Content Brief Harness BLOCKED Workflow ${stamp}`,
+      status: "PUBLISHED",
+      campaignId: blockedCampaign.id,
+    }).returning())[0]!;
+    const blockedVersion = (await db.insert(workflowVersions).values({
+      workflowId: blockedWorkflow.id,
+      version: 1,
+      nodeGraph: MERGED as unknown as InputJsonValue,
+    }).returning())[0]!;
+    const blockedInstance = (await db.insert(executionInstances).values({
+      workflowVersionId: blockedVersion.id,
+      creatorId: creator.id,
+      currentState: "ACCEPTED",
+      currentNodeId: null,
+      campaignTermsSnapshotId: blockedSnapshot.id,
+    }).returning())[0]!;
+    try {
+      await seedFinalAgreement(blockedInstance.id);
+      await runtime.stepInstance(blockedInstance.id);
+      assert.equal(
+        await state(blockedInstance.id),
+        "MANUAL_REVIEW",
+        "a BLOCKED pluvus_builder CampaignBrief must escalate, never retry the same dead render forever",
+      );
+      const escalations = await listEventsByInstance(blockedInstance.id, { type: "MANUAL_REVIEW_FLAGGED" });
+      assert.equal(
+        (escalations[0]?.payload as Record<string, unknown> | undefined)?.["reason"],
+        "campaign_brief_mismatch",
+      );
+      const blockedMsgs = await listMessagesByInstance(blockedInstance.id);
+      assert.equal(
+        blockedMsgs.filter((m) => m.direction === "OUTBOUND").length,
+        0,
+        "no brief/offer email may be sent for a BLOCKED campaign brief",
+      );
+      const brandNotifs = await db
+        .select()
+        .from(brandNotifications)
+        .where(eq(brandNotifications.instanceId, blockedInstance.id));
+      assert.equal(
+        brandNotifs.length,
+        0,
+        "a campaign_brief_mismatch escalation is platform-side — the brand must not be notified",
+      );
+      console.log(
+        "  ✓ pluvus_builder BLOCKED CampaignBrief → MANUAL_REVIEW (campaign_brief_mismatch), no brand notification",
+      );
+    } finally {
+      await db.delete(events).where(eq(events.instanceId, blockedInstance.id));
+      await db.delete(messages).where(eq(messages.instanceId, blockedInstance.id));
+      await db.delete(brandNotifications).where(eq(brandNotifications.instanceId, blockedInstance.id));
+      await db.delete(finalAgreements).where(eq(finalAgreements.instanceId, blockedInstance.id));
+      await db.delete(executionInstances).where(eq(executionInstances.id, blockedInstance.id));
+      await db.delete(campaignBriefs).where(eq(campaignBriefs.campaignId, blockedCampaign.id));
+      await db.delete(workflowVersions).where(eq(workflowVersions.id, blockedVersion.id));
+      await db.delete(workflows).where(eq(workflows.id, blockedWorkflow.id));
+      await db.delete(campaignTermsSnapshots).where(eq(campaignTermsSnapshots.campaignId, blockedCampaign.id));
+      await db.delete(negotiationPolicySnapshots).where(eq(negotiationPolicySnapshots.campaignId, blockedCampaign.id));
+      await db.delete(negotiationPolicies).where(eq(negotiationPolicies.campaignId, blockedCampaign.id));
+      await db.delete(campaignDetails).where(eq(campaignDetails.campaignId, blockedCampaign.id));
+      await db.delete(campaigns).where(eq(campaigns.id, blockedCampaign.id));
     }
 
     // ── LEGACY SUB-CASE: reward → payment → content-brief still reaches terminal ─

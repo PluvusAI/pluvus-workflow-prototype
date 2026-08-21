@@ -26,7 +26,6 @@ import { resolveEffectiveNegotiationConfig } from "../effectiveTerms.js";
 // PLU-143: the two canonical creator-specific/shared-obligation sources this
 // executor now reads from — see docs/plu-143-content-brief-final-agreement-plan.md.
 import { resolveCurrentCampaignBriefForInstance } from "../../db/campaignBriefValidation.js";
-import type { CampaignBriefMismatchCategory } from "../../db/campaignBriefValidation.js";
 import {
   findFinalAgreementByInstance,
   recordContentBriefGeneration,
@@ -190,9 +189,20 @@ export async function executeContentBrief(
     // material negotiated term the snapshot exists to freeze, just a
     // classification, and skipping this guard entirely for every no-snapshot
     // legacy instance would defeat its purpose.
+    //
+    // Review fix (round 4): default to REQUIRING a fee, and only skip the
+    // guard when the persisted classification EXPLICITLY names an amountless
+    // model (AFFILIATE / GIFT_ONLY) — never when campaignType could not be
+    // resolved at all (no pinned snapshot AND no live campaignDetails, e.g.
+    // an orphaned/unlinked workflow). The old `needsFixedFee` check inverted
+    // this: an unresolvable campaignType read as `undefined`, which matched
+    // neither PAID nor HYBRID, so `needsFixedFee` was FALSE and a fee-less
+    // agreement sailed straight through to a minted payout link. Failing
+    // closed here mirrors the "never fabricate/guess terms" posture the rest
+    // of this executor already follows for a missing FinalAgreement/brand.
     const campaignType = detailsSnapshot?.["campaignType"] ?? ctx.campaignDetails?.campaignType;
-    const needsFixedFee = campaignType === "PAID" || campaignType === "HYBRID";
-    if (needsFixedFee && fixedFee === undefined) {
+    const isExplicitlyAmountless = campaignType === "AFFILIATE" || campaignType === "GIFT_ONLY";
+    if (fixedFee === undefined && !isExplicitlyAmountless) {
       return blockedByMissingFixedFee(node.type);
     }
 
@@ -219,25 +229,30 @@ export async function executeContentBrief(
 
     if (briefDeliveryMethod === "pluvus_builder") {
       const briefResult = await resolveCurrentCampaignBriefForInstance(instance.id);
-      if (briefResult.status !== "CURRENT") {
-        const IDENTITY_MISMATCH_CATEGORIES = new Set<CampaignBriefMismatchCategory>([
-          "NO_CAMPAIGN",
-          "NO_PINNED_SNAPSHOT",
-          "SNAPSHOT_MISMATCH",
-          "CROSS_CAMPAIGN",
-        ]);
-        if (briefResult.mismatchCategory && IDENTITY_MISMATCH_CATEGORIES.has(briefResult.mismatchCategory)) {
-          // A real identity/integrity problem — no retry fixes this.
-          return blockedByCampaignBriefMismatch(node.type, briefResult);
-        }
-        // The asset just isn't ready yet (NO_CURRENT_BRIEF/ASSET_UNAVAILABLE/
-        // DATA_INCOMPLETE) — resolveCurrentCampaignBriefForInstance already
-        // triggered a regeneration. Throw so the engine's own retry re-attempts
-        // later, same pattern the missing-briefFileRef check below already
-        // uses, rather than escalating a transient state to a human.
+      // Review fix: branch on `status`, the field that actually distinguishes
+      // "will resolve on its own" from "will never resolve on its own" —
+      // `mismatchCategory` alone doesn't. A transient category like
+      // ASSET_UNAVAILABLE/NO_CURRENT_BRIEF/DATA_INCOMPLETE can STILL end up
+      // BLOCKED (not REGENERATING) when the deterministic render for this
+      // exact snapshot already failed once — retrying that render can never
+      // produce a different result (see campaignBriefValidation.ts's own
+      // "FAILED" branch: a fresh attempt needs a NEW client-supplied
+      // renderRequestId, which this auto-path deliberately never mints).
+      // Escalating BLOCKED before this fix threw for retry instead, so a
+      // failed render churned forever: render fails → BLOCKED → throw/retry
+      // → same failed render → BLOCKED → retry → ... — the creator's turn
+      // never actually advanced.
+      if (briefResult.status === "BLOCKED") {
+        return blockedByCampaignBriefMismatch(node.type, briefResult);
+      }
+      if (briefResult.status === "REGENERATING") {
+        // Genuinely in flight — resolveCurrentCampaignBriefForInstance
+        // already (re)triggered the regeneration. Throw so the engine's own
+        // retry re-attempts once it finishes, same pattern the missing-
+        // briefFileRef check below already uses.
         throw new Error(
-          `CONTENT_BRIEF for ${instance.id}: campaign brief not yet ready ` +
-            `(status=${briefResult.status}, category=${briefResult.mismatchCategory ?? "none"})`,
+          `CONTENT_BRIEF for ${instance.id}: campaign brief regenerating ` +
+            `(category=${briefResult.mismatchCategory ?? "none"})`,
         );
       }
       const brief = briefResult.brief;

@@ -178,6 +178,18 @@ export interface GraphValidationOptions {
    * names) launchable while still refusing structurally-broken graphs.
    */
   structuralOnly?: boolean;
+  /**
+   * Review fix (PLU-143): CampaignDetails.briefDeliveryMethod — NOT node
+   * config, so this validator (which otherwise only ever sees the
+   * NodeSnapshot[] graph) has no way to see it unless the caller threads it
+   * in explicitly. When `"pluvus_builder"`, the CONTENT_BRIEF node attaches
+   * the PLU-142-resolved rendered CampaignBrief at send time instead of a
+   * brand-uploaded `briefFileRef` (see contentBrief.ts) — so requiring
+   * `briefFileRef` at publish for that campaign is a false positive that
+   * blocks an otherwise-complete, correctly-configured campaign. Absent/
+   * `"own_doc"`/anything else falls back to today's behavior unchanged.
+   */
+  briefDeliveryMethod?: string | null;
 }
 
 export function validateWorkflowGraph(
@@ -406,7 +418,7 @@ export function validateWorkflowGraph(
   // required node config (skipped in structural-only mode)
   if (!options.structuralOnly) {
     for (const n of nodes) {
-      const issue = validateNodeConfig(n);
+      const issue = validateNodeConfig(n, options.briefDeliveryMethod);
       if (issue) push(issue);
     }
   }
@@ -418,7 +430,7 @@ export function validateWorkflowGraph(
 // Per-node required config.
 // ---------------------------------------------------------------------------
 
-function validateNodeConfig(n: GNode): ValidationIssue | null {
+function validateNodeConfig(n: GNode, briefDeliveryMethod?: string | null): ValidationIssue | null {
   const cfg = n.config ?? {};
   switch (n.type) {
     case "INITIAL_OUTREACH": {
@@ -483,7 +495,10 @@ function validateNodeConfig(n: GNode): ValidationIssue | null {
       return null;
     }
     case "CONTENT_BRIEF": {
-      if (!nonEmpty(cfg["briefFileRef"]))
+      // Review fix (PLU-143): a "pluvus_builder" campaign attaches the
+      // rendered CampaignBrief at send time, never briefFileRef — see
+      // GraphValidationOptions.briefDeliveryMethod's own doc comment.
+      if (briefDeliveryMethod !== "pluvus_builder" && !nonEmpty(cfg["briefFileRef"]))
         return err(
           n,
           "MISSING_BRIEF_ATTACHMENT",
