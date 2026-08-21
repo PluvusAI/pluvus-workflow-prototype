@@ -18,9 +18,11 @@ import {
 } from "../db/campaigns.js";
 import {
   CampaignLockedError,
+  CampaignDetailsValidationError,
   getCampaignDetails,
   getCampaignDetailsByCampaignIds,
   upsertCampaignDetails,
+  upsertCampaignDetailsValidated,
 } from "../db/campaignDetails.js";
 import {
   getNegotiationPolicy,
@@ -1080,7 +1082,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
         : existing;
     const details =
       Object.keys(detailsPatch).length > 0
-        ? await upsertCampaignDetails(req.params["id"]!, detailsPatch)
+        ? await upsertCampaignDetailsValidated(req.params["id"]!, detailsPatch)
         : await getCampaignDetails(req.params["id"]!);
     res.json({
       ...flattenCampaign(campaign, details),
@@ -1089,6 +1091,15 @@ router.patch("/:id", async (req: Request, res: Response) => {
   } catch (err) {
     if (err instanceof CampaignLockedError) {
       res.status(409).json({ error: err.message });
+      return;
+    }
+    // Review fix — "validate public fee, commission, and unit changes
+    // together with the stored policy before committing the details
+    // update": the symmetric direction of the negotiation-policy PATCH's
+    // own validation error, same stable codes (FEE_LIMIT_BELOW_PUBLIC_OFFER /
+    // COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION), same 400 response shape.
+    if (err instanceof CampaignDetailsValidationError) {
+      negotiationPolicyValidationError(res, err.code, err.message);
       return;
     }
     console.error("[campaigns] update error:", err);
