@@ -178,6 +178,15 @@ test("missing content brief attachment is rejected", () => {
   assert.ok(codes(res).includes("MISSING_BRIEF_ATTACHMENT"));
 });
 
+test("pluvus_builder brief delivery suppresses missing attachment error", () => {
+  const nodes = [
+    gnode("a", "INITIAL_OUTREACH", ["cb"], OUTREACH_CFG),
+    gnode("cb", "CONTENT_BRIEF", []), // no briefFileRef
+  ];
+  const res = validateWorkflowGraph(nodes, { briefDeliveryMethod: "pluvus_builder" });
+  assert.ok(!codes(res).includes("MISSING_BRIEF_ATTACHMENT"), JSON.stringify(res.errors));
+});
+
 test("manual outreach missing subject is rejected", () => {
   const nodes = [
     gnode("a", "INITIAL_OUTREACH", ["r"], { outreachMode: "manual", bodyTemplate: "Body only" }),

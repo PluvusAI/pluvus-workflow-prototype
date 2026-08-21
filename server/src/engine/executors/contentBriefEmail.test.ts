@@ -26,7 +26,7 @@ const full = () =>
     formLink: FORM_LINK,
     fixedFee: 750,
     commissionRate: 15,
-    deliverables: "2 Reels + 1 Story",
+    deliverableLines: ["2 Reels", "1 Story"],
     timeline: "Content live by July 20, 2026",
     creatorNotes: "Please tag @pluvus in your first story.",
   });

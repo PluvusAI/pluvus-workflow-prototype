@@ -472,8 +472,15 @@ export class WorkflowRuntime {
     // manual queue. Email the brand so a human can take over. Best-effort: the
     // state is already persisted above, and notifyBrandOfEscalation never throws,
     // so a notification failure cannot roll back or block the workflow step.
+    // Review fix (PLU-143): skip the brand email for reasons that are purely
+    // internal/platform-side — see INTERNAL_ONLY_ESCALATION_REASONS' own
+    // comment. The instance still lands in MANUAL_REVIEW and the Manual Queue
+    // either way; only the brand-facing notice is skipped.
     if (result.nextState === "MANUAL_REVIEW" && instance.currentState !== "MANUAL_REVIEW") {
-      await notifyBrandOfEscalation(this.email, instanceId, escalationReason(result));
+      const reason = escalationReason(result);
+      if (!INTERNAL_ONLY_ESCALATION_REASONS.has(reason)) {
+        await notifyBrandOfEscalation(this.email, instanceId, reason);
+      }
     }
 
     // ── Deal-finalization notification (PLU-70) ───────────────────────────────
@@ -1536,3 +1543,12 @@ function escalationReason(result: NodeResult): string {
   }
   return "escalated";
 }
+
+// Review fix (PLU-143): a BLOCKED CampaignBrief render (blockedByCampaignBriefMismatch)
+// is a platform-side rendering/data-integrity problem — a stuck render for the
+// pinned snapshot, or the pinned snapshot no longer matching the campaign's own
+// current one. It is never something the brand caused or can act on (unlike,
+// say, missing_brand_name, which IS a config the brand's own team can fix), so
+// it belongs in the internal Manual Queue only. Scoped to this one reason —
+// every other escalation reason keeps notifying the brand exactly as before.
+const INTERNAL_ONLY_ESCALATION_REASONS = new Set<string>(["campaign_brief_mismatch"]);

@@ -71,6 +71,7 @@ async function seedLaunchedCampaign(
     campaignType: "PAID",
     priceStrategy: "REQUEST_RATE_CARD",
     compensationReviewStatus: "CONFIRMED",
+    deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
     ...details,
   });
   await pgdb.insert(schema.negotiationPolicies).values({

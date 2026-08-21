@@ -51,6 +51,7 @@ async function seedLaunchedCampaign(pgdb: Db): Promise<{ campaignId: string; ter
     campaignType: "PAID",
     priceStrategy: "REQUEST_RATE_CARD",
     compensationReviewStatus: "CONFIRMED",
+    deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
   });
   await pgdb.insert(schema.negotiationPolicies).values({
     campaignId: campaign!.id,
@@ -146,6 +147,7 @@ async function main(): Promise<void> {
       productOrOffer: "A free pair of running shoes",
       giftDisposition: "KEEP",
       compensationReviewStatus: "CONFIRMED",
+      deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
     });
     await pgdb.insert(schema.negotiationPolicies).values({
       campaignId: campaign!.id,

@@ -57,7 +57,7 @@ const router = Router();
 // keeps the historical `errors: string[]` shape AND adds structured `issues[]`.
 function validateWorkflowNodes(
   nodesRaw: unknown,
-  opts: { structuralOnly?: boolean } = {},
+  opts: { structuralOnly?: boolean; briefDeliveryMethod?: string | null } = {},
 ): {
   valid: boolean;
   errors: string[];
@@ -455,7 +455,6 @@ router.put("/:id/metadata", async (req: Request, res: Response) => {
 router.put("/:id/draft", async (req: Request, res: Response) => {
   const { nodes } = req.body as { nodes?: unknown };
 
-  const validation = validateWorkflowNodes(nodes);
   // For draft saves we allow partial/empty graphs (soft validation warnings only).
   // We just store what the builder sends as-is unless it's malformed JSON.
   if (!Array.isArray(nodes)) {
@@ -470,24 +469,29 @@ router.put("/:id/draft", async (req: Request, res: Response) => {
       return;
     }
 
+    // Review fix (PLU-143): load campaign/details BEFORE validating so
+    // validateWorkflowNodes can see briefDeliveryMethod — see the /publish
+    // route's identical comment for why.
+    const campaign = wf.campaignId ? await findCampaignById(wf.campaignId) : null;
+    const details = campaign ? await getCampaignDetails(campaign.id) : null;
+    const validation = validateWorkflowNodes(nodes, {
+      briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
+    });
+
     // Re-inject the campaign brand into node configs so it survives builder
     // edits (the per-node forms can drop brandName/senderName on save).
     let nodesToSave: unknown = nodes;
-    if (wf.campaignId) {
-      const campaign = await findCampaignById(wf.campaignId);
-      if (campaign) {
-        const details = await getCampaignDetails(campaign.id);
-        nodesToSave = restampBrand(
-          nodes,
-          campaign.brand,
-          details?.brandDescription,
-          details?.shipsPhysicalProduct,
-        );
-        // PLU-117: stamp campaignName + deal-shape sources onto the outreach node
-        // so the builder palette/preview/AI see their real values (or hide them
-        // when absent). Depends on the NEGOTIATION node, so run after restamp.
-        nodesToSave = stampOutreachDerivedFields(nodesToSave, campaign.name);
-      }
+    if (campaign) {
+      nodesToSave = restampBrand(
+        nodes,
+        campaign.brand,
+        details?.brandDescription,
+        details?.shipsPhysicalProduct,
+      );
+      // PLU-117: stamp campaignName + deal-shape sources onto the outreach node
+      // so the builder palette/preview/AI see their real values (or hide them
+      // when absent). Depends on the NEGOTIATION node, so run after restamp.
+      nodesToSave = stampOutreachDerivedFields(nodesToSave, campaign.name);
     }
     // Mirror the brand's negotiation commission onto the Reward Setup node so the
     // builder + runtime always show the current value (independent of campaign).
@@ -522,7 +526,11 @@ router.post("/:id/validate", async (req: Request, res: Response) => {
       res.status(404).json({ error: "workflow not found" });
       return;
     }
-    const validation = validateWorkflowNodes(wf.draftNodes);
+    // Review fix (PLU-143): see the /publish route's identical comment.
+    const details = wf.campaignId ? await getCampaignDetails(wf.campaignId) : null;
+    const validation = validateWorkflowNodes(wf.draftNodes, {
+      briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
+    });
     res.json({ valid: validation.valid, errors: validation.errors, issues: validation.issues });
   } catch (err) {
     console.error("[workflows] validate error:", err);
@@ -544,7 +552,18 @@ router.post("/:id/publish", async (req: Request, res: Response) => {
       return;
     }
 
-    const validation = validateWorkflowNodes(wf.draftNodes);
+    // Review fix (PLU-143): load campaign/details BEFORE validating (not
+    // after, as this route previously did) so validateWorkflowNodes can see
+    // briefDeliveryMethod — a "pluvus_builder" campaign attaches the rendered
+    // CampaignBrief at send time, never briefFileRef, so requiring an
+    // uploaded PDF at publish for it is a false-positive MISSING_BRIEF_
+    // ATTACHMENT block on an otherwise-complete campaign.
+    const campaign = wf.campaignId ? await findCampaignById(wf.campaignId) : null;
+    const details = campaign ? await getCampaignDetails(campaign.id) : null;
+
+    const validation = validateWorkflowNodes(wf.draftNodes, {
+      briefDeliveryMethod: details?.briefDeliveryMethod ?? null,
+    });
     if (!validation.valid) {
       res.status(422).json({
         error: "workflow has validation errors",
@@ -559,23 +578,19 @@ router.post("/:id/publish", async (req: Request, res: Response) => {
     // builder's draft-save didn't stamp it (e.g. workflows created before
     // brandDescription was added, or configs edited in the builder).
     let nodeGraphToPublish: InputJsonValue = wf.draftNodes as InputJsonValue;
-    if (wf.campaignId) {
-      const campaign = await findCampaignById(wf.campaignId);
-      if (campaign) {
-        const details = await getCampaignDetails(campaign.id);
-        nodeGraphToPublish = restampBrand(
-          wf.draftNodes,
-          campaign.brand,
-          details?.brandDescription,
-          details?.shipsPhysicalProduct,
-        ) as InputJsonValue;
-        // PLU-117: freeze the derived outreach placeholder sources (campaignName +
-        // deal shape) onto the immutable version, matching what the builder showed.
-        nodeGraphToPublish = stampOutreachDerivedFields(
-          nodeGraphToPublish,
-          campaign.name,
-        ) as InputJsonValue;
-      }
+    if (campaign) {
+      nodeGraphToPublish = restampBrand(
+        wf.draftNodes,
+        campaign.brand,
+        details?.brandDescription,
+        details?.shipsPhysicalProduct,
+      ) as InputJsonValue;
+      // PLU-117: freeze the derived outreach placeholder sources (campaignName +
+      // deal shape) onto the immutable version, matching what the builder showed.
+      nodeGraphToPublish = stampOutreachDerivedFields(
+        nodeGraphToPublish,
+        campaign.name,
+      ) as InputJsonValue;
     }
     // Freeze the current negotiation commission onto the Reward Setup node so the
     // immutable version carries the finalized value the deal was published with.

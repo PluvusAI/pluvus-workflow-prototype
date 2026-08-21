@@ -11,8 +11,9 @@ import {
   deliverableSchema,
   deliverablesSchema,
   validateDeliverables,
-  normalizeLegacyDeliverableIds,
+  normalizeLegacyDeliverables,
   remapLegacyDeliverablePricingKeys,
+  resolveDeliverableSave,
 } from "./deliverablesValidator.js";
 
 function d(overrides: Record<string, unknown> = {}) {
@@ -186,11 +187,11 @@ test("\"other\" platform allows only \"other\" format (decision #8)", () => {
   assert.deepEqual(PLATFORM_FORMAT_MATRIX.other, ["other"]);
 });
 
-console.log("\nnormalizeLegacyDeliverableIds — a campaign can still hold rows saved before id was required\n");
+console.log("\nnormalizeLegacyDeliverables — a campaign can still hold rows saved before id was required\n");
 
 test("an id-less legacy row is minted a fresh, non-empty id", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 }; // no id
-  const { items } = normalizeLegacyDeliverableIds([legacy]);
+  const { items } = normalizeLegacyDeliverables([legacy]);
   const [normalized] = items as Array<Record<string, unknown>>;
   assert.equal(typeof normalized?.["id"], "string");
   assert.ok((normalized?.["id"] as string).length > 0);
@@ -198,7 +199,7 @@ test("an id-less legacy row is minted a fresh, non-empty id", () => {
 });
 
 test("a row that already has an id keeps that EXACT id (not re-minted)", () => {
-  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds([d({ id: "del_stable" })]);
+  const { items, legacyKeyToId } = normalizeLegacyDeliverables([d({ id: "del_stable" })]);
   const [normalized] = items as Array<Record<string, unknown>>;
   assert.equal(normalized?.["id"], "del_stable");
   assert.equal(legacyKeyToId.size, 0, "an already-id'd row mints nothing");
@@ -207,20 +208,20 @@ test("a row that already has an id keeps that EXACT id (not re-minted)", () => {
 test("two id-less rows in the same array each get their OWN distinct minted id", () => {
   const a = { platform: "instagram", format: "reel", quantity: 1 };
   const b = { platform: "instagram", format: "story", quantity: 1 };
-  const { items } = normalizeLegacyDeliverableIds([a, b]);
+  const { items } = normalizeLegacyDeliverables([a, b]);
   const [na, nb] = items as Array<Record<string, unknown>>;
   assert.notEqual(na?.["id"], nb?.["id"]);
 });
 
 test("non-array input passes through untouched, letting validateDeliverables produce the real error", () => {
   const input = { not: "an array" };
-  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds(input);
+  const { items, legacyKeyToId } = normalizeLegacyDeliverables(input);
   assert.equal(items, input);
   assert.equal(legacyKeyToId.size, 0);
 });
 
 test("non-object array entries pass through untouched", () => {
-  const { items } = normalizeLegacyDeliverableIds([null, 42, "x"]);
+  const { items } = normalizeLegacyDeliverables([null, 42, "x"]);
   assert.deepEqual(items, [null, 42, "x"]);
 });
 
@@ -236,9 +237,9 @@ test("regression: an id-less legacy row FAILS validateDeliverables directly (pro
 // The fix: normalize BEFORE validating, exactly as finalAgreements.ts's
 // resolveFinalDeliverables and routes/campaigns.ts's PATCH handler now do —
 // the same legacy row now passes.
-test("fix: normalizeLegacyDeliverableIds then validateDeliverables accepts the same legacy row", () => {
+test("fix: normalizeLegacyDeliverables then validateDeliverables accepts the same legacy row", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 };
-  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacy]).items);
+  const result = validateDeliverables(normalizeLegacyDeliverables([legacy]).items);
   assert.equal(result.ok, true);
 });
 
@@ -246,7 +247,7 @@ test("a mix of legacy id-less rows and already-id'd rows all validate together, 
   const legacyA = { platform: "instagram", format: "reel", quantity: 1 };
   const legacyB = { platform: "instagram", format: "story", quantity: 1 };
   const modern = d({ id: "del_modern", platform: "tiktok", format: "video" });
-  const result = validateDeliverables(normalizeLegacyDeliverableIds([legacyA, legacyB, modern]).items);
+  const result = validateDeliverables(normalizeLegacyDeliverables([legacyA, legacyB, modern]).items);
   assert.equal(result.ok, true);
   if (result.ok) {
     assert.equal(result.deliverables.length, 3);
@@ -255,25 +256,129 @@ test("a mix of legacy id-less rows and already-id'd rows all validate together, 
   }
 });
 
-console.log("\nnormalizeLegacyDeliverableIds — legacyKeyToId (feeds the deliverablePricing remap)\n");
+console.log("\nnormalizeLegacyDeliverables — round 2: free-form platform/format and bad quantity\n");
+
+test("an unrecognized platform string is rebucketed into other/other with a synthesized customLabel", () => {
+  const legacy = { id: "del_1", platform: "facebook", format: "livestream", quantity: 1 };
+  const { items } = normalizeLegacyDeliverables([legacy]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["platform"], "other");
+  assert.equal(normalized?.["format"], "other");
+  assert.equal(normalized?.["customLabel"], "facebook livestream");
+});
+
+test("a recognized platform/format pair NOT in PLATFORM_FORMAT_MATRIX (e.g. tiktok+reel) is also rebucketed", () => {
+  const legacy = { id: "del_1", platform: "tiktok", format: "reel", quantity: 1 };
+  const { items } = normalizeLegacyDeliverables([legacy]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["platform"], "other");
+  assert.equal(normalized?.["format"], "other");
+  assert.equal(normalized?.["customLabel"], "tiktok reel");
+});
+
+test("an already-valid platform/format pair is left completely untouched, including any existing customLabel", () => {
+  const valid = { id: "del_1", platform: "instagram", format: "reel", quantity: 1, customLabel: "keep me" };
+  const { items } = normalizeLegacyDeliverables([valid]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["platform"], "instagram");
+  assert.equal(normalized?.["format"], "reel");
+  assert.equal(normalized?.["customLabel"], "keep me", "not clobbered — the pair was already valid");
+});
+
+test("an already-other/other row keeps its existing customLabel — never re-migrated", () => {
+  const existing = { id: "del_1", platform: "other", format: "other", quantity: 1, customLabel: "Raw Footage" };
+  const { items } = normalizeLegacyDeliverables([existing]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["customLabel"], "Raw Footage");
+});
+
+test("a completely missing/blank platform+format still gets a non-empty fallback label, never an empty string", () => {
+  const legacy = { id: "del_1", quantity: 1 };
+  const { items } = normalizeLegacyDeliverables([legacy]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["platform"], "other");
+  assert.equal(normalized?.["format"], "other");
+  assert.equal(normalized?.["customLabel"], "Legacy deliverable");
+});
+
+test("zero quantity migrates to 1", () => {
+  const legacy = { id: "del_1", platform: "instagram", format: "reel", quantity: 0 };
+  const { items } = normalizeLegacyDeliverables([legacy]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["quantity"], 1);
+});
+
+test("negative, non-numeric-string, and missing quantity all migrate to 1", () => {
+  for (const quantity of [-5, "not a number", undefined, null]) {
+    const { items } = normalizeLegacyDeliverables([{ id: "del_1", platform: "instagram", format: "reel", quantity }]);
+    const [normalized] = items as Array<Record<string, unknown>>;
+    assert.equal(normalized?.["quantity"], 1, `quantity ${JSON.stringify(quantity)} must migrate to 1`);
+  }
+});
+
+test("a numeric-string quantity is parsed rather than defaulted", () => {
+  const { items } = normalizeLegacyDeliverables([{ id: "del_1", platform: "instagram", format: "reel", quantity: "3" }]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["quantity"], 3);
+});
+
+test("a fractional quantity rounds rather than defaulting to 1", () => {
+  const { items } = normalizeLegacyDeliverables([{ id: "del_1", platform: "instagram", format: "reel", quantity: 2.7 }]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["quantity"], 3);
+});
+
+test("an already-valid positive integer quantity is left completely untouched", () => {
+  const { items } = normalizeLegacyDeliverables([{ id: "del_1", platform: "instagram", format: "reel", quantity: 5 }]);
+  const [normalized] = items as Array<Record<string, unknown>>;
+  assert.equal(normalized?.["quantity"], 5);
+});
+
+// The reviewer's exact reported bug: a historical free-form platform/format
+// or zero quantity fails validateDeliverables directly, even with the id
+// fix already applied — this is what still 400'd an unrelated edit to a
+// legacy campaign after the FIRST round of this fix shipped.
+test("regression: id-fixed-but-otherwise-legacy rows (bad platform, bad combo, zero quantity) still FAIL validateDeliverables directly", () => {
+  const badPlatform = { id: "del_1", platform: "facebook", format: "livestream", quantity: 1 };
+  const badCombo = { id: "del_2", platform: "tiktok", format: "reel", quantity: 1 };
+  const zeroQty = { id: "del_3", platform: "instagram", format: "reel", quantity: 0 };
+  for (const item of [badPlatform, badCombo, zeroQty]) {
+    assert.equal(validateDeliverables([item]).ok, false, JSON.stringify(item));
+  }
+});
+
+// The fix: the SAME rows now survive normalizeLegacyDeliverables + validateDeliverables.
+test("fix: the same historically-invalid rows all pass after normalizeLegacyDeliverables", () => {
+  const badPlatform = { platform: "facebook", format: "livestream", quantity: 1 }; // also no id
+  const badCombo = { id: "del_2", platform: "tiktok", format: "reel", quantity: 1 };
+  const zeroQty = { id: "del_3", platform: "instagram", format: "reel", quantity: 0 };
+  const { items } = normalizeLegacyDeliverables([badPlatform, badCombo, zeroQty]);
+  const result = validateDeliverables(items);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.deliverables.length, 3, "no row silently dropped — every legacy row survives, migrated");
+  }
+});
+
+console.log("\nnormalizeLegacyDeliverables — legacyKeyToId (feeds the deliverablePricing remap)\n");
 
 test("a minted legacy id is recorded under its \"<platform>:<format>\" composite key", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 };
-  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds([legacy]);
+  const { items, legacyKeyToId } = normalizeLegacyDeliverables([legacy]);
   const [normalized] = items as Array<Record<string, unknown>>;
   assert.equal(legacyKeyToId.size, 1);
   assert.equal(legacyKeyToId.get("instagram:reel"), normalized?.["id"]);
 });
 
 test("an already-id'd row contributes NOTHING to legacyKeyToId", () => {
-  const { legacyKeyToId } = normalizeLegacyDeliverableIds([d({ id: "del_stable" })]);
+  const { legacyKeyToId } = normalizeLegacyDeliverables([d({ id: "del_stable" })]);
   assert.equal(legacyKeyToId.size, 0);
 });
 
 test("two legacy rows sharing the same platform+format only map the FIRST (an already-ambiguous case under the old composite-keyed scheme)", () => {
   const a = { platform: "other", format: "other", quantity: 1, customLabel: "Raw Footage" };
   const b = { platform: "other", format: "other", quantity: 1, customLabel: "Loose Post" };
-  const { legacyKeyToId } = normalizeLegacyDeliverableIds([a, b]);
+  const { legacyKeyToId } = normalizeLegacyDeliverables([a, b]);
   assert.equal(legacyKeyToId.size, 1, "only one entry — the composite key can't disambiguate the two");
 });
 
@@ -281,7 +386,7 @@ console.log("\nremapLegacyDeliverablePricingKeys — review fix: keep deliverabl
 
 test("a pricing entry keyed by the OLD composite is folded onto the newly minted id", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 };
-  const { legacyKeyToId } = normalizeLegacyDeliverableIds([legacy]);
+  const { legacyKeyToId } = normalizeLegacyDeliverables([legacy]);
   const newId = legacyKeyToId.get("instagram:reel")!;
   const remapped = remapLegacyDeliverablePricingKeys({ "instagram:reel": 50000 }, legacyKeyToId) as Record<
     string,
@@ -322,7 +427,7 @@ test("non-object pricing (null, array, scalar) passes through untouched for the 
 
 test("end-to-end: normalize a legacy deliverable, then remap its pricing entry, exactly as the PATCH route does", () => {
   const legacy = { platform: "instagram", format: "reel", quantity: 2 };
-  const { items, legacyKeyToId } = normalizeLegacyDeliverableIds([legacy]);
+  const { items, legacyKeyToId } = normalizeLegacyDeliverables([legacy]);
   const validated = validateDeliverables(items);
   assert.equal(validated.ok, true);
   const remappedPricing = remapLegacyDeliverablePricingKeys(
@@ -333,4 +438,90 @@ test("end-to-end: normalize a legacy deliverable, then remap its pricing entry, 
     const newId = validated.deliverables[0]!.id;
     assert.equal(remappedPricing[newId], 75000, "PricingGrid's keyOf(row) now finds the price under row.id");
   }
+});
+
+console.log("\nresolveDeliverableSave — fresh input is validated strictly, legacy carry-forward is self-healed\n");
+
+test("a fresh, malformed item ([{}]) with no matching existing row is REJECTED, not coerced into quantity 1", () => {
+  const result = resolveDeliverableSave([{}], []);
+  assert.equal(result.ok, false);
+});
+
+test("a fresh, well-shaped item with quantity: 0 is REJECTED, not coerced into quantity 1", () => {
+  const result = resolveDeliverableSave(
+    [{ id: "new_1", platform: "instagram", format: "reel", quantity: 0 }],
+    [],
+  );
+  assert.equal(result.ok, false);
+});
+
+test("a fresh item with an invalid platform/format combination is REJECTED, not migrated to other/other", () => {
+  const result = resolveDeliverableSave(
+    [{ id: "new_1", platform: "tiktok", format: "reel", quantity: 1 }],
+    [],
+  );
+  assert.equal(result.ok, false);
+});
+
+test("a genuinely new, well-formed item (no matching existing row) is accepted as submitted", () => {
+  const item = { id: "new_1", platform: "instagram", format: "reel", quantity: 3 };
+  const result = resolveDeliverableSave([item], []);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.deliverables.length, 1);
+    assert.equal(result.deliverables[0]!.quantity, 3);
+  }
+});
+
+test("an item byte-for-byte identical to an already-stored legacy row IS self-healed (id minted, platform/format migrated)", () => {
+  const legacyStored = { platform: "myspace", format: "blast", quantity: 2 };
+  const result = resolveDeliverableSave([legacyStored], [legacyStored]);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.deliverables.length, 1);
+    assert.equal(result.deliverables[0]!.platform, "other");
+    assert.equal(result.deliverables[0]!.format, "other");
+    assert.ok(result.deliverables[0]!.id.length > 0, "an id must have been minted");
+  }
+});
+
+test("editing a stored legacy row's quantity makes it FRESH input — validated strictly, not silently repaired", () => {
+  const stored = { platform: "myspace", format: "blast", quantity: 2 };
+  // The brand edited quantity from 2 -> 0 this save — no longer identical to
+  // what's stored, so it must NOT be treated as a safe-to-self-heal carry
+  // forward; it must be rejected outright (an invalid FRESH edit), not
+  // silently coerced back to quantity 1.
+  const edited = { platform: "myspace", format: "blast", quantity: 0 };
+  const result = resolveDeliverableSave([edited], [stored]);
+  assert.equal(result.ok, false);
+});
+
+test("key order inside a submitted object doesn't defeat the 'unchanged legacy row' match", () => {
+  const stored = { platform: "myspace", format: "blast", quantity: 2 };
+  const resubmittedReordered = { quantity: 2, format: "blast", platform: "myspace" };
+  const result = resolveDeliverableSave([resubmittedReordered], [stored]);
+  assert.equal(result.ok, true, "a mere key-order difference must still match as unchanged");
+});
+
+test("two identical items can't both hide behind ONE stored legacy row (multiset match) — the second is treated as fresh and, being raw legacy shape, fails strict validation", () => {
+  const stored = { platform: "myspace", format: "blast", quantity: 2 };
+  // Two items, byte-identical to each other AND to the one stored row — but
+  // only ONE stored row exists to match against.
+  const result = resolveDeliverableSave([stored, { ...stored }], [stored]);
+  // The FIRST occurrence consumes the one stored match and self-heals. The
+  // SECOND occurrence, with nothing left to match, is validated as fresh
+  // input — and since the raw legacy shape (no id, unrecognized platform)
+  // is not schema-valid on its own, the whole save is rejected rather than
+  // silently letting the second copy through unmigrated.
+  assert.equal(result.ok, false, "the second, unmatched occurrence must fail strict fresh validation");
+});
+
+test("a well-formed, schema-valid item that's ALSO fresh (not matching anything stored) still passes on its own merits", () => {
+  const alreadyValid = { id: "del_x", platform: "instagram", format: "reel", quantity: 1 };
+  const result = resolveDeliverableSave([alreadyValid, { ...alreadyValid, id: "del_y" }], [alreadyValid]);
+  // Only ONE of the two matches the stored row; the second (del_y) is fresh
+  // but is ALSO independently schema-valid, so it passes on its own merits —
+  // proving "fresh" doesn't mean "always rejected," only "not coerced."
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.deliverables.length, 2);
 });

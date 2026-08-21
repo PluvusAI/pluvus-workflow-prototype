@@ -32,6 +32,13 @@ async function test(name: string, fn: () => Promise<void>): Promise<void> {
   console.log(`  ✓ ${name}`);
 }
 
+// Review fix: launch/readiness now requires a non-empty structured
+// deliverables list regardless of campaignType — default one here so this
+// file's fixtures (all about compensation-field completeness, not
+// deliverables) keep matching launchCampaign()'s real behavior. A test that
+// wants to exercise the deliverables gate itself overrides via `details`.
+const DEFAULT_DELIVERABLES = [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }];
+
 async function seedCampaign(
   pgdb: Db,
   suffix: string,
@@ -46,6 +53,7 @@ async function seedCampaign(
     await pgdb.insert(schema.campaignDetails).values({
       campaignId: campaign!.id,
       compensationReviewStatus: "CONFIRMED",
+      deliverableQuantities: DEFAULT_DELIVERABLES,
       ...details,
     });
   }
@@ -185,6 +193,19 @@ async function main(): Promise<void> {
       "no fee blocker for a commission-only campaign",
     );
     assert.equal(await launchSucceeds(pgdb, id), true);
+  });
+
+  await test("empty deliverableQuantities → not ready, deliverables blocker, parity with launch", async () => {
+    const id = await seedCampaign(
+      pgdb,
+      "empty-deliverables",
+      { campaignType: "PAID", priceStrategy: "REQUEST_RATE_CARD", deliverableQuantities: [] },
+      { floorCents: 10000, ceilingCents: 30000 },
+    );
+    const r = await readiness(pgdb, id);
+    assert.equal(r.ready, false);
+    assert.ok(r.blockers.some((b) => b.includes("deliverableQuantities")));
+    assert.equal(await launchSucceeds(pgdb, id), false, "ready:false ⟺ launch fails");
   });
 
   console.log(`\n${n} passed\n`);

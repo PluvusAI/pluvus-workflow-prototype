@@ -1582,6 +1582,22 @@ export const finalAgreements = pgTable(
     sourceMessageId: text("sourceMessageId").references(() => messages.id),
     acceptedAt: ts("acceptedAt").notNull(),
 
+    // -- PLU-143: Content Brief generation provenance. Nullable — populated by
+    //    recordContentBriefGeneration() AFTER this row's initial insert (a
+    //    second, later write against the same row, by instanceId), once
+    //    executeContentBrief actually generates the creator's Content Brief.
+    //    campaignBriefId is null on the "own_doc" briefDeliveryMethod path (no
+    //    CampaignBrief row is ever consulted there); contentBriefTemplateVersion
+    //    is the fixed marker "brand_uploaded" on that same path, so the column
+    //    is always meaningful, never silently null-because-not-applicable. --
+    contentBriefGeneratedAt: ts("contentBriefGeneratedAt"),
+    contentBriefCampaignBriefId: text("contentBriefCampaignBriefId").references(
+      () => campaignBriefs.id,
+      { onDelete: "restrict" },
+    ),
+    contentBriefAssetRef: text("contentBriefAssetRef"),
+    contentBriefTemplateVersion: text("contentBriefTemplateVersion"),
+
     createdAt: tsNow("createdAt"),
     updatedAt: tsUpdatedAt("updatedAt"),
   },

@@ -34,6 +34,7 @@ import {
   type NegotiationPolicy,
   type WorkflowStatus,
 } from "./schema.js";
+import { validateDeliverables, normalizeLegacyDeliverables } from "../domain/deliverablesValidator.js";
 
 export async function findCampaignById(
   id: string,
@@ -257,6 +258,15 @@ function isMarkedNonNegotiable(
  *              itself.
  *   Any structure with includesGifting: also requires productOrOffer +
  *   giftDisposition + private gift authority, on top of its primary rules.
+ *
+ *   Every campaignType: a non-empty, structurally valid deliverableQuantities
+ *   array (review fix). Deliverables describe WHAT content the creator makes
+ *   — orthogonal to compensation structure, and required regardless of it.
+ *   Without this, launch permitted a campaign with missing/empty
+ *   deliverableQuantities; the accepted creator's FinalAgreement then
+ *   resolved to an empty deliverables array, and Content Brief routed them to
+ *   MANUAL_REVIEW instead of continuing to payment — a launch-time gap
+ *   surfacing as a runtime failure deep into a real creator's journey.
  */
 export function validateCompensationReadiness(
   details: CampaignDetails,
@@ -268,6 +278,20 @@ export function validateCompensationReadiness(
   const needsCommission =
     details.campaignType === "AFFILIATE" || details.campaignType === "HYBRID";
   const needsGift = details.campaignType === "GIFT_ONLY" || details.includesGifting;
+
+  // Legacy rows predating the id requirement are normalized (never rejected
+  // purely for missing an id — the separate backfill script handles that
+  // class of gap) before running the full shared validator.
+  const deliverablesResult = validateDeliverables(
+    normalizeLegacyDeliverables(details.deliverableQuantities ?? []).items,
+  );
+  if (!deliverablesResult.ok) {
+    missing.push(`CampaignDetails.deliverableQuantities: ${deliverablesResult.error}`);
+  } else if (deliverablesResult.deliverables.length === 0) {
+    missing.push(
+      "CampaignDetails.deliverableQuantities (must be a non-empty structured deliverables list)",
+    );
+  }
 
   if (needsFee) {
     if (!details.priceStrategy) missing.push("CampaignDetails.priceStrategy");

@@ -25,8 +25,9 @@ import {
 import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
 import {
   validateDeliverables,
-  normalizeLegacyDeliverableIds,
+  normalizeLegacyDeliverables,
   remapLegacyDeliverablePricingKeys,
+  resolveDeliverableSave,
 } from "../domain/deliverablesValidator.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
@@ -871,21 +872,51 @@ router.patch("/:id", async (req: Request, res: Response) => {
     // yet). The intake resends the complete array on every group-level PATCH
     // — including an edit to a totally unrelated field — so validating the
     // raw input rejected any legacy, not-yet-backfilled campaign with a 400
-    // until an operator ran the backfill. Normalize legacy rows (mint a
-    // missing id) BEFORE validating, and persist the NORMALIZED array (not
-    // the raw input) so those ids become stable from this save forward —
-    // this campaign incrementally self-heals the first time anyone happens
-    // to save it, without waiting on the separate backfill script.
+    // until an operator ran the backfill. Normalize legacy rows BEFORE
+    // validating, and persist the NORMALIZED array (not the raw input) so
+    // the fix becomes stable from this save forward — this campaign
+    // incrementally self-heals the first time anyone happens to save it,
+    // without waiting on the separate backfill script.
+    //
+    // Review fix (round 2): the id mint alone wasn't enough — a legacy row
+    // predating the CLOSED platform/format catalog (a free-form platform
+    // string, an unsupported platform/format pairing) or carrying a zero/
+    // missing quantity still failed `deliverablesSchema` after the id fix,
+    // 400ing the exact same "unrelated edit to an old campaign" case for a
+    // different reason. normalizeLegacyDeliverables now migrates those too
+    // (see its own doc comment for exactly what "migrate" means for each).
+    //
+    // Review fix (round 3): the two fixes above normalized EVERY submitted
+    // item unconditionally — with no way to tell "a pre-existing legacy row
+    // this save is just carrying forward unchanged" from "a row THIS request
+    // is introducing or editing right now." That let a genuinely fresh,
+    // malformed submission (e.g. a bare `[{}]`, or a real row with
+    // `quantity: 0`) get silently coerced into a fabricated valid deliverable
+    // (an "other"/"other" slot, or quantity forced to 1) and saved with a 200
+    // instead of rejected with a 400 — inventing a creator obligation the
+    // brand never actually specified, which then flows into
+    // FinalAgreement/Content Brief as if it were real. resolveDeliverableSave
+    // normalizes ONLY an item that is byte-for-byte identical
+    // (order-independent) to something already stored for this campaign;
+    // every other item — new, edited, or malformed — is validated AS
+    // SUBMITTED, strictly, with no coercion.
     let normalizedDeliverables: JsonValue | null = deliverableQuantities as JsonValue | null;
     if (deliverableQuantities !== null) {
-      const { items: normalizedItems, legacyKeyToId } = normalizeLegacyDeliverableIds(deliverableQuantities);
-      legacyDeliverableKeyToId = legacyKeyToId;
-      const result = validateDeliverables(normalizedItems);
-      if (!result.ok) {
-        res.status(400).json({ error: `deliverableQuantities: ${result.error}` });
+      if (!Array.isArray(deliverableQuantities)) {
+        res.status(400).json({ error: "deliverableQuantities must be an array or null" });
         return;
       }
-      normalizedDeliverables = result.deliverables as unknown as JsonValue;
+      const existingDetails = await getCampaignDetails(req.params["id"]!);
+      const existingItems = Array.isArray(existingDetails?.deliverableQuantities)
+        ? (existingDetails!.deliverableQuantities as unknown[])
+        : [];
+      const saveResult = resolveDeliverableSave(deliverableQuantities, existingItems);
+      if (!saveResult.ok) {
+        res.status(400).json({ error: `deliverableQuantities: ${saveResult.error}` });
+        return;
+      }
+      legacyDeliverableKeyToId = saveResult.legacyKeyToId;
+      normalizedDeliverables = saveResult.deliverables as unknown as JsonValue;
     }
     (detailsPatch as Record<string, unknown>)["deliverableQuantities"] = normalizedDeliverables;
   }

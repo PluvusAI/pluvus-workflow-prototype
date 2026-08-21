@@ -1,5 +1,6 @@
 import type { NodeResult } from "../types.js";
 import { maskGuardHits, type GuardHit } from "../guards/outputGuard.js";
+import type { CampaignBriefValidationResult } from "../../db/campaignBriefValidation.js";
 
 // ---------------------------------------------------------------------------
 // Shared output-guard escalation (FIX-4)
@@ -107,6 +108,95 @@ export function blockedByMissingBrand(node: string): NodeResult {
     eventPayload: {
       outcome: "ESCALATE",
       reason: "missing_brand_name",
+      node,
+    },
+  };
+}
+
+// PLU-143: the creator journey's pinned CampaignTermsSnapshot is no longer the
+// campaign's genuine current one (an identity/integrity problem —
+// NO_CAMPAIGN / NO_PINNED_SNAPSHOT / SNAPSHOT_MISMATCH / CROSS_CAMPAIGN — see
+// docs/plu-143-content-brief-final-agreement-plan.md's "Architecture
+// decision"). Only the identity categories reach this guard; the transient
+// "asset not ready yet" categories (NO_CURRENT_BRIEF/ASSET_UNAVAILABLE/
+// DATA_INCOMPLETE) are handled by a plain throw at the call site instead, so
+// the engine's own retry can pick them up once the async regeneration PLU-142
+// already triggered finishes — no retry fixes an identity mismatch, so this
+// one escalates immediately.
+export function blockedByCampaignBriefMismatch(
+  node: string,
+  result: CampaignBriefValidationResult,
+): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "MANUAL_REVIEW_FLAGGED",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "campaign_brief_mismatch",
+      mismatchCategory: result.mismatchCategory,
+      node,
+    },
+  };
+}
+
+// PLU-143: no FinalAgreement row exists for this instance — most likely a
+// legacy instance that reached ACCEPTED before PLU-169 shipped (PLU-169 does
+// not backfill historical acceptances) and is somehow being re-driven through
+// this node later. Per the issue's own "do not fall back" list: a hard block,
+// never a resolveAgreedFee/nodeGraph replay.
+export function blockedByMissingFinalAgreement(node: string): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "MANUAL_REVIEW_FLAGGED",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "no_final_agreement",
+      node,
+    },
+  };
+}
+
+// Review fix: a campaign whose campaignType requires a fixed fee (PAID /
+// HYBRID) accepted with no finite finalFeeCents — most likely an ACCEPT turn
+// that carried no numeric proposedTerms.rate (the accept still went through,
+// e.g. on a pure-commission/gift acknowledgement, but this campaign's type
+// says a fee is owed). Content Brief must never mint a payout-form link and
+// present "Fixed Fee: the agreed fee" for a genuinely amountless agreement —
+// that sends a real creator to a real payout form with no fee attached.
+export function blockedByMissingFixedFee(node: string): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "MANUAL_REVIEW_FLAGGED",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "missing_fixed_fee",
+      node,
+    },
+  };
+}
+
+// PLU-143: FinalAgreement.finalDeliverables is missing, empty, or fails
+// deliverablesSchema (an invalid platform/format combination, a missing
+// applicable quantity, or — per the issue's deliverable-projection contract —
+// what would otherwise look like only a stored delta or an incomplete
+// package). Never rendered as "To be finalized" or silently dropped; always a
+// hard block so a human resolves the underlying FinalAgreement row.
+export function blockedByIncompleteDeliverables(node: string, reason: string): NodeResult {
+  return {
+    nextState: "MANUAL_REVIEW",
+    nextNodeId: null,
+    completedAt: new Date(),
+    eventType: "MANUAL_REVIEW_FLAGGED",
+    eventPayload: {
+      outcome: "ESCALATE",
+      reason: "incomplete_final_deliverables",
+      detail: reason,
       node,
     },
   };

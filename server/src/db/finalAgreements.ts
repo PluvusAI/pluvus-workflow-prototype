@@ -7,7 +7,7 @@ import {
   type FinalAgreementInsert,
 } from "./schema.js";
 import type { Deliverable } from "../domain/deliverables.js";
-import { validateDeliverables, normalizeLegacyDeliverableIds } from "../domain/deliverablesValidator.js";
+import { validateDeliverables, normalizeLegacyDeliverables } from "../domain/deliverablesValidator.js";
 
 // ---------------------------------------------------------------------------
 // FinalAgreement — the ONE canonical accepted-terms record (PLU-169, 1f).
@@ -66,6 +66,42 @@ export async function findFinalAgreementByInstance(
     .from(finalAgreements)
     .where(eq(finalAgreements.instanceId, instanceId))
     .limit(1);
+  return rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Content Brief generation provenance (PLU-143).
+// ---------------------------------------------------------------------------
+// A second, LATER write against the same row `recordFinalAgreementOnce`
+// already inserted (at accept time) — never a new row. Safe to call more
+// than once for the same instance: it's a plain overwrite of these four
+// columns, not an insert, so a retried CONTENT_BRIEF step (the email send
+// itself is separately deduped by sendOnce) just rewrites the same
+// provenance with the same or refreshed values — never a conflict, never a
+// duplicate row.
+
+export interface ContentBriefGenerationInput {
+  campaignBriefId: string | null; // null on the "own_doc" briefDeliveryMethod path
+  assetRef: string;
+  templateVersion: string; // the CampaignBrief's templateVersion, or the fixed marker "brand_uploaded"
+  generatedAt: Date;
+}
+
+export async function recordContentBriefGeneration(
+  instanceId: string,
+  data: ContentBriefGenerationInput,
+  client: Db | DbTx = db,
+): Promise<FinalAgreement | null> {
+  const rows = await client
+    .update(finalAgreements)
+    .set({
+      contentBriefGeneratedAt: data.generatedAt,
+      contentBriefCampaignBriefId: data.campaignBriefId,
+      contentBriefAssetRef: data.assetRef,
+      contentBriefTemplateVersion: data.templateVersion,
+    })
+    .where(eq(finalAgreements.instanceId, instanceId))
+    .returning();
   return rows[0] ?? null;
 }
 
@@ -211,17 +247,19 @@ export type ResolveFinalDeliverablesResult =
  *
  * Review fix (PR #48): the old version re-validated with its OWN loose shape
  * check (platform/format are strings, quantity is a number) and silently
- * FILTERED OUT anything that failed it — so an invalid platform/format
- * combination (e.g. tiktok + reel, not in PLATFORM_FORMAT_MATRIX) would
- * SURVIVE into FinalAgreement, and any genuinely malformed item would just
- * vanish from the final package with no record it was ever dropped. Now runs
- * the complete array through the SAME shared `deliverablesSchema` the intake
- * route already enforces (deliverablesValidator.ts — built for exactly this
- * second call site, per its own doc comment) and fails the WHOLE resolution
- * rather than silently keeping only the valid subset — a half-silently-
- * dropped deliverables package is worse than an explicit escalation. The
- * caller (negotiation.ts's accept case) routes a failure to MANUAL_REVIEW
- * before any accept email is drafted or sent.
+ * FILTERED OUT anything that failed it — so a genuinely malformed item would
+ * just vanish from the final package with no record it was ever dropped. Now
+ * runs the complete array through the SAME shared `deliverablesSchema` the
+ * intake route already enforces (deliverablesValidator.ts — built for
+ * exactly this second call site, per its own doc comment), via
+ * `normalizeLegacyDeliverables` first (see its own doc comment) — a
+ * non-object / unrecognizable entry still fails the WHOLE resolution rather
+ * than silently keeping only the valid subset, but an invalid platform/
+ * format combination (e.g. tiktok + reel, not in PLATFORM_FORMAT_MATRIX) is
+ * a recognized LEGACY shape and is migrated into the flexible
+ * platform:"other"/format:"other" slot instead of blocking the accept turn.
+ * The caller (negotiation.ts's accept case) routes a genuine failure to
+ * MANUAL_REVIEW before any accept email is drafted or sent.
  *
  * A missing/empty baseline still resolves to `{ ok: true, deliverables: [] }`
  * — a legacy campaign with no structured deliverables recorded yet is a
@@ -234,22 +272,23 @@ export type ResolveFinalDeliverablesResult =
 // its own doc comment in schema.ts), so the one-time id backfill script
 // (decision #4), which only writes to the MUTABLE CampaignDetails row, can
 // never reach an already-launched campaign's frozen snapshot.
-// normalizeLegacyDeliverableIds mints a fresh id here, BEFORE
-// validateDeliverables runs, so a launched snapshot predating the backfill
-// doesn't fail validation forever on every one of its items. This id is NOT
-// written back to the immutable snapshot and is only guaranteed stable for
-// the lifetime of this one FinalAgreement row — acceptable for Phase 1, since
-// nothing references a deliverable id yet (negotiation-delta support,
-// decision #5, is a separate future ticket that will need its own answer for
-// referencing an id inside an immutable snapshot before it can rely on
-// reproducibility here).
+// normalizeLegacyDeliverables mints a fresh id (and migrates any legacy
+// platform/format/quantity that no longer fits the current schema) here,
+// BEFORE validateDeliverables runs, so a launched snapshot predating either
+// requirement doesn't fail validation forever on every one of its items.
+// This id is NOT written back to the immutable snapshot and is only
+// guaranteed stable for the lifetime of this one FinalAgreement row —
+// acceptable for Phase 1, since nothing references a deliverable id yet
+// (negotiation-delta support, decision #5, is a separate future ticket that
+// will need its own answer for referencing an id inside an immutable
+// snapshot before it can rely on reproducibility here).
 export function resolveFinalDeliverables(args: {
   baseline: unknown; // termsSnapshot.detailsSnapshot["deliverableQuantities"]
 }): ResolveFinalDeliverablesResult {
   if (!Array.isArray(args.baseline) || args.baseline.length === 0) {
     return { ok: true, deliverables: [] };
   }
-  const { items: normalized } = normalizeLegacyDeliverableIds(args.baseline);
+  const { items: normalized } = normalizeLegacyDeliverables(args.baseline);
   const result = validateDeliverables(normalized);
   if (!result.ok) return { ok: false, error: result.error };
   return { ok: true, deliverables: result.deliverables };

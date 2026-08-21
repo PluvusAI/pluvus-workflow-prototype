@@ -17,7 +17,11 @@ import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import * as schema from "./schema.js";
 import type { Db } from "./drizzle.js";
-import { recordFinalAgreementOnce, findFinalAgreementByInstance } from "./finalAgreements.js";
+import {
+  recordFinalAgreementOnce,
+  findFinalAgreementByInstance,
+  recordContentBriefGeneration,
+} from "./finalAgreements.js";
 import { applyPGliteMigrations } from "../testUtils/pgliteMigrations.js";
 
 let n = 0;
@@ -172,6 +176,70 @@ async function main(): Promise<void> {
     });
 
     assert.equal(dup.id, first.id, "the existing row is returned, not a new one");
+  });
+
+  // ── PLU-143: Content Brief generation provenance ──────────────────────────
+  await test("recordContentBriefGeneration writes provenance onto the EXISTING row, not a new one", async () => {
+    const instanceId = await seedInstance(pgdb);
+    const inserted = await recordFinalAgreementOnce(agreement(instanceId), pgdb);
+    assert.equal(inserted.contentBriefGeneratedAt, null, "provenance is unset at accept time");
+
+    const generatedAt = new Date("2026-08-21T12:00:00.000Z");
+    const updated = await recordContentBriefGeneration(
+      instanceId,
+      {
+        campaignBriefId: null,
+        assetRef: "uploads/brand-brief.pdf",
+        templateVersion: "brand_uploaded",
+        generatedAt,
+      },
+      pgdb,
+    );
+    assert.ok(updated);
+    assert.equal(updated!.id, inserted.id, "same row updated, not a new insert");
+    assert.equal(updated!.contentBriefCampaignBriefId, null);
+    assert.equal(updated!.contentBriefAssetRef, "uploads/brand-brief.pdf");
+    assert.equal(updated!.contentBriefTemplateVersion, "brand_uploaded");
+    assert.deepEqual(updated!.contentBriefGeneratedAt, generatedAt);
+
+    const rows = await pgdb
+      .select()
+      .from(schema.finalAgreements)
+      .where(eq(schema.finalAgreements.instanceId, instanceId));
+    assert.equal(rows.length, 1, "still exactly one row for this instance");
+  });
+
+  await test("recordContentBriefGeneration is safe to call twice (a retried CONTENT_BRIEF step)", async () => {
+    const instanceId = await seedInstance(pgdb);
+    await recordFinalAgreementOnce(agreement(instanceId), pgdb);
+
+    await recordContentBriefGeneration(
+      instanceId,
+      { campaignBriefId: null, assetRef: "uploads/first.pdf", templateVersion: "brand_uploaded", generatedAt: new Date() },
+      pgdb,
+    );
+    const second = await recordContentBriefGeneration(
+      instanceId,
+      { campaignBriefId: null, assetRef: "uploads/second.pdf", templateVersion: "brand_uploaded", generatedAt: new Date() },
+      pgdb,
+    );
+    assert.equal(second!.contentBriefAssetRef, "uploads/second.pdf", "the later write wins — a plain overwrite, not append");
+
+    const rows = await pgdb
+      .select()
+      .from(schema.finalAgreements)
+      .where(eq(schema.finalAgreements.instanceId, instanceId));
+    assert.equal(rows.length, 1, "still exactly one row — never a duplicate on retry");
+  });
+
+  await test("recordContentBriefGeneration returns null for an instance with no FinalAgreement row", async () => {
+    const instanceId = await seedInstance(pgdb);
+    const result = await recordContentBriefGeneration(
+      instanceId,
+      { campaignBriefId: null, assetRef: "uploads/orphan.pdf", templateVersion: "brand_uploaded", generatedAt: new Date() },
+      pgdb,
+    );
+    assert.equal(result, null);
   });
 
   console.log(`\n${n} passed\n`);
