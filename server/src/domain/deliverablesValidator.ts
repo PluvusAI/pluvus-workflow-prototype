@@ -263,3 +263,83 @@ export function remapLegacyDeliverablePricingKeys(
   }
   return remapped;
 }
+
+// ---------------------------------------------------------------------------
+// Review fix (round 3) — the PATCH route's single save-time entry point
+// ---------------------------------------------------------------------------
+// normalizeLegacyDeliverables() alone can't tell "a legacy row already
+// stored for this campaign, being resent unchanged by the intake's own
+// 'send the complete array on every save' convention" from "a row THIS
+// save is introducing or editing right now." Calling it on every submitted
+// item unconditionally (the PATCH route's original approach) let a
+// genuinely fresh, malformed submission — a bare `[{}]`, or a real row with
+// `quantity: 0` — get silently coerced into a fabricated valid deliverable
+// (an "other"/"other" slot, or quantity forced to 1) and persisted with a
+// 200 instead of rejected with a 400: a creator obligation the brand never
+// actually specified, flowing into FinalAgreement/Content Brief as if real.
+//
+// Fix: normalize ONLY an item that is byte-for-byte identical
+// (key-order-independent) to something already stored for this campaign;
+// every other item is validated AS SUBMITTED, strictly, with no coercion.
+
+function canonicalizeForComparison(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalizeForComparison);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = canonicalizeForComparison((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
+}
+function canonicalDeliverableKey(value: unknown): string {
+  return JSON.stringify(canonicalizeForComparison(value));
+}
+
+export type ResolveDeliverableSaveResult =
+  | { ok: true; deliverables: Deliverable[]; legacyKeyToId: Map<string, string> }
+  | { ok: false; error: string };
+
+/**
+ * `existing` is the campaign's CURRENTLY stored deliverableQuantities raw
+ * array (before this save) — pass [] for a campaign with none yet. Each
+ * existing row can satisfy at most ONE submitted item's "this is unchanged"
+ * claim (a multiset match), so two genuinely fresh, identical-looking items
+ * can't both hide behind a single stored row.
+ */
+export function resolveDeliverableSave(
+  submitted: unknown[],
+  existing: unknown[],
+): ResolveDeliverableSaveResult {
+  const existingCounts = new Map<string, number>();
+  for (const item of existing) {
+    const key = canonicalDeliverableKey(item);
+    existingCounts.set(key, (existingCounts.get(key) ?? 0) + 1);
+  }
+
+  const resultItems: unknown[] = [];
+  const legacyKeyToId = new Map<string, string>();
+  for (const item of submitted) {
+    const key = canonicalDeliverableKey(item);
+    const remaining = existingCounts.get(key) ?? 0;
+    if (remaining > 0) {
+      // Genuinely carried forward unchanged — safe to self-heal.
+      existingCounts.set(key, remaining - 1);
+      const { items: normalizedOne, legacyKeyToId: mintedOne } = normalizeLegacyDeliverables([item]);
+      resultItems.push((normalizedOne as unknown[])[0]);
+      for (const [k, v] of mintedOne) legacyKeyToId.set(k, v);
+    } else {
+      // New or edited by THIS request — no coercion; reject loudly if invalid.
+      const single = deliverableSchema.safeParse(item);
+      if (!single.success) {
+        return { ok: false, error: single.error.issues.map((i) => i.message).join("; ") };
+      }
+      resultItems.push(single.data);
+    }
+  }
+
+  const result = validateDeliverables(resultItems);
+  if (!result.ok) return { ok: false, error: result.error };
+  return { ok: true, deliverables: result.deliverables, legacyKeyToId };
+}

@@ -13,6 +13,7 @@ import {
   validateDeliverables,
   normalizeLegacyDeliverables,
   remapLegacyDeliverablePricingKeys,
+  resolveDeliverableSave,
 } from "./deliverablesValidator.js";
 
 function d(overrides: Record<string, unknown> = {}) {
@@ -437,4 +438,90 @@ test("end-to-end: normalize a legacy deliverable, then remap its pricing entry, 
     const newId = validated.deliverables[0]!.id;
     assert.equal(remappedPricing[newId], 75000, "PricingGrid's keyOf(row) now finds the price under row.id");
   }
+});
+
+console.log("\nresolveDeliverableSave — fresh input is validated strictly, legacy carry-forward is self-healed\n");
+
+test("a fresh, malformed item ([{}]) with no matching existing row is REJECTED, not coerced into quantity 1", () => {
+  const result = resolveDeliverableSave([{}], []);
+  assert.equal(result.ok, false);
+});
+
+test("a fresh, well-shaped item with quantity: 0 is REJECTED, not coerced into quantity 1", () => {
+  const result = resolveDeliverableSave(
+    [{ id: "new_1", platform: "instagram", format: "reel", quantity: 0 }],
+    [],
+  );
+  assert.equal(result.ok, false);
+});
+
+test("a fresh item with an invalid platform/format combination is REJECTED, not migrated to other/other", () => {
+  const result = resolveDeliverableSave(
+    [{ id: "new_1", platform: "tiktok", format: "reel", quantity: 1 }],
+    [],
+  );
+  assert.equal(result.ok, false);
+});
+
+test("a genuinely new, well-formed item (no matching existing row) is accepted as submitted", () => {
+  const item = { id: "new_1", platform: "instagram", format: "reel", quantity: 3 };
+  const result = resolveDeliverableSave([item], []);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.deliverables.length, 1);
+    assert.equal(result.deliverables[0]!.quantity, 3);
+  }
+});
+
+test("an item byte-for-byte identical to an already-stored legacy row IS self-healed (id minted, platform/format migrated)", () => {
+  const legacyStored = { platform: "myspace", format: "blast", quantity: 2 };
+  const result = resolveDeliverableSave([legacyStored], [legacyStored]);
+  assert.equal(result.ok, true);
+  if (result.ok) {
+    assert.equal(result.deliverables.length, 1);
+    assert.equal(result.deliverables[0]!.platform, "other");
+    assert.equal(result.deliverables[0]!.format, "other");
+    assert.ok(result.deliverables[0]!.id.length > 0, "an id must have been minted");
+  }
+});
+
+test("editing a stored legacy row's quantity makes it FRESH input — validated strictly, not silently repaired", () => {
+  const stored = { platform: "myspace", format: "blast", quantity: 2 };
+  // The brand edited quantity from 2 -> 0 this save — no longer identical to
+  // what's stored, so it must NOT be treated as a safe-to-self-heal carry
+  // forward; it must be rejected outright (an invalid FRESH edit), not
+  // silently coerced back to quantity 1.
+  const edited = { platform: "myspace", format: "blast", quantity: 0 };
+  const result = resolveDeliverableSave([edited], [stored]);
+  assert.equal(result.ok, false);
+});
+
+test("key order inside a submitted object doesn't defeat the 'unchanged legacy row' match", () => {
+  const stored = { platform: "myspace", format: "blast", quantity: 2 };
+  const resubmittedReordered = { quantity: 2, format: "blast", platform: "myspace" };
+  const result = resolveDeliverableSave([resubmittedReordered], [stored]);
+  assert.equal(result.ok, true, "a mere key-order difference must still match as unchanged");
+});
+
+test("two identical items can't both hide behind ONE stored legacy row (multiset match) — the second is treated as fresh and, being raw legacy shape, fails strict validation", () => {
+  const stored = { platform: "myspace", format: "blast", quantity: 2 };
+  // Two items, byte-identical to each other AND to the one stored row — but
+  // only ONE stored row exists to match against.
+  const result = resolveDeliverableSave([stored, { ...stored }], [stored]);
+  // The FIRST occurrence consumes the one stored match and self-heals. The
+  // SECOND occurrence, with nothing left to match, is validated as fresh
+  // input — and since the raw legacy shape (no id, unrecognized platform)
+  // is not schema-valid on its own, the whole save is rejected rather than
+  // silently letting the second copy through unmigrated.
+  assert.equal(result.ok, false, "the second, unmatched occurrence must fail strict fresh validation");
+});
+
+test("a well-formed, schema-valid item that's ALSO fresh (not matching anything stored) still passes on its own merits", () => {
+  const alreadyValid = { id: "del_x", platform: "instagram", format: "reel", quantity: 1 };
+  const result = resolveDeliverableSave([alreadyValid, { ...alreadyValid, id: "del_y" }], [alreadyValid]);
+  // Only ONE of the two matches the stored row; the second (del_y) is fresh
+  // but is ALSO independently schema-valid, so it passes on its own merits —
+  // proving "fresh" doesn't mean "always rejected," only "not coerced."
+  assert.equal(result.ok, true);
+  if (result.ok) assert.equal(result.deliverables.length, 2);
 });
