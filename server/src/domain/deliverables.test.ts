@@ -14,6 +14,7 @@ import {
   normalizeLegacyDeliverables,
   remapLegacyDeliverablePricingKeys,
   resolveDeliverableSave,
+  validateDeliverableDeltas,
 } from "./deliverablesValidator.js";
 
 function d(overrides: Record<string, unknown> = {}) {
@@ -524,4 +525,117 @@ test("a well-formed, schema-valid item that's ALSO fresh (not matching anything 
   // proving "fresh" doesn't mean "always rejected," only "not coerced."
   assert.equal(result.ok, true);
   if (result.ok) assert.equal(result.deliverables.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// PLU-172 — DeliverableDelta (the frozen negotiation-delta contract)
+// ---------------------------------------------------------------------------
+
+console.log("\nDeliverableDelta — SET_QUANTITY / REPLACE_FORMAT / ADD / REMOVE\n");
+
+test("SET_QUANTITY with a positive integer quantity is valid", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "SET_QUANTITY", sourceDeliverableId: "del_1", quantity: 1, normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, true);
+});
+
+test("SET_QUANTITY with quantity 0 is rejected", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "SET_QUANTITY", sourceDeliverableId: "del_1", quantity: 0, normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, false);
+});
+
+test("REPLACE_FORMAT with a valid platform/format combination is accepted", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "REPLACE_FORMAT", sourceDeliverableId: "del_1", platform: "instagram", format: "story", normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, true);
+});
+
+test("REPLACE_FORMAT with TIKTOK + REEL (invalid combination) is rejected — reuses PLATFORM_FORMAT_MATRIX", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "REPLACE_FORMAT", sourceDeliverableId: "del_1", platform: "tiktok", format: "reel", normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, false);
+});
+
+test("ADD with a fully valid new deliverable (no id — minted downstream) is accepted", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "ADD", deliverable: { platform: "instagram", format: "reel", quantity: 1 }, normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, true);
+});
+
+test("ADD with an explicit id is also accepted (structural validity only — collision with an existing package item is an apply-step concern)", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "ADD", deliverable: { id: "del_new", platform: "instagram", format: "reel", quantity: 1 }, normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, true);
+});
+
+test("ADD with an invalid platform/format combination on the embedded deliverable is rejected (the SAME invariants as any other deliverable)", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "ADD", deliverable: { platform: "linkedin", format: "carousel", quantity: 1 }, normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, false);
+});
+
+test("ADD with platform 'other' and no customLabel is rejected (same customLabel-required invariant as deliverableSchema)", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "ADD", deliverable: { platform: "other", format: "other", quantity: 1 }, normalization: "EXACT" },
+  ]);
+  assert.equal(r.ok, false);
+});
+
+test("REMOVE with just a sourceDeliverableId is valid", () => {
+  const r = validateDeliverableDeltas([{ operation: "REMOVE", sourceDeliverableId: "del_1", normalization: "EXACT" }]);
+  assert.equal(r.ok, true);
+});
+
+test("an unknown operation is rejected", () => {
+  const r = validateDeliverableDeltas([{ operation: "REPLACE_EVERYTHING", sourceDeliverableId: "del_1", normalization: "EXACT" }]);
+  assert.equal(r.ok, false);
+});
+
+test("SET_QUANTITY missing sourceDeliverableId is rejected", () => {
+  const r = validateDeliverableDeltas([{ operation: "SET_QUANTITY", quantity: 2, normalization: "EXACT" }]);
+  assert.equal(r.ok, false);
+});
+
+test("normalization: AMBIGUOUS is structurally valid (the SCHEMA accepts it — routing an ambiguous proposal away from auto-approval is the apply-step's/evaluator's job, not this schema's)", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "SET_QUANTITY", sourceDeliverableId: "del_1", quantity: 1, normalization: "AMBIGUOUS" },
+  ]);
+  assert.equal(r.ok, true);
+});
+
+test("a delta missing normalization entirely is rejected", () => {
+  const r = validateDeliverableDeltas([{ operation: "REMOVE", sourceDeliverableId: "del_1" }]);
+  assert.equal(r.ok, false);
+});
+
+test("sourceText is optional and, when present, carried through", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "REMOVE", sourceDeliverableId: "del_1", normalization: "EXACT", sourceText: "drop the story post" },
+  ]);
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.deltas[0]!.sourceText, "drop the story post");
+});
+
+test("an unrecognized extra field on a delta is rejected (.strict())", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "REMOVE", sourceDeliverableId: "del_1", normalization: "EXACT", extra: true },
+  ]);
+  assert.equal(r.ok, false);
+});
+
+test("multiple deltas in one array validate independently", () => {
+  const r = validateDeliverableDeltas([
+    { operation: "SET_QUANTITY", sourceDeliverableId: "del_1", quantity: 3, normalization: "EXACT" },
+    { operation: "REMOVE", sourceDeliverableId: "del_2", normalization: "ALIASED" },
+  ]);
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal(r.deltas.length, 2);
 });

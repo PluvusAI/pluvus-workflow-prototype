@@ -3,7 +3,7 @@ import type { Request, Response } from "express";
 import {
   listCampaigns,
   createCampaign,
-  updateCampaign,
+  updateCampaignWithDetails,
   getCampaignWithWorkflows,
   findCampaignById,
   deleteCampaign,
@@ -18,17 +18,30 @@ import {
 } from "../db/campaigns.js";
 import {
   CampaignLockedError,
+  CampaignDetailsValidationError,
   getCampaignDetails,
   getCampaignDetailsByCampaignIds,
   upsertCampaignDetails,
 } from "../db/campaignDetails.js";
-import { getNegotiationPolicy, upsertNegotiationPolicy } from "../db/negotiationPolicy.js";
+import {
+  getNegotiationPolicy,
+  upsertNegotiationPolicy,
+  upsertNegotiationPolicyValidated,
+  NegotiationPolicyValidationError,
+} from "../db/negotiationPolicy.js";
 import {
   validateDeliverables,
   normalizeLegacyDeliverables,
   remapLegacyDeliverablePricingKeys,
   resolveDeliverableSave,
 } from "../domain/deliverablesValidator.js";
+import { validateDeliverablePolicyRules } from "../domain/deliverablePolicyRules.js";
+import {
+  validateRightsPolicyRules,
+  SCRIPT_WAIVER_MODES,
+  isScriptWaiverMode,
+} from "../domain/rightsPolicyRules.js";
+import type { NegotiationPolicyValidationCode as CrossFieldValidationCode } from "../domain/negotiationPolicyValidation.js";
 import { getBrandIdentity, upsertBrandIdentity } from "../db/brandIdentity.js";
 import {
   getCreatorRequirement,
@@ -204,6 +217,64 @@ const PRICE_STRATEGIES = ["REQUEST_RATE_CARD", "PROPOSE_STARTING_FEE"] as const;
 type PriceStrategyValue = (typeof PRICE_STRATEGIES)[number];
 function isPriceStrategy(v: unknown): v is PriceStrategyValue {
   return typeof v === "string" && (PRICE_STRATEGIES as readonly string[]).includes(v);
+}
+
+// PLU-172: one guard factory instead of 9 hand-written copies of the same
+// "typeof v === string && values.includes(v)" check — the Page-8 mode
+// enums all follow the identical shape isCampaignType/isPriceStrategy
+// above already established.
+function makeEnumGuard<T extends string>(values: readonly T[]): (v: unknown) => v is T {
+  return (v: unknown): v is T => typeof v === "string" && (values as readonly string[]).includes(v);
+}
+
+const FEE_NEGOTIATION_MODES = ["KEEP_PUBLIC_OFFER", "ALLOW_WITHIN_LIMIT", "ASK_FOR_APPROVAL"] as const;
+const isFeeNegotiationMode = makeEnumGuard(FEE_NEGOTIATION_MODES);
+
+const COMMISSION_NEGOTIATION_MODES = ["KEEP_PUBLIC_COMMISSION", "ALLOW_WITHIN_LIMIT", "ASK_FOR_APPROVAL"] as const;
+const isCommissionNegotiationMode = makeEnumGuard(COMMISSION_NEGOTIATION_MODES);
+
+const COMMISSION_DURATION_MODES = ["KEEP_PUBLIC_DURATION", "ALLOW_WITHIN_LIMIT", "ASK_FOR_APPROVAL"] as const;
+const isCommissionDurationMode = makeEnumGuard(COMMISSION_DURATION_MODES);
+
+const DURATION_UNITS = ["DAYS", "LIFETIME", "COUNT"] as const;
+const isDurationUnit = makeEnumGuard(DURATION_UNITS);
+
+const GIFT_SUBSTITUTION_MODES = ["KEEP_OFFERED_BENEFIT", "ALLOW_EQUIVALENT_APPROVED_OPTION", "ASK_FOR_APPROVAL"] as const;
+const isGiftSubstitutionMode = makeEnumGuard(GIFT_SUBSTITUTION_MODES);
+
+const GIFT_CASH_REPLACEMENT_MODES = ["REJECT", "ASK_FOR_APPROVAL", "ALLOW_UP_TO_AMOUNT"] as const;
+const isGiftCashReplacementMode = makeEnumGuard(GIFT_CASH_REPLACEMENT_MODES);
+
+const DELIVERABLE_NEGOTIATION_MODES = ["KEEP_REQUESTED", "ASK_FOR_APPROVAL", "ALLOW_SELECTED_CHANGES"] as const;
+const isDeliverableNegotiationMode = makeEnumGuard(DELIVERABLE_NEGOTIATION_MODES);
+
+const POSTING_NEGOTIATION_MODES = ["KEEP_DEADLINE", "ALLOW_DELAY_DAYS", "ASK_FOR_APPROVAL"] as const;
+const isPostingNegotiationMode = makeEnumGuard(POSTING_NEGOTIATION_MODES);
+
+const OUT_OF_POLICY_ACTIONS = ["ASK_FOR_APPROVAL", "REJECT_REQUEST"] as const;
+const isOutOfPolicyAction = makeEnumGuard(OUT_OF_POLICY_ACTIONS);
+
+function isStringArrayOrNull(v: unknown): v is string[] | null {
+  return v === null || (Array.isArray(v) && v.every((x) => typeof x === "string"));
+}
+
+// PLU-172 (review item 4 — "Stable API errors"): every new validation branch
+// this ticket adds returns a machine-readable `code` alongside the human
+// `error` message, so a client can branch on the FAILURE REASON rather than
+// parsing prose. A plain string union (not a thrown Error class, unlike
+// CampaignLockedError/CompensationIncompleteError) — this is a single
+// route's field-validation branch, not a reusable domain error a caller
+// catches by type. Extends the pure cross-field validator's own 3 codes
+// (domain/negotiationPolicyValidation.ts — the single source of truth for
+// those) with one more this route adds locally for its enum/shape guards.
+type NegotiationPolicyValidationCode = CrossFieldValidationCode | "INVALID_FIELD_VALUE";
+
+function negotiationPolicyValidationError(
+  res: Response,
+  code: NegotiationPolicyValidationCode,
+  error: string,
+): void {
+  res.status(400).json({ error, code });
 }
 
 // Accepted on create/patch so a future explicit-selection UI can set
@@ -664,7 +735,7 @@ router.patch("/:id", async (req: Request, res: Response) => {
     trackingParameter?: string | null;
   };
 
-  const patch: Parameters<typeof updateCampaign>[1] = {};
+  const patch: Parameters<typeof updateCampaignWithDetails>[1] = {};
   // PLU-135 (1a): the creator-facing fields below now live in CampaignDetails,
   // patched separately from the Campaign row itself.
   const detailsPatch: Parameters<typeof upsertCampaignDetails>[1] = {};
@@ -1004,14 +1075,18 @@ router.patch("/:id", async (req: Request, res: Response) => {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const campaign =
-      Object.keys(patch).length > 0
-        ? await updateCampaign(req.params["id"]!, patch)
-        : existing;
-    const details =
-      Object.keys(detailsPatch).length > 0
-        ? await upsertCampaignDetails(req.params["id"]!, detailsPatch)
-        : await getCampaignDetails(req.params["id"]!);
+    // Review fix — "a request that changes campaign fields and public terms
+    // can return a validation error after updateCampaign() has already
+    // committed the campaign patch": both writes now happen inside ONE
+    // transaction (db/campaigns.ts's updateCampaignWithDetails) so a
+    // rejected details validation rolls back the campaign patch too,
+    // leaving no partial update.
+    const { campaign, details } = await updateCampaignWithDetails(
+      req.params["id"]!,
+      patch,
+      detailsPatch,
+      existing,
+    );
     res.json({
       ...flattenCampaign(campaign, details),
       updatedAt: campaign.updatedAt.toISOString(),
@@ -1019,6 +1094,15 @@ router.patch("/:id", async (req: Request, res: Response) => {
   } catch (err) {
     if (err instanceof CampaignLockedError) {
       res.status(409).json({ error: err.message });
+      return;
+    }
+    // Review fix — "validate public fee, commission, and unit changes
+    // together with the stored policy before committing the details
+    // update": the symmetric direction of the negotiation-policy PATCH's
+    // own validation error, same stable codes (FEE_LIMIT_BELOW_PUBLIC_OFFER /
+    // COMMISSION_LIMIT_BELOW_PUBLIC_COMMISSION), same 400 response shape.
+    if (err instanceof CampaignDetailsValidationError) {
+      negotiationPolicyValidationError(res, err.code, err.message);
       return;
     }
     console.error("[campaigns] update error:", err);
@@ -1092,6 +1176,24 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     giftValueFlexibilityCents,
     negotiableTerms,
     nonNegotiableTerms,
+    // PLU-172 — Page-8 negotiation-authority fields.
+    feeMode,
+    commissionNegotiationMode,
+    commissionCeilingAmountCents,
+    commissionDurationMode,
+    commissionDurationLimitValue,
+    commissionDurationLimitUnit,
+    giftSubstitutionMode,
+    giftApprovedSubstitutes,
+    giftCashReplacementMode,
+    giftCashReplacementLimitCents,
+    deliverableNegotiationMode,
+    deliverablePolicyRules,
+    postingNegotiationMode,
+    postingMaxDelayDays,
+    rightsPolicyRules,
+    scriptWaiverMode,
+    outOfPolicyAction,
   } = req.body as {
     floorCents?: number | null;
     ceilingCents?: number | null;
@@ -1107,6 +1209,23 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     giftValueFlexibilityCents?: number | null;
     negotiableTerms?: unknown;
     nonNegotiableTerms?: unknown;
+    feeMode?: string;
+    commissionNegotiationMode?: string;
+    commissionCeilingAmountCents?: number | null;
+    commissionDurationMode?: string;
+    commissionDurationLimitValue?: number | null;
+    commissionDurationLimitUnit?: string | null;
+    giftSubstitutionMode?: string;
+    giftApprovedSubstitutes?: unknown;
+    giftCashReplacementMode?: string;
+    giftCashReplacementLimitCents?: number | null;
+    deliverableNegotiationMode?: string;
+    deliverablePolicyRules?: unknown;
+    postingNegotiationMode?: string;
+    postingMaxDelayDays?: number | null;
+    rightsPolicyRules?: unknown;
+    scriptWaiverMode?: string;
+    outOfPolicyAction?: string;
   };
 
   // negotiableTerms/nonNegotiableTerms follow the category-list convention
@@ -1133,6 +1252,98 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
       error: `nonNegotiableTerms must be an array of: ${NON_NEGOTIABLE_CATEGORIES.join(", ")}`,
     });
     return;
+  }
+
+  // PLU-172 — mode enums: reject-unrecognized-value-loudly, same posture as
+  // campaignType/priceStrategy above.
+  if (feeMode !== undefined && !isFeeNegotiationMode(feeMode)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `feeMode must be one of: ${FEE_NEGOTIATION_MODES.join(", ")}`);
+    return;
+  }
+  if (commissionNegotiationMode !== undefined && !isCommissionNegotiationMode(commissionNegotiationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `commissionNegotiationMode must be one of: ${COMMISSION_NEGOTIATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (commissionDurationMode !== undefined && !isCommissionDurationMode(commissionDurationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `commissionDurationMode must be one of: ${COMMISSION_DURATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (
+    commissionDurationLimitUnit !== undefined &&
+    commissionDurationLimitUnit !== null &&
+    !isDurationUnit(commissionDurationLimitUnit)
+  ) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `commissionDurationLimitUnit must be one of: ${DURATION_UNITS.join(", ")}`);
+    return;
+  }
+  if (giftSubstitutionMode !== undefined && !isGiftSubstitutionMode(giftSubstitutionMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `giftSubstitutionMode must be one of: ${GIFT_SUBSTITUTION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (giftCashReplacementMode !== undefined && !isGiftCashReplacementMode(giftCashReplacementMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `giftCashReplacementMode must be one of: ${GIFT_CASH_REPLACEMENT_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (deliverableNegotiationMode !== undefined && !isDeliverableNegotiationMode(deliverableNegotiationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `deliverableNegotiationMode must be one of: ${DELIVERABLE_NEGOTIATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (postingNegotiationMode !== undefined && !isPostingNegotiationMode(postingNegotiationMode)) {
+    negotiationPolicyValidationError(
+      res,
+      "INVALID_FIELD_VALUE",
+      `postingNegotiationMode must be one of: ${POSTING_NEGOTIATION_MODES.join(", ")}`,
+    );
+    return;
+  }
+  if (outOfPolicyAction !== undefined && !isOutOfPolicyAction(outOfPolicyAction)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `outOfPolicyAction must be one of: ${OUT_OF_POLICY_ACTIONS.join(", ")}`);
+    return;
+  }
+  // Calvin review (item 9): its own dedicated mode — NOT rightsNegotiationModeEnum.
+  if (scriptWaiverMode !== undefined && !isScriptWaiverMode(scriptWaiverMode)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `scriptWaiverMode must be one of: ${SCRIPT_WAIVER_MODES.join(", ")}`);
+    return;
+  }
+
+  // PLU-172 — the two validated rule arrays + the free-text substitute list.
+  if (giftApprovedSubstitutes !== undefined && !isStringArrayOrNull(giftApprovedSubstitutes)) {
+    negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", "giftApprovedSubstitutes must be an array of strings or null");
+    return;
+  }
+  if (deliverablePolicyRules !== undefined && deliverablePolicyRules !== null) {
+    const result = validateDeliverablePolicyRules(deliverablePolicyRules);
+    if (!result.ok) {
+      negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `deliverablePolicyRules: ${result.error}`);
+      return;
+    }
+  }
+  if (rightsPolicyRules !== undefined && rightsPolicyRules !== null) {
+    const result = validateRightsPolicyRules(rightsPolicyRules);
+    if (!result.ok) {
+      negotiationPolicyValidationError(res, "INVALID_FIELD_VALUE", `rightsPolicyRules: ${result.error}`);
+      return;
+    }
   }
 
   // floorCents/ceilingCents/preferredFeeCents/maxRounds/giftValueFlexibilityCents
@@ -1168,7 +1379,54 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
   ) {
     return;
   }
+  if (
+    commissionCeilingAmountCents !== undefined &&
+    commissionCeilingAmountCents !== null &&
+    !validateInt4(commissionCeilingAmountCents, "commissionCeilingAmountCents", res)
+  ) {
+    return;
+  }
+  if (
+    commissionDurationLimitValue !== undefined &&
+    commissionDurationLimitValue !== null &&
+    !validateInt4(commissionDurationLimitValue, "commissionDurationLimitValue", res)
+  ) {
+    return;
+  }
+  if (
+    postingMaxDelayDays !== undefined &&
+    postingMaxDelayDays !== null &&
+    !validateInt4(postingMaxDelayDays, "postingMaxDelayDays", res)
+  ) {
+    return;
+  }
+  if (
+    giftCashReplacementLimitCents !== undefined &&
+    giftCashReplacementLimitCents !== null &&
+    !validateInt4(giftCashReplacementLimitCents, "giftCashReplacementLimitCents", res)
+  ) {
+    return;
+  }
 
+  // PLU-172 — cross-field validation against the public offer, and
+  // write-time rejection of a limit whose mode doesn't authorize it (item
+  // 9's "ideally reject the combination at write time too"). The actual
+  // rules live in domain/negotiationPolicyValidation.ts (pure, unit-tested
+  // there).
+  //
+  // Review fix ("policy validation is not atomic with its write"): this
+  // used to read CampaignDetails/NegotiationPolicy and validate HERE, then
+  // separately call upsertNegotiationPolicy — two steps with no lock held
+  // across them, so two concurrent PATCHes could each validate against a
+  // stale view of the OTHER's not-yet-committed change (e.g. one sets
+  // feeMode=ALLOW_WITHIN_LIMIT, the other concurrently sets a ceilingCents
+  // below the public fee — each looks valid in isolation against what it
+  // read, both commit, the combination is invalid). The read + validate now
+  // happens INSIDE db/negotiationPolicy.ts's upsertNegotiationPolicyValidated,
+  // in the SAME transaction and behind the SAME Campaign-row lock as the
+  // write itself — see that function's own doc comment for the full
+  // reasoning. This route no longer validates before calling it; it just
+  // builds the patch and lets the atomic function validate+write+throw.
   const patch: Parameters<typeof upsertNegotiationPolicy>[1] = {};
   if (floorCents !== undefined) patch.floorCents = floorCents;
   if (ceilingCents !== undefined) patch.ceilingCents = ceilingCents;
@@ -1192,13 +1450,54 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
     patch.nonNegotiableTerms = nonNegotiableTerms as JsonValue | null;
   }
 
+  // PLU-172 — already validated (enum guards + schema.safeParse + cross-field
+  // checks) above; a straight assignment here, same convention as every
+  // field above it.
+  if (feeMode !== undefined) patch.feeMode = feeMode as (typeof FEE_NEGOTIATION_MODES)[number];
+  if (commissionNegotiationMode !== undefined) {
+    patch.commissionNegotiationMode = commissionNegotiationMode as (typeof COMMISSION_NEGOTIATION_MODES)[number];
+  }
+  if (commissionCeilingAmountCents !== undefined) patch.commissionCeilingAmountCents = commissionCeilingAmountCents;
+  if (commissionDurationMode !== undefined) {
+    patch.commissionDurationMode = commissionDurationMode as (typeof COMMISSION_DURATION_MODES)[number];
+  }
+  if (commissionDurationLimitValue !== undefined) patch.commissionDurationLimitValue = commissionDurationLimitValue;
+  if (commissionDurationLimitUnit !== undefined) {
+    patch.commissionDurationLimitUnit = commissionDurationLimitUnit as (typeof DURATION_UNITS)[number] | null;
+  }
+  if (giftSubstitutionMode !== undefined) {
+    patch.giftSubstitutionMode = giftSubstitutionMode as (typeof GIFT_SUBSTITUTION_MODES)[number];
+  }
+  if (giftApprovedSubstitutes !== undefined) patch.giftApprovedSubstitutes = giftApprovedSubstitutes as JsonValue | null;
+  if (giftCashReplacementMode !== undefined) {
+    patch.giftCashReplacementMode = giftCashReplacementMode as (typeof GIFT_CASH_REPLACEMENT_MODES)[number];
+  }
+  if (giftCashReplacementLimitCents !== undefined) {
+    patch.giftCashReplacementLimitCents = giftCashReplacementLimitCents;
+  }
+  if (deliverableNegotiationMode !== undefined) {
+    patch.deliverableNegotiationMode = deliverableNegotiationMode as (typeof DELIVERABLE_NEGOTIATION_MODES)[number];
+  }
+  if (deliverablePolicyRules !== undefined) patch.deliverablePolicyRules = deliverablePolicyRules as JsonValue | null;
+  if (postingNegotiationMode !== undefined) {
+    patch.postingNegotiationMode = postingNegotiationMode as (typeof POSTING_NEGOTIATION_MODES)[number];
+  }
+  if (postingMaxDelayDays !== undefined) patch.postingMaxDelayDays = postingMaxDelayDays;
+  if (rightsPolicyRules !== undefined) patch.rightsPolicyRules = rightsPolicyRules as JsonValue | null;
+  if (scriptWaiverMode !== undefined) {
+    patch.scriptWaiverMode = scriptWaiverMode as (typeof SCRIPT_WAIVER_MODES)[number];
+  }
+  if (outOfPolicyAction !== undefined) {
+    patch.outOfPolicyAction = outOfPolicyAction as (typeof OUT_OF_POLICY_ACTIONS)[number];
+  }
+
   try {
     const campaign = await findCampaignById(req.params["id"]!);
     if (!campaign) {
       res.status(404).json({ error: "campaign not found" });
       return;
     }
-    const policy = await upsertNegotiationPolicy(req.params["id"]!, patch);
+    const policy = await upsertNegotiationPolicyValidated(req.params["id"]!, patch);
     res.json({
       ...policy,
       createdAt: policy.createdAt.toISOString(),
@@ -1207,6 +1506,10 @@ router.patch("/:id/negotiation-policy", async (req: Request, res: Response) => {
   } catch (err) {
     if (err instanceof CampaignLockedError) {
       res.status(409).json({ error: err.message });
+      return;
+    }
+    if (err instanceof NegotiationPolicyValidationError) {
+      negotiationPolicyValidationError(res, err.code, err.message);
       return;
     }
     console.error("[campaigns] update negotiation policy error:", err);

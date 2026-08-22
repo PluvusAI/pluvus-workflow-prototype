@@ -29,12 +29,22 @@ import {
   workflowVersions,
   type Campaign,
   type CampaignDetails,
+  type CampaignDetailsInsert,
   type CampaignInsert,
   type CampaignTermsSnapshot,
+  type JsonValue,
   type NegotiationPolicy,
   type WorkflowStatus,
 } from "./schema.js";
+import { getCampaignDetails, upsertCampaignDetailsValidated } from "./campaignDetails.js";
 import { validateDeliverables, normalizeLegacyDeliverables } from "../domain/deliverablesValidator.js";
+import {
+  needsFee as _needsFee,
+  needsCommission as _needsCommission,
+  projectActivePublicFields,
+  projectActivePrivatePolicyFields,
+  buildRightsPublicValues,
+} from "../domain/compensationShape.js";
 
 export async function findCampaignById(
   id: string,
@@ -70,8 +80,9 @@ export async function createCampaign(data: CampaignInsert): Promise<Campaign> {
 export async function updateCampaign(
   id: string,
   data: Partial<CampaignInsert>,
+  client: Db | DbTx = db,
 ): Promise<Campaign> {
-  const rows = await db
+  const rows = await client
     .update(campaigns)
     .set(data)
     .where(eq(campaigns.id, id))
@@ -82,6 +93,48 @@ export async function updateCampaign(
     throw new Error(`Campaign ${id} not found`);
   }
   return updated;
+}
+
+// PLU-172 (review fix — "a request that changes campaign fields and public
+// terms can return a validation error after updateCampaign() has already
+// committed the campaign patch"). The `PATCH /campaigns/:id` route used to
+// call updateCampaign() and upsertCampaignDetailsValidated() as two
+// separate statements: a name change plus a public-fee raise above the
+// stored private ceiling committed the name change, THEN rejected the fee
+// change — leaving the campaign in a state neither the pre- nor post-request
+// shape, with no way for the client to tell from the 400 response that part
+// of its request had already taken effect.
+//
+// Fixed by moving both writes inside ONE transaction. upsertCampaignDetailsValidated
+// (db/campaignDetails.ts) already composes correctly inside a caller's
+// transaction — its own withDraftLock opens a Postgres SAVEPOINT when handed
+// an existing tx (see that function's doc comment) — so when its validation
+// throws CampaignDetailsValidationError, the exception propagates up through
+// this function's own `client.transaction()` callback and the WHOLE
+// transaction rolls back, undoing updateCampaign()'s write too, not just the
+// savepoint. `existingCampaign` is the ALREADY-fetched campaign row the route
+// resolved for its own 404 check — reused here (not re-queried) so the
+// "campaignPatch is empty" branch behaves identically to the pre-fix code,
+// which returned that same object without opening any transaction at all.
+export async function updateCampaignWithDetails(
+  id: string,
+  campaignPatch: Partial<CampaignInsert>,
+  detailsPatch: Omit<Partial<CampaignDetailsInsert>, "id" | "campaignId">,
+  existingCampaign: Campaign,
+  client: Db | DbTx = db,
+): Promise<{ campaign: Campaign; details: CampaignDetails | null }> {
+  const hasCampaignPatch = Object.keys(campaignPatch).length > 0;
+  const hasDetailsPatch = Object.keys(detailsPatch).length > 0;
+  if (!hasCampaignPatch && !hasDetailsPatch) {
+    return { campaign: existingCampaign, details: await getCampaignDetails(id, client) };
+  }
+  return client.transaction(async (tx) => {
+    const campaign = hasCampaignPatch ? await updateCampaign(id, campaignPatch, tx) : existingCampaign;
+    const details = hasDetailsPatch
+      ? await upsertCampaignDetailsValidated(id, detailsPatch, tx)
+      : await getCampaignDetails(id, tx);
+    return { campaign, details };
+  });
 }
 
 /**
@@ -274,9 +327,12 @@ export function validateCompensationReadiness(
 ): string[] {
   const missing: string[] = [];
 
-  const needsFee = details.campaignType === "PAID" || details.campaignType === "HYBRID";
-  const needsCommission =
-    details.campaignType === "AFFILIATE" || details.campaignType === "HYBRID";
+  // PLU-172: shared with the activation-time projection (compensationShape.ts)
+  // and the negotiation-policy PATCH route, so "does this campaignType need
+  // a fee/commission" can't drift between call sites the way it could when
+  // each one re-derived the answer inline.
+  const needsFee = _needsFee(details.campaignType);
+  const needsCommission = _needsCommission(details.campaignType);
   const needsGift = details.campaignType === "GIFT_ONLY" || details.includesGifting;
 
   // Legacy rows predating the id requirement are normalized (never rejected
@@ -512,8 +568,20 @@ export async function launchCampaign(
       confirmedAt: _detailsConfirmedAt,
       createdAt: _dc,
       updatedAt: _du,
-      ...detailsSnapshot
+      ...rawDetailsSnapshot
     } = details;
+
+    // PLU-172: exclude inactive conditional fields before freezing — a
+    // campaign that changed campaignType/includesGifting since an earlier
+    // edit must not carry stale leftovers (e.g. a HYBRID->GIFT_ONLY
+    // campaign's old publicCommissionRate) into the IMMUTABLE snapshot. See
+    // domain/compensationShape.ts's own doc comment for the full rule.
+    const detailsSnapshot = projectActivePublicFields(rawDetailsSnapshot);
+    const rightsPublicValues = buildRightsPublicValues(rawDetailsSnapshot);
+    const privatePolicySnapshot = projectActivePrivatePolicyFields(
+      { ...policy },
+      { campaignType: details.campaignType, includesGifting: details.includesGifting, rightsPublicValues },
+    );
 
     // Second layer behind the FOR UPDATE lock above (belt and suspenders,
     // same posture as payouts.ts): run the writes in a nested transaction
@@ -527,27 +595,52 @@ export async function launchCampaign(
           .insert(campaignTermsSnapshots)
           .values({
             campaignId: id,
-            detailsSnapshot,
+            detailsSnapshot: detailsSnapshot as JsonValue,
             briefExtractionId: confirmedFromExtractionId,
           })
           .returning();
 
         await tx2.insert(negotiationPolicySnapshots).values({
           campaignId: id,
-          floorCents: policy.floorCents,
-          ceilingCents: policy.ceilingCents,
-          preferredFeeCents: policy.preferredFeeCents,
-          commissionFloorRate: policy.commissionFloorRate,
-          commissionCeilingRate: policy.commissionCeilingRate,
-          preferredCommissionRate: policy.preferredCommissionRate,
+          floorCents: privatePolicySnapshot["floorCents"] as number | null,
+          ceilingCents: privatePolicySnapshot["ceilingCents"] as number | null,
+          preferredFeeCents: privatePolicySnapshot["preferredFeeCents"] as number | null,
+          commissionFloorRate: privatePolicySnapshot["commissionFloorRate"] as number | null,
+          commissionCeilingRate: privatePolicySnapshot["commissionCeilingRate"] as number | null,
+          preferredCommissionRate: privatePolicySnapshot["preferredCommissionRate"] as number | null,
           maxRounds: policy.maxRounds,
           openingOfferPosition: policy.openingOfferPosition,
           overCeilingTolerance: policy.overCeilingTolerance,
           negotiationGuidance: policy.negotiationGuidance,
-          giftSubstitutionAllowed: policy.giftSubstitutionAllowed,
-          giftValueFlexibilityCents: policy.giftValueFlexibilityCents,
+          giftSubstitutionAllowed: privatePolicySnapshot["giftSubstitutionAllowed"] as boolean | null,
+          giftValueFlexibilityCents: privatePolicySnapshot["giftValueFlexibilityCents"] as number | null,
           negotiableTerms: policy.negotiableTerms,
           nonNegotiableTerms: policy.nonNegotiableTerms,
+
+          // PLU-172: the Page-8 authority fields, run through the SAME
+          // exclusion projection as the fields above (mode-conditional for
+          // these — see compensationShape.ts's own doc comment on why the
+          // three fields above are exempt from that and these are not).
+          feeMode: policy.feeMode,
+          commissionNegotiationMode: policy.commissionNegotiationMode,
+          commissionCeilingAmountCents: privatePolicySnapshot["commissionCeilingAmountCents"] as number | null,
+          commissionDurationMode: policy.commissionDurationMode,
+          commissionDurationLimitValue: privatePolicySnapshot["commissionDurationLimitValue"] as number | null,
+          commissionDurationLimitUnit: privatePolicySnapshot["commissionDurationLimitUnit"] as NegotiationPolicy["commissionDurationLimitUnit"],
+          giftSubstitutionMode: policy.giftSubstitutionMode,
+          giftApprovedSubstitutes: privatePolicySnapshot["giftApprovedSubstitutes"] as JsonValue | null,
+          giftCashReplacementMode: policy.giftCashReplacementMode,
+          giftCashReplacementLimitCents: privatePolicySnapshot["giftCashReplacementLimitCents"] as number | null,
+          deliverableNegotiationMode: policy.deliverableNegotiationMode,
+          deliverablePolicyRules: privatePolicySnapshot["deliverablePolicyRules"] as JsonValue | null,
+          postingNegotiationMode: policy.postingNegotiationMode,
+          postingMaxDelayDays: privatePolicySnapshot["postingMaxDelayDays"] as number | null,
+          rightsPolicyRules: privatePolicySnapshot["rightsPolicyRules"] as JsonValue | null,
+          // Calvin review (item 9): scriptWaiverMode is never mode-gated by
+          // this projection (it has no associated limit field) — copied
+          // straight through, same as feeMode/giftCashReplacementMode above.
+          scriptWaiverMode: policy.scriptWaiverMode,
+          outOfPolicyAction: policy.outOfPolicyAction,
         });
 
         await tx2.update(campaigns).set({ status: "ACTIVE" }).where(eq(campaigns.id, id));

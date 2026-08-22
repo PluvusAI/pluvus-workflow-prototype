@@ -14,6 +14,7 @@
 import { z } from "zod";
 import { createId } from "@paralleldrive/cuid2";
 import type { Deliverable, DeliverableFormat, DeliverablePlatform } from "./deliverables.js";
+import { canonicalJsonKey } from "./jsonCanonicalize.js";
 
 export const DELIVERABLE_PLATFORMS: readonly DeliverablePlatform[] = [
   "instagram",
@@ -59,16 +60,33 @@ const requirementsSchema = z
   })
   .strict();
 
-export const deliverableSchema = z
-  .object({
-    id: z.string().min(1),
-    platform: z.enum(DELIVERABLE_PLATFORMS as [DeliverablePlatform, ...DeliverablePlatform[]]),
-    format: z.enum(DELIVERABLE_FORMATS as [DeliverableFormat, ...DeliverableFormat[]]),
-    quantity: z.number().int().positive(),
-    requirements: requirementsSchema.nullable().optional(),
-    customLabel: z.string().min(1).nullable().optional(),
-    notes: z.string().nullable().optional(),
-  })
+// The raw (un-refined) object shape — kept separate from deliverableSchema
+// (below) so PLU-172's ADD-delta variant can build its own, differently-
+// shaped version (an optional `id`) via `.omit()`/`.extend()`. Zod's `.omit`
+// only exists on a plain ZodObject, not on the ZodEffects a `.refine()` call
+// produces — reusing deliverableSchema itself for that would require
+// stripping refinements back off, which isn't possible either.
+const deliverableObjectSchema = z.object({
+  id: z.string().min(1),
+  platform: z.enum(DELIVERABLE_PLATFORMS as [DeliverablePlatform, ...DeliverablePlatform[]]),
+  format: z.enum(DELIVERABLE_FORMATS as [DeliverableFormat, ...DeliverableFormat[]]),
+  quantity: z.number().int().positive(),
+  requirements: requirementsSchema.nullable().optional(),
+  customLabel: z.string().min(1).nullable().optional(),
+  notes: z.string().nullable().optional(),
+});
+
+// The two invariants every deliverable-shaped object must satisfy — applied
+// here AND, identically, to the ADD-delta's newDeliverableSchema further
+// down, so an ADD can't smuggle in an otherwise-invalid deliverable through
+// a looser check. Deliberately NOT factored into a shared generic helper:
+// `.refine()` on a generically-typed zod schema (`T extends ZodType<Base>`)
+// collapses the INFERRED shape back down to the generic's own constraint
+// type, silently dropping sibling properties (like `id`) from what
+// TypeScript thinks the schema produces — tried and reverted here, see git
+// history. A few duplicated lines beat zod type inference that lies.
+
+export const deliverableSchema = deliverableObjectSchema
   .strict()
   .refine((d) => PLATFORM_FORMAT_MATRIX[d.platform].includes(d.format), {
     message: "invalid platform/format combination",
@@ -95,6 +113,129 @@ export function validateDeliverables(value: unknown): DeliverablesValidationResu
   if (result.success) {
     return { ok: true, deliverables: result.data as Deliverable[] };
   }
+  return { ok: false, error: result.error.issues.map((i) => i.message).join("; ") };
+}
+
+// ---------------------------------------------------------------------------
+// PLU-172 — the frozen negotiation-delta contract
+// ---------------------------------------------------------------------------
+// "Freeze a typed DeliverableDelta[] inside CounterDelta rather than asking
+// the model to return a complete replacement package for every reply." This
+// is the delta shape itself (PolicyDecision/CounterDelta, which WRAP this,
+// live in domain/policyDecision.ts). Reuses DeliverablePlatform/
+// DeliverableFormat/PLATFORM_FORMAT_MATRIX verbatim — an ADD or
+// REPLACE_FORMAT delta is validated against the EXACT same matrix a
+// requested/final package already uses.
+//
+// Types only — no apply/evaluation logic lives here. The apply-step rules
+// this schema alone cannot enforce (an id must exist in the PINNED package,
+// two deltas can't target the same id, an ADD can't reuse an existing id)
+// are frozen as a contract for that future apply step
+// (docs/plu-172-private-policy-contract-plan.md §5.3), since this schema has
+// no view of any specific campaign's package to check against.
+
+export const DELIVERABLE_DELTA_OPERATIONS = ["SET_QUANTITY", "REPLACE_FORMAT", "ADD", "REMOVE"] as const;
+export type DeliverableDeltaOperation = (typeof DELIVERABLE_DELTA_OPERATIONS)[number];
+
+// How confidently a delta was normalized from raw model/creator text BEFORE
+// it reaches this schema. Regex/alias normalization (IG -> instagram)
+// happens upstream; this field records whether that normalization was
+// exact, required an alias-table lookup, or is uncertain enough that a
+// human/agent should treat the proposal as ambiguous rather than
+// authoritative. Distinct from PolicyDecision's outcome — this is about
+// whether the PROPOSAL was understood; PolicyDecision is about whether it's
+// ALLOWED.
+export const DELTA_NORMALIZATION_STATES = ["EXACT", "ALIASED", "AMBIGUOUS"] as const;
+export type DeltaNormalizationState = (typeof DELTA_NORMALIZATION_STATES)[number];
+
+const deltaBase = z.object({
+  normalization: z.enum(DELTA_NORMALIZATION_STATES),
+  /** Verbatim source text this delta was derived from, for audit — same
+   *  evidence-text discipline as the negotiation adapter's ExtractedFact.
+   *  Never authoritative on its own. */
+  sourceText: z.string().optional(),
+});
+
+// The ADD variant's embedded new deliverable — same shape/invariants as
+// deliverableSchema, but id is OPTIONAL (minted if absent, same convention
+// as normalizeLegacyDeliverables). Built from the raw object schema (not
+// deliverableSchema itself — see that const's own comment on why) so
+// `.omit` is available, then given the SAME two invariant refinements
+// deliverableSchema has above so an ADD can't smuggle in an otherwise-
+// invalid deliverable through a looser check.
+const newDeliverableSchema = deliverableObjectSchema
+  .omit({ id: true })
+  .extend({ id: z.string().min(1).optional() })
+  .strict()
+  .refine((d) => PLATFORM_FORMAT_MATRIX[d.platform].includes(d.format), {
+    message: "invalid platform/format combination",
+    path: ["format"],
+  })
+  .refine((d) => d.platform !== "other" || Boolean(d.customLabel && d.customLabel.trim().length > 0), {
+    message: 'customLabel is required when platform is "other"',
+    path: ["customLabel"],
+  });
+
+// discriminatedUnion requires every variant to be a plain ZodObject (not a
+// ZodEffects) — so the REPLACE_FORMAT platform/format-matrix check can't be
+// a `.refine()` on that one variant directly (that was tried and rejected;
+// see git history if resurrecting this pattern). It's applied instead as a
+// `.superRefine()` on the whole union below, which any variant can run
+// operation-conditional logic in without breaking discriminatedUnion's
+// variant-type requirement.
+const deliverableDeltaUnion = z.discriminatedUnion("operation", [
+  deltaBase
+    .extend({
+      operation: z.literal("SET_QUANTITY"),
+      sourceDeliverableId: z.string().min(1),
+      quantity: z.number().int().positive(),
+    })
+    .strict(),
+  deltaBase
+    .extend({
+      operation: z.literal("REPLACE_FORMAT"),
+      sourceDeliverableId: z.string().min(1),
+      platform: z.enum(DELIVERABLE_PLATFORMS as [DeliverablePlatform, ...DeliverablePlatform[]]),
+      format: z.enum(DELIVERABLE_FORMATS as [DeliverableFormat, ...DeliverableFormat[]]),
+    })
+    .strict(),
+  deltaBase
+    .extend({
+      operation: z.literal("ADD"),
+      // A caller-supplied id colliding with an existing package item is an
+      // apply-step concern (§5.3), not something this schema (with no view
+      // of any package) can check.
+      deliverable: newDeliverableSchema,
+    })
+    .strict(),
+  deltaBase
+    .extend({
+      operation: z.literal("REMOVE"),
+      sourceDeliverableId: z.string().min(1),
+    })
+    .strict(),
+]);
+
+export const deliverableDeltaSchema = deliverableDeltaUnion.superRefine((d, ctx) => {
+  if (d.operation === "REPLACE_FORMAT" && !PLATFORM_FORMAT_MATRIX[d.platform].includes(d.format)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "invalid platform/format combination",
+      path: ["format"],
+    });
+  }
+});
+
+export type DeliverableDelta = z.infer<typeof deliverableDeltaSchema>;
+export const deliverableDeltasSchema = z.array(deliverableDeltaSchema);
+
+export type DeliverableDeltaValidationResult =
+  | { ok: true; deltas: DeliverableDelta[] }
+  | { ok: false; error: string };
+
+export function validateDeliverableDeltas(value: unknown): DeliverableDeltaValidationResult {
+  const result = deliverableDeltasSchema.safeParse(value);
+  if (result.success) return { ok: true, deltas: result.data };
   return { ok: false, error: result.error.issues.map((i) => i.message).join("; ") };
 }
 
@@ -281,21 +422,9 @@ export function remapLegacyDeliverablePricingKeys(
 // Fix: normalize ONLY an item that is byte-for-byte identical
 // (key-order-independent) to something already stored for this campaign;
 // every other item is validated AS SUBMITTED, strictly, with no coercion.
-
-function canonicalizeForComparison(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonicalizeForComparison);
-  if (value !== null && typeof value === "object") {
-    const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-      out[key] = canonicalizeForComparison((value as Record<string, unknown>)[key]);
-    }
-    return out;
-  }
-  return value;
-}
-function canonicalDeliverableKey(value: unknown): string {
-  return JSON.stringify(canonicalizeForComparison(value));
-}
+// canonicalJsonKey is shared with domain/draftRevision.ts (PLU-172), which
+// needs the identical key-order-independent comparison for its approval
+// hash — see jsonCanonicalize.ts's own doc comment.
 
 export type ResolveDeliverableSaveResult =
   | { ok: true; deliverables: Deliverable[]; legacyKeyToId: Map<string, string> }
@@ -314,14 +443,14 @@ export function resolveDeliverableSave(
 ): ResolveDeliverableSaveResult {
   const existingCounts = new Map<string, number>();
   for (const item of existing) {
-    const key = canonicalDeliverableKey(item);
+    const key = canonicalJsonKey(item);
     existingCounts.set(key, (existingCounts.get(key) ?? 0) + 1);
   }
 
   const resultItems: unknown[] = [];
   const legacyKeyToId = new Map<string, string>();
   for (const item of submitted) {
-    const key = canonicalDeliverableKey(item);
+    const key = canonicalJsonKey(item);
     const remaining = existingCounts.get(key) ?? 0;
     if (remaining > 0) {
       // Genuinely carried forward unchanged — safe to self-heal.

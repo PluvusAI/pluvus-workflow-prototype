@@ -237,8 +237,107 @@ export const campaignAuditEventTypeEnum = pgEnum("CampaignAuditEventType", [
   "SNAPSHOT_CREATED",
   "DUPLICATED",
   "BRIEF_RENDERED",
+  // PLU-172: private-policy PATCHes (including the new Page-8 authority
+  // fields) reuse this EXISTING event type rather than adding a new one —
+  // Calvin review: no new audit-event value needed as long as change
+  // metadata can be recorded without exposing raw private values (see
+  // routes/campaigns.ts's negotiation-policy PATCH handler for what the
+  // payload actually records).
   "POLICY_CHANGED",
   "ARCHIVED",
+]);
+
+// PLU-172: closed-form fee-negotiation authority for a Paid/Hybrid campaign
+// (worksheet S8.P1). Conservative default KEEP_PUBLIC_OFFER — a campaign
+// nobody has configured Page 8 for negotiates nothing. See
+// negotiationPolicies' own doc comment for the full field-by-field mapping.
+export const feeNegotiationModeEnum = pgEnum("FeeNegotiationMode", [
+  "KEEP_PUBLIC_OFFER",
+  "ALLOW_WITHIN_LIMIT",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172: mirrors feeNegotiationModeEnum for commission (S8.A1). Named
+// distinctly from campaignDetails.commissionMode ("percent" | "flat", the
+// PUBLIC unit selector) — an unrelated axis that happens to share a topic.
+export const commissionNegotiationModeEnum = pgEnum("CommissionNegotiationMode", [
+  "KEEP_PUBLIC_COMMISSION",
+  "ALLOW_WITHIN_LIMIT",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172: commission-window duration authority (S8.A2).
+export const commissionDurationModeEnum = pgEnum("CommissionDurationMode", [
+  "KEEP_PUBLIC_DURATION",
+  "ALLOW_WITHIN_LIMIT",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172: the unit a duration value is expressed in, shared by the
+// commission-duration limit and its public counterpart
+// (campaignDetails.commissionDurationUnit) — "Customer lifetime, time-span,
+// or count" semantics per the worksheet.
+export const durationUnitEnum = pgEnum("DurationUnit", ["DAYS", "LIFETIME", "COUNT"]);
+
+// PLU-172: gift/product substitution authority (S8.G1).
+export const giftSubstitutionModeEnum = pgEnum("GiftSubstitutionMode", [
+  "KEEP_OFFERED_BENEFIT",
+  "ALLOW_EQUIVALENT_APPROVED_OPTION",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172: cash-instead-of-product authority (S8.G2). Conservative default
+// REJECT — no cash substitution until a brand opts in.
+export const giftCashReplacementModeEnum = pgEnum("GiftCashReplacementMode", [
+  "REJECT",
+  "ASK_FOR_APPROVAL",
+  "ALLOW_UP_TO_AMOUNT",
+]);
+
+// PLU-172: deliverable quantity/format change authority (S8.C1).
+export const deliverableNegotiationModeEnum = pgEnum("DeliverableNegotiationMode", [
+  "KEEP_REQUESTED",
+  "ASK_FOR_APPROVAL",
+  "ALLOW_SELECTED_CHANGES",
+]);
+
+// PLU-172: posting-deadline slack authority (S8.C2).
+export const postingNegotiationModeEnum = pgEnum("PostingNegotiationMode", [
+  "KEEP_DEADLINE",
+  "ALLOW_DELAY_DAYS",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172: shared mode for every DURATION-bearing rights-family term (usage
+// rights, exclusivity, ad authorization, post retention, content-repurpose
+// rights — S8.C3). Reused per-term inside negotiationPolicies.rightsPolicyRules
+// (a JSON rule array, not one column per term).
+//
+// Calvin review: script submission (S8.C5) does NOT share this enum —
+// ALLOW_TO_MINIMUM has no meaning for a boolean-ish "require the script or
+// not" term. It has its own dedicated mode (scriptWaiverModeEnum, below)
+// and its own column, not a rightsPolicyRules entry.
+export const rightsNegotiationModeEnum = pgEnum("RightsNegotiationMode", [
+  "KEEP_REQUESTED",
+  "ALLOW_TO_MINIMUM",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172 (Calvin review): script/idea submission waiver authority (S8.C5)
+// — deliberately NOT rightsNegotiationModeEnum (see that enum's own doc
+// comment for why).
+export const scriptWaiverModeEnum = pgEnum("ScriptWaiverMode", [
+  "KEEP_SUBMISSION_REQUIRED",
+  "ALLOW_WAIVER",
+  "ASK_FOR_APPROVAL",
+]);
+
+// PLU-172: what happens when a creator's request falls outside every
+// configured authority above (S8.E1, worksheet: Required). The worksheet
+// states the default explicitly: defaults to approval.
+export const outOfPolicyActionEnum = pgEnum("OutOfPolicyAction", [
+  "ASK_FOR_APPROVAL",
+  "REJECT_REQUEST",
 ]);
 
 // PLU-135 (1a): a campaign's launch lifecycle. DRAFT is freely editable;
@@ -492,6 +591,25 @@ export type PriceStrategy = (typeof priceStrategyEnum.enumValues)[number];
 export type CompensationReviewStatus =
   (typeof compensationReviewStatusEnum.enumValues)[number];
 
+// PLU-172
+export type FeeNegotiationMode = (typeof feeNegotiationModeEnum.enumValues)[number];
+export type CommissionNegotiationMode =
+  (typeof commissionNegotiationModeEnum.enumValues)[number];
+export type CommissionDurationMode =
+  (typeof commissionDurationModeEnum.enumValues)[number];
+export type DurationUnit = (typeof durationUnitEnum.enumValues)[number];
+export type GiftSubstitutionMode = (typeof giftSubstitutionModeEnum.enumValues)[number];
+export type GiftCashReplacementMode =
+  (typeof giftCashReplacementModeEnum.enumValues)[number];
+export type DeliverableNegotiationMode =
+  (typeof deliverableNegotiationModeEnum.enumValues)[number];
+export type PostingNegotiationMode =
+  (typeof postingNegotiationModeEnum.enumValues)[number];
+export type RightsNegotiationMode =
+  (typeof rightsNegotiationModeEnum.enumValues)[number];
+export type ScriptWaiverMode = (typeof scriptWaiverModeEnum.enumValues)[number];
+export type OutOfPolicyAction = (typeof outOfPolicyActionEnum.enumValues)[number];
+
 // ---------------------------------------------------------------------------
 // Definition models
 // ---------------------------------------------------------------------------
@@ -709,6 +827,19 @@ export const campaignDetails = pgTable("CampaignDetails", {
   trackingLinkMode: text("trackingLinkMode"), // S7.T1 "pluvus" | "own"
   trackingDestinationUrl: text("trackingDestinationUrl"), // S7.T2
   trackingParameter: text("trackingParameter"), // S7.T3
+  // PLU-172: the public counterpart to negotiationPolicies'
+  // commissionDurationLimitValue — lets the private limit state which
+  // semantics its number uses ("Customer lifetime, time-span, or count" per
+  // the worksheet). Existing rows read as DAYS at the application layer
+  // (matching commissionDurationDays' current implicit meaning), not via a
+  // DB default, so an operator confirms rather than has old rows silently
+  // reinterpreted.
+  commissionDurationUnit: durationUnitEnum("commissionDurationUnit"),
+  // PLU-172: the worksheet's rights family includes "content repurpose
+  // rights," which had no public field until this ticket. No intake page
+  // collects this yet — any private rightsPolicyRules entry for this term
+  // is excluded at activation-projection time until one does.
+  contentRepurposeRights: text("contentRepurposeRights"),
   // PLU-139 field-level provenance: { "<fieldKey>": "manual" | "pdf_extracted" }.
   // How each creator-facing value got here (typed = manual, applied from a brief
   // candidate = pdf_extracted). Absent key = no provenance recorded.
@@ -857,6 +988,107 @@ export const negotiationPolicies = pgTable("NegotiationPolicy", {
   // convention (metadata/socialLinks/etc.) instead of introducing a new one.
   negotiableTerms: jsonb("negotiableTerms").$type<JsonValue>(),
   nonNegotiableTerms: jsonb("nonNegotiableTerms").$type<JsonValue>(),
+
+  // ===========================================================================
+  // PLU-172: the closed-form Page-8 negotiation-authority fields. Every mode
+  // column defaults to its most conservative value — "every campaign has a
+  // conservative private policy, even when no term may change" is the
+  // worksheet's own governing rule, so a campaign nobody has configured
+  // Page 8 for reads as "negotiate nothing" by construction, not by the
+  // convention of a reader treating null as conservative.
+  //
+  // A limit field (the *Cents/*Rate/*Value/*Days columns) is only
+  // meaningful when its paired mode authorizes it (e.g. ceilingCents is a
+  // real bound only when feeMode = ALLOW_WITHIN_LIMIT) — see
+  // domain/compensationShape.ts's projectActivePrivatePolicyFields for the
+  // activation-time exclusion of a limit whose mode doesn't authorize it,
+  // and routes/campaigns.ts's PATCH validation for the write-time
+  // rejection. floorCents/ceilingCents/giftValueFlexibilityCents ABOVE
+  // pre-date this ticket and are deliberately NOT gated by these new mode
+  // columns at either point — the live negotiation agent (resolveBand())
+  // already depends on them unconditionally; gating them would be an
+  // undeclared runtime behavior change, not a schema addition. See
+  // compensationShape.ts's own doc comment for the full reasoning.
+  // ===========================================================================
+
+  // S8.P1 fee-negotiation authority. Limit = ceilingCents (above, reused).
+  feeMode: feeNegotiationModeEnum("feeMode").notNull().default("KEEP_PUBLIC_OFFER"),
+
+  // S8.A1 commission-negotiation authority. Limit = commissionCeilingRate
+  // (above, reused) when the public commission is percent-based, or
+  // commissionCeilingAmountCents (below, new) when it's flat-amount —
+  // campaignDetails.commissionMode ("percent" | "flat") decides which.
+  commissionNegotiationMode: commissionNegotiationModeEnum("commissionNegotiationMode")
+    .notNull()
+    .default("KEEP_PUBLIC_COMMISSION"),
+  // New — S8.A1's "same percentage or flat-amount semantics as the enabled
+  // public mode" requirement. commissionCeilingRate (a rate) has no way to
+  // express a flat-dollar maximum; this does.
+  commissionCeilingAmountCents: integer("commissionCeilingAmountCents"),
+
+  // S8.A2 commission-duration authority.
+  commissionDurationMode: commissionDurationModeEnum("commissionDurationMode")
+    .notNull()
+    .default("KEEP_PUBLIC_DURATION"),
+  commissionDurationLimitValue: integer("commissionDurationLimitValue"),
+  commissionDurationLimitUnit: durationUnitEnum("commissionDurationLimitUnit"),
+
+  // S8.G1 gift-substitution authority. Free-text list of PRE-APPROVED
+  // substitute products/perks — only meaningful under
+  // ALLOW_EQUIVALENT_APPROVED_OPTION.
+  giftSubstitutionMode: giftSubstitutionModeEnum("giftSubstitutionMode")
+    .notNull()
+    .default("KEEP_OFFERED_BENEFIT"),
+  giftApprovedSubstitutes: jsonb("giftApprovedSubstitutes").$type<JsonValue>(),
+  // S8.G2 cash-replacement authority.
+  giftCashReplacementMode: giftCashReplacementModeEnum("giftCashReplacementMode")
+    .notNull()
+    .default("REJECT"),
+  // Calvin review: a DEDICATED limit, not a reuse of
+  // giftValueFlexibilityCents above. "Cash replacement" and "gift-value
+  // flexibility" are different concepts that happen to share a unit
+  // (cents) — permanently overloading one field for both would make it
+  // impossible to ever give them independent values. Only meaningful under
+  // giftCashReplacementMode = ALLOW_UP_TO_AMOUNT.
+  giftCashReplacementLimitCents: integer("giftCashReplacementLimitCents"),
+
+  // S8.C1 deliverable-change authority. deliverablePolicyRules is a
+  // validated array of {appliesTo, allowQuantityDecreaseTo,
+  // allowFormatChangeTo} — see domain/deliverablePolicyRules.ts — only
+  // meaningful under ALLOW_SELECTED_CHANGES.
+  deliverableNegotiationMode: deliverableNegotiationModeEnum("deliverableNegotiationMode")
+    .notNull()
+    .default("KEEP_REQUESTED"),
+  deliverablePolicyRules: jsonb("deliverablePolicyRules").$type<JsonValue>(),
+
+  // S8.C2 posting-deadline authority.
+  postingNegotiationMode: postingNegotiationModeEnum("postingNegotiationMode")
+    .notNull()
+    .default("KEEP_DEADLINE"),
+  postingMaxDelayDays: integer("postingMaxDelayDays"),
+
+  // S8.C3 rights family (usage rights, exclusivity, ad authorization, post
+  // retention, content-repurpose rights — NOT script submission, see
+  // scriptWaiverMode below). One rule per applicable public duration term
+  // ({term, mode, minimumValue?, minimumUnit?}) — see
+  // domain/rightsPolicyRules.ts. A term with NO entry reads as
+  // KEEP_REQUESTED (the conservative default); no DB default applies to an
+  // array the same way a scalar mode gets one — the absence rule is
+  // enforced by every reader (resolveRightsMode), not the column.
+  rightsPolicyRules: jsonb("rightsPolicyRules").$type<JsonValue>(),
+
+  // S8.C5 script/idea submission waiver authority. Calvin review: its own
+  // dedicated mode+column, NOT a rightsPolicyRules entry — see
+  // scriptWaiverModeEnum's own doc comment for why.
+  scriptWaiverMode: scriptWaiverModeEnum("scriptWaiverMode")
+    .notNull()
+    .default("KEEP_SUBMISSION_REQUIRED"),
+
+  // S8.E1 out-of-policy fallback. Worksheet: Required, defaults to approval.
+  outOfPolicyAction: outOfPolicyActionEnum("outOfPolicyAction")
+    .notNull()
+    .default("ASK_FOR_APPROVAL"),
+
   createdAt: tsNow("createdAt"),
   updatedAt: tsUpdatedAt("updatedAt"),
 });
@@ -891,6 +1123,47 @@ export const negotiationPolicySnapshots = pgTable("NegotiationPolicySnapshot", {
   giftValueFlexibilityCents: integer("giftValueFlexibilityCents"),
   negotiableTerms: jsonb("negotiableTerms").$type<JsonValue>(),
   nonNegotiableTerms: jsonb("nonNegotiableTerms").$type<JsonValue>(),
+
+  // PLU-172: mirrors negotiationPolicies' Page-8 authority fields exactly
+  // (same columns, same defaults) — see that table's own doc comment for
+  // the full field-by-field mapping. Frozen at launch by
+  // domain/compensationShape.ts's projectActivePrivatePolicyFields, which
+  // nulls a limit whose mode doesn't authorize it (for every field added
+  // by this ticket — NOT for the three pre-existing fields above).
+  feeMode: feeNegotiationModeEnum("feeMode").notNull().default("KEEP_PUBLIC_OFFER"),
+  commissionNegotiationMode: commissionNegotiationModeEnum("commissionNegotiationMode")
+    .notNull()
+    .default("KEEP_PUBLIC_COMMISSION"),
+  commissionCeilingAmountCents: integer("commissionCeilingAmountCents"),
+  commissionDurationMode: commissionDurationModeEnum("commissionDurationMode")
+    .notNull()
+    .default("KEEP_PUBLIC_DURATION"),
+  commissionDurationLimitValue: integer("commissionDurationLimitValue"),
+  commissionDurationLimitUnit: durationUnitEnum("commissionDurationLimitUnit"),
+  giftSubstitutionMode: giftSubstitutionModeEnum("giftSubstitutionMode")
+    .notNull()
+    .default("KEEP_OFFERED_BENEFIT"),
+  giftApprovedSubstitutes: jsonb("giftApprovedSubstitutes").$type<JsonValue>(),
+  giftCashReplacementMode: giftCashReplacementModeEnum("giftCashReplacementMode")
+    .notNull()
+    .default("REJECT"),
+  giftCashReplacementLimitCents: integer("giftCashReplacementLimitCents"),
+  deliverableNegotiationMode: deliverableNegotiationModeEnum("deliverableNegotiationMode")
+    .notNull()
+    .default("KEEP_REQUESTED"),
+  deliverablePolicyRules: jsonb("deliverablePolicyRules").$type<JsonValue>(),
+  postingNegotiationMode: postingNegotiationModeEnum("postingNegotiationMode")
+    .notNull()
+    .default("KEEP_DEADLINE"),
+  postingMaxDelayDays: integer("postingMaxDelayDays"),
+  rightsPolicyRules: jsonb("rightsPolicyRules").$type<JsonValue>(),
+  scriptWaiverMode: scriptWaiverModeEnum("scriptWaiverMode")
+    .notNull()
+    .default("KEEP_SUBMISSION_REQUIRED"),
+  outOfPolicyAction: outOfPolicyActionEnum("outOfPolicyAction")
+    .notNull()
+    .default("ASK_FOR_APPROVAL"),
+
   launchedAt: tsNow("launchedAt"),
   createdAt: tsNow("createdAt"),
 });

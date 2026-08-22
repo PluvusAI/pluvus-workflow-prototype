@@ -248,8 +248,116 @@ enum CampaignAuditEventType {
   SNAPSHOT_CREATED
   DUPLICATED
   BRIEF_RENDERED
+  /// PLU-172: private-policy PATCHes (including the new Page-8 authority
+  /// fields) reuse this EXISTING event type rather than adding a new one —
+  /// Calvin review: no new audit-event value needed as long as change
+  /// metadata can be recorded without exposing raw private values.
   POLICY_CHANGED
   ARCHIVED
+}
+
+/// PLU-172: closed-form fee-negotiation authority for a Paid/Hybrid
+/// campaign (worksheet S8.P1). KEEP_PUBLIC_OFFER = never move off the
+/// public starting fee; ALLOW_WITHIN_LIMIT = autonomously negotiate up to
+/// NegotiationPolicy.ceilingCents (reused — see that field's own doc
+/// comment); ASK_FOR_APPROVAL = a submitted rate always routes to the
+/// brand. Conservative default: KEEP_PUBLIC_OFFER (a campaign nobody has
+/// configured Page 8 for negotiates nothing).
+enum FeeNegotiationMode {
+  KEEP_PUBLIC_OFFER
+  ALLOW_WITHIN_LIMIT
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172: mirrors FeeNegotiationMode for commission (worksheet S8.A1).
+/// Named distinctly from CampaignDetails.commissionMode ("percent" |
+/// "flat", the PUBLIC unit selector) — this is the PRIVATE negotiation
+/// authority, an unrelated axis that happens to share a topic.
+enum CommissionNegotiationMode {
+  KEEP_PUBLIC_COMMISSION
+  ALLOW_WITHIN_LIMIT
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172: commission-window duration authority (worksheet S8.A2).
+enum CommissionDurationMode {
+  KEEP_PUBLIC_DURATION
+  ALLOW_WITHIN_LIMIT
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172: the unit a duration value is expressed in, shared by the
+/// commission-duration limit (NegotiationPolicy) and its public
+/// counterpart (CampaignDetails.commissionDurationUnit) so both sides
+/// compare like-for-like ("Customer lifetime, time-span, or count"
+/// semantics per the worksheet).
+enum DurationUnit {
+  DAYS
+  LIFETIME
+  COUNT
+}
+
+/// PLU-172: gift/product substitution authority (worksheet S8.G1).
+enum GiftSubstitutionMode {
+  KEEP_OFFERED_BENEFIT
+  ALLOW_EQUIVALENT_APPROVED_OPTION
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172: cash-instead-of-product authority (worksheet S8.G2).
+/// Conservative default REJECT — no cash substitution until a brand opts in.
+enum GiftCashReplacementMode {
+  REJECT
+  ASK_FOR_APPROVAL
+  ALLOW_UP_TO_AMOUNT
+}
+
+/// PLU-172: deliverable quantity/format change authority (worksheet S8.C1).
+enum DeliverableNegotiationMode {
+  KEEP_REQUESTED
+  ASK_FOR_APPROVAL
+  ALLOW_SELECTED_CHANGES
+}
+
+/// PLU-172: posting-deadline slack authority (worksheet S8.C2).
+enum PostingNegotiationMode {
+  KEEP_DEADLINE
+  ALLOW_DELAY_DAYS
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172: shared mode for every DURATION-bearing rights-family term
+/// (usage rights, exclusivity, ad authorization, post retention,
+/// content-repurpose rights — worksheet S8.C3). One enum, reused per-term
+/// inside NegotiationPolicy.rightsPolicyRules (a JSON rule array, not one
+/// column per term — see that field's own doc comment).
+///
+/// Calvin review: script submission (S8.C5) does NOT share this enum —
+/// ALLOW_TO_MINIMUM has no meaning for a boolean-ish "require the script or
+/// not" term (there is no duration to shrink toward a minimum). It has its
+/// own dedicated mode (ScriptWaiverMode, below) and its own column
+/// (scriptWaiverMode), not a rightsPolicyRules entry.
+enum RightsNegotiationMode {
+  KEEP_REQUESTED
+  ALLOW_TO_MINIMUM
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172 (Calvin review): script/idea submission waiver authority
+/// (worksheet S8.C5) — deliberately NOT RightsNegotiationMode (see that
+/// enum's own doc comment for why ALLOW_TO_MINIMUM doesn't apply here).
+enum ScriptWaiverMode {
+  KEEP_SUBMISSION_REQUIRED
+  ALLOW_WAIVER
+  ASK_FOR_APPROVAL
+}
+
+/// PLU-172: what happens when a creator's request falls outside every
+/// configured authority above (worksheet S8.E1, marked Required). The
+/// worksheet states the default explicitly: defaults to approval.
+enum OutOfPolicyAction {
+  ASK_FOR_APPROVAL
+  REJECT_REQUEST
 }
 
 /// PLU-135 (1a): a campaign's launch lifecycle. DRAFT is freely editable;
@@ -540,6 +648,22 @@ model CampaignDetails {
   trackingDestinationUrl String? /// S7.T2
   trackingParameter      String? /// S7.T3
 
+  /// PLU-172: the public counterpart to NegotiationPolicy's
+  /// commissionDurationLimitValue — lets the private limit state which
+  /// semantics its number uses ("Customer lifetime, time-span, or count"
+  /// per the worksheet). Existing rows read as DAYS at the application
+  /// layer (matching commissionDurationDays' current implicit meaning),
+  /// not via a DB default, so an operator confirms rather than has old
+  /// rows silently reinterpreted.
+  commissionDurationUnit DurationUnit?
+  /// PLU-172: the worksheet's rights family includes "content repurpose
+  /// rights," which had no public field until this ticket. Free text, same
+  /// convention as adAuthorization/postRetention. No intake page collects
+  /// this yet (see docs/plu-172-private-policy-contract-plan.md open
+  /// question 3) — any private rightsPolicyRules entry for this term is
+  /// excluded at activation-projection time until one does.
+  contentRepurposeRights String?
+
   /// PLU-139 field-level provenance: { "<fieldKey>": "manual" | "pdf_extracted" }.
   /// How each creator-facing value got here — a field the brand typed/edited is
   /// "manual"; a value applied from an uploaded brief candidate is "pdf_extracted".
@@ -696,6 +820,90 @@ model NegotiationPolicy {
   negotiableTerms    Json?
   nonNegotiableTerms Json?
 
+  /// =========================================================================
+  /// PLU-172: the closed-form Page-8 negotiation-authority fields. Every mode
+  /// column below defaults to its most conservative value — "every campaign
+  /// has a conservative private policy, even when no term may change" is the
+  /// worksheet's own governing rule, so a campaign nobody has configured
+  /// Page 8 for reads as "negotiate nothing" by construction, not by the
+  /// convention of a reader treating null as conservative.
+  ///
+  /// A limit field (the *Cents/*Rate/*Value/*Days columns below) is only
+  /// meaningful when its paired mode authorizes it (e.g. ceilingCents is
+  /// read as a real bound only when feeMode = ALLOW_WITHIN_LIMIT) — see
+  /// domain/compensationShape.ts's projectActivePrivatePolicyFields for the
+  /// activation-time exclusion of a limit whose mode doesn't authorize it,
+  /// and routes/campaigns.ts's PATCH validation for the equivalent
+  /// write-time rejection. floorCents/ceilingCents/giftValueFlexibilityCents
+  /// above PRE-DATE this ticket and are deliberately NOT gated by the new
+  /// mode columns at either point — see compensationShape.ts's own doc
+  /// comment for why (the live negotiation agent already depends on them
+  /// unconditionally; gating them would be an undeclared runtime behavior
+  /// change, not a schema addition).
+  /// =========================================================================
+
+  /// S8.P1 fee-negotiation authority. Limit = ceilingCents (above, reused).
+  feeMode FeeNegotiationMode @default(KEEP_PUBLIC_OFFER)
+
+  /// S8.A1 commission-negotiation authority. Limit = commissionCeilingRate
+  /// (above, reused) when the public commission is percent-based, or
+  /// commissionCeilingAmountCents (below, new) when it's flat-amount —
+  /// CampaignDetails.commissionMode ("percent" | "flat") decides which.
+  commissionNegotiationMode CommissionNegotiationMode @default(KEEP_PUBLIC_COMMISSION)
+  /// New — S8.A1's "same percentage or flat-amount semantics as the
+  /// enabled public mode" requirement. commissionCeilingRate (a rate) has
+  /// no way to express a flat-dollar maximum; this does.
+  commissionCeilingAmountCents Int?
+
+  /// S8.A2 commission-duration authority.
+  commissionDurationMode      CommissionDurationMode @default(KEEP_PUBLIC_DURATION)
+  commissionDurationLimitValue Int?
+  commissionDurationLimitUnit  DurationUnit?
+
+  /// S8.G1 gift-substitution authority. Free-text list of PRE-APPROVED
+  /// substitute products/perks — only meaningful under
+  /// ALLOW_EQUIVALENT_APPROVED_OPTION.
+  giftSubstitutionMode      GiftSubstitutionMode @default(KEEP_OFFERED_BENEFIT)
+  giftApprovedSubstitutes   Json?
+  /// S8.G2 cash-replacement authority.
+  giftCashReplacementMode   GiftCashReplacementMode @default(REJECT)
+  /// Calvin review: a DEDICATED limit, not a reuse of
+  /// giftValueFlexibilityCents above. "Cash replacement" and "gift-value
+  /// flexibility" are different concepts that happen to share a unit
+  /// (cents) — permanently overloading one field for both would make it
+  /// impossible to ever give them independent values. Only meaningful
+  /// under giftCashReplacementMode = ALLOW_UP_TO_AMOUNT.
+  giftCashReplacementLimitCents Int?
+
+  /// S8.C1 deliverable-change authority. deliverablePolicyRules is a
+  /// validated array of {appliesTo, allowQuantityDecreaseTo,
+  /// allowFormatChangeTo} — see domain/deliverablePolicyRules.ts — only
+  /// meaningful under ALLOW_SELECTED_CHANGES.
+  deliverableNegotiationMode DeliverableNegotiationMode @default(KEEP_REQUESTED)
+  deliverablePolicyRules     Json?
+
+  /// S8.C2 posting-deadline authority.
+  postingNegotiationMode PostingNegotiationMode @default(KEEP_DEADLINE)
+  postingMaxDelayDays    Int?
+
+  /// S8.C3 rights family (usage rights, exclusivity, ad authorization, post
+  /// retention, content-repurpose rights — NOT script submission, see
+  /// ScriptWaiverMode's own doc comment). One rule per applicable public
+  /// duration term ({term, mode, minimumValue?, minimumUnit?}) — see
+  /// domain/rightsPolicyRules.ts. A term with NO entry reads as
+  /// KEEP_REQUESTED (the conservative default); no DB default applies to
+  /// an array the same way a scalar mode gets one — the absence rule is
+  /// enforced by every reader (resolveRightsMode), not the column.
+  rightsPolicyRules Json?
+
+  /// S8.C5 script/idea submission waiver authority. Calvin review: its own
+  /// dedicated mode+column, NOT a rightsPolicyRules entry — see
+  /// ScriptWaiverMode's own doc comment for why.
+  scriptWaiverMode ScriptWaiverMode @default(KEEP_SUBMISSION_REQUIRED)
+
+  /// S8.E1 out-of-policy fallback. Worksheet: Required, defaults to approval.
+  outOfPolicyAction OutOfPolicyAction @default(ASK_FOR_APPROVAL)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -731,6 +939,30 @@ model NegotiationPolicySnapshot {
   giftValueFlexibilityCents Int?
   negotiableTerms      Json?
   nonNegotiableTerms   Json?
+
+  /// PLU-172: mirrors NegotiationPolicy's Page-8 authority fields exactly
+  /// (same columns, same defaults, same exclusion rules) — see that
+  /// model's own doc comment for the full explanation. Frozen at launch by
+  /// domain/compensationShape.ts's projectActivePrivatePolicyFields, which
+  /// nulls a limit whose mode doesn't authorize it (for every field added
+  /// by this ticket — NOT for the three pre-existing fields above).
+  feeMode                      FeeNegotiationMode @default(KEEP_PUBLIC_OFFER)
+  commissionNegotiationMode    CommissionNegotiationMode @default(KEEP_PUBLIC_COMMISSION)
+  commissionCeilingAmountCents Int?
+  commissionDurationMode       CommissionDurationMode @default(KEEP_PUBLIC_DURATION)
+  commissionDurationLimitValue Int?
+  commissionDurationLimitUnit  DurationUnit?
+  giftSubstitutionMode         GiftSubstitutionMode @default(KEEP_OFFERED_BENEFIT)
+  giftApprovedSubstitutes      Json?
+  giftCashReplacementMode      GiftCashReplacementMode @default(REJECT)
+  giftCashReplacementLimitCents Int?
+  deliverableNegotiationMode   DeliverableNegotiationMode @default(KEEP_REQUESTED)
+  deliverablePolicyRules       Json?
+  postingNegotiationMode       PostingNegotiationMode @default(KEEP_DEADLINE)
+  postingMaxDelayDays          Int?
+  rightsPolicyRules            Json?
+  scriptWaiverMode             ScriptWaiverMode @default(KEEP_SUBMISSION_REQUIRED)
+  outOfPolicyAction            OutOfPolicyAction @default(ASK_FOR_APPROVAL)
 
   launchedAt DateTime @default(now())
   createdAt  DateTime @default(now())

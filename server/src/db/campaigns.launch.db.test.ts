@@ -342,6 +342,73 @@ async function main(): Promise<void> {
     },
   );
 
+  await test(
+    "PLU-172: launchCampaign() excludes a limit whose mode doesn't authorize it, and a rights rule for a term with no public value, from the immutable snapshot",
+    async () => {
+      const [campaign] = await pgdb
+        .insert(schema.campaigns)
+        .values({ name: "Launch Test policy-projection", brand: "Acme" })
+        .returning();
+      await pgdb.insert(schema.campaignDetails).values({
+        campaignId: campaign!.id,
+        objective: "Drive signups",
+        priceStrategy: "REQUEST_RATE_CARD",
+        compensationReviewStatus: "CONFIRMED",
+        deliverableQuantities: [{ id: "del_default", platform: "instagram", format: "reel", quantity: 1 }],
+        usageRights: "90-day paid social",
+        // contentRepurposeRights deliberately left null/unset — no intake
+        // page collects it yet (see docs/plu-172-...-plan.md open question 3).
+      });
+      await pgdb.insert(schema.negotiationPolicies).values({
+        campaignId: campaign!.id,
+        floorCents: 20000,
+        ceilingCents: 50000,
+        maxRounds: 3,
+        // A limit set WITHOUT its authorizing mode — hand-inserted directly
+        // (bypassing the PATCH route's own write-time rejection of exactly
+        // this combination) to prove launchCampaign()'s activation
+        // projection ALSO excludes it, independently, at the one point
+        // that actually freezes the immutable snapshot.
+        postingNegotiationMode: "KEEP_DEADLINE",
+        postingMaxDelayDays: 7,
+        // Two rights rules: one for a term WITH a public value (survives),
+        // one for a term with NO public value (contentRepurposeRights —
+        // must be excluded).
+        rightsPolicyRules: [
+          { term: "usageRights", mode: "ALLOW_TO_MINIMUM", minimumValue: 30, minimumUnit: "DAYS" },
+          { term: "contentRepurposeRights", mode: "KEEP_REQUESTED" },
+        ],
+      });
+
+      await launchCampaign(campaign!.id, pgdb);
+      const [snapshot] = await pgdb
+        .select()
+        .from(schema.negotiationPolicySnapshots)
+        .where(eq(schema.negotiationPolicySnapshots.campaignId, campaign!.id));
+
+      assert.equal(
+        snapshot!.postingMaxDelayDays,
+        null,
+        "postingMaxDelayDays must be excluded — postingNegotiationMode is KEEP_DEADLINE, not ALLOW_DELAY_DAYS",
+      );
+      assert.equal(snapshot!.postingNegotiationMode, "KEEP_DEADLINE", "the MODE itself is never excluded, only the limit it fails to authorize");
+
+      const rules = snapshot!.rightsPolicyRules as Array<{ term: string }>;
+      assert.equal(rules.length, 1, "the contentRepurposeRights rule must be dropped (no public value exists for that term)");
+      assert.equal(rules[0]!.term, "usageRights");
+
+      // Regression guard (§3.6): the PRE-EXISTING ceilingCents field must
+      // survive completely untouched by any mode gating — feeMode defaults
+      // to KEEP_PUBLIC_OFFER (nothing set it), which would null ceilingCents
+      // if the new mode-exclusion rule were (incorrectly) applied to it.
+      assert.equal(
+        snapshot!.ceilingCents,
+        50000,
+        "ceilingCents must never be mode-gated — the live negotiation agent already depends on it unconditionally",
+      );
+    },
+  );
+
   console.log(`\n${n} passed\n`);
   process.exit(0);
 }
