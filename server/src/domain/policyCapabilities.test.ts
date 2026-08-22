@@ -36,28 +36,54 @@ test("every expected category is present, exactly once, with persisted+snapshott
   }
 });
 
-// PLU-175 (domain/compensationPolicyEvaluator.ts) is the first evaluator to
-// land — it flips exactly these five categories. Every other category still
-// waits on PLU-176/178.
-const PLU_175_EVALUATED_CATEGORIES = [
+// PLU-175 (domain/compensationPolicyEvaluator.ts) and PLU-176
+// (domain/rightsPolicyEvaluator.ts) are the first two evaluators to land —
+// together they flip exactly these nine categories. usageRights,
+// contentRepurposeRights, deliverables, and posting still wait — usageRights
+// is a DELIBERATE, permanent exclusion from PLU-176's own scope (see
+// docs/plu-176-rights-policy-evaluator-plan.md §4.1); contentRepurposeRights
+// has a fully-implemented, tested evaluator branch but is held at
+// evaluated:false until a Page-6 intake field actually writes its public
+// value (review fix — same doc §4.8), NOT an oversight either.
+const EVALUATED_CATEGORIES = [
+  // PLU-175
   "fee",
   "commission",
   "commissionDuration",
   "giftSubstitution",
   "giftCashReplacement",
+  // PLU-176
+  "exclusivity",
+  "adAuthorization",
+  "postRetention",
+  "scriptSubmission",
 ];
 
-test("only PLU-175's five compensation categories report evaluated: true; everything else still waits on PLU-176/178", () => {
+test("only PLU-175's and PLU-176's evaluated categories report evaluated: true; everything else (including usageRights and contentRepurposeRights) still waits", () => {
   for (const cap of POLICY_CAPABILITIES) {
-    const expected = PLU_175_EVALUATED_CATEGORIES.includes(cap.category);
+    const expected = EVALUATED_CATEGORIES.includes(cap.category);
     assert.equal(
       cap.evaluated,
       expected,
       expected
-        ? `"${cap.category}" must claim its PLU-175 evaluator`
+        ? `"${cap.category}" must claim its evaluator`
         : `"${cap.category}" must not claim an evaluator this ticket didn't ship`,
     );
   }
+});
+
+test("usageRights specifically stays evaluated:false despite sharing rightsPolicyRules.ts's RIGHTS_TERMS shape with PLU-176's four terms", () => {
+  const usageRights = getPolicyCapability("usageRights" as never);
+  assert.equal(usageRights?.persisted, true);
+  assert.equal(usageRights?.snapshotted, true);
+  assert.equal(usageRights?.evaluated, false);
+});
+
+test("contentRepurposeRights stays evaluated:false — the evaluator branch exists, but no Page-6 intake field writes the public value yet, so it can only ever produce UNSUPPORTED in a real snapshot", () => {
+  const contentRepurposeRights = getPolicyCapability("contentRepurposeRights" as never);
+  assert.equal(contentRepurposeRights?.persisted, true);
+  assert.equal(contentRepurposeRights?.snapshotted, true);
+  assert.equal(contentRepurposeRights?.evaluated, false);
 });
 
 test("commission's supportedUnits is narrowed to percent only — flat/two-level are explicitly out of PLU-175's scope", () => {
@@ -67,7 +93,7 @@ test("commission's supportedUnits is narrowed to percent only — flat/two-level
 
 test("isExecutable matches evaluated exactly for every category (persisted && snapshotted are true for all of them)", () => {
   for (const category of EXPECTED_CATEGORIES) {
-    const expected = PLU_175_EVALUATED_CATEGORIES.includes(category);
+    const expected = EVALUATED_CATEGORIES.includes(category);
     assert.equal(isExecutable(category as never), expected);
   }
 });

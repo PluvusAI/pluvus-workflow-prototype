@@ -58,6 +58,36 @@ export interface PolicyCapability {
 // until their complete public/private contract is enabled") explicitly
 // scopes flat out of THIS ticket; a commissionMode: "flat" proposal returns
 // UNSUPPORTED from the evaluator, matching supportedUnits here exactly.
+//
+// PLU-176 (domain/rightsPolicyEvaluator.ts) flips exclusivity/
+// adAuthorization/postRetention/scriptSubmission below. usageRights
+// deliberately stays evaluated:false — it predates the Page-6 structured
+// duration fields and has no reliable duration semantics; the ticket's own
+// enabled-terms list omits it (see
+// docs/plu-176-rights-policy-evaluator-plan.md §4.1). It shares
+// rightsPolicyRules.ts's RIGHTS_TERMS storage shape with the other four
+// rights-family terms, but sharing a storage shape is a write-time
+// (PLU-172) concern, not an evaluation-readiness claim — this file's whole
+// reason for existing is keeping those two axes independent.
+//
+// contentRepurposeRights ALSO stays evaluated:false, for a DIFFERENT
+// reason than usageRights (review fix, resolving PLU-172's open question
+// 3): the evaluator's own branch for this term is fully implemented and
+// tested, but the PUBLIC field it reads (CampaignDetails.contentRepurposeRights)
+// has no intake page writing it yet (schema.ts's own column comment says
+// so) — in every REAL snapshot the value is null, so the evaluator's
+// isActivePublicTerm() gate is unconditionally false and the term can only
+// ever return UNSUPPORTED. Claiming evaluated:true here would be exactly
+// the "fake TURBO button" PLU-140/this file's own header exists to make
+// structurally impossible: isExecutable() would say the control works
+// end-to-end for a term that structurally cannot produce any other
+// outcome. The same reasoning the usageRights comment above already makes
+// ("sharing a storage shape is a write-time concern, not an
+// evaluation-readiness claim") applies here with equal force: shipping a
+// code path is not an evaluation-readiness claim either, when the input it
+// depends on is always absent. Flip to evaluated:true the day a Page-6
+// intake field writes contentRepurposeRights — no evaluator change needed
+// then, only this one flag.
 export const POLICY_CAPABILITIES: readonly PolicyCapability[] = [
   { category: "fee", persisted: true, snapshotted: true, evaluated: true },
   { category: "commission", persisted: true, snapshotted: true, evaluated: true, supportedUnits: ["percent"] },
@@ -67,13 +97,13 @@ export const POLICY_CAPABILITIES: readonly PolicyCapability[] = [
   { category: "deliverables", persisted: true, snapshotted: true, evaluated: false },
   { category: "posting", persisted: true, snapshotted: true, evaluated: false },
   { category: "usageRights", persisted: true, snapshotted: true, evaluated: false },
-  { category: "exclusivity", persisted: true, snapshotted: true, evaluated: false },
-  { category: "adAuthorization", persisted: true, snapshotted: true, evaluated: false },
-  { category: "postRetention", persisted: true, snapshotted: true, evaluated: false },
+  { category: "exclusivity", persisted: true, snapshotted: true, evaluated: true },
+  { category: "adAuthorization", persisted: true, snapshotted: true, evaluated: true },
+  { category: "postRetention", persisted: true, snapshotted: true, evaluated: true },
   { category: "contentRepurposeRights", persisted: true, snapshotted: true, evaluated: false },
   // Calvin review: its own dedicated mode/column now (scriptWaiverMode),
   // not a rightsPolicyRules entry — still one capability entry, unchanged.
-  { category: "scriptSubmission", persisted: true, snapshotted: true, evaluated: false },
+  { category: "scriptSubmission", persisted: true, snapshotted: true, evaluated: true },
 ];
 
 export function getPolicyCapability(category: PolicyTermCategory): PolicyCapability | undefined {
