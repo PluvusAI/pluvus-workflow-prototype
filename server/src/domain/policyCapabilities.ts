@@ -58,6 +58,17 @@ export interface PolicyCapability {
 // until their complete public/private contract is enabled") explicitly
 // scopes flat out of THIS ticket; a commissionMode: "flat" proposal returns
 // UNSUPPORTED from the evaluator, matching supportedUnits here exactly.
+//
+// PLU-176 (domain/rightsPolicyEvaluator.ts) flips exclusivity/
+// adAuthorization/postRetention/contentRepurposeRights/scriptSubmission
+// below. usageRights deliberately stays evaluated:false — it predates the
+// Page-6 structured duration fields and has no reliable duration
+// semantics; the ticket's own enabled-terms list omits it (see
+// docs/plu-176-rights-policy-evaluator-plan.md §4.1). It shares
+// rightsPolicyRules.ts's RIGHTS_TERMS storage shape with the other four
+// rights-family terms, but sharing a storage shape is a write-time
+// (PLU-172) concern, not an evaluation-readiness claim — this file's whole
+// reason for existing is keeping those two axes independent.
 export const POLICY_CAPABILITIES: readonly PolicyCapability[] = [
   { category: "fee", persisted: true, snapshotted: true, evaluated: true },
   { category: "commission", persisted: true, snapshotted: true, evaluated: true, supportedUnits: ["percent"] },
@@ -67,13 +78,13 @@ export const POLICY_CAPABILITIES: readonly PolicyCapability[] = [
   { category: "deliverables", persisted: true, snapshotted: true, evaluated: false },
   { category: "posting", persisted: true, snapshotted: true, evaluated: false },
   { category: "usageRights", persisted: true, snapshotted: true, evaluated: false },
-  { category: "exclusivity", persisted: true, snapshotted: true, evaluated: false },
-  { category: "adAuthorization", persisted: true, snapshotted: true, evaluated: false },
-  { category: "postRetention", persisted: true, snapshotted: true, evaluated: false },
-  { category: "contentRepurposeRights", persisted: true, snapshotted: true, evaluated: false },
+  { category: "exclusivity", persisted: true, snapshotted: true, evaluated: true },
+  { category: "adAuthorization", persisted: true, snapshotted: true, evaluated: true },
+  { category: "postRetention", persisted: true, snapshotted: true, evaluated: true },
+  { category: "contentRepurposeRights", persisted: true, snapshotted: true, evaluated: true },
   // Calvin review: its own dedicated mode/column now (scriptWaiverMode),
   // not a rightsPolicyRules entry — still one capability entry, unchanged.
-  { category: "scriptSubmission", persisted: true, snapshotted: true, evaluated: false },
+  { category: "scriptSubmission", persisted: true, snapshotted: true, evaluated: true },
 ];
 
 export function getPolicyCapability(category: PolicyTermCategory): PolicyCapability | undefined {
