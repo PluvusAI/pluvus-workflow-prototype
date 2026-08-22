@@ -319,8 +319,16 @@ function evaluateCommissionDuration(delta: CounterDelta, snap: CompensationPolic
       }
       if (limitUnit === "LIFETIME") {
         // LIFETIME has no numeric bound to exceed — authorizing the mode IS
-        // the grant; there is nothing further to compare.
-        return decide("commissionDuration", "AUTO_APPROVED", "within_limit", delta.proposedValue);
+        // the grant; there is nothing further to compare. appliedValue is
+        // deliberately left UNSET here (review fix, mirroring
+        // rightsPolicyEvaluator.ts's identical LIFETIME-floor fix):
+        // delta.proposedValue is unvalidated at this point (no
+        // asNonNegativeFiniteNumber guard applies when there's no numeric
+        // bound to check it against), so passing it straight through would
+        // let a malformed/negative/non-numeric proposedValue leak into the
+        // decision. The unit match alone is the grant; no numeric value is
+        // ever read OR recorded on this path.
+        return decide("commissionDuration", "AUTO_APPROVED", "within_limit");
       }
       const limitValue = snap.commissionDurationLimitValue;
       if (limitValue == null) {
@@ -343,7 +351,10 @@ function evaluateCommissionDuration(delta: CounterDelta, snap: CompensationPolic
         return decide("commissionDuration", "UNSUPPORTED", "missing_unit");
       }
       if (publicUnit === "LIFETIME") {
-        return decide("commissionDuration", "AUTO_APPROVED", "matches_public_offer", delta.proposedValue);
+        // Same review fix as the ALLOW_WITHIN_LIMIT/LIFETIME branch above —
+        // appliedValue deliberately omitted, never the unvalidated raw
+        // delta.proposedValue.
+        return decide("commissionDuration", "AUTO_APPROVED", "matches_public_offer");
       }
       if (snap.commissionDurationDays == null) {
         return decide("commissionDuration", "REQUIRES_BRAND_APPROVAL", "no_limit_configured");

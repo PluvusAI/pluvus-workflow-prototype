@@ -397,6 +397,53 @@ test("commissionDuration: LIFETIME under KEEP_PUBLIC_DURATION matches the public
   assert.equal(d.reasonCode, "matches_public_offer");
 });
 
+// Review fix (mirrors rightsPolicyEvaluator.ts's identical B2 fix): both
+// LIFETIME branches used to pass delta.proposedValue straight into
+// appliedValue with no validation — the only numeric paths in this file
+// that skipped asNonNegativeFiniteNumber. A malformed, negative, or absent
+// proposedValue still auto-approves (the unit match alone is the grant),
+// but the unvalidated value must never be recorded in the decision.
+const LIFETIME_LEAK_CASES: readonly [string, number | string][] = [
+  ["negative", -500],
+  ["non-numeric string", "whatever"],
+];
+for (const [label, proposedValue] of LIFETIME_LEAK_CASES) {
+  test(`commissionDuration: ALLOW_WITHIN_LIMIT LIFETIME auto-approves regardless of a ${label} proposedValue, but never records it`, () => {
+    const d = evaluateCompensationTerm(
+      delta({ category: "commissionDuration", proposedValue, proposedUnit: "LIFETIME" }),
+      snap({ commissionDurationMode: "ALLOW_WITHIN_LIMIT", commissionDurationLimitUnit: "LIFETIME" }),
+    );
+    assert.equal(d.outcome, "AUTO_APPROVED");
+    assert.equal(d.appliedValue, undefined, "an unvalidated proposedValue must never leak into appliedValue");
+  });
+
+  test(`commissionDuration: KEEP_PUBLIC_DURATION LIFETIME auto-approves regardless of a ${label} proposedValue, but never records it`, () => {
+    const d = evaluateCompensationTerm(
+      delta({ category: "commissionDuration", proposedValue, proposedUnit: "LIFETIME" }),
+      snap({ commissionDurationMode: "KEEP_PUBLIC_DURATION", commissionDurationUnit: "LIFETIME" }),
+    );
+    assert.equal(d.outcome, "AUTO_APPROVED");
+    assert.equal(d.appliedValue, undefined, "an unvalidated proposedValue must never leak into appliedValue");
+  });
+}
+
+test("commissionDuration: ALLOW_WITHIN_LIMIT LIFETIME auto-approves with NO proposedValue at all, and records nothing", () => {
+  const d = evaluateCompensationTerm(
+    delta({ category: "commissionDuration", proposedUnit: "LIFETIME" }),
+    snap({ commissionDurationMode: "ALLOW_WITHIN_LIMIT", commissionDurationLimitUnit: "LIFETIME" }),
+  );
+  assert.equal(d.outcome, "AUTO_APPROVED");
+  assert.equal(d.appliedValue, undefined);
+});
+
+test("commissionDuration: a negative proposedValue on a LIFETIME path never appears in the serialized decision", () => {
+  const d = evaluateCompensationTerm(
+    delta({ category: "commissionDuration", proposedValue: -500, proposedUnit: "LIFETIME" }),
+    snap({ commissionDurationMode: "ALLOW_WITHIN_LIMIT", commissionDurationLimitUnit: "LIFETIME" }),
+  );
+  assert.ok(!JSON.stringify(d).includes("-500"));
+});
+
 test("commissionDuration: a unit mismatch (DAYS proposal against a COUNT policy) never silently converts", () => {
   const d = evaluateCompensationTerm(
     delta({ category: "commissionDuration", proposedValue: 30, proposedUnit: "DAYS" }),
