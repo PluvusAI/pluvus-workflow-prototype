@@ -203,10 +203,6 @@ function evaluateDurationRightsTerm(
   if (!isActivePublicTerm(term, getPublicDurationValue(term, snap))) {
     return decide(term, "UNSUPPORTED", "unsupported_operation");
   }
-  if (!isDurationUnit(delta.proposedUnit)) {
-    return decide(term, "UNSUPPORTED", "missing_unit");
-  }
-  const proposedUnit = delta.proposedUnit;
 
   // Absence is conservative (rightsPolicyRules.ts's own resolveRightsMode
   // rule, reapplied directly here so this same lookup also yields
@@ -216,8 +212,32 @@ function evaluateDurationRightsTerm(
 
   switch (mode) {
     case "ALLOW_TO_MINIMUM": {
+      // Review fix (C1): the unit check used to run unconditionally before
+      // the mode was even looked up, so a KEEP_REQUESTED or ASK_FOR_APPROVAL
+      // term with a malformed/missing unit incorrectly short-circuited to
+      // UNSUPPORTED/missing_unit instead of reaching its own mode branch —
+      // contradicting "any proposal under KEEP_REQUESTED is treated as a
+      // request to relax the term, full stop" (plan doc §4.3), and (under
+      // outOfPolicyAction: REJECT_REQUEST) silently swapping a REJECTED
+      // result for UNSUPPORTED, which ranks differently in
+      // buildAggregatePolicyDecision's precedence. A unit is only ever
+      // actually USED in this ALLOW_TO_MINIMUM branch, so the check now
+      // lives here, and only here.
+      if (!isDurationUnit(delta.proposedUnit)) {
+        return decide(term, "UNSUPPORTED", "missing_unit");
+      }
+      const proposedUnit = delta.proposedUnit;
       const minimumUnit = rule?.minimumUnit;
       if (minimumUnit == null) {
+        // Deliberate asymmetry (review fix, documented per C3): an
+        // out-of-bound proposal (below) is routed through
+        // outOfPolicyDecision and can become REJECTED under
+        // outOfPolicyAction: REJECT_REQUEST. A MISCONFIGURED rule — mode
+        // says ALLOW_TO_MINIMUM but no minimum was ever set — always asks
+        // instead, never rejects, regardless of outOfPolicyAction: a
+        // config gap is not the creator's fault, so it never produces a
+        // hard REJECTED. Same rule PLU-175 already applies for
+        // no_limit_configured throughout compensationPolicyEvaluator.ts.
         return decide(term, "REQUIRES_BRAND_APPROVAL", "no_limit_configured");
       }
       // Never silently convert DAYS <-> COUNT <-> LIFETIME.
@@ -227,8 +247,15 @@ function evaluateDurationRightsTerm(
       if (minimumUnit === "LIFETIME") {
         // LIFETIME is the most restrictive possible FLOOR (plan doc §4.4)
         // — matching it exactly is the only way "at or above" can ever be
-        // satisfied, and no numeric value is read on either side.
-        return decide(term, "AUTO_APPROVED", "within_limit", delta.proposedValue);
+        // satisfied. appliedValue is deliberately left UNSET here (review
+        // fix, B2): delta.proposedValue is unvalidated at this point (no
+        // asNonNegativeFiniteNumber guard applies when the unit is
+        // LIFETIME, since there is no numeric floor to check it against),
+        // so passing it straight through as appliedValue would let a
+        // malformed/negative/non-numeric proposedValue leak into the
+        // decision. The unit match alone is the grant; no numeric value is
+        // ever read OR recorded on this path.
+        return decide(term, "AUTO_APPROVED", "within_limit");
       }
       const minimumValue = rule?.minimumValue;
       if (minimumValue == null) {
@@ -252,7 +279,8 @@ function evaluateDurationRightsTerm(
     case "KEEP_REQUESTED":
     default:
       // No structured public value to compare against (plan doc §4.3) — a
-      // KEEP_REQUESTED term treats ANY proposal as a request to relax it.
+      // KEEP_REQUESTED term treats ANY proposal as a request to relax it,
+      // regardless of what unit (or no unit at all) it was expressed in.
       return outOfPolicyDecision(term, snap.outOfPolicyAction, "explicitly_fixed");
   }
 }

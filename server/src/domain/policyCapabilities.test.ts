@@ -38,10 +38,13 @@ test("every expected category is present, exactly once, with persisted+snapshott
 
 // PLU-175 (domain/compensationPolicyEvaluator.ts) and PLU-176
 // (domain/rightsPolicyEvaluator.ts) are the first two evaluators to land —
-// together they flip exactly these ten categories. usageRights,
-// deliverables, and posting still wait on a future ticket; usageRights in
-// particular is a DELIBERATE exclusion from PLU-176's own scope (see
-// docs/plu-176-rights-policy-evaluator-plan.md §4.1), not an oversight.
+// together they flip exactly these nine categories. usageRights,
+// contentRepurposeRights, deliverables, and posting still wait — usageRights
+// is a DELIBERATE, permanent exclusion from PLU-176's own scope (see
+// docs/plu-176-rights-policy-evaluator-plan.md §4.1); contentRepurposeRights
+// has a fully-implemented, tested evaluator branch but is held at
+// evaluated:false until a Page-6 intake field actually writes its public
+// value (review fix — same doc §4.8), NOT an oversight either.
 const EVALUATED_CATEGORIES = [
   // PLU-175
   "fee",
@@ -53,11 +56,10 @@ const EVALUATED_CATEGORIES = [
   "exclusivity",
   "adAuthorization",
   "postRetention",
-  "contentRepurposeRights",
   "scriptSubmission",
 ];
 
-test("only PLU-175's and PLU-176's evaluated categories report evaluated: true; everything else (including usageRights) still waits", () => {
+test("only PLU-175's and PLU-176's evaluated categories report evaluated: true; everything else (including usageRights and contentRepurposeRights) still waits", () => {
   for (const cap of POLICY_CAPABILITIES) {
     const expected = EVALUATED_CATEGORIES.includes(cap.category);
     assert.equal(
@@ -75,6 +77,13 @@ test("usageRights specifically stays evaluated:false despite sharing rightsPolic
   assert.equal(usageRights?.persisted, true);
   assert.equal(usageRights?.snapshotted, true);
   assert.equal(usageRights?.evaluated, false);
+});
+
+test("contentRepurposeRights stays evaluated:false — the evaluator branch exists, but no Page-6 intake field writes the public value yet, so it can only ever produce UNSUPPORTED in a real snapshot", () => {
+  const contentRepurposeRights = getPolicyCapability("contentRepurposeRights" as never);
+  assert.equal(contentRepurposeRights?.persisted, true);
+  assert.equal(contentRepurposeRights?.snapshotted, true);
+  assert.equal(contentRepurposeRights?.evaluated, false);
 });
 
 test("commission's supportedUnits is narrowed to percent only — flat/two-level are explicitly out of PLU-175's scope", () => {

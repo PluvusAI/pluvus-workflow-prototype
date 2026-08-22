@@ -122,6 +122,43 @@ for (const term of DURATION_TERMS) {
     assert.equal(d.outcome, "REQUIRES_BRAND_APPROVAL");
     assert.equal(d.reasonCode, "no_limit_configured");
   });
+
+  // Review fix (C1): the unit check used to run unconditionally BEFORE the
+  // mode was looked up, so a malformed/missing unit on a KEEP_REQUESTED or
+  // ASK_FOR_APPROVAL term incorrectly produced UNSUPPORTED/missing_unit
+  // instead of that mode's own outcome — contradicting "KEEP_REQUESTED
+  // treats any proposal as a relax request, full stop" and silently
+  // downgrading what should be REJECTED (under outOfPolicyAction:
+  // REJECT_REQUEST) to UNSUPPORTED, a materially different outcome in
+  // buildAggregatePolicyDecision's precedence.
+  test(`${term}: KEEP_REQUESTED still produces its own non-autonomous outcome even with NO unit on the proposal at all`, () => {
+    const d = evaluateRightsTerm(
+      delta({ category: term, proposedValue: "some duration" }), // no proposedUnit
+      snap({ rightsPolicyRules: [] }),
+    );
+    assert.equal(d.outcome, "REQUIRES_BRAND_APPROVAL");
+    assert.equal(d.reasonCode, "explicitly_fixed");
+  });
+
+  test(`${term}: KEEP_REQUESTED with no unit is REJECTED (not UNSUPPORTED) when outOfPolicyAction is REJECT_REQUEST`, () => {
+    const d = evaluateRightsTerm(
+      delta({ category: term, proposedValue: "some duration" }),
+      snap({ rightsPolicyRules: [], outOfPolicyAction: "REJECT_REQUEST" }),
+    );
+    assert.equal(d.outcome, "REJECTED");
+    assert.equal(d.reasonCode, "out_of_policy_reject");
+  });
+
+  test(`${term}: ASK_FOR_APPROVAL still requires approval even with a malformed unit on the proposal`, () => {
+    const d = evaluateRightsTerm(
+      // @ts-expect-error deliberately malformed unit — ASK_FOR_APPROVAL
+      // never inspects it at all.
+      delta({ category: term, proposedValue: 1, proposedUnit: "WEEKS" }),
+      snap({ rightsPolicyRules: [rule({ term, mode: "ASK_FOR_APPROVAL" })] }),
+    );
+    assert.equal(d.outcome, "REQUIRES_BRAND_APPROVAL");
+    assert.equal(d.reasonCode, "mode_requires_approval");
+  });
 }
 
 // ===========================================================================
@@ -146,6 +183,44 @@ test("adAuthorization: a LIFETIME minimum auto-approves a matching LIFETIME prop
   );
   assert.equal(d.outcome, "AUTO_APPROVED");
   assert.equal(d.reasonCode, "within_limit");
+});
+
+// Review fix (B2): the LIFETIME branch used to pass delta.proposedValue
+// straight into appliedValue with no validation — the only numeric path in
+// the file that skipped asNonNegativeFiniteNumber. A malformed, negative,
+// or absent proposedValue still auto-approves (the unit match alone is the
+// grant — plan doc §4.4), but the unvalidated value must never be recorded
+// in the decision.
+const LIFETIME_LEAK_CASES: readonly [string, number | string][] = [
+  ["negative", -500],
+  ["non-numeric string", "whatever"],
+];
+for (const [label, proposedValue] of LIFETIME_LEAK_CASES) {
+  test(`adAuthorization: a LIFETIME minimum auto-approves regardless of a ${label} proposedValue, but never records it`, () => {
+    const d = evaluateRightsTerm(
+      delta({ category: "adAuthorization", proposedValue, proposedUnit: "LIFETIME" }),
+      snap({ rightsPolicyRules: [rule({ term: "adAuthorization", mode: "ALLOW_TO_MINIMUM", minimumUnit: "LIFETIME" })] }),
+    );
+    assert.equal(d.outcome, "AUTO_APPROVED");
+    assert.equal(d.appliedValue, undefined, "an unvalidated proposedValue must never leak into appliedValue");
+  });
+}
+
+test("adAuthorization: a LIFETIME minimum auto-approves with NO proposedValue at all, and records nothing", () => {
+  const d = evaluateRightsTerm(
+    delta({ category: "adAuthorization", proposedUnit: "LIFETIME" }),
+    snap({ rightsPolicyRules: [rule({ term: "adAuthorization", mode: "ALLOW_TO_MINIMUM", minimumUnit: "LIFETIME" })] }),
+  );
+  assert.equal(d.outcome, "AUTO_APPROVED");
+  assert.equal(d.appliedValue, undefined);
+});
+
+test("adAuthorization: a LIFETIME minimum with a negative proposedValue never lets the raw value appear in the serialized decision", () => {
+  const d = evaluateRightsTerm(
+    delta({ category: "adAuthorization", proposedValue: -500, proposedUnit: "LIFETIME" }),
+    snap({ rightsPolicyRules: [rule({ term: "adAuthorization", mode: "ALLOW_TO_MINIMUM", minimumUnit: "LIFETIME" })] }),
+  );
+  assert.ok(!JSON.stringify(d).includes("-500"));
 });
 
 test("adAuthorization: a LIFETIME minimum against a DAYS proposal is a unit mismatch, never silently interpreted as 'below'", () => {
