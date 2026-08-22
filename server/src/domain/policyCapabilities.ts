@@ -47,18 +47,23 @@ export interface PolicyCapability {
 }
 
 // PLU-172 ships persisted+snapshotted storage for every category below;
-// evaluated stays false for ALL of them until PLU-175/176/178 lands the
-// evaluator for that category — flipped ONLY by that ticket's own PR, and
-// by no other change (this file's diff in that PR IS the capability flip).
+// evaluated stays false until PLU-175/176/178 lands the evaluator for that
+// category — flipped ONLY by that ticket's own PR, and by no other change
+// (this file's diff in that PR IS the capability flip).
+//
+// PLU-175 (domain/compensationPolicyEvaluator.ts) flips the five
+// compensation-shaped categories below. commission is evaluated:true with
+// supportedUnits narrowed to ["percent"] only — the worksheet's own text
+// ("Unsupported flat or Two-level public structures remain unavailable ...
+// until their complete public/private contract is enabled") explicitly
+// scopes flat out of THIS ticket; a commissionMode: "flat" proposal returns
+// UNSUPPORTED from the evaluator, matching supportedUnits here exactly.
 export const POLICY_CAPABILITIES: readonly PolicyCapability[] = [
-  { category: "fee", persisted: true, snapshotted: true, evaluated: false },
-  // "percent" backs commissionCeilingRate, "flat" backs
-  // commissionCeilingAmountCents (schema.ts) — both exist today; this list
-  // documents that a future evaluator MAY roll out to just one first.
-  { category: "commission", persisted: true, snapshotted: true, evaluated: false, supportedUnits: ["percent", "flat"] },
-  { category: "commissionDuration", persisted: true, snapshotted: true, evaluated: false, supportedUnits: ["days", "lifetime", "count"] },
-  { category: "giftSubstitution", persisted: true, snapshotted: true, evaluated: false },
-  { category: "giftCashReplacement", persisted: true, snapshotted: true, evaluated: false },
+  { category: "fee", persisted: true, snapshotted: true, evaluated: true },
+  { category: "commission", persisted: true, snapshotted: true, evaluated: true, supportedUnits: ["percent"] },
+  { category: "commissionDuration", persisted: true, snapshotted: true, evaluated: true, supportedUnits: ["days", "lifetime", "count"] },
+  { category: "giftSubstitution", persisted: true, snapshotted: true, evaluated: true },
+  { category: "giftCashReplacement", persisted: true, snapshotted: true, evaluated: true },
   { category: "deliverables", persisted: true, snapshotted: true, evaluated: false },
   { category: "posting", persisted: true, snapshotted: true, evaluated: false },
   { category: "usageRights", persisted: true, snapshotted: true, evaluated: false },

@@ -36,15 +36,39 @@ test("every expected category is present, exactly once, with persisted+snapshott
   }
 });
 
-test("no category reports evaluated: true at PLU-172 ship time (no evaluator exists yet)", () => {
+// PLU-175 (domain/compensationPolicyEvaluator.ts) is the first evaluator to
+// land — it flips exactly these five categories. Every other category still
+// waits on PLU-176/178.
+const PLU_175_EVALUATED_CATEGORIES = [
+  "fee",
+  "commission",
+  "commissionDuration",
+  "giftSubstitution",
+  "giftCashReplacement",
+];
+
+test("only PLU-175's five compensation categories report evaluated: true; everything else still waits on PLU-176/178", () => {
   for (const cap of POLICY_CAPABILITIES) {
-    assert.equal(cap.evaluated, false, `"${cap.category}" must not claim an evaluator this ticket didn't ship`);
+    const expected = PLU_175_EVALUATED_CATEGORIES.includes(cap.category);
+    assert.equal(
+      cap.evaluated,
+      expected,
+      expected
+        ? `"${cap.category}" must claim its PLU-175 evaluator`
+        : `"${cap.category}" must not claim an evaluator this ticket didn't ship`,
+    );
   }
 });
 
-test("isExecutable is false for every category (persisted && snapshotted && evaluated, and evaluated is false everywhere)", () => {
+test("commission's supportedUnits is narrowed to percent only — flat/two-level are explicitly out of PLU-175's scope", () => {
+  const commission = getPolicyCapability("commission" as never);
+  assert.deepEqual(commission?.supportedUnits, ["percent"]);
+});
+
+test("isExecutable matches evaluated exactly for every category (persisted && snapshotted are true for all of them)", () => {
   for (const category of EXPECTED_CATEGORIES) {
-    assert.equal(isExecutable(category as never), false);
+    const expected = PLU_175_EVALUATED_CATEGORIES.includes(category);
+    assert.equal(isExecutable(category as never), expected);
   }
 });
 
