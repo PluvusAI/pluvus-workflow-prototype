@@ -31,6 +31,8 @@ import type {
   GiftDisposition,
   PriceStrategy,
   NegotiationCategory,
+  CampaignDetail,
+  DeliverableQuantity,
 } from "../../../api/builderTypes";
 
 // ---------------------------------------------------------------------------
@@ -1545,4 +1547,158 @@ export function blockerSection(blocker: string): SectionKey {
   // Everything else — CampaignDetails public fields + the review-status gate —
   // is fixed in the public reward section.
   return "rewardStructure";
+}
+
+// ---------------------------------------------------------------------------
+// PLU-182 (2f.1) — Page-9 review completeness + approval persistence helpers.
+// All pure so LaunchReview and sections.test.ts share one definition.
+// ---------------------------------------------------------------------------
+
+// The server readiness blocker that clears ONLY by approving Stage 1
+// (computeReadiness pushes it when compensationReviewStatus !== "CONFIRMED").
+// It must byte-match server/src/db/campaigns.ts:349 — the two files can't import
+// each other, so sections.test.ts pins this against a copied literal fixture so
+// a server reword fails CI loudly instead of the filter silently no-op-ing.
+export const REVIEW_CONFIRMED_BLOCKER = "Compensation review is not confirmed";
+
+/** The blockers a brand must actually FIX in an editing section before Stage-1
+ *  approval is possible — i.e. everything except the review-confirmed
+ *  self-reference. The Page-9 approve gates on THESE being empty (+ both boxes
+ *  checked), NEVER on `ready`: `ready` counts the review-confirmed blocker, which
+ *  only clears by approving, so gating on it deadlocks the CTA (Bug D). */
+export function fixableBlockers(blockers: string[]): string[] {
+  return blockers.filter((b) => b !== REVIEW_CONFIRMED_BLOCKER);
+}
+
+/** One creator-facing public-review row. Keeps its origin `section` so the Edit
+ *  link routes to the right public page — NEVER negotiationSettings (private). */
+export interface PublicReviewRow {
+  label: string; // COPY:PLU-159
+  value: string;
+  section: SectionKey;
+}
+
+/** Summarize the structured deliverable cards as "3× Instagram Reel, 2× TikTok
+ *  video". Empty/absent → "" so the caller can fall back to the free-text
+ *  `deliverables` note. Label reuses the S3 card copy where the pair is known. */
+export function summarizeDeliverables(rows: DeliverableQuantity[] | null | undefined): string {
+  if (!Array.isArray(rows) || rows.length === 0) return "";
+  const cardLabel = new Map(DELIVERABLE_CARDS.map((c) => [`${c.platform}:${c.format}`, c.label]));
+  return rows
+    .filter((r) => r.platform && r.format)
+    .map((r) => {
+      const label = cardLabel.get(`${r.platform}:${r.format}`) ?? `${r.platform} ${r.format}`;
+      const n = typeof r.quantity === "number" && r.quantity > 0 ? r.quantity : 1;
+      return `${n}× ${label}`;
+    })
+    .join(", ");
+}
+
+/** Format a public commission value in its own unit — percent or a flat dollar
+ *  amount (S7.A1 commissionMode). publicCommissionRate is persisted in the SAME
+ *  unit the brand typed: whole percent for "percent", whole DOLLARS for "flat"
+ *  (the S7.A1 CommissionAmount input stores the raw number, no cents conversion —
+ *  see CampaignIntake buildCampaignPayload). So flat renders as-is with a $, NOT
+ *  divided by 100. Exported so every review surface uses ONE formatter and can't
+ *  drift into the cents/dollars mismatch. */
+export function commissionDisplay(rate: number, mode: string | null | undefined): string {
+  return mode === "flat" ? `$${rate.toLocaleString()}` : `${rate}%`;
+}
+
+/**
+ * PLU-182 (2f.1) — the public creator-facing review projection (S9.1). Returns
+ * ONLY enabled, non-empty CampaignDetails PUBLIC fields, each tagged with the
+ * section that edits it. Two-stage gating per row (reviewer B3):
+ *   1. STRUCTURAL — conditional rows are gated on the pure compensation-shape
+ *      predicates (needsFee/needsCommission/showsGiftDetails/showsStartingFee),
+ *      NOT on `value != null`. That is what correctly excludes "inactive
+ *      conditional values" (AC4) — a cleared field only reads null because the
+ *      payload builder nulls it, so `!= null` would be a data check, not the
+ *      structure check the ticket asks for.
+ *   2. NON-EMPTY — a secondary filter drops blank rows so the panel isn't noise.
+ *
+ * NEVER emits a NegotiationPolicy / private field, fieldProvenance, brief
+ * extraction sources/confidence, an inactive conditional value, or Content
+ * Angles (deferred — not a field here). Public rows NEVER target the
+ * negotiationSettings section (privacy boundary + Edit-link contract, R8/AC5).
+ */
+export function buildPublicReviewRows(
+  campaign: CampaignDetail,
+  comp: CompensationShape,
+): PublicReviewRow[] {
+  const rows: PublicReviewRow[] = [];
+  // Non-empty string of a raw value, else null (skip the row).
+  const s = (v: unknown): string | null => {
+    if (v == null) return null;
+    const str = String(v).trim();
+    return str === "" ? null : str;
+  };
+  const push = (label: string, value: string | null, section: SectionKey) => {
+    if (value != null) rows.push({ label, value, section });
+  };
+
+  // --- Always-on creator-facing overview (Pages 1-2 / 5-6) ------------------
+  // Campaign name "where appropriate" — the header of the public brief.
+  push("Campaign name", s(campaign.name), "startSources");
+  push("Objective", s(campaign.objective), "campaignProduct");
+  push("Product / offer", s(campaign.productName || campaign.rewardDescription), "campaignProduct");
+
+  // Deliverables: prefer the structured card summary, else the free-text note.
+  push(
+    "Deliverables",
+    summarizeDeliverables(campaign.deliverableQuantities) || s(campaign.deliverables),
+    "platformsDeliverables",
+  );
+  push("Content requirements", s(campaign.contentRequirements), "contentGuidelines");
+
+  // Timeline & rights (Page 6) — all public, always applicable.
+  push("Timeline", s(campaign.timeline), "timelineRights");
+  push("Usage rights", s(campaign.usageRights), "timelineRights");
+  push("Exclusivity", s(campaign.exclusivity), "timelineRights");
+
+  // --- Reward terms (Page 7) — compensation structure + conditional detail ---
+  // Compensation structure is always shown; the detail rows below are gated on
+  // the STRUCTURAL predicates, so an inactive conditional value never surfaces.
+  push("Compensation structure", s(campaign.campaignType), "rewardStructure");
+
+  // Public starting fee — only in PROPOSE_STARTING_FEE mode (showsStartingFee),
+  // NOT merely needsFee, else a rate-card PAID shows a blank fee row (N2).
+  if (showsStartingFee(comp) && typeof campaign.publicStartingFeeCents === "number") {
+    push(
+      "Public starting fee",
+      `$${(campaign.publicStartingFeeCents / 100).toLocaleString()}`,
+      "rewardStructure",
+    );
+  }
+
+  // Commission + its public detail — Affiliate / Hybrid only (needsCommission).
+  if (needsCommission(comp.campaignType)) {
+    if (typeof campaign.publicCommissionRate === "number") {
+      push(
+        "Public commission",
+        commissionDisplay(campaign.publicCommissionRate, campaign.commissionMode),
+        "rewardStructure",
+      );
+    }
+    push("Commission length", s(campaign.commissionConditions), "rewardStructure");
+    push(
+      "Commission duration",
+      typeof campaign.commissionDurationDays === "number" ? String(campaign.commissionDurationDays) : null,
+      "rewardStructure",
+    );
+    push("Attribution window", s(campaign.attributionWindow), "rewardStructure");
+    // Public affiliate tracking terms (T-series) — all CampaignDetails PUBLIC
+    // columns, cleared when !needsCommission; none is a policy/private field (N3).
+    push("Affiliate tracking URL", s(campaign.affiliateTrackingUrl), "rewardStructure");
+    push("Tracking link mode", s(campaign.trackingLinkMode), "rewardStructure");
+    push("Tracking destination", s(campaign.trackingDestinationUrl), "rewardStructure");
+    push("Tracking parameter", s(campaign.trackingParameter), "rewardStructure");
+  }
+
+  // Gift terms — GIFT_ONLY or additive gifting (showsGiftDetails).
+  if (showsGiftDetails(comp)) {
+    push("Gift / product", s(campaign.rewardDescription), "rewardStructure");
+  }
+
+  return rows;
 }
