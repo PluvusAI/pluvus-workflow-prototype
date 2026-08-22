@@ -75,6 +75,7 @@ import {
   showsInstagramCollab,
   isGiftOnly,
   candidateFieldFor,
+  mergeSeed,
   clearedPolicyFieldKeys,
   BOOL_RADIO_KEYS,
   DELIVERABLE_CARDS,
@@ -165,7 +166,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // instead of a captured closure, so the save reads the latest committed drafts
   // (a debounce scheduled from setField's render would otherwise PATCH pre-edit
   // values). Kept current by the effect below.
-  const latestSaveRef = useRef<() => Promise<void>>(async () => {});
+  // PLU-170 (G1): returns whether the save succeeded (a no-op save is success).
+  const latestSaveRef = useRef<() => Promise<boolean>>(async () => true);
   // Serialize saves: at most ONE doSave runs at a time. A save requested while
   // one is in flight sets rerunRef and returns; the in-flight save re-fires once
   // it settles. Without this, two overlapping PATCHes for the same group could be
@@ -181,6 +183,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // one-shot ref carries the approved value into that immediate PATCH; the build
   // prefers it over the not-yet-committed draft and consumes it.
   const pendingReviewStatusRef = useRef<"NEEDS_REVIEW" | "CONFIRMED" | null>(null);
+
+  // PLU-170 (G2): holds the specific dirty-and-unseeded groups captured when a
+  // failed-read Retry fires. The resume effect (below doSave) waits until exactly
+  // those groups have seeded, then resumes the pending save once and clears this.
+  const pendingResumeRef = useRef<FieldGroup[] | null>(null);
 
   const [duplicating, setDuplicating] = useState(false);
 
@@ -275,12 +282,17 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   useEffect(() => {
     if (seededBrandRef.current || brandQ.isLoading || brandQ.isError) return;
     const b = brandQ.data;
-    setBrandDraft({
+    // PLU-170 (G2): merge, not overwrite — a retained edit made while this group
+    // was unseeded (failed read) must win, but unseen sibling fields still get
+    // their real persisted values. Before recovery `prev` is `{}` (brand seeds
+    // all-or-nothing), so on the no-edit path this is server-only; on the edit
+    // path the edited key wins.
+    setBrandDraft((prev) => mergeSeed({
       logoRef: b?.logoRef ?? "",
       primaryColor: b?.primaryColor ?? "",
       secondaryColor: b?.secondaryColor ?? "",
       typography: b?.typography ?? "",
-    });
+    }, prev));
     seededBrandRef.current = true;
   }, [brandQ.data, brandQ.isLoading, brandQ.isError]);
 
@@ -292,10 +304,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     // platforms is derived from the deliverable cards, not seeded/edited here.
     // geography is a string[] of ISO codes (the country picker works on the
     // array directly — no comma round-trip).
-    setCreatorDraft({
+    // PLU-170 (G2): merge, not overwrite — same no-clobber reasoning as brand.
+    setCreatorDraft((prev) => mergeSeed({
       geography: Array.isArray(cr?.geography) ? cr.geography : [],
       minFollowers: cr?.minFollowers != null ? String(cr.minFollowers) : "",
-    });
+    }, prev));
     seededCreatorRef.current = true;
   }, [creatorQ.data, creatorQ.isLoading, creatorQ.isError]);
 
@@ -565,13 +578,16 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     };
   }, [policyDraft, comp]);
 
-  const doSave = useCallback(async () => {
+  const doSave = useCallback(async (): Promise<boolean> => {
     // Serialize: if a save is already running, don't start a second concurrent
     // PATCH for the same group (a network reorder could land the older payload
     // last). Mark a rerun and let the in-flight save re-fire when it settles.
+    // PLU-170 (G1): return true — the in-flight save already owns this dirty set
+    // (it survives via the version map below), so advancing loses nothing. The
+    // ONLY false path is the catch; everything else is safe-to-advance.
     if (savingInFlightRef.current) {
       rerunSaveRef.current = true;
-      return;
+      return true;
     }
     // Snapshot the version of every dirty group at the START of this save. On
     // success we clear a group only if its version is unchanged — an edit that
@@ -579,7 +595,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
     // will save it), even a re-edit of the SAME group already in flight.
     const snapshot = new Map(dirtyRef.current);
     const groups = Array.from(snapshot.keys());
-    if (groups.length === 0) return;
+    if (groups.length === 0) return true; // PLU-170 (G1): nothing dirty = safe to advance
     savingInFlightRef.current = true;
     setSaving(true);
     setSaveError(null);
@@ -662,6 +678,8 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
         rerunSaveRef.current = false;
       }
     }
+    // PLU-170 (G1): only the catch leaves succeeded false → the caller stays put.
+    return succeeded;
   }, [
     campaignId,
     qc,
@@ -676,6 +694,57 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // flush always run the latest closure (newest drafts), not a stale one.
   latestSaveRef.current = doSave;
 
+  // PLU-170 (G2): recover a FAILED SUBGROUP READ. A genuine 5xx on the
+  // brand/creator (retry:false) or campaign read leaves that group unseeded, so
+  // doSave's guard blocks its PATCH forever with no path back. This refetches the
+  // failed reads and, once the seed lands, resumes the pending save exactly once.
+  // Policy (Page 8) is deliberately excluded — PLU-173 owns its recovery.
+  const retrySave = useCallback(async () => {
+    // Which of the recoverable public groups actually failed to read?
+    const failed: Array<{ group: FieldGroup; q: { refetch: () => Promise<unknown> } }> = [];
+    if (campaignQ.isError) failed.push({ group: "campaign", q: campaignQ });
+    if (brandQ.isError) failed.push({ group: "brandIdentity", q: brandQ });
+    if (creatorQ.isError) failed.push({ group: "creatorRequirement", q: creatorQ });
+    if (failed.length === 0) {
+      // No read failed — the error is a PATCH failure; just re-run the save.
+      void doSave();
+      return;
+    }
+    // Capture the dirty-AND-unseeded groups so the resume effect knows exactly
+    // which seeds to wait for (same unseeded detection as doSave, but keyed on
+    // the group, not the message). Only groups the user has actually edited.
+    const dirty = new Set(dirtyRef.current.keys());
+    const want: FieldGroup[] = [];
+    if (dirty.has("campaign") && !seededCampaignRef.current) want.push("campaign");
+    if (dirty.has("brandIdentity") && !seededBrandRef.current) want.push("brandIdentity");
+    if (dirty.has("creatorRequirement") && !seededCreatorRef.current) {
+      want.push("creatorRequirement");
+    }
+    pendingResumeRef.current = want.length > 0 ? want : null;
+    // Refetch the failed reads. Do NOT call doSave inline — the seed commits on
+    // the NEXT render, so the resume effect (keyed on the query fields) fires it.
+    await Promise.all(failed.map((f) => f.q.refetch()));
+  }, [campaignQ, brandQ, creatorQ, doSave]);
+
+  // PLU-170 (G2): resume the pending save exactly once, after the failed subset
+  // has seeded. Keyed on the REACTIVE query fields (not the seed refs, which
+  // aren't reactive); reads the refs inside. Scoped to `want` so policy (never in
+  // it) can't hang the resume forever.
+  useEffect(() => {
+    const want = pendingResumeRef.current;
+    if (!want) return;
+    const seeded: Record<FieldGroup, boolean> = {
+      campaign: seededCampaignRef.current,
+      brandIdentity: seededBrandRef.current,
+      creatorRequirement: seededCreatorRef.current,
+      negotiationPolicy: seededPolicyRef.current,
+    };
+    if (!want.every((g) => seeded[g])) return; // wait until exactly the failed subset seeded
+    pendingResumeRef.current = null; // clear ON CONSUME, before doSave — a later PATCH failure must not re-trigger
+    void doSave();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [brandQ.data, brandQ.isError, creatorQ.data, creatorQ.isError, campaignQ.data]);
+
   const scheduleSave = useCallback(() => {
     if (readOnly) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
@@ -684,10 +753,11 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
 
   // Save & continue: cancel the pending debounce and persist now, so advancing a
   // section doesn't leave a redundant timer firing a second identical PATCH.
+  // PLU-170 (G1): resolves the save result so validateAndAdvance can gate on it.
   const flushSave = useCallback(() => {
-    if (readOnly) return;
+    if (readOnly) return true; // read-only can't dirty anything → safe to advance
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    void latestSaveRef.current();
+    return latestSaveRef.current();
   }, [readOnly]);
 
   // Flush any pending timer on unmount so a debounced edit isn't dropped.
@@ -815,7 +885,7 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
   // is force-required until this gate), so a partially filled page is fine until
   // the user chooses to move forward.
   const validateAndAdvance = useCallback(
-    (next: SectionKey) => {
+    async (next: SectionKey) => {
       const missing = missingRequiredKeys(section, comp, readFieldValue);
       if (missing.length > 0) {
         setErrorKeys(new Set(missing));
@@ -829,8 +899,10 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
         return;
       }
       setErrorKeys(new Set());
-      flushSave();
-      setActiveSection(next);
+      // PLU-170 (G1): advance ONLY after the save this action requested succeeds.
+      // On failure stay put — saveError + SaveStatus Retry already render.
+      const ok = await flushSave();
+      if (ok) setActiveSection(next);
     },
     [section, comp, readFieldValue, flushSave],
   );
@@ -846,9 +918,17 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
       <Center>
         <div style={{ textAlign: "center" }}>
           <div style={{ ...text.heading, marginBottom: 8 }}>Couldn't load this campaign</div>
-          <Button variant="secondary" onClick={onBack}>
-            Back to campaigns
-          </Button>
+          {/* PLU-170 (G2): the campaign read is the full-screen path — offer a
+              retry beside "Back" so a transient GET blip on create→save→reopen
+              is recoverable in place. */}
+          <div style={{ display: "flex", gap: 8, justifyContent: "center" }}>
+            <Button variant="secondary" onClick={() => void campaignQ.refetch()}>
+              Try again
+            </Button>
+            <Button variant="secondary" onClick={onBack}>
+              Back to campaigns
+            </Button>
+          </div>
         </div>
       </Center>
     );
@@ -884,7 +964,9 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
             Campaign Brief · Stage 1 of 3 {/* COPY:PLU-159 */}
           </div>
         </div>
-        <SaveStatus saving={saving} saveError={saveError} savedTick={savedTick} onRetry={() => void doSave()} readOnly={readOnly} />
+        {/* PLU-170 (G2): header Retry recovers a failed subgroup READ then resumes
+            the save; falls back to a plain save re-run when only the PATCH failed. */}
+        <SaveStatus saving={saving} saveError={saveError} savedTick={savedTick} onRetry={() => void retrySave()} readOnly={readOnly} />
       </div>
 
       {readOnly && (
@@ -1010,6 +1092,14 @@ export function CampaignIntake({ campaignId, onBack, onOpenCampaign }: Props) {
                 saving={saving}
                 saveError={saveError}
                 onRetry={() => void doSave()}
+                // PLU-182: a material edit reopens review by setting the DRAFT to
+                // NEEDS_REVIEW; the server row only flips once that PATCH lands. If
+                // it failed, campaignQ.data is still CONFIRMED — pass the unsaved
+                // draft state so Page 9 doesn't report "Approved — current" over a
+                // failed review-reset write (the required write) it just lost.
+                reviewReopenedUnsaved={
+                  campaignDraft.compensationReviewStatus === "NEEDS_REVIEW"
+                }
               />
             ) : (
               <>

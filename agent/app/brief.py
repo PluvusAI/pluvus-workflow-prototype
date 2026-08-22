@@ -367,6 +367,9 @@ _SINGLE_KEYS = (
     "requiredTalkingPoints",
     "shipping",
     "contentExamples",
+    # PLU-170 (G3): prohibited-claims/restrictions text — aliased on the web side
+    # onto the reviewable Page-5 "Content requirements" field.
+    "restrictions",
 )
 
 # Heading/label → canonical key (invariant, §4.3 tier 1). A heading line whose
@@ -385,9 +388,15 @@ _HEADING_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
     ("exclusivity", re.compile(r"^(exclusivity|category exclusivity|exclusive(ity)?( terms)?)\b", re.I)),
     ("timeline", re.compile(r"^(timeline|schedule|key dates?|important dates?|milestones?|go[- ]?live|deadlines?)\b", re.I)),
+    # PLU-170 (G3): restrictions/prohibited-claims MUST match before deliverables —
+    # "Content requirements" now routes here (Page-5 alias), not to Deliverables.
+    (
+        "restrictions",
+        re.compile(r"^(restrictions?|prohibited( claims?)?|do ?not|don.?ts?|disclaimers?|compliance|must not|content (restrictions?|requirements?))\b", re.I),
+    ),
     (
         "deliverables",
-        re.compile(r"^(deliverables?|what (we need|you'?ll (create|deliver))|content requirements?|scope of work|assets? required)\b", re.I),
+        re.compile(r"^(deliverables?|what (we need|you'?ll (create|deliver))|scope of work|assets? required)\b", re.I),
     ),
     ("shipping", re.compile(r"^(shipping|product (shipping|delivery)|fulfillment|sending (you )?product)\b", re.I)),
     (
@@ -413,6 +422,8 @@ _KEYWORD_SIGNALS: list[tuple[str, re.Pattern[str]]] = [
     ("shipping", re.compile(r"\bship(ping|ment|ped)?\b|shipping address|we'?ll send you|product (will be )?(sent|shipped|mailed)", re.I)),
     ("timeline", re.compile(r"\bgo[- ]?live\b|\b(deadline|due date|publish (by|date)|launch date)\b|by (mon|tues|wednes|thurs|fri|satur|sun)day", re.I)),
     ("deliverables", re.compile(r"\b\d+\s*(reels?|posts?|stories|videos?|tiktoks?|shorts?)\b|deliver(able)?s?:", re.I)),
+    # PLU-170 (G3): prohibited-claims / restrictions signal.
+    ("restrictions", re.compile(r"\b(do not|don.?t|avoid|prohibited|must not|no (competitor|health|medical) claims?)\b", re.I)),
 ]
 
 # A heading line is short, non-terminal prose. Guard against treating a full

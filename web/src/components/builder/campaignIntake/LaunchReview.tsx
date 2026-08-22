@@ -73,6 +73,12 @@ interface Props {
   saving: boolean;
   saveError: string | null;
   onRetry: () => void;
+  /** PLU-182: a material edit locally reset review to NEEDS_REVIEW, but that
+   *  write hasn't landed yet (in flight, or its PATCH failed). While true the
+   *  approval is NOT current no matter what the fetched campaign row says — the
+   *  server row still reads CONFIRMED until the reset persists. Prevents a failed
+   *  review-reset write from being masked by a stale "Approved — current." */
+  reviewReopenedUnsaved: boolean;
 }
 
 const SECTION_LABEL: Record<SectionKey, string> = {
@@ -106,6 +112,7 @@ export function LaunchReview({
   saving,
   saveError,
   onRetry,
+  reviewReopenedUnsaved,
 }: Props) {
   const toast = useToast();
   const readinessQ = useReadiness(campaignId);
@@ -399,7 +406,13 @@ export function LaunchReview({
               bothApproved={bothApproved}
               fixableCount={fixable.length}
               confirmedCurrent={
-                campaign.compensationReviewStatus === "CONFIRMED" && bothApproved
+                campaign.compensationReviewStatus === "CONFIRMED" &&
+                bothApproved &&
+                // PLU-182: not current if a material edit locally reopened review
+                // and that reset hasn't persisted — the fetched row still reads
+                // CONFIRMED, so without this a failed reset PATCH would render
+                // "Approved — current" and misblame the failure on "other changes."
+                !reviewReopenedUnsaved
               }
               saving={saving}
               saveError={saveError}

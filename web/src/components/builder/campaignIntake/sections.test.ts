@@ -19,6 +19,7 @@ import {
   clearedRewardFieldKeys,
   clearedPolicyFieldKeys,
   candidateFieldFor,
+  mergeSeed,
   blockerSection,
   needsFee,
   needsCommission,
@@ -323,12 +324,23 @@ test("candidateFieldFor maps known parser keys to their editable campaign field"
   }
 });
 
+// PLU-170 (G3): restrictions/prohibited-claims → the reviewable Page-5 field.
+test("candidateFieldFor routes restrictions/prohibitedClaims to Content requirements", () => {
+  // The parser actually emits "restrictions"; prohibitedClaims is a forward-compat
+  // alias. Both must land on the Page-5 "contentRequirements" richText field so
+  // extracted prohibited-claims text becomes a reviewable creator-facing input.
+  for (const key of ["restrictions", "prohibitedClaims"]) {
+    const f = candidateFieldFor(key);
+    assert.ok(f, `"${key}" should map to the Content requirements field`);
+    assert.equal(f!.key, "contentRequirements");
+    assert.equal(f!.group, "campaign");
+    assert.equal(f!.control, "richText");
+  }
+});
+
 test("candidateFieldFor returns null for unmapped / non-applicable keys", () => {
   // Unknown key → no Apply target (shown as read-only evidence).
   assert.equal(candidateFieldFor("somethingWeDontModel"), null);
-  // PLU-139 (B): prohibitedClaims was dropped (off-worksheet) — the parser may
-  // still emit a "restrictions" section but it has no field to apply into now.
-  assert.equal(candidateFieldFor("prohibitedClaims"), null);
   // name/brand are campaign identity, not brief content → never an apply target
   // (editable on page 1, but a brief import must not retarget them).
   assert.equal(candidateFieldFor("name"), null);
@@ -342,6 +354,21 @@ test("candidateFieldFor returns null for unmapped / non-applicable keys", () => 
   // radioCards/select/toggle fields aren't text candidates.
   assert.equal(candidateFieldFor("campaignType"), null);
   assert.equal(candidateFieldFor("includesGifting"), null);
+});
+
+// -- G2 seed-merge no-clobber ------------------------------------------------
+
+test("mergeSeed fills gaps from server but a retained draft edit wins", () => {
+  const server = { logoRef: "logo.png", primaryColor: "#000", typography: "Inter" };
+  // No local edits (the no-edit recovery path): server values pass through whole.
+  assert.deepEqual(mergeSeed(server, {}), server);
+  // A retained edit made while the group was unseeded must WIN over the server
+  // value, while unseen sibling fields still get their real persisted values.
+  assert.deepEqual(mergeSeed(server, { primaryColor: "#fff" }), {
+    logoRef: "logo.png",
+    primaryColor: "#fff",
+    typography: "Inter",
+  });
 });
 
 // -- deliverable cards (S3.2–S3.9) -------------------------------------------

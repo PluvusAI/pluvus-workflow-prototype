@@ -143,6 +143,34 @@ def test_inline_label_line_is_rejected_as_heading():
     assert b._match_heading("- Timeline") == "timeline"
 
 
+def test_restrictions_heading_segments_and_content_requirements_no_longer_deliverables():
+    # PLU-170 (G3): a "Restrictions" (and "Prohibited claims") heading opens a
+    # `restrictions` section — the key the web side aliases onto the reviewable
+    # Page-5 "Content requirements" field. And a literal "Content requirements"
+    # heading must route to `restrictions`, NOT get swallowed by Deliverables.
+    # A "Content requirements" heading (the phrase deliverables' regex used to
+    # swallow) now opens the restrictions section, not deliverables.
+    lines = [
+        "Deliverables",
+        "3 Instagram Reels.",
+        "Content Requirements",
+        "No health or medical claims. Must include the #ad disclosure.",
+    ]
+    parsed = b.parse_brief_structured(make_pdf(lines))
+    assert parsed.status == "ok"
+    assert "restrictions" in parsed.sections
+    restrictions = parsed.sections["restrictions"].text
+    assert "health or medical claims" in restrictions
+    assert "disclosure" in restrictions
+    # ...and did NOT leak into deliverables.
+    deliverables = parsed.sections["deliverables"].text if "deliverables" in parsed.sections else ""
+    assert "disclosure" not in deliverables
+    # Every restrictions synonym maps to the same key (order: before deliverables).
+    assert b._match_heading("Restrictions") == "restrictions"
+    assert b._match_heading("Prohibited Claims") == "restrictions"
+    assert b._match_heading("Content Requirements") == "restrictions"
+
+
 def test_heading_light_brief_falls_to_keyword_tier_and_keeps_unmatched():
     text = (
         "We are excited to partner with you.\n\n"

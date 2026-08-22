@@ -1507,10 +1507,16 @@ export function candidateFieldFor(sectionKey: string): FieldSpec | null {
   // name/brand are campaign identity (set at create, editable on page 1), not
   // brief content — a brief import must never retarget them.
   if (sectionKey === "name" || sectionKey === "brand") return null;
+  // PLU-170 (G3): the parser emits "restrictions" for prohibited-claims/
+  // restrictions text; route it to the reviewable Page-5 "Content requirements"
+  // field (Option A). prohibitedClaims kept only for forward-compat — the parser
+  // never actually produces it (keys not in _SINGLE_KEYS spill to `other[]`).
+  const CR_ALIASES = new Set(["restrictions", "prohibitedClaims"]);
+  const lookupKey = CR_ALIASES.has(sectionKey) ? "contentRequirements" : sectionKey;
   for (const section of SECTIONS) {
     for (const f of section.fields) {
       if (
-        f.key === sectionKey &&
+        f.key === lookupKey &&
         f.group === "campaign" &&
         !f.readOnly &&
         // Free-text-backed controls can accept extracted brief text verbatim.
@@ -1526,6 +1532,17 @@ export function candidateFieldFor(sectionKey: string): FieldSpec | null {
     }
   }
   return null;
+}
+
+// PLU-170 (G2): no-clobber seed merge. When a failed subgroup read is recovered,
+// the real server values fill any field the user hasn't touched, but a retained
+// local edit (already in `draft`) wins — so recovering a read never overwrites an
+// edit the user made while the group was unseeded.
+export function mergeSeed(
+  server: Record<string, unknown>,
+  draft: Record<string, unknown>,
+): Record<string, unknown> {
+  return { ...server, ...draft };
 }
 
 export function getSection(key: SectionKey): SectionSpec {
